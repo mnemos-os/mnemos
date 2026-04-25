@@ -1,4 +1,4 @@
-"""CHARON v0.2 round-trip integration test against real Postgres.
+"""CHARON round-trip integration test against real Postgres.
 
 Verifies that an envelope produced by `GET /v1/export?include_sidecars=true`
 and consumed by `POST /v1/import?preserve_owner=true` is lossless on
@@ -13,7 +13,7 @@ JSONB serialization, type-cast edge cases.
 To run locally against a fresh Postgres (with pgvector + pgcrypto):
 
   MNEMOS_TEST_PG_URL=postgresql://user:pw@host:port/db \\
-    pytest tests/test_charon_v02_roundtrip.py -v
+    pytest tests/test_charon_roundtrip.py -v
 
 The DB must already have all 21 migrations applied. The test
 truncates the four CHARON tables between phases; it does NOT touch
@@ -278,7 +278,7 @@ def _root_user():
 
 
 @pytest.mark.asyncio
-async def test_charon_v02_full_round_trip(fresh_db):
+async def test_charon_full_round_trip(fresh_db):
     """End-to-end: seed → export(include_sidecars=True) → truncate
     → import(preserve_owner=True) → snapshot. The before-export and
     after-import snapshots must be identical."""
@@ -356,7 +356,7 @@ async def test_charon_v02_full_round_trip(fresh_db):
 
 
 @pytest.mark.asyncio
-async def test_charon_v02_re_import_is_idempotent(fresh_db):
+async def test_charon_re_import_is_idempotent(fresh_db):
     """Re-running the same import against an already-populated DB
     must be a no-op — not an error, not a partial overwrite. The
     on-the-wire ON CONFLICT DO NOTHING contract translates to
@@ -396,7 +396,7 @@ async def test_charon_v02_re_import_is_idempotent(fresh_db):
 
 
 @pytest.mark.asyncio
-async def test_charon_v02_export_omits_sidecars_when_flag_off(fresh_db):
+async def test_charon_export_omits_sidecars_when_flag_off(fresh_db):
     """With include_sidecars=False (the default), the envelope must
     NOT carry the three sidecar arrays — back-compat with 0.1.0
     consumers that only know about kind=memory."""
