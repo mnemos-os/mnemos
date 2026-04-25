@@ -1198,6 +1198,12 @@ async def _import_memory_versions(
                     extra="memory_versions",
                 )
         # Translate the entry's own id and any parent references.
+        # Also remap commit_hash — it has a global UNIQUE index in
+        # memory_versions, so two non-root callers importing the
+        # same envelope would collide there too (Codex round-16
+        # finding). Caller-scope by hashing (caller, raw hash):
+        # uniqueness preserved across callers, traceability preserved
+        # within a caller's space.
         for entry in sidecar:
             if entry.get("id") in version_id_remap:
                 entry["id"] = version_id_remap[entry["id"]]
@@ -1209,6 +1215,15 @@ async def _import_memory_versions(
                 entry["merge_parents"] = [
                     version_id_remap.get(str(mp), str(mp)) for mp in mp_list
                 ]
+            ch = entry.get("commit_hash")
+            if ch:
+                entry["commit_hash"] = hashlib.sha256(
+                    b"\x00".join([
+                        caller_user_id.encode("utf-8"),
+                        caller_namespace.encode("utf-8"),
+                        str(ch).encode("utf-8"),
+                    ])
+                ).hexdigest()
 
     # Real topological sort over parent_version_id + merge_parents
     # so parent rows are inserted before children regardless of

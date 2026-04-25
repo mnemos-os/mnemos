@@ -769,7 +769,14 @@ def test_import_memory_versions_sidecar_imports(monkeypatch):
     mv_insert = next(e for e in conn.executes if "INSERT INTO memory_versions" in e[0])
     args = mv_insert[1]
     assert _ALICE_MEM_ALICE1_DERIVED in args
-    assert "abc123" in args  # commit_hash
+    # commit_hash is caller-scoped under non-root (round-16 fix);
+    # verify the envelope's raw "abc123" is NOT in args, and a
+    # 64-char hex hash IS present.
+    assert "abc123" not in args
+    assert any(
+        isinstance(a, str) and len(a) == 64 and all(c in "0123456789abcdef" for c in a)
+        for a in args
+    ), f"expected sha256 hex commit_hash in args; got {args}"
     assert "main" in args    # branch
 
 
