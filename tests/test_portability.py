@@ -628,6 +628,13 @@ def _mv_sidecar_entry(
     }
 
 
+def _allowlist_row(memory_id="mem_alice1", owner_id="alice", namespace="alice-ns"):
+    """Routed-fetch row for the allowlist SELECT issued before sidecar
+    imports. Mirrors what `_build_referenced_memory_allowlist` expects:
+    a memories row with id + owner_id + namespace columns."""
+    return {"id": memory_id, "owner_id": owner_id, "namespace": namespace}
+
+
 def _cm_sidecar_entry(
     record_id: str = "mem_alice1",
     owner_id: str = "alice",
@@ -651,7 +658,9 @@ def _cm_sidecar_entry(
 def test_import_kg_triples_sidecar_imports_with_caller_owner_for_non_root(monkeypatch):
     """Same anti-smuggling rule as memories — non-root rewrites
     owner_id + namespace on every kg_triple to the caller's identity."""
-    conn = _Conn()
+    # Allowlist SELECT after the records loop returns mem_alice1
+    # under alice's identity (the records loop just inserted it).
+    conn = _Conn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -674,7 +683,15 @@ def test_import_kg_triples_sidecar_imports_with_caller_owner_for_non_root(monkey
 
 
 def test_import_kg_triples_root_preserve_owner_honors_envelope(monkeypatch):
-    conn = _Conn()
+    # preserve_owner=True: sidecar's stated owner+ns must match the
+    # referenced memory's actual owner+ns. Here the kg_triple claims
+    # bob/bob-ns; the allowlist says mem_alice1 IS owned by bob/bob-ns
+    # (root-driven cross-tenant migration scenario, not a smuggle).
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(owner_id="bob", namespace="bob-ns")
+        ],
+    })
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -710,7 +727,7 @@ def test_import_kg_triples_missing_predicate_failed(monkeypatch):
 
 
 def test_import_memory_versions_sidecar_imports(monkeypatch):
-    conn = _Conn()
+    conn = _Conn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -744,7 +761,7 @@ def test_import_memory_versions_missing_required_fails(monkeypatch):
 
 
 def test_import_compression_manifest_sidecar_imports(monkeypatch):
-    conn = _Conn()
+    conn = _Conn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -768,7 +785,7 @@ def test_import_all_three_sidecars_under_one_envelope(monkeypatch):
     """Most realistic scenario: a CHARON round-trip envelope with one
     memory + a triple + a version + a compression entry. Per-surface
     counters break out cleanly."""
-    conn = _Conn()
+    conn = _Conn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -796,7 +813,7 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"
-    conn = _DupeConn()
+    conn = _DupeConn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -832,3 +849,136 @@ def test_import_no_sidecars_means_no_sidecar_inserts(monkeypatch):
                    "memory_versions" in e[0] or
                    "memory_compressed_variants" in e[0]
                    for e in conn.executes)
+
+
+# ─── /v1/import — cross-tenant attachment defense (Codex finding #3) ────────
+
+
+def test_import_kg_triple_referencing_foreign_memory_id_rejected(monkeypatch):
+    """Attack scenario: alice posts a kg_triple with memory_id =
+    'mem_bob_secret', a memory she does NOT own. The records loop
+    skips bob's row via ON CONFLICT (id) DO NOTHING, but without the
+    allowlist gate the kg_triple would attach to bob's memory under
+    alice's owner_id+namespace, poisoning bob's read paths.
+
+    Allowlist SELECT must return ZERO rows (alice does not own
+    mem_bob_secret), and the helper must reject the entry, count it
+    under sidecars_failed, and execute no INSERT against kg_triples."""
+    conn = _Conn(routed_rows={
+        # Allowlist returns nothing — alice owns no matching memory.
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[],
+        kg_triples=[_kg_sidecar_entry(id="kg_attack")],
+    )
+    # Override the entry's memory_id to point at bob.
+    env.kg_triples[0]["memory_id"] = "mem_bob_secret"
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {}
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert any(
+        "mem_bob_secret" in e and "not in caller-owned" in e
+        for e in stats.errors
+    ), f"expected rejection error, got {stats.errors}"
+    assert not any("INSERT INTO kg_triples" in e[0] for e in conn.executes)
+
+
+def test_import_memory_version_referencing_foreign_record_id_rejected(monkeypatch):
+    """Same attack via memory_versions — alice tries to attach
+    authoritative version history to bob's record_id."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["record_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    assert any(
+        "mem_bob_secret" in e and "not in caller-owned" in e
+        for e in stats.errors
+    ), f"expected rejection error, got {stats.errors}"
+    assert not any("INSERT INTO memory_versions" in e[0] for e in conn.executes)
+
+
+def test_import_compression_manifest_referencing_foreign_record_id_rejected(monkeypatch):
+    """Same attack via compression_manifest — would let alice plant
+    arbitrary compressed_content + judge scores on bob's memory."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _cm_sidecar_entry()
+    bad["record_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], compression_manifest=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_failed == {"compression_manifest": 1}
+    assert any(
+        "mem_bob_secret" in e and "not in caller-owned" in e
+        for e in stats.errors
+    ), f"expected rejection error, got {stats.errors}"
+    assert not any(
+        "INSERT INTO memory_compressed_variants" in e[0] for e in conn.executes
+    )
+
+
+def test_import_kg_triple_with_no_memory_id_is_first_class(monkeypatch):
+    """A kg_triple without memory_id is a stand-alone fact (e.g.
+    Graphiti-style first-class triple). It should NOT be rejected
+    by the allowlist gate — there's no memory FK to validate."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    free = _kg_sidecar_entry(id="kg_first_class")
+    free.pop("memory_id")  # first-class triple
+    env = portability.MPFEnvelope(records=[], kg_triples=[free])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {"kg_triples": 1}
+    assert stats.sidecars_failed == {}
+
+
+def test_import_preserve_owner_rejects_owner_namespace_mismatch(monkeypatch):
+    """Under preserve_owner=true: sidecar's stated owner+ns MUST
+    match the referenced memory's actual owner+ns. If a root caller
+    posts a kg_triple stamped owner=bob+ns=bob-ns referencing a
+    memory_id that DB says is owned by carol, reject."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_carol_real",
+                           owner_id="carol", namespace="carol-ns")
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _kg_sidecar_entry(owner_id="bob", namespace="bob-ns")
+    bad["memory_id"] = "mem_carol_real"
+    env = portability.MPFEnvelope(records=[], kg_triples=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert any(
+        "mem_carol_real" in e and "carol" in e.lower()
+        for e in stats.errors
+    ), f"expected owner-mismatch rejection, got {stats.errors}"

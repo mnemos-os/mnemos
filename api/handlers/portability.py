@@ -539,6 +539,85 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
+async def _build_referenced_memory_allowlist(
+    conn,
+    envelope: "MPFEnvelope",
+) -> Dict[str, tuple]:
+    """Return {memory_id: (owner_id, namespace)} for every memory_id
+    a sidecar in this envelope claims to attach to, looked up in DB.
+
+    This is the set of memories the caller is *capable of* attaching
+    sidecars to. Each sidecar import helper then checks per-entry
+    whether the effective (post-rewrite) owner/namespace matches
+    what's in the DB — that's what blocks a malicious envelope from
+    smuggling kg_triples / version history / compressed-content onto
+    another tenant's memory_id.
+
+    First-class kg_triples (memory_id absent) are not subject to
+    this check. They have no FK to a memory record by design.
+    """
+    referenced: set = set()
+    for entry in envelope.kg_triples or []:
+        mid = entry.get("memory_id")
+        if mid:
+            referenced.add(mid)
+    for entry in envelope.memory_versions or []:
+        rid = entry.get("record_id")
+        if rid:
+            referenced.add(rid)
+    for entry in envelope.compression_manifest or []:
+        rid = entry.get("record_id")
+        if rid:
+            referenced.add(rid)
+    if not referenced:
+        return {}
+    rows = await conn.fetch(
+        "SELECT id, owner_id, namespace FROM memories WHERE id = ANY($1::text[])",
+        list(referenced),
+    )
+    return {r["id"]: (r["owner_id"], r["namespace"]) for r in rows}
+
+
+def _is_allowed_reference(
+    memory_id: Optional[str],
+    *,
+    effective_owner: str,
+    effective_namespace: Optional[str],
+    allowlist: Dict[str, tuple],
+    require_namespace_match: bool = True,
+) -> tuple[bool, str]:
+    """Return (allowed, reason). The sidecar is allowed iff the
+    referenced memory_id either (a) is None — first-class triple
+    case — or (b) exists in the allowlist AND the memory's actual
+    owner+namespace matches the post-rewrite effective owner+ns
+    that this sidecar would land under.
+
+    `require_namespace_match=False` for compression_manifest, which
+    has no namespace column — owner match is sufficient there.
+    """
+    if memory_id is None:
+        return True, ""
+    if memory_id not in allowlist:
+        return False, (
+            f"record_id {memory_id!r} not in caller-owned memory id set; "
+            "skipped (cross-tenant attachment refused)"
+        )
+    actual_owner, actual_ns = allowlist[memory_id]
+    if actual_owner != effective_owner:
+        return False, (
+            f"record_id {memory_id!r} belongs to owner {actual_owner!r}, "
+            f"not the sidecar's effective owner {effective_owner!r}; "
+            "skipped (cross-tenant attachment refused)"
+        )
+    if require_namespace_match and actual_ns != effective_namespace:
+        return False, (
+            f"record_id {memory_id!r} is in namespace {actual_ns!r}, "
+            f"not the sidecar's effective namespace {effective_namespace!r}; "
+            "skipped (cross-tenant attachment refused)"
+        )
+    return True, ""
+
+
 def _row_owner_ns(
     entry: Dict[str, Any],
     *,
@@ -577,6 +656,7 @@ async def _import_kg_triples(
     caller_namespace: str,
     preserve_owner: bool,
     stats: ImportStats,
+    allowlist: Dict[str, tuple],
 ) -> None:
     """Upsert MPF kg_triples sidecar entries into the kg_triples
     table. Idempotent on `id`. Subject/object literals and id
@@ -611,6 +691,20 @@ async def _import_kg_triples(
             caller_namespace=caller_namespace,
             preserve_owner=preserve_owner,
         )
+        # Tenant-scope check: the triple's memory_id (when present)
+        # must reference a memory whose actual owner+namespace match
+        # the post-rewrite owner+ns we'd persist this triple under.
+        # Blocks alice from attaching kg_triples to bob's memory_id.
+        allowed, reason = _is_allowed_reference(
+            entry.get("memory_id"),
+            effective_owner=row_owner,
+            effective_namespace=row_ns,
+            allowlist=allowlist,
+        )
+        if not allowed:
+            _bump(stats.sidecars_failed, surface)
+            stats.errors.append(f"[{surface}] {entry['id']}: {reason}")
+            continue
         try:
             row = await conn.execute(
                 """
@@ -658,6 +752,7 @@ async def _import_memory_versions(
     caller_namespace: str,
     preserve_owner: bool,
     stats: ImportStats,
+    allowlist: Dict[str, tuple],
 ) -> None:
     """Upsert MPF memory_version_entry sidecar entries into
     memory_versions. Idempotent on `id`. Carries the full DAG
@@ -679,6 +774,18 @@ async def _import_memory_versions(
                 caller_namespace=caller_namespace,
                 preserve_owner=preserve_owner,
             )
+            # Same tenant-scope check as kg_triples — every version
+            # must attach to a memory the caller (post-rewrite) owns.
+            allowed, reason = _is_allowed_reference(
+                entry.get("record_id"),
+                effective_owner=row_owner,
+                effective_namespace=row_ns,
+                allowlist=allowlist,
+            )
+            if not allowed:
+                _bump(stats.sidecars_failed, surface)
+                stats.errors.append(f"[{surface}] {entry['id']}: {reason}")
+                continue
             metadata = entry.get("metadata") or {}
             try:
                 row = await conn.execute(
@@ -730,6 +837,7 @@ async def _import_compression_manifest(
     caller_namespace: str,
     preserve_owner: bool,
     stats: ImportStats,
+    allowlist: Dict[str, tuple],
 ) -> None:
     """Upsert MPF compression_manifest_entry sidecar entries into
     memory_compressed_variants. Primary key is `memory_id` (one
@@ -755,6 +863,37 @@ async def _import_compression_manifest(
                 preserve_owner=preserve_owner,
                 has_namespace_column=False,
             )
+            # Same tenant-scope check as the other sidecars; namespace
+            # match not required because this table has no namespace
+            # column. Owner-only check is the right granularity.
+            allowed, reason = _is_allowed_reference(
+                entry.get("record_id"),
+                effective_owner=row_owner,
+                effective_namespace=None,
+                allowlist=allowlist,
+                require_namespace_match=False,
+            )
+            if not allowed:
+                _bump(stats.sidecars_failed, surface)
+                stats.errors.append(f"[{surface}] {entry.get('record_id')}: {reason}")
+                continue
+            # winner_candidate_id is FK→memory_compression_candidates(id)
+            # ON DELETE SET NULL. The manifest sidecar carries the
+            # winner ID for traceability but CHARON does not also
+            # ship the candidate row, so the FK target may be absent
+            # after import. NULL-out when missing so the import
+            # doesn't fail on a back-pointer to data that doesn't
+            # exist; it can be repaired later by re-running a
+            # compression contest. Lossless on the manifest's
+            # primary content (engine_id, compressed_content, scores).
+            winner_id = entry.get("winner_contest_id")
+            if winner_id:
+                exists = await conn.fetchval(
+                    "SELECT 1 FROM memory_compression_candidates WHERE id = $1::uuid",
+                    winner_id,
+                )
+                if not exists:
+                    winner_id = None
             try:
                 row = await conn.execute(
                     """
@@ -775,7 +914,7 @@ async def _import_compression_manifest(
                     )
                     ON CONFLICT (memory_id) DO NOTHING
                     """,
-                    entry["record_id"], row_owner, entry.get("winner_contest_id"),
+                    entry["record_id"], row_owner, winner_id,
                     entry["engine_id"], entry.get("engine_version"),
                     entry.get("compressed_content"),
                     entry.get("compressed_tokens"),
@@ -861,17 +1000,24 @@ async def import_memories(
             # synthesize a fresh v1 on every memory INSERT, then
             # collide with the envelope's v1 on the
             # idx_mv_main_linear partial unique index `(memory_id,
-            # version_num) WHERE branch='main'`. Disable the trigger
+            # version_num) WHERE branch='main'`. Suppress the trigger
             # for the duration of this transaction; the envelope IS
             # the version log.
-            suppress_version_trigger = bool(envelope.memory_versions)
-            if suppress_version_trigger:
-                # session_replication_role=replica skips user-defined
-                # triggers without DROP/RECREATE — scoped to this
-                # session via `LOCAL`, so concurrent writers on the
-                # same pool connection (none in transaction context,
-                # but defense-in-depth) aren't affected.
-                await conn.execute("SET LOCAL session_replication_role = replica")
+            #
+            # Targeted suppression via the `mnemos.suppress_version_snapshot`
+            # custom GUC. The trigger creation in
+            # db/migrations_v3_4_charon_trigger_guard.sql attaches a
+            # WHEN clause that no-ops the three version-snapshot
+            # triggers when this GUC is '1'. Custom dot-namespaced
+            # GUCs are settable per-transaction by any role — no
+            # superuser required, unlike `session_replication_role`,
+            # which is what the v3.3 cut originally used. The GUC also
+            # leaves FK enforcement and every other user-defined
+            # trigger untouched.
+            if envelope.memory_versions:
+                await conn.execute(
+                    "SET LOCAL mnemos.suppress_version_snapshot = '1'"
+                )
 
             for record in envelope.records:
                 if record.kind != "memory":
@@ -949,6 +1095,19 @@ async def import_memories(
                     stats.errors.append(f"{record.id}: {type(exc).__name__}: {exc}")
                     logger.exception("MPF import failed for record %s", record.id)
 
+            # Build the per-request allowlist of memory_ids the
+            # caller may attach sidecars to. Computed AFTER the
+            # records loop so any memory just imported in this
+            # request is included. The check inside each helper
+            # confirms post-rewrite owner+namespace matches the
+            # memory's actual ownership in DB — so an envelope
+            # cannot smuggle sidecars onto another tenant's
+            # memory_id by labeling them with the caller's
+            # identity. This is the cross-tenant-attachment fix.
+            allowlist = await _build_referenced_memory_allowlist(
+                conn, envelope,
+            )
+
             # Sidecars run inside the same transaction so a partial
             # failure rolls everything back. Order: kg_triples first
             # (no FK to memories required), then memory_versions and
@@ -960,6 +1119,7 @@ async def import_memories(
                     caller_namespace=user.namespace,
                     preserve_owner=preserve_owner,
                     stats=stats,
+                    allowlist=allowlist,
                 )
             if envelope.memory_versions:
                 await _import_memory_versions(
@@ -968,6 +1128,7 @@ async def import_memories(
                     caller_namespace=user.namespace,
                     preserve_owner=preserve_owner,
                     stats=stats,
+                    allowlist=allowlist,
                 )
             if envelope.compression_manifest:
                 await _import_compression_manifest(
@@ -976,6 +1137,7 @@ async def import_memories(
                     caller_namespace=user.namespace,
                     preserve_owner=preserve_owner,
                     stats=stats,
+                    allowlist=allowlist,
                 )
 
     logger.info(
