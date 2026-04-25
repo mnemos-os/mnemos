@@ -1031,6 +1031,7 @@ async def _validate_version_parents(
     effective_ns: Optional[str],
     in_envelope_index: Dict[str, Dict[str, Any]],
     preserve_owner: bool = True,
+    require_in_envelope: bool = False,
 ) -> tuple:
     """Verify every parent UUID points at a row under the same
     record_id + owner + namespace as the entry being imported.
@@ -1074,6 +1075,20 @@ async def _validate_version_parents(
     }
     bad: List[str] = []
     for p in parent_uuids:
+        if require_in_envelope and p not in in_envelope_index:
+            # For NEW records being inserted in this request,
+            # parent UUIDs must be either NULL or also in the
+            # current envelope. A stale prior-lifetime row left
+            # behind by a delete (memory_versions survives memory
+            # deletion by design) could otherwise be grafted as a
+            # parent of the freshly-inserted memory's history,
+            # producing a DAG that walks back into deleted state
+            # while the live row shows fresh content. Codex
+            # round-28 finding. The constraint says: if you're
+            # creating a memory now, its history must be self-
+            # contained in this import.
+            bad.append(p)
+            continue
         if p in db_truth:
             # DB has this parent. Tenancy is whatever's in DB,
             # NOT what the envelope claims (the envelope's INSERT
@@ -1214,6 +1229,7 @@ async def _import_memory_versions(
     preserve_owner: bool,
     stats: ImportStats,
     allowlist: Dict[str, tuple],
+    inserted_record_ids: Optional[set] = None,
 ) -> tuple:
     """Upsert MPF memory_version_entry sidecar entries into
     memory_versions. Idempotent on `id`. Carries the full DAG
@@ -1360,6 +1376,16 @@ async def _import_memory_versions(
                 if mp:
                     parent_uuids.append(str(mp))
             if parent_uuids:
+                # If this version's record_id was newly INSERTed
+                # in this request, require its parents to be in
+                # the current envelope (not stale DB rows from a
+                # prior lifetime). If the record_id pre-existed
+                # (ON CONFLICT), DB-only parents are legitimate
+                # — the record's history was already valid.
+                require_in_envelope = (
+                    inserted_record_ids is not None
+                    and entry["record_id"] in inserted_record_ids
+                )
                 ok, bad = await _validate_version_parents(
                     conn, parent_uuids,
                     expected_record_id=entry["record_id"],
@@ -1367,6 +1393,7 @@ async def _import_memory_versions(
                     effective_ns=row_ns,
                     in_envelope_index=in_envelope_index,
                     preserve_owner=preserve_owner,
+                    require_in_envelope=require_in_envelope,
                 )
                 if not ok:
                     _bump(stats.sidecars_failed, surface)
@@ -2033,6 +2060,7 @@ async def import_memories(
                     preserve_owner=preserve_owner,
                     stats=stats,
                     allowlist=allowlist,
+                    inserted_record_ids=inserted_record_ids,
                 )
                 # All-or-nothing per record (Codex round-7 finding):
                 # if a record was INSERTed in this transaction AND
