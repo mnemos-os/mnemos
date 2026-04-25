@@ -1993,6 +1993,18 @@ async def import_memories(
             # roll back an unrelated import (Codex round-4 finding).
             inserted_record_ids: set = set()
 
+            # Persisted IDs the envelope CLAIMED to define but whose
+            # insert was rejected (conflict-row content/owner/ns
+            # mismatch, or per-row exception). Used to actively
+            # exclude these from the sidecar allowlist after the
+            # records loop — without this, a same-tenant collision
+            # where the existing DB row holds different content
+            # would still let kg_triples / compression_manifest
+            # attach to the stale row, since the row legitimately
+            # exists in DB and would otherwise pass the allowlist
+            # SELECT (Codex round-35 finding).
+            rejected_persisted_ids: set = set()
+
             # Per-request id remap: envelope record_id -> the id the
             # row was actually persisted under. For non-root callers
             # (no preserve_owner) we DERIVE a caller-scoped id from
@@ -2132,10 +2144,17 @@ async def import_memories(
                                 "(content/owner/namespace differ); "
                                 "sidecar attachment refused"
                             )
-                            # Don't add to inserted_record_ids — the
-                            # allowlist will reject sidecars referencing
-                            # this id since it's not under the caller's
-                            # post-rewrite identity.
+                            # Codex round-35 finding: id_remap was
+                            # populated BEFORE the conflict check
+                            # (line 2062), so leaving it in place
+                            # would let sidecar references rewrite
+                            # to persisted_id and attach to the
+                            # stale DB row via the allowlist.
+                            # Remove the remap entry AND mark the
+                            # persisted_id rejected so the allowlist
+                            # build excludes it.
+                            id_remap.pop(record.id, None)
+                            rejected_persisted_ids.add(persisted_id)
                             continue
                         stats.skipped += 1
                     else:
@@ -2145,6 +2164,16 @@ async def import_memories(
                     stats.failed += 1
                     stats.errors.append(f"{record.id}: {type(exc).__name__}: {exc}")
                     logger.exception("MPF import failed for record %s", record.id)
+                    # Same hazard as the conflict-mismatch branch:
+                    # id_remap was set before the INSERT ran. If a
+                    # per-row exception aborted the SAVEPOINT, the
+                    # row didn't land — but a same-id row may still
+                    # exist in DB from a prior import. Drop the
+                    # remap and reject the persisted_id so sidecars
+                    # can't ride a partial-failure into the stale
+                    # row (Codex round-35 finding extended).
+                    id_remap.pop(record.id, None)
+                    rejected_persisted_ids.add(persisted_id)
 
             # Build the per-request allowlist of memory_ids the
             # caller may attach sidecars to. Computed AFTER the
@@ -2196,6 +2225,16 @@ async def import_memories(
                 scope_owner=scope_owner,
                 scope_namespace=scope_namespace,
             )
+            # Codex round-35 finding: even with id_remap cleared
+            # for rejected records, a sidecar that references the
+            # persisted_id directly (envelope record_id == DB id
+            # under root + preserve_owner) would still resolve in
+            # the unscoped allowlist SELECT and attach to the
+            # stale row. Strip the rejected ids from the allowlist
+            # so any sidecar referencing them is refused at
+            # _is_allowed_reference time.
+            for rid in rejected_persisted_ids:
+                allowlist.pop(rid, None)
 
             # Sidecars run inside the same transaction so a partial
             # failure rolls everything back. Order: kg_triples first

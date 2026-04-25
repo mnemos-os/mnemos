@@ -582,6 +582,66 @@ def test_import_idempotent_on_id_collision(monkeypatch):
     assert stats.skipped == 1
 
 
+def test_import_rejected_conflict_blocks_sidecar_attachment(monkeypatch):
+    """Round-35 finding: under root + preserve_owner=true, a memory
+    record whose ON CONFLICT row mismatches the envelope (different
+    content) is marked failed — but earlier code populated id_remap
+    BEFORE the verification, leaving sidecar references rewritable
+    to the stale DB row. Without the round-35 fix, a kg_triples
+    entry referencing that record_id would still attach to the
+    pre-existing memory because it legitimately exists in DB and
+    passes the unscoped allowlist SELECT.
+
+    Setup: envelope claims memory id ``mem_alice1`` with content
+    ``new body``; DB already has ``mem_alice1`` with ``stale body``.
+    Conflict-row check rejects the memory record. The kg_triples
+    sidecar entry referencing ``mem_alice1`` MUST be refused — not
+    attached to the stale row.
+    """
+    class _MismatchConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memories" in sql:
+                return "INSERT 0 0"  # always conflict
+            return "INSERT 0 1"
+
+    conn = _MismatchConn(routed_rows={
+        # The conflict-row verification SELECT — DB content does NOT
+        # match envelope's "new body" claim.
+        "FROM memories WHERE id = $1": [
+            {"content": "stale body", "category": "solutions",
+             "owner_id": "alice", "namespace": "alice-ns"},
+        ],
+        # Allowlist SELECT (unscoped under root + preserve_owner)
+        # would normally find the existing row.
+        "SELECT id, owner_id, namespace FROM memories": [
+            _allowlist_row(memory_id="mem_alice1"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.0",
+        records=[_memory_record(id="mem_alice1", content="new body")],
+        kg_triples=[_kg_sidecar_entry()],
+    )
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.failed >= 1
+    # The kg_triples sidecar MUST NOT attach to the rejected record.
+    assert stats.sidecars_imported.get("kg_triples", 0) == 0
+    assert all(
+        "INSERT INTO kg_triples" not in sql
+        for sql, _ in conn.executes
+    ), (
+        "kg_triples must not be inserted when its referenced memory "
+        "record was rejected by the conflict-row verification"
+    )
+
+
 def test_import_accepts_011_envelope(monkeypatch):
     """Forward-compat ratchet: 0.1.1 envelopes import cleanly against
     the same handler. The required-fields contract didn't change in
