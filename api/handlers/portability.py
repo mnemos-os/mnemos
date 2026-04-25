@@ -2034,6 +2034,19 @@ async def import_memories(
                         f"{record.id}: unsupported payload_version "
                         f"{record.payload_version!r}; expected {MEMORY_PAYLOAD_VERSION}"
                     )
+                    # Codex round-37: early-continue paths happen
+                    # BEFORE persisted_id is computed and id_remap
+                    # is populated. Without recording the envelope
+                    # id as rejected, root+preserve_owner sidecars
+                    # referencing the same id would still attach
+                    # to whatever pre-existing DB row matches,
+                    # because the allowlist build sees nothing
+                    # rejected. Add record.id to
+                    # rejected_persisted_ids — under root+preserve
+                    # persisted_id would have been record.id so
+                    # this is the right key to strip from the
+                    # allowlist post-build.
+                    rejected_persisted_ids.add(record.id)
                     continue
 
                 p = record.payload
@@ -2049,6 +2062,12 @@ async def import_memories(
                 if not content or not str(content).strip():
                     stats.failed += 1
                     stats.errors.append(f"{record.id}: empty content; skipped")
+                    # Same hazard as the payload_version-mismatch
+                    # branch above (Codex round-37): an envelope
+                    # record that fails empty-content validation
+                    # must not authorize sidecars referencing the
+                    # same id against any pre-existing DB row.
+                    rejected_persisted_ids.add(record.id)
                     continue
 
                 category = p.get("category") or "imported"

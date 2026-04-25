@@ -746,6 +746,54 @@ def test_import_rejects_conflict_on_stale_permission_mode(monkeypatch):
     )
 
 
+def test_import_early_validation_rejection_blocks_sidecar(monkeypatch):
+    """Round-37 finding: pre-insert validation rejections (empty
+    content, unsupported payload_version) hit ``continue`` BEFORE
+    persisted_id is computed and id_remap is populated. Without
+    adding the envelope record_id to rejected_persisted_ids at
+    those points, a root+preserve_owner=true import can reject
+    the memory record and STILL attach kg_triples /
+    compression_manifest / memory_versions to a pre-existing DB
+    row carrying the same id, because the allowlist build sees
+    nothing rejected.
+
+    Setup: envelope claims memory id ``mem_alice1`` with empty
+    content (early-fail validation). DB has the pre-existing row
+    matching that id under root+preserve_owner unscoped allowlist.
+    The kg_triples sidecar referencing ``mem_alice1`` MUST be
+    refused — not attached to the pre-existing row.
+    """
+    conn = _Conn(routed_rows={
+        "SELECT id, owner_id, namespace FROM memories": [
+            _allowlist_row(memory_id="mem_alice1"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.0",
+        records=[_memory_record(id="mem_alice1", content="")],
+        kg_triples=[_kg_sidecar_entry()],
+    )
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.failed >= 1
+    assert any(
+        "empty content" in err for err in stats.errors
+    ), f"expected empty-content rejection in {stats.errors!r}"
+    assert stats.sidecars_imported.get("kg_triples", 0) == 0
+    assert all(
+        "INSERT INTO kg_triples" not in sql
+        for sql, _ in conn.executes
+    ), (
+        "kg_triples must not attach to a pre-existing DB row when its "
+        "envelope memory record was rejected by early-validation"
+    )
+
+
 def test_import_accepts_011_envelope(monkeypatch):
     """Forward-compat ratchet: 0.1.1 envelopes import cleanly against
     the same handler. The required-fields contract didn't change in
