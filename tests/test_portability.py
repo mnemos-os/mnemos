@@ -633,10 +633,23 @@ def _mv_sidecar_entry(
     }
 
 
-def _allowlist_row(memory_id="mem_alice1", owner_id="alice", namespace="alice-ns"):
+# Standard test fixture's derived id under non-root path:
+# _derive_caller_scoped_id('mem_alice1', 'alice', 'alice-ns', 'body').
+# Hardcoded so tests don't need to import the helper. Round-14 fix.
+_ALICE_MEM_ALICE1_DERIVED = "mnemos_70c2ee51e5c57c5fd6ba105e5ded1595"
+
+
+def _allowlist_row(memory_id=None, owner_id="alice", namespace="alice-ns"):
     """Routed-fetch row for the allowlist SELECT issued before sidecar
     imports. Mirrors what `_build_referenced_memory_allowlist` expects:
-    a memories row with id + owner_id + namespace columns."""
+    a memories row with id + owner_id + namespace columns.
+
+    Default memory_id is the derived caller-scoped id for the
+    standard non-root test fixture (mem_alice1 → alice/alice-ns/body).
+    Tests using root + preserve_owner=true pass memory_id="mem_alice1"
+    explicitly to bypass the derivation."""
+    if memory_id is None:
+        memory_id = _ALICE_MEM_ALICE1_DERIVED
     return {"id": memory_id, "owner_id": owner_id, "namespace": namespace}
 
 
@@ -692,9 +705,12 @@ def test_import_kg_triples_root_preserve_owner_honors_envelope(monkeypatch):
     # referenced memory's actual owner+ns. Here the kg_triple claims
     # bob/bob-ns; the allowlist says mem_alice1 IS owned by bob/bob-ns
     # (root-driven cross-tenant migration scenario, not a smuggle).
+    # preserve_owner=true keeps envelope id verbatim — explicit
+    # memory_id="mem_alice1" in the allowlist row.
     conn = _Conn(routed_rows={
         "FROM memories WHERE id = ANY": [
-            _allowlist_row(owner_id="bob", namespace="bob-ns")
+            _allowlist_row(memory_id="mem_alice1",
+                           owner_id="bob", namespace="bob-ns")
         ],
     })
     _install(monkeypatch, conn)
@@ -737,7 +753,7 @@ def test_import_memory_versions_sidecar_imports(monkeypatch):
         # Post-import v1 verification SELECT — return mem_alice1 as
         # covered so the rollback path doesn't fire.
         "SELECT DISTINCT memory_id FROM memory_versions": [
-            {"memory_id": "mem_alice1"},
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED},
         ],
     })
     _install(monkeypatch, conn)
@@ -752,7 +768,7 @@ def test_import_memory_versions_sidecar_imports(monkeypatch):
     assert stats.sidecars_imported == {"memory_versions": 1}
     mv_insert = next(e for e in conn.executes if "INSERT INTO memory_versions" in e[0])
     args = mv_insert[1]
-    assert "mem_alice1" in args
+    assert _ALICE_MEM_ALICE1_DERIVED in args
     assert "abc123" in args  # commit_hash
     assert "main" in args    # branch
 
@@ -786,7 +802,7 @@ def test_import_compression_manifest_sidecar_imports(monkeypatch):
     assert stats.sidecars_imported == {"compression_manifest": 1}
     cm_insert = next(e for e in conn.executes if "INSERT INTO memory_compressed_variants" in e[0])
     args = cm_insert[1]
-    assert "mem_alice1" in args
+    assert _ALICE_MEM_ALICE1_DERIVED in args
     assert "apollo" in args
     # No namespace column on this table — caller's namespace must NOT
     # appear in the args list (only owner_id is bound).
@@ -800,7 +816,7 @@ def test_import_all_three_sidecars_under_one_envelope(monkeypatch):
     conn = _Conn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row()],
         "SELECT DISTINCT memory_id FROM memory_versions": [
-            {"memory_id": "mem_alice1"},
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED},
         ],
     })
     _install(monkeypatch, conn)
@@ -830,7 +846,10 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"
-    conn = _DupeConn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+    })
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -1077,13 +1096,17 @@ def test_import_partial_memory_versions_coverage_rejected(monkeypatch):
 def test_import_full_memory_versions_coverage_passes(monkeypatch):
     """Companion to the partial-coverage rejection test: when every
     record HAS a v1 in the sidecar, the import proceeds normally."""
+    # Non-root path derives caller-scoped ids — precomputed via
+    # _derive_caller_scoped_id(<id>, 'alice', 'alice-ns', 'body').
+    derived_a = "mnemos_b8f8ae3971167b1b060885669cd11fc3"
+    derived_b = "mnemos_8bfbe644770dd7a0ed6826cd13a098d9"
     conn = _Conn(routed_rows={
         "FROM memories WHERE id = ANY": [
-            _allowlist_row(memory_id="mem_a"),
-            _allowlist_row(memory_id="mem_b"),
+            _allowlist_row(memory_id=derived_a),
+            _allowlist_row(memory_id=derived_b),
         ],
         "SELECT DISTINCT memory_id FROM memory_versions": [
-            {"memory_id": "mem_a"}, {"memory_id": "mem_b"},
+            {"memory_id": derived_a}, {"memory_id": derived_b},
         ],
     })
     _install(monkeypatch, conn)
@@ -1121,12 +1144,12 @@ def test_import_memory_versions_restores_branch_head(monkeypatch):
         # against memory_versions — return the v1 row we'd expect
         # post-import.
         "SELECT DISTINCT ON (memory_id, branch)": [
-            {"memory_id": "mem_alice1", "branch": "main",
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED, "branch": "main",
              "head_version_id": "11111111-1111-1111-1111-111111111111"},
         ],
         # Post-import v1 verification needs to find the imported memory.
         "SELECT DISTINCT memory_id FROM memory_versions": [
-            {"memory_id": "mem_alice1"},
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED},
         ],
     })
     _install(monkeypatch, conn)
@@ -1146,7 +1169,7 @@ def test_import_memory_versions_restores_branch_head(monkeypatch):
         f"{[e[0][:60] for e in conn.executes]}"
     )
     args = branch_inserts[0][1]
-    assert "mem_alice1" in args
+    assert _ALICE_MEM_ALICE1_DERIVED in args
     assert "main" in args
 
 
@@ -1184,8 +1207,9 @@ def test_import_post_verification_rolls_back_when_memory_unversioned(monkeypatch
     # caught by the all-or-nothing check, NOT only by the post-
     # verification SELECT. Either path satisfies the integrity
     # contract; check the unifying property: "rolled back".
+    # Round-14 fix: id is the derived caller-scoped hash for non-root.
     assert "rolled back" in exc.value.detail
-    assert "mem_alice1" in exc.value.detail
+    assert _ALICE_MEM_ALICE1_DERIVED in exc.value.detail
 
 
 def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkeypatch):
@@ -1264,15 +1288,16 @@ def test_import_memory_versions_rejects_cross_tenant_parent(monkeypatch):
 
     Verify the import rejects such an entry without inserting."""
     foreign_parent_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1
     conn = _Conn(routed_rows={
-        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         # Parent UUID exists in DB but under bob's memory_id.
         "FROM memory_versions WHERE id = ANY": [
             {"id": foreign_parent_uuid, "memory_id": "mem_bob_secret",
              "owner_id": "bob", "namespace": "bob-ns"},
         ],
         "SELECT DISTINCT memory_id FROM memory_versions": [
-            {"memory_id": "mem_alice1"},
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED},
         ],
     })
     _install(monkeypatch, conn)
@@ -1315,7 +1340,7 @@ def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
              "owner_id": "bob", "namespace": "bob-ns"},
         ],
         "SELECT DISTINCT memory_id FROM memory_versions": [
-            {"memory_id": "mem_alice1"},
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED},
         ],
     })
     _install(monkeypatch, conn)
@@ -1350,6 +1375,49 @@ def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
     assert insert_args == [], (
         f"child must not insert when its parent shadows a foreign UUID; "
         f"found {len(insert_args)} INSERTs"
+    )
+
+
+def test_import_non_root_record_id_is_caller_scoped_not_envelope_verbatim(monkeypatch):
+    """Codex round-14 finding: a non-root caller could probe for
+    foreign memory_ids via the records-loop's imported-vs-skipped
+    response — POSTing a guessed id either inserts (id was new)
+    or hits ON CONFLICT DO NOTHING (id existed). Different counts
+    leak existence.
+
+    Fix: under non-root, the envelope's record.id is rewritten to
+    a deterministic caller-scoped hash. Foreign-id collisions
+    can't happen because every caller's id space is disjoint.
+    Verify the actually-inserted id is the derived hash, not
+    the envelope-supplied 'mem_bob_secret'."""
+    captured: list = []
+
+    class _CaptureConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            captured.append((sql, args))
+            return "INSERT 0 1"
+    conn = _CaptureConn()
+    _install(monkeypatch, conn)
+
+    # Adversary submits envelope with bob's id.
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_bob_secret", content="payload")],
+    )
+    asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    insert = next(
+        e for e in captured if "INSERT INTO memories" in e[0]
+    )
+    args = insert[1]
+    # The id stored MUST be the derived hash, NOT bob's id.
+    assert args[0].startswith("mnemos_"), (
+        f"non-root insert must use derived id; got {args[0]!r}"
+    )
+    assert "mem_bob_secret" not in args, (
+        f"non-root insert must NOT use envelope id verbatim; "
+        f"args contained 'mem_bob_secret'"
     )
 
 
@@ -1436,8 +1504,9 @@ def test_import_memory_versions_handles_v2_before_v1(monkeypatch):
                 seen_inserts.append(args[2])
             return "INSERT 0 1"
 
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1
     conn = _OrderTrackingConn(routed_rows={
-        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         "SELECT DISTINCT memory_id FROM memory_versions": [
             {"memory_id": "mem_alice1"},
         ],

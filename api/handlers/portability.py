@@ -41,6 +41,7 @@ Deferred to later commits:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import uuid
@@ -716,6 +717,41 @@ def _is_allowed_reference(
             "skipped (cross-tenant attachment refused)"
         )
     return True, ""
+
+
+def _derive_caller_scoped_id(
+    envelope_id: str,
+    *,
+    caller_owner: str,
+    caller_namespace: str,
+    content: str,
+) -> str:
+    """Derive a caller-scoped, deterministic id for non-root
+    record imports. Replaces the envelope's record.id so a
+    non-root caller cannot probe for foreign memory_ids via
+    `imported` vs `skipped` outcome inference (Codex round-14
+    finding).
+
+    Hash inputs: caller identity + envelope id + content. Mixing
+    in caller identity ensures alice and carol can both have
+    identical content without colliding (different hashes).
+    Mixing in the envelope id keeps re-imports of the SAME
+    envelope idempotent (same id derives same hash → ON CONFLICT
+    DO NOTHING). Mixing in content prevents an adversary from
+    pre-computing a target id space (they'd need to know the
+    target's content).
+
+    Returns a string that fits in the memories.id TEXT column.
+    """
+    h = hashlib.sha256(
+        b"\x00".join([
+            caller_owner.encode("utf-8"),
+            caller_namespace.encode("utf-8"),
+            envelope_id.encode("utf-8"),
+            content.encode("utf-8"),
+        ])
+    ).hexdigest()[:32]
+    return f"mnemos_{h}"
 
 
 def _row_owner_ns(
@@ -1492,6 +1528,19 @@ async def import_memories(
             # roll back an unrelated import (Codex round-4 finding).
             inserted_record_ids: set = set()
 
+            # Per-request id remap: envelope record_id -> the id the
+            # row was actually persisted under. For non-root callers
+            # (no preserve_owner) we DERIVE a caller-scoped id from
+            # caller identity + envelope id + content, so an attacker
+            # can't probe for foreign memory_ids via
+            # imported-vs-skipped outcome inference. Sidecar
+            # references in the same envelope get translated through
+            # this dict before allowlist + INSERT (Codex round-14
+            # finding). For root + preserve_owner=true, the dict is
+            # the identity mapping — admin migration preserves ids.
+            id_remap: Dict[str, str] = {}
+            non_root_id_rewrite = not (preserve_owner and _is_root(user))
+
             for record in envelope.records:
                 if record.kind != "memory":
                     stats.unsupported_kinds[record.kind] = (
@@ -1531,9 +1580,27 @@ async def import_memories(
                 metadata = p.get("metadata") or {}
                 quality_rating = p.get("quality_rating") or 75
 
-                # Use the envelope-provided id verbatim. ON CONFLICT DO NOTHING
-                # gives us idempotent re-imports — running /v1/export followed
-                # by /v1/import against the same DB is a no-op.
+                # Determine the persisted id. Root with
+                # preserve_owner=true keeps envelope id verbatim
+                # (admin migration); non-root derives a caller-
+                # scoped hash so foreign-id collisions don't
+                # leak existence (round-14 fix).
+                if non_root_id_rewrite:
+                    persisted_id = _derive_caller_scoped_id(
+                        record.id,
+                        caller_owner=imported_owner,
+                        caller_namespace=imported_ns,
+                        content=str(content),
+                    )
+                else:
+                    persisted_id = record.id
+                id_remap[record.id] = persisted_id
+
+                # ON CONFLICT DO NOTHING gives us idempotent re-imports —
+                # running /v1/export followed by /v1/import against the
+                # same DB is a no-op. For non-root, idempotency is on
+                # the derived id (which collapses identical content
+                # under the same caller into one row).
                 #
                 # Wrap the per-row INSERT in a SAVEPOINT (asyncpg's
                 # nested transaction context) so a Postgres-level
@@ -1561,7 +1628,7 @@ async def import_memories(
                             )
                             ON CONFLICT (id) DO NOTHING
                             """,
-                            record.id, content, category, subcategory,
+                            persisted_id, content, category, subcategory,
                             json.dumps(metadata),
                             quality_rating, imported_owner, imported_ns, permission_mode,
                             p.get("source_model"), p.get("source_provider"),
@@ -1573,7 +1640,7 @@ async def import_memories(
                         stats.skipped += 1
                     else:
                         stats.imported += 1
-                        inserted_record_ids.add(record.id)
+                        inserted_record_ids.add(persisted_id)
                 except Exception as exc:
                     stats.failed += 1
                     stats.errors.append(f"{record.id}: {type(exc).__name__}: {exc}")
@@ -1588,6 +1655,28 @@ async def import_memories(
             # cannot smuggle sidecars onto another tenant's
             # memory_id by labeling them with the caller's
             # identity. This is the cross-tenant-attachment fix.
+            # Translate sidecar memory references through the
+            # records-loop id remap. Under non-root, envelope ids
+            # were rewritten to caller-scoped hashes; sidecar
+            # references must follow so they bind to the right
+            # memories. Untouched ids (sidecar references that
+            # weren't in envelope.records) are passed through —
+            # they'll be rejected by the allowlist gate downstream
+            # if they don't belong to the caller.
+            if id_remap:
+                for entry in envelope.kg_triples or []:
+                    mid = entry.get("memory_id")
+                    if mid and mid in id_remap:
+                        entry["memory_id"] = id_remap[mid]
+                for entry in envelope.memory_versions or []:
+                    rid = entry.get("record_id")
+                    if rid and rid in id_remap:
+                        entry["record_id"] = id_remap[rid]
+                for entry in envelope.compression_manifest or []:
+                    rid = entry.get("record_id")
+                    if rid and rid in id_remap:
+                        entry["record_id"] = id_remap[rid]
+
             # Scope the allowlist SELECT structurally so a non-root
             # caller can't probe for foreign memory_ids via
             # rejection-message inference (Codex round-13 finding).
