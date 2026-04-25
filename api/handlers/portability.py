@@ -504,130 +504,141 @@ async def export_memories(
     params.extend([limit, offset])
 
     async with _lc._pool.acquire() as conn:
-        rows = await conn.fetch(sql, *params)
+        # Codex round-41 finding: the memories SELECT and the three
+        # sidecar SELECTs must read from a single consistent
+        # snapshot. Under default READ COMMITTED, a concurrent
+        # update between the memories fetch and a memory_versions
+        # fetch could produce an envelope where records[] carries
+        # old content while the sidecar holds the new HEAD —
+        # internally inconsistent for migration backups. Wrap all
+        # reads in a REPEATABLE READ READ ONLY transaction so the
+        # snapshot is taken at the first statement and held for
+        # all subsequent SELECTs.
+        async with conn.transaction(isolation="repeatable_read", readonly=True):
+            rows = await conn.fetch(sql, *params)
 
-        records = [_memory_to_record(dict(r)) for r in rows]
+            records = [_memory_to_record(dict(r)) for r in rows]
 
-        kg_triples_out: Optional[List[Dict[str, Any]]] = None
-        memory_versions_out: Optional[List[Dict[str, Any]]] = None
-        compression_manifest_out: Optional[List[Dict[str, Any]]] = None
+            kg_triples_out: Optional[List[Dict[str, Any]]] = None
+            memory_versions_out: Optional[List[Dict[str, Any]]] = None
+            compression_manifest_out: Optional[List[Dict[str, Any]]] = None
 
-        if include_sidecars:
-            memory_ids = [r["id"] for r in rows]
+            if include_sidecars:
+                memory_ids = [r["id"] for r in rows]
 
-            # Owner/namespace filters mirror the memories query so a
-            # root caller targeting a single owner gets the matching
-            # slice on each sidecar; non-root is locked to their own
-            # identity by the time we get here. Sidecars also constrain
-            # to the exported memory_ids, so a category-filtered
-            # export only carries the sidecar rows for those memories.
-            def _enforce_sidecar_cap(rows, surface: str):
-                # Codex round-40 DoS guard: _fetch_sidecar fetches
-                # cap+1 rows so we can detect overflow without
-                # materializing more. Bail with 413 here rather
-                # than building the giant JSON envelope.
-                if len(rows) > _EXPORT_SIDECAR_HARD_LIMIT:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"{surface} export exceeds the per-surface "
-                            f"hard limit of {_EXPORT_SIDECAR_HARD_LIMIT} "
-                            "rows for one envelope. Narrow the slice "
-                            "(filter by category, owner_id, namespace, "
-                            "or a smaller `limit`) and re-export, or "
-                            "split the export into multiple chunks."
-                        ),
-                    )
+                # Owner/namespace filters mirror the memories query so a
+                # root caller targeting a single owner gets the matching
+                # slice on each sidecar; non-root is locked to their own
+                # identity by the time we get here. Sidecars also constrain
+                # to the exported memory_ids, so a category-filtered
+                # export only carries the sidecar rows for those memories.
+                def _enforce_sidecar_cap(rows, surface: str):
+                    # Codex round-40 DoS guard: _fetch_sidecar fetches
+                    # cap+1 rows so we can detect overflow without
+                    # materializing more. Bail with 413 here rather
+                    # than building the giant JSON envelope.
+                    if len(rows) > _EXPORT_SIDECAR_HARD_LIMIT:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"{surface} export exceeds the per-surface "
+                                f"hard limit of {_EXPORT_SIDECAR_HARD_LIMIT} "
+                                "rows for one envelope. Narrow the slice "
+                                "(filter by category, owner_id, namespace, "
+                                "or a smaller `limit`) and re-export, or "
+                                "split the export into multiple chunks."
+                            ),
+                        )
 
-            kg_rows = await _fetch_sidecar(
-                conn,
-                table="kg_triples",
-                columns=(
-                    "id, subject, predicate, object, subject_type, "
-                    "object_type, valid_from, valid_until, memory_id, "
-                    "confidence, created, owner_id, namespace"
-                ),
-                memory_id_column="memory_id",
-                memory_ids=memory_ids,
-                effective_owner=effective_owner,
-                effective_ns=effective_ns,
-                # KG triples have two flavors: first-class (memory_id
-                # NULL, e.g. external Graphiti-style facts) and
-                # attached (memory_id pointing at a specific memory
-                # they were extracted from).
-                #
-                # Default behavior (include_unattached_kg=False):
-                # only attached triples whose memory_id is in the
-                # exported slice. A category- or limit-filtered
-                # export of M1+M2 does NOT carry every standalone
-                # fact in the owner/namespace, which would leak
-                # unrelated data into a partial export.
-                #
-                # Opt-in (include_unattached_kg=True): also include
-                # the NULL-memory_id rows. Used for full-corpus
-                # exports / cross-system migrations where first-
-                # class facts are part of the intended scope.
-                bound_to_memories=True,
-                null_ok=include_unattached_kg,
-            )
-            _enforce_sidecar_cap(kg_rows, "kg_triples")
-            kg_triples_out = [_kg_triple_to_entry(dict(r)) for r in kg_rows]
+                kg_rows = await _fetch_sidecar(
+                    conn,
+                    table="kg_triples",
+                    columns=(
+                        "id, subject, predicate, object, subject_type, "
+                        "object_type, valid_from, valid_until, memory_id, "
+                        "confidence, created, owner_id, namespace"
+                    ),
+                    memory_id_column="memory_id",
+                    memory_ids=memory_ids,
+                    effective_owner=effective_owner,
+                    effective_ns=effective_ns,
+                    # KG triples have two flavors: first-class (memory_id
+                    # NULL, e.g. external Graphiti-style facts) and
+                    # attached (memory_id pointing at a specific memory
+                    # they were extracted from).
+                    #
+                    # Default behavior (include_unattached_kg=False):
+                    # only attached triples whose memory_id is in the
+                    # exported slice. A category- or limit-filtered
+                    # export of M1+M2 does NOT carry every standalone
+                    # fact in the owner/namespace, which would leak
+                    # unrelated data into a partial export.
+                    #
+                    # Opt-in (include_unattached_kg=True): also include
+                    # the NULL-memory_id rows. Used for full-corpus
+                    # exports / cross-system migrations where first-
+                    # class facts are part of the intended scope.
+                    bound_to_memories=True,
+                    null_ok=include_unattached_kg,
+                )
+                _enforce_sidecar_cap(kg_rows, "kg_triples")
+                kg_triples_out = [_kg_triple_to_entry(dict(r)) for r in kg_rows]
 
-            mv_rows = await _fetch_sidecar(
-                conn,
-                table="memory_versions",
-                columns=(
-                    "id, memory_id, version_num, content, category, "
-                    "subcategory, metadata, verbatim_content, owner_id, "
-                    "namespace, permission_mode, source_model, source_provider, "
-                    "source_session, source_agent, snapshot_at, snapshot_by, "
-                    "change_type, commit_hash, parent_version_id, branch, "
-                    "merge_parents"
-                ),
-                memory_id_column="memory_id",
-                memory_ids=memory_ids,
-                effective_owner=effective_owner,
-                effective_ns=effective_ns,
-                bound_to_memories=True,
-                # Topological-stable order — parent rows ship before
-                # child rows so the import-side parent_version_id FK
-                # check passes even on consumers that import in
-                # received order. See _import_memory_versions for
-                # the matching defensive sort. Codex round-8 finding.
-                order_by="memory_id ASC, branch ASC, version_num ASC",
-            )
-            _enforce_sidecar_cap(mv_rows, "memory_versions")
-            # SQL ORDER BY (memory_id, branch, version_num) is a
-            # heuristic that breaks for forked branches — feature/v1
-            # whose parent_version_id points at main/vN sorts before
-            # main/vN. Apply the real Kahn's-algorithm topo sort
-            # (defined alongside _import_memory_versions) before
-            # emitting, so consumers that import in received order
-            # get a topologically-correct envelope without needing
-            # the defensive sort our own importer applies.
-            memory_versions_out = _topo_sort_versions(
-                [_memory_version_to_entry(dict(r)) for r in mv_rows]
-            )
+                mv_rows = await _fetch_sidecar(
+                    conn,
+                    table="memory_versions",
+                    columns=(
+                        "id, memory_id, version_num, content, category, "
+                        "subcategory, metadata, verbatim_content, owner_id, "
+                        "namespace, permission_mode, source_model, source_provider, "
+                        "source_session, source_agent, snapshot_at, snapshot_by, "
+                        "change_type, commit_hash, parent_version_id, branch, "
+                        "merge_parents"
+                    ),
+                    memory_id_column="memory_id",
+                    memory_ids=memory_ids,
+                    effective_owner=effective_owner,
+                    effective_ns=effective_ns,
+                    bound_to_memories=True,
+                    # Topological-stable order — parent rows ship before
+                    # child rows so the import-side parent_version_id FK
+                    # check passes even on consumers that import in
+                    # received order. See _import_memory_versions for
+                    # the matching defensive sort. Codex round-8 finding.
+                    order_by="memory_id ASC, branch ASC, version_num ASC",
+                )
+                _enforce_sidecar_cap(mv_rows, "memory_versions")
+                # SQL ORDER BY (memory_id, branch, version_num) is a
+                # heuristic that breaks for forked branches — feature/v1
+                # whose parent_version_id points at main/vN sorts before
+                # main/vN. Apply the real Kahn's-algorithm topo sort
+                # (defined alongside _import_memory_versions) before
+                # emitting, so consumers that import in received order
+                # get a topologically-correct envelope without needing
+                # the defensive sort our own importer applies.
+                memory_versions_out = _topo_sort_versions(
+                    [_memory_version_to_entry(dict(r)) for r in mv_rows]
+                )
 
-            cv_rows = await _fetch_sidecar(
-                conn,
-                table="memory_compressed_variants",
-                columns=(
-                    "memory_id, owner_id, winner_candidate_id, engine_id, "
-                    "engine_version, compressed_content, compressed_tokens, "
-                    "compression_ratio, quality_score, composite_score, "
-                    "scoring_profile, judge_model, selected_at"
-                ),
-                memory_id_column="memory_id",
-                memory_ids=memory_ids,
-                effective_owner=effective_owner,
-                # memory_compressed_variants has no `namespace` column;
-                # tenancy is owner-only here.
-                effective_ns=None,
-                bound_to_memories=True,
-            )
-            _enforce_sidecar_cap(cv_rows, "compression_manifest")
-            compression_manifest_out = [_compression_variant_to_entry(dict(r)) for r in cv_rows]
+                cv_rows = await _fetch_sidecar(
+                    conn,
+                    table="memory_compressed_variants",
+                    columns=(
+                        "memory_id, owner_id, winner_candidate_id, engine_id, "
+                        "engine_version, compressed_content, compressed_tokens, "
+                        "compression_ratio, quality_score, composite_score, "
+                        "scoring_profile, judge_model, selected_at"
+                    ),
+                    memory_id_column="memory_id",
+                    memory_ids=memory_ids,
+                    effective_owner=effective_owner,
+                    # memory_compressed_variants has no `namespace` column;
+                    # tenancy is owner-only here.
+                    effective_ns=None,
+                    bound_to_memories=True,
+                )
+                _enforce_sidecar_cap(cv_rows, "compression_manifest")
+                compression_manifest_out = [_compression_variant_to_entry(dict(r)) for r in cv_rows]
 
     return MPFEnvelope(
         mpf_version=MPF_VERSION,

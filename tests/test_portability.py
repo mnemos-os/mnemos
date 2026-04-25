@@ -82,7 +82,10 @@ class _Conn:
                 return payload[0] if payload else None
         return self._rows[0] if self._rows else None
 
-    def transaction(self):
+    def transaction(self, *args, **kwargs):
+        # Accept asyncpg's transaction kwargs (isolation, readonly)
+        # so the export handler's REPEATABLE READ READ ONLY wrapper
+        # works against this mock — Codex round-41.
         class _NullCtx:
             async def __aenter__(self_): return self_
             async def __aexit__(self_, *a): return False
@@ -350,6 +353,53 @@ def test_export_with_sidecars_emits_three_arrays(monkeypatch):
     assert cm["engine_id"] == "apollo"
     assert cm["quality_score"] == 0.87
     assert cm["compressed_tokens"] == 4
+
+
+def test_export_runs_in_repeatable_read_readonly_transaction(monkeypatch):
+    """Round-41 finding: under READ COMMITTED, a concurrent
+    update between the memories SELECT and a sidecar SELECT can
+    produce an envelope where records[] holds old content while
+    memory_versions[] holds the new HEAD — internally inconsistent
+    for migration backups. The handler now wraps all reads in a
+    REPEATABLE READ READ ONLY transaction so the snapshot is taken
+    at the first statement and held for every subsequent SELECT.
+
+    We can't simulate the concurrent write against the mock, but
+    we can assert that the transaction context manager is opened
+    with the right isolation/readonly flags, which is the
+    structural guarantee the fix provides.
+    """
+    captured: list[dict] = []
+
+    class _CapturingConn(_Conn):
+        def transaction(self, *args, **kwargs):
+            captured.append(dict(args=args, kwargs=kwargs))
+            return super().transaction(*args, **kwargs)
+
+    conn = _CapturingConn(
+        rows=[_memory_row()],
+        routed_rows={
+            "FROM kg_triples": [],
+            "FROM memory_versions": [],
+            "FROM memory_compressed_variants": [],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None,
+        include_sidecars=True, user=_alice(),
+    ))
+
+    assert captured, "export must open a transaction"
+    tx = captured[0]
+    assert tx["kwargs"].get("isolation") == "repeatable_read", (
+        f"export must use repeatable_read isolation, got {tx!r}"
+    )
+    assert tx["kwargs"].get("readonly") is True, (
+        f"export transaction must be readonly, got {tx!r}"
+    )
 
 
 def test_export_returns_413_when_sidecar_exceeds_hard_cap(monkeypatch):
