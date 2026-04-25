@@ -187,12 +187,24 @@ def _memory_to_record(row) -> MPFRecord:
 def _iso(value) -> Optional[str]:
     """Render a DB timestamp value as an RFC 3339 / ISO 8601 string,
     or None when the source is None. Top-level helper so the sidecar
-    mappers can share it."""
+    mappers can share it.
+
+    Naive datetimes are treated as UTC (the MNEMOS convention; the
+    DB never stores a non-UTC value in a TIMESTAMP column). Calling
+    `.astimezone(timezone.utc)` directly on a naive datetime would
+    interpret it as LOCAL TIME and shift it by the host's TZ offset
+    — which means an EDT host's `2026-01-15 10:30:00` would export
+    as `2026-01-15T15:30:00+00:00` and re-import shifted by 5
+    hours. (Codex round-17 finding.) Tag naive values with UTC
+    explicitly before formatting.
+    """
     if value is None:
         return None
     if isinstance(value, str):
         return value
     if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc).isoformat()
         return value.astimezone(timezone.utc).isoformat()
     return str(value)
 
@@ -599,7 +611,12 @@ async def export_memories(
 def _parse_iso(value: Optional[str]) -> Optional[datetime]:
     """Best-effort parse for the handful of timestamp fields MPF
     memory payloads carry. Returns None on any failure — the caller
-    lets the DB default fire instead of inserting garbage."""
+    lets the DB default fire instead of inserting garbage.
+
+    Returns aware datetime suitable for TIMESTAMPTZ columns. For
+    naive TIMESTAMP columns (memories.created/updated) use
+    `_parse_iso_naive` instead so asyncpg doesn't shift the value
+    by the session's timezone offset (Codex round-17 finding)."""
     if not value:
         return None
     try:
@@ -611,6 +628,22 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
         return datetime.fromisoformat(value)
     except Exception:
         return None
+
+
+def _parse_iso_naive(value: Optional[str]) -> Optional[datetime]:
+    """Like _parse_iso, but always returns a NAIVE datetime in UTC.
+
+    For binding into TIMESTAMP (no timezone) columns. asyncpg
+    converts an aware datetime to the SESSION's timezone before
+    stripping tzinfo, which shifts naive TIMESTAMP values by the
+    server's TZ offset. Pre-strip to UTC-as-naive to bypass that.
+    """
+    parsed = _parse_iso(value)
+    if parsed is None:
+        return None
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+    return parsed
 
 
 async def _build_referenced_memory_allowlist(
@@ -1741,8 +1774,12 @@ async def import_memories(
                             quality_rating, imported_owner, imported_ns, permission_mode,
                             p.get("source_model"), p.get("source_provider"),
                             p.get("source_session"), p.get("source_agent"),
-                            _parse_iso(p.get("created")),
-                            _parse_iso(p.get("updated")),
+                            # memories.created/updated are TIMESTAMP
+                            # (no tz) — pre-strip to naive UTC so
+                            # asyncpg doesn't apply session-tz shift
+                            # (Codex round-17 finding).
+                            _parse_iso_naive(p.get("created")),
+                            _parse_iso_naive(p.get("updated")),
                         )
                     if row == "INSERT 0 0":
                         stats.skipped += 1

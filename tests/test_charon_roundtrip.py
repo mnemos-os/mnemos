@@ -233,7 +233,7 @@ async def _snapshot(pool) -> Dict[str, Any]:
         memories = await conn.fetch(
             "SELECT id, content, category, subcategory, owner_id, namespace, "
             "permission_mode, quality_rating, source_model, source_provider, "
-            "source_session, source_agent, metadata "
+            "source_session, source_agent, metadata, created, updated "
             "FROM memories WHERE id = $1",
             SEED_MEMORY_ID,
         )
