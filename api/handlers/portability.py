@@ -1920,71 +1920,84 @@ async def import_memories(
             # rows that hit ON CONFLICT DO NOTHING are NOT verified
             # here — their v1 history is whatever it already was;
             # this transaction didn't touch them.
-            if envelope.memory_versions and inserted_record_ids:
-                covered = await conn.fetch(
-                    "SELECT DISTINCT memory_id FROM memory_versions "
-                    "WHERE memory_id = ANY($1::text[])",
-                    list(inserted_record_ids),
-                )
-                covered_ids = {r["memory_id"] for r in covered}
-                uncovered = inserted_record_ids - covered_ids
-                if uncovered:
-                    sample = sorted(uncovered)[:5]
-                    extra = "..." if len(uncovered) > 5 else ""
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            "CHARON import inserted "
-                            f"{len(uncovered)} memory record(s) "
-                            "without version history under "
-                            f"trigger suppression: {sample}{extra}. "
-                            "Sidecar likely contained malformed or "
-                            "rejected entries that did not produce "
-                            "rows. Transaction rolled back."
-                        ),
+            if envelope.memory_versions:
+                # Coverage check: every newly INSERTed record must
+                # have at least one version row. (Pre-existing
+                # memories aren't checked here — their version
+                # history was set up by their original import.)
+                if inserted_record_ids:
+                    covered = await conn.fetch(
+                        "SELECT DISTINCT memory_id FROM memory_versions "
+                        "WHERE memory_id = ANY($1::text[])",
+                        list(inserted_record_ids),
                     )
+                    covered_ids = {r["memory_id"] for r in covered}
+                    uncovered = inserted_record_ids - covered_ids
+                    if uncovered:
+                        sample = sorted(uncovered)[:5]
+                        extra = "..." if len(uncovered) > 5 else ""
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "CHARON import inserted "
+                                f"{len(uncovered)} memory record(s) "
+                                "without version history under "
+                                f"trigger suppression: {sample}{extra}. "
+                                "Sidecar likely contained malformed or "
+                                "rejected entries that did not produce "
+                                "rows. Transaction rolled back."
+                            ),
+                        )
 
-                # Round-18 finding: verify the restored DAG HEAD
-                # actually represents the live memory state. An
-                # envelope can pass coverage by having SOME version
-                # for each record, but if the version's content
-                # differs from the live memories.content, /log and
-                # branch traversal report a stale history. Compare
-                # the main-branch HEAD's content to the live row
-                # for every inserted record; rollback on mismatch.
-                head_check = await conn.fetch(
-                    """
-                    SELECT m.id, m.content AS memory_content,
-                           mv.content AS head_content
-                    FROM memories m
-                    JOIN memory_branches b
-                      ON b.memory_id = m.id AND b.name = 'main'
-                    JOIN memory_versions mv
-                      ON mv.id = b.head_version_id
-                    WHERE m.id = ANY($1::text[])
-                    """,
-                    list(inserted_record_ids),
-                )
-                divergent = [
-                    r["id"] for r in head_check
-                    if r["memory_content"] != r["head_content"]
-                ]
-                if divergent:
-                    sample = sorted(divergent)[:5]
-                    extra = "..." if len(divergent) > 5 else ""
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            "CHARON import: live memory content "
-                            "diverges from restored memory_versions "
-                            f"HEAD for {len(divergent)} record(s): "
-                            f"{sample}{extra}. The envelope's "
-                            "memory_versions sidecar must include "
-                            "an entry whose content matches the "
-                            "kind:memory record's payload.content. "
-                            "Transaction rolled back."
-                        ),
+                # HEAD-content integrity check: every record_id
+                # whose branch HEAD was touched (newly inserted OR
+                # pre-existing memory whose sidecar landed) must
+                # have memories.content == HEAD memory_versions
+                # content. Otherwise /log + branch traversal report
+                # forged history (Codex round-18 + round-19 findings).
+                # Round-19: extend to authorized_version_ids, not
+                # just inserted_record_ids — sidecar-only imports
+                # against pre-existing memories can poison HEAD too.
+                # authorized_version_ids was populated earlier when
+                # envelope.memory_versions was processed; it
+                # represents every record_id whose sidecar
+                # successfully imported (or hit ON CONFLICT against
+                # an authorized pre-existing row).
+                touched_ids = inserted_record_ids | authorized_version_ids
+                if touched_ids:
+                    head_check = await conn.fetch(
+                        """
+                        SELECT m.id, m.content AS memory_content,
+                               mv.content AS head_content
+                        FROM memories m
+                        JOIN memory_branches b
+                          ON b.memory_id = m.id AND b.name = 'main'
+                        JOIN memory_versions mv
+                          ON mv.id = b.head_version_id
+                        WHERE m.id = ANY($1::text[])
+                        """,
+                        list(touched_ids),
                     )
+                    divergent = [
+                        r["id"] for r in head_check
+                        if r["memory_content"] != r["head_content"]
+                    ]
+                    if divergent:
+                        sample = sorted(divergent)[:5]
+                        extra = "..." if len(divergent) > 5 else ""
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "CHARON import: live memory content "
+                                "diverges from restored memory_versions "
+                                f"HEAD for {len(divergent)} record(s): "
+                                f"{sample}{extra}. The envelope's "
+                                "memory_versions sidecar must include "
+                                "an entry whose content matches each "
+                                "touched memory's content. "
+                                "Transaction rolled back."
+                            ),
+                        )
 
     logger.info(
         "[MPF] import: user=%s imported=%d skipped=%d failed=%d unsupported=%s sidecars_imported=%s",

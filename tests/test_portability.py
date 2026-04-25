@@ -1385,6 +1385,45 @@ def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
     )
 
 
+def test_import_rolls_back_existing_memory_dag_poisoning(monkeypatch):
+    """Codex round-19 finding: round-18's HEAD-content check only
+    ran on inserted_record_ids. A sidecar-only import against an
+    EXISTING caller-owned memory can move that memory's HEAD to
+    stale content while the live row stays unchanged. Verify the
+    extended check catches this."""
+    derived_id = _ALICE_MEM_ALICE1_DERIVED
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": "mem_alice1", "branch": "main",
+             "head_version_id": "11111111-1111-1111-1111-111111111111"},
+        ],
+        # head_check after the DAG-only sidecar lands: HEAD points
+        # at stale "v0_OLD" but live memory.content is "current".
+        "JOIN memory_branches b": [
+            {"id": "mem_alice1",
+             "memory_content": "current",
+             "head_content": "v0_OLD_STALE"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    # Sidecar-only import (no records=). Targets pre-existing
+    # mem_alice1 owned by alice.
+    bad = _mv_sidecar_entry()
+    bad["record_id"] = "mem_alice1"
+    bad["content"] = "v0_OLD_STALE"
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=False, user=_alice(),
+        ))
+    assert exc.value.status_code == 500
+    assert "diverges" in exc.value.detail
+
+
 def test_import_rolls_back_when_memory_content_diverges_from_head_version(monkeypatch):
     """Codex round-18 finding: an envelope can pass coverage by
     having SOME version for each record, but if the version's
