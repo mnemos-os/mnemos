@@ -1224,6 +1224,49 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
     assert stats.sidecars_skipped.get("memory_versions") == 1
 
 
+def test_topo_sort_handles_forked_branch(monkeypatch):
+    """Codex round-9 finding: feature-branch v1 with parent on
+    main vN. Lexicographic-on-branch sort would emit feature/v1
+    before main/v(N-1)..vN, breaking the FK. Real topological
+    sort emits parents before children regardless of branch."""
+    main_v1 = {**_mv_sidecar_entry(),
+               "id": "00000000-0000-0000-0000-000000000001",
+               "version_num": 1, "branch": "main",
+               "parent_version_id": None}
+    main_v2 = {**_mv_sidecar_entry(),
+               "id": "00000000-0000-0000-0000-000000000002",
+               "version_num": 2, "branch": "main",
+               "parent_version_id": "00000000-0000-0000-0000-000000000001"}
+    feature_v1 = {**_mv_sidecar_entry(),
+                  "id": "00000000-0000-0000-0000-000000000003",
+                  "version_num": 1, "branch": "feature",
+                  "parent_version_id": "00000000-0000-0000-0000-000000000002"}
+
+    # Adversarial input order: feature_v1 first, then main_v2, then main_v1.
+    sorted_entries = portability._topo_sort_versions([feature_v1, main_v2, main_v1])
+    ids = [e["id"] for e in sorted_entries]
+    # main_v1 must be first (no parent), main_v2 next (parent=main_v1),
+    # feature_v1 last (parent=main_v2).
+    assert ids == [
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+        "00000000-0000-0000-0000-000000000003",
+    ], f"topo sort failed: {ids}"
+
+
+def test_topo_sort_treats_external_parents_as_roots(monkeypatch):
+    """If parent_version_id points at a UUID that's NOT in the
+    envelope (parent already in DB), the entry is a root from
+    this envelope's POV."""
+    orphan = {**_mv_sidecar_entry(),
+              "id": "00000000-0000-0000-0000-000000000abc",
+              "version_num": 5,
+              "parent_version_id": "00000000-0000-0000-0000-000000099999"}  # not in envelope
+    sorted_entries = portability._topo_sort_versions([orphan])
+    assert len(sorted_entries) == 1
+    assert sorted_entries[0]["id"] == orphan["id"]
+
+
 def test_import_memory_versions_handles_v2_before_v1(monkeypatch):
     """Codex round-8 finding: parent_version_id is a self-referential
     FK. If a child version arrives in the envelope before its parent,

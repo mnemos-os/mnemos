@@ -341,27 +341,30 @@ async def _fetch_sidecar(
     short-circuits to no rows without hitting the DB. With
     `null_ok=True` the query still runs (NULL memory_ids may match).
     """
-    # Empty memory slice → no sidecars, even under null_ok.
-    # Otherwise a category-filtered export with no matching memories
-    # would return ALL first-class kg_triples in the owner/namespace,
-    # leaking unrelated data outside the requested slice (Codex
-    # round-6 finding). The export is "memories + their attached
-    # surfaces"; first-class triples without an associated memory
-    # are by definition NOT part of that scope on a per-export
-    # basis. A future explicit `?include_unattached_kg=true` could
-    # opt-in to the broader behavior, but it's not the default.
-    if bound_to_memories and not memory_ids:
+    # Empty memory slice short-circuit. The intent: a category-
+    # filtered export with no matching memories shouldn't leak
+    # all first-class kg_triples in the owner/namespace (round-6
+    # finding). But this short-circuit must NOT fire when the
+    # caller explicitly opted in via null_ok=True — that's the
+    # KG-only migration use case where there are no memories but
+    # the caller does want first-class triples (round-9 finding).
+    if bound_to_memories and not memory_ids and not null_ok:
         return []
     conditions: List[str] = []
     params: List[Any] = []
     idx = 1
     if bound_to_memories:
-        if null_ok:
+        if null_ok and memory_ids:
             conditions.append(
                 f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))"
             )
             params.append(memory_ids)
             idx += 1
+        elif null_ok:
+            # Explicit opt-in with empty slice: first-class only.
+            # Combined with owner/namespace filters this still
+            # scopes the export to the caller's tenancy.
+            conditions.append(f"{memory_id_column} IS NULL")
         else:
             conditions.append(f"{memory_id_column} = ANY(${idx}::text[])")
             params.append(memory_ids)
@@ -845,6 +848,94 @@ async def _restore_memory_branches(conn, memory_ids: List[str]) -> None:
         )
 
 
+def _topo_sort_versions(sidecar: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Kahn's-algorithm topological sort over a memory_versions
+    sidecar list, treating parent_version_id + merge_parents as
+    incoming edges.
+
+    Parents that aren't in the sidecar (already in DB, or absent
+    entirely) count as zero in-degree edges — they're treated as
+    roots from this envelope's POV; their FK will resolve at INSERT
+    time against existing DB rows.
+
+    Tie-breaker: lower version_num first, then id-string ASC, so
+    the order is deterministic for round-trip reproducibility.
+
+    Cycles (shouldn't happen in a real DAG but defensive): any
+    nodes left in the working set after Kahn's terminates get
+    appended at the end in tie-broken order. The DB will reject
+    them at INSERT time, but the sort itself never deadlocks.
+    """
+    if not sidecar:
+        return []
+
+    # Build the index: id → entry. Some entries may have no id
+    # (already counted as failed by the caller's required-field
+    # check); skip those for the graph but keep them at the end
+    # so the loop still sees them and counts the failure.
+    by_id: Dict[str, Dict[str, Any]] = {}
+    no_id: List[Dict[str, Any]] = []
+    for entry in sidecar:
+        eid = entry.get("id")
+        if eid:
+            by_id[str(eid)] = entry
+        else:
+            no_id.append(entry)
+
+    # Build incoming-edge counts. Only edges whose target is also
+    # in this envelope contribute.
+    in_degree: Dict[str, int] = {eid: 0 for eid in by_id}
+    children: Dict[str, List[str]] = {eid: [] for eid in by_id}
+    for eid, entry in by_id.items():
+        parents: List[str] = []
+        pv = entry.get("parent_version_id")
+        if pv:
+            parents.append(str(pv))
+        for mp in entry.get("merge_parents") or []:
+            if mp:
+                parents.append(str(mp))
+        for p in parents:
+            if p in by_id:
+                in_degree[eid] += 1
+                children[p].append(eid)
+
+    def _key(eid: str) -> tuple:
+        e = by_id[eid]
+        return (int(e.get("version_num") or 0), eid)
+
+    ready = sorted([eid for eid, d in in_degree.items() if d == 0], key=_key)
+    out: List[Dict[str, Any]] = []
+    while ready:
+        eid = ready.pop(0)
+        out.append(by_id[eid])
+        for child in children[eid]:
+            in_degree[child] -= 1
+            if in_degree[child] == 0:
+                # Insert maintaining tie-break order.
+                k = _key(child)
+                lo, hi = 0, len(ready)
+                while lo < hi:
+                    mid = (lo + hi) // 2
+                    if _key(ready[mid]) < k:
+                        lo = mid + 1
+                    else:
+                        hi = mid
+                ready.insert(lo, child)
+
+    if len(out) < len(by_id):
+        # Cycle detected (or unreachable dep graph). Append the
+        # remaining nodes in tie-broken order; the DB will reject
+        # them at INSERT time, which the per-row SAVEPOINT and
+        # all-or-nothing post-check both handle.
+        leftover = sorted(
+            [eid for eid in by_id if by_id[eid] not in out],
+            key=_key,
+        )
+        out.extend(by_id[eid] for eid in leftover)
+
+    return out + no_id
+
+
 async def _import_memory_versions(
     conn,
     sidecar: List[Dict[str, Any]],
@@ -877,23 +968,21 @@ async def _import_memory_versions(
     surface = "memory_versions"
     authorized_record_ids: set = set()
     failed_record_ids: set = set()
-    # Topological-stable order: (memory_id, branch, version_num ASC).
-    # parent_version_id is a self-referential FK in memory_versions —
-    # if a child v2 row is inserted before its parent v1, the FK
-    # check fails. Envelopes from a friendly export already arrive
-    # in this order (the server export query has ORDER BY), but the
-    # contract is that import is order-independent: a hand-crafted
-    # or cross-system envelope might arrive in any order. Sort here
-    # so the import is robust to whatever the envelope's order is.
-    # Codex round-8 finding.
-    sidecar = sorted(
-        sidecar,
-        key=lambda e: (
-            str(e.get("record_id") or ""),
-            str(e.get("branch") or "main"),
-            int(e.get("version_num") or 0),
-        ),
-    )
+    # Real topological sort over parent_version_id + merge_parents
+    # so parent rows are inserted before children regardless of
+    # envelope order or branch name. The previous (record_id,
+    # branch, version_num) sort failed for forked histories where
+    # a feature branch's v1 parents to main's vN — alphabetic on
+    # branch name put feature/v1 before main/vN, FK violation
+    # (Codex round-9 finding).
+    #
+    # Algorithm: Kahn's. Build edges child→parent for both
+    # parent_version_id and merge_parents (UUID[]). A node's
+    # "in-degree" is the number of its parents that ALSO appear
+    # in this envelope; parents already in DB count as zero
+    # (treated as roots, their FK will resolve at INSERT time).
+    # Pop zero-in-degree nodes in ties broken by version_num.
+    sidecar = _topo_sort_versions(sidecar)
     for entry in sidecar:
         # Capture record_id even when other required fields are
         # missing — we need it for the failure-tracking set so the
