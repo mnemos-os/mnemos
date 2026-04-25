@@ -1944,6 +1944,48 @@ async def import_memories(
                         ),
                     )
 
+                # Round-18 finding: verify the restored DAG HEAD
+                # actually represents the live memory state. An
+                # envelope can pass coverage by having SOME version
+                # for each record, but if the version's content
+                # differs from the live memories.content, /log and
+                # branch traversal report a stale history. Compare
+                # the main-branch HEAD's content to the live row
+                # for every inserted record; rollback on mismatch.
+                head_check = await conn.fetch(
+                    """
+                    SELECT m.id, m.content AS memory_content,
+                           mv.content AS head_content
+                    FROM memories m
+                    JOIN memory_branches b
+                      ON b.memory_id = m.id AND b.name = 'main'
+                    JOIN memory_versions mv
+                      ON mv.id = b.head_version_id
+                    WHERE m.id = ANY($1::text[])
+                    """,
+                    list(inserted_record_ids),
+                )
+                divergent = [
+                    r["id"] for r in head_check
+                    if r["memory_content"] != r["head_content"]
+                ]
+                if divergent:
+                    sample = sorted(divergent)[:5]
+                    extra = "..." if len(divergent) > 5 else ""
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "CHARON import: live memory content "
+                            "diverges from restored memory_versions "
+                            f"HEAD for {len(divergent)} record(s): "
+                            f"{sample}{extra}. The envelope's "
+                            "memory_versions sidecar must include "
+                            "an entry whose content matches the "
+                            "kind:memory record's payload.content. "
+                            "Transaction rolled back."
+                        ),
+                    )
+
     logger.info(
         "[MPF] import: user=%s imported=%d skipped=%d failed=%d unsupported=%s sidecars_imported=%s",
         user.user_id, stats.imported, stats.skipped, stats.failed,
