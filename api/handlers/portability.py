@@ -1760,6 +1760,53 @@ async def _import_compression_manifest(
                         _parse_iso(entry.get("selected_at")),
                     )
                 if row == "INSERT 0 0":
+                    # Exact-match conflict verification (round 32 —
+                    # mirrors round-23 / round-30 fixes for
+                    # memory_versions and kg_triples). The PK is
+                    # memory_id, so a re-import of a corrected
+                    # variant with the same memory_id would silently
+                    # skip and leave stale compressed_content in
+                    # place. Read paths use this content directly,
+                    # so the staleness is operator-visible.
+                    existing = await conn.fetchrow(
+                        "SELECT owner_id, winner_candidate_id::text "
+                        "AS winner_candidate_id, engine_id, "
+                        "engine_version, compressed_content, "
+                        "compressed_tokens, compression_ratio, "
+                        "quality_score, composite_score, "
+                        "scoring_profile, judge_model, selected_at "
+                        "FROM memory_compressed_variants "
+                        "WHERE memory_id = $1",
+                        entry["record_id"],
+                    )
+                    expected_winner = (
+                        str(winner_id) if winner_id else None
+                    )
+                    expected_scoring = entry.get("scoring_profile") or "balanced"
+                    expected_selected_at = _parse_iso(entry.get("selected_at"))
+                    if existing is None or (
+                        existing["owner_id"] != row_owner
+                        or existing["winner_candidate_id"] != expected_winner
+                        or existing["engine_id"] != entry["engine_id"]
+                        or existing["engine_version"] != entry.get("engine_version")
+                        or existing["compressed_content"] != entry.get("compressed_content")
+                        or existing["compressed_tokens"] != entry.get("compressed_tokens")
+                        or existing["compression_ratio"] != entry.get("compression_ratio")
+                        or existing["quality_score"] != entry.get("quality_score")
+                        or existing["composite_score"] != entry.get("composite_score")
+                        or existing["scoring_profile"] != expected_scoring
+                        or existing["judge_model"] != entry.get("judge_model")
+                        or (expected_selected_at is not None and
+                            existing["selected_at"] != expected_selected_at)
+                    ):
+                        _bump(stats.sidecars_failed, surface)
+                        stats.errors.append(
+                            f"[{surface}] {entry.get('record_id')}: "
+                            "existing variant doesn't match envelope "
+                            "claim (likely stale prior-lifetime row); "
+                            "rejected"
+                        )
+                        continue
                     _bump(stats.sidecars_skipped, surface)
                 else:
                     _bump(stats.sidecars_imported, surface)

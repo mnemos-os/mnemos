@@ -909,10 +909,28 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         "valid_until": None,
         "created": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
     }
+    # Round-32: compression_manifest now does exact-match too —
+    # seed a matching cm row.
+    cm_entry = _cm_sidecar_entry()
+    matching_cm = {
+        "owner_id": "alice",
+        "winner_candidate_id": cm_entry.get("winner_contest_id"),
+        "engine_id": cm_entry["engine_id"],
+        "engine_version": cm_entry.get("engine_version"),
+        "compressed_content": cm_entry.get("compressed_content"),
+        "compressed_tokens": cm_entry.get("compressed_tokens"),
+        "compression_ratio": cm_entry.get("compression_ratio"),
+        "quality_score": cm_entry.get("quality_score"),
+        "composite_score": cm_entry.get("composite_score"),
+        "scoring_profile": cm_entry.get("scoring_profile") or "balanced",
+        "judge_model": cm_entry.get("judge_model"),
+        "selected_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    }
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
         "FROM kg_triples WHERE id = $1": [matching_kg],
+        "FROM memory_compressed_variants": [matching_cm],
     })
     _install(monkeypatch, conn)
 
