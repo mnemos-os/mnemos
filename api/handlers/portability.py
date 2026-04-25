@@ -967,6 +967,16 @@ async def _import_kg_triples(
                 expected_valid_from = _parse_iso(entry.get("valid_from"))
                 expected_valid_until = _parse_iso(entry.get("valid_until"))
                 expected_created = _parse_iso(entry.get("created"))
+                # COALESCE-tolerance for INSERT-time NOW() defaults
+                # (Codex round-38). valid_from and created use
+                # COALESCE($N, NOW()) on INSERT — when envelope omits
+                # them, DB stores NOW(). On idempotent retry the
+                # envelope still has None, so strict equality
+                # (existing != None) would falsely reject the retry.
+                # valid_until is plain $N (no COALESCE) so strict
+                # NULL=NULL comparison stays correct there.
+                tolerate_valid_from = entry.get("valid_from") is None
+                tolerate_created = entry.get("created") is None
                 if existing is None or (
                     existing["subject"] != subject
                     or existing["predicate"] != entry["predicate"]
@@ -985,17 +995,15 @@ async def _import_kg_triples(
                     # Temporal columns (round-31): a corrected
                     # temporal edge with the same id but different
                     # valid_from / valid_until / created window
-                    # must NOT be counted as skipped. Note: when
-                    # the envelope omits a temporal field, the
-                    # INSERT uses COALESCE($N, NOW()) so we only
-                    # compare when the envelope explicitly
-                    # supplied a value.
-                    # IS NOT DISTINCT FROM semantics for temporal
-                    # columns — round-33 fix. Envelope-NULL must
-                    # match DB-NULL, not be wildcarded.
-                    or existing["valid_from"] != expected_valid_from
+                    # must NOT be counted as skipped. When the
+                    # envelope explicitly supplied a temporal value
+                    # we compare strictly. When envelope omitted it
+                    # AND the column uses COALESCE(NOW()) on insert,
+                    # tolerate the DB-generated value so retries are
+                    # idempotent (round-38).
+                    or (not tolerate_valid_from and existing["valid_from"] != expected_valid_from)
                     or existing["valid_until"] != expected_valid_until
-                    or existing["created"] != expected_created
+                    or (not tolerate_created and existing["created"] != expected_created)
                 ):
                     _bump(stats.sidecars_failed, surface)
                     stats.errors.append(
@@ -1568,6 +1576,12 @@ async def _import_memory_versions(
                     actual_snapshot_at = (
                         existing["snapshot_at"] if existing else None
                     )
+                    # snapshot_at uses COALESCE($16, NOW()) on
+                    # INSERT (line ~1495). When envelope omits it,
+                    # DB stores NOW(); on retry the envelope still
+                    # has None so strict equality would falsely
+                    # reject the retry (round-38).
+                    tolerate_snapshot_at = entry.get("snapshot_at") is None
                     if existing is None or (
                         existing["memory_id"] != entry["record_id"]
                         or existing["owner_id"] != row_owner
@@ -1594,10 +1608,11 @@ async def _import_memory_versions(
                         or existing["source_provider"] != entry.get("source_provider")
                         or existing["source_session"] != entry.get("source_session")
                         or existing["source_agent"] != entry.get("source_agent")
-                        # IS NOT DISTINCT FROM semantics — envelope
-                        # NULL must match DB NULL, not be wildcarded.
-                        # Round-33 fix.
-                        or actual_snapshot_at != expected_snapshot_at
+                        # snapshot_at: round-33 enforced IS NOT
+                        # DISTINCT FROM semantics; round-38 added
+                        # COALESCE-tolerance for envelope-NULL since
+                        # the INSERT path stores NOW() in that case.
+                        or (not tolerate_snapshot_at and actual_snapshot_at != expected_snapshot_at)
                         or existing["snapshot_by"] != entry.get("snapshot_by")
                         or existing["change_type"] != expected_change_type
                     ):
@@ -1797,6 +1812,12 @@ async def _import_compression_manifest(
                     )
                     expected_scoring = entry.get("scoring_profile") or "balanced"
                     expected_selected_at = _parse_iso(entry.get("selected_at"))
+                    # selected_at uses COALESCE($13, NOW()) on
+                    # INSERT (line ~1760). When envelope omits it,
+                    # DB stores NOW(); on retry the envelope still
+                    # has None so strict equality would falsely
+                    # reject the retry (round-38).
+                    tolerate_selected_at = entry.get("selected_at") is None
                     if existing is None or (
                         existing["owner_id"] != row_owner
                         or existing["winner_candidate_id"] != expected_winner
@@ -1809,8 +1830,11 @@ async def _import_compression_manifest(
                         or existing["composite_score"] != entry.get("composite_score")
                         or existing["scoring_profile"] != expected_scoring
                         or existing["judge_model"] != entry.get("judge_model")
-                        # IS NOT DISTINCT FROM semantics — round-33
-                        or existing["selected_at"] != expected_selected_at
+                        # selected_at: round-33 enforced IS NOT
+                        # DISTINCT FROM semantics; round-38 added
+                        # COALESCE-tolerance for envelope-NULL since
+                        # the INSERT stores NOW() in that case.
+                        or (not tolerate_selected_at and existing["selected_at"] != expected_selected_at)
                     ):
                         _bump(stats.sidecars_failed, surface)
                         stats.errors.append(

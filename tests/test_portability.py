@@ -746,6 +746,126 @@ def test_import_rejects_conflict_on_stale_permission_mode(monkeypatch):
     )
 
 
+def test_import_idempotent_when_sidecar_envelopes_omit_optional_timestamps(monkeypatch):
+    """Round-38 finding: kg_triples (valid_from, created),
+    memory_versions (snapshot_at), and compression_manifest
+    (selected_at) all use COALESCE($N, NOW()) on INSERT. When an
+    envelope omits any of these, the first import succeeds (DB
+    stores NOW()). On idempotent retry, the envelope still has
+    None for that field, so strict-equality conflict verification
+    rejects the row as 'stale prior-lifetime' even though the
+    only difference is the DB-generated default the verifier
+    can't see in the envelope. Round-38 fix tolerates the mismatch
+    only when the envelope omitted the field — the DB-generated
+    default is the right answer for that case.
+
+    Setup: envelope sidecars omit valid_from/created (kg),
+    snapshot_at (mv), selected_at (cm). DB rows match across all
+    other columns and carry NOW() in those slots. The handler must
+    count all three as skipped, not failed.
+    """
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+
+    kg_entry = _kg_sidecar_entry()
+    kg_entry.pop("valid_from", None)
+    kg_entry.pop("created", None)
+
+    mv_entry = _mv_sidecar_entry()
+    mv_entry.pop("snapshot_at", None)
+
+    cm_entry = _cm_sidecar_entry()
+    cm_entry.pop("selected_at", None)
+
+    db_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    matching_kg = {
+        "subject": kg_entry["subject_literal"],
+        "predicate": kg_entry["predicate"],
+        "object": kg_entry["object_literal"],
+        "subject_type": kg_entry.get("subject_type"),
+        "object_type": kg_entry.get("object_type"),
+        "memory_id": kg_entry.get("memory_id"),
+        "confidence": kg_entry.get("confidence"),
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        # COALESCE-stored DB defaults — round-38 must tolerate
+        # these even though the envelope has None.
+        "valid_from": db_now,
+        "valid_until": None,
+        "created": db_now,
+    }
+    matching_mv = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+        "merge_parents": None,
+        "category": mv_entry.get("category"),
+        "subcategory": mv_entry.get("subcategory"),
+        "metadata": mv_entry.get("metadata") or {},
+        "verbatim_content": mv_entry.get("verbatim_content"),
+        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "source_model": mv_entry.get("source_model"),
+        "source_provider": mv_entry.get("source_provider"),
+        "source_session": mv_entry.get("source_session"),
+        "source_agent": mv_entry.get("source_agent"),
+        # Same: DB has the COALESCE'd NOW() value.
+        "snapshot_at": db_now,
+        "snapshot_by": mv_entry.get("snapshot_by"),
+        "change_type": mv_entry.get("change_type") or "create",
+    }
+    matching_cm = {
+        "owner_id": "alice",
+        "winner_candidate_id": cm_entry.get("winner_contest_id"),
+        "engine_id": cm_entry["engine_id"],
+        "engine_version": cm_entry.get("engine_version"),
+        "compressed_content": cm_entry.get("compressed_content"),
+        "compressed_tokens": cm_entry.get("compressed_tokens"),
+        "compression_ratio": cm_entry.get("compression_ratio"),
+        "quality_score": cm_entry.get("quality_score"),
+        "composite_score": cm_entry.get("composite_score"),
+        "scoring_profile": cm_entry.get("scoring_profile") or "balanced",
+        "judge_model": cm_entry.get("judge_model"),
+        # Same: DB has COALESCE'd NOW() value.
+        "selected_at": db_now,
+    }
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "FROM memory_versions WHERE id = $1::uuid": [matching_mv],
+        "FROM kg_triples WHERE id = $1": [matching_kg],
+        "FROM memory_compressed_variants": [matching_cm],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[],
+        kg_triples=[kg_entry],
+        memory_versions=[mv_entry],
+        compression_manifest=[cm_entry],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.sidecars_failed == {}, (
+        f"timestamp omission should not fail conflict verification "
+        f"on idempotent retry, but got {stats.sidecars_failed!r} "
+        f"with errors {stats.errors!r}"
+    )
+    assert stats.sidecars_skipped == {
+        "kg_triples": 1,
+        "memory_versions": 1,
+        "compression_manifest": 1,
+    }
+
+
 def test_import_early_validation_rejection_blocks_sidecar(monkeypatch):
     """Round-37 finding: pre-insert validation rejections (empty
     content, unsupported payload_version) hit ``continue`` BEFORE
