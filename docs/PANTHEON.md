@@ -22,6 +22,30 @@ Every existing tool keeps working — PANTHEON is OpenAI-shape. The win is the c
 
 ---
 
+## CHARON v0.2 contract note (related work)
+
+The CHARON v0.2 portability subsystem (which ships with this v4
+cut) restricts the trigger-suppressed `memory_versions` sidecar
+import path to the **root + preserve_owner=true** admin/migration
+path. Non-root callers can ship `kg_triples` and
+`compression_manifest` sidecars without restriction, but
+`memory_versions` requires a root bearer token (`--preserve-metadata`
+on `tools/memory_import.py`). This restriction is structural:
+the interaction of caller-scoped deterministic id derivation,
+ON CONFLICT idempotency, and `memory_versions` surviving memory
+deletion makes the non-root path a defect-prone surface where
+adversarial review surfaced a sequence of stale-state edge cases
+that each required extending the equality check on every column.
+The architectural restriction collapses the entire class.
+
+**Practical impact for PANTHEON clients:** none. PANTHEON callers
+hitting `/v1/import` for non-DAG-history use cases (typical agent
+memory sync) still work as before. Cross-system migrations go
+through the documented root path. If a peer-system adapter wants
+to preserve authoritative version history across systems, it
+needs a root token — the same constraint as any administrative
+data movement.
+
 ## What we are NOT building
 
 - **A new message queue.** PANTHEON uses **NATS JetStream** (Apache 2.0, single binary, ~30MB RAM, native Python client). Building bespoke MQ infrastructure is not the project. Same posture as MNEMOS choosing pgvector over a custom vector store: pick the boring proven option, focus engineering on the layer that's actually novel.

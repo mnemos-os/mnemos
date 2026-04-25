@@ -1688,6 +1688,46 @@ async def import_memories(
         errors=[],
     )
 
+    # Restrict trigger-suppressed memory_versions imports to the
+    # root + preserve_owner=true admin/migration path. CHARON v0.2
+    # adversarial review (Codex rounds 16-24) systematically
+    # surfaced a sequence of stale-state edge cases on the non-root
+    # path arising from the interaction of (a) caller-scoped
+    # deterministic id derivation, (b) ON CONFLICT idempotency,
+    # (c) memory_versions surviving memory deletion (audit feature),
+    # and (d) trigger suppression for sidecar imports. Each finding
+    # was a real bypass with a local fix, but the underlying state
+    # machine kept producing new variants — every persisted column
+    # had to be in an equality check, every prior-lifetime artifact
+    # had to be cleared, and the contract committed us to keeping
+    # those checks exhaustive as the schema evolved.
+    #
+    # Architectural restriction: the documented migration path is
+    # root + preserve_owner=true (`--preserve-metadata` on the CLI),
+    # which already requires a root bearer token and skips id
+    # derivation. The non-root path was never load-bearing for the
+    # documented migration or interop use cases — non-root callers
+    # who want authoritative version history can use the records-
+    # only import and rely on the trigger-fired default v1, or
+    # ship kg_triples / compression_manifest sidecars (no trigger
+    # interaction).
+    if envelope.memory_versions and not (preserve_owner and _is_root(user)):
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "memory_versions sidecar import requires root + "
+                "preserve_owner=true (the admin/migration path; "
+                "use --preserve-metadata in tools/memory_import.py "
+                "with a root bearer token). Non-root callers can "
+                "import records and rely on the trigger-fired "
+                "default v1 history, or ship kg_triples / "
+                "compression_manifest sidecars without restriction. "
+                "The non-root + memory_versions sidecar combination "
+                "is not supported under CHARON v0.2 due to "
+                "deterministic-id stale-state interactions."
+            ),
+        )
+
     # Pre-validate memory_versions coverage BEFORE opening the
     # transaction. When an envelope carries memory_versions, the
     # records loop runs with the version-snapshot trigger
