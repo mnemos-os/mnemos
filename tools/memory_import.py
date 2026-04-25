@@ -343,6 +343,8 @@ class JsonImporter(BaseImporter):
         """Return a list of raw memory dicts regardless of input shape."""
         if self.jsonl:
             items = []
+            mpf_records: list = []
+            jsonl_sidecars: Dict[str, list] = {}
             with self.file_path.open(encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
@@ -353,6 +355,20 @@ class JsonImporter(BaseImporter):
                     except json.JSONDecodeError as exc:
                         print(f"WARNING: line {line_num}: bad JSON ({exc})",
                               file=sys.stderr)
+                        continue
+                    # CHARON sidecar trailer:
+                    # memory_export.py jsonl mode emits a final line
+                    # {"mpf_sidecars": true, "kg_triples": [...], ...}
+                    # carrying any populated sidecar arrays. Detect
+                    # and capture into source_envelope so the
+                    # passthrough path picks them up.
+                    if (isinstance(parsed, dict)
+                            and parsed.get("mpf_sidecars") is True):
+                        for k in ("kg_triples", "memory_versions",
+                                  "compression_manifest"):
+                            arr = parsed.get(k)
+                            if isinstance(arr, list) and arr:
+                                jsonl_sidecars[k] = arr
                         continue
                     # Per-line MPF record unwrap:
                     # memory_export.py emits one full MPF record per
@@ -372,8 +388,37 @@ class JsonImporter(BaseImporter):
                         if "id" in parsed:
                             payload.setdefault("id", parsed["id"])
                         items.append(payload)
+                        # Keep the original record shape so we can
+                        # rebuild a verbatim envelope below if a
+                        # trailer was seen.
+                        mpf_records.append(parsed)
                     else:
                         items.append(parsed)
+            # If a trailer was seen and we're in preserve_metadata
+            # mode, materialize a single passthrough envelope so the
+            # CLI POSTs records + sidecars together. Otherwise the
+            # sidecars would be silently dropped on import.
+            if jsonl_sidecars and self.preserve_metadata and mpf_records:
+                self.source_envelope = {
+                    "mpf_version": self.MPF_VERSION,
+                    "source_system": "memory_import",
+                    "source_version": self.MEMORY_PAYLOAD_VERSION,
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    "records": mpf_records,
+                    **jsonl_sidecars,
+                }
+            elif jsonl_sidecars and not self.preserve_metadata:
+                # Without preserve_metadata the per-record path is
+                # used, which can't carry sidecars. Warn loudly so
+                # operators don't get a silent partial import.
+                kinds = ", ".join(jsonl_sidecars.keys())
+                print(
+                    f"WARNING: input JSONL contains sidecars ({kinds}) "
+                    "but --preserve-metadata is not set; sidecars will "
+                    "NOT be imported. Re-run with --preserve-metadata "
+                    "to use the CHARON envelope passthrough path.",
+                    file=sys.stderr,
+                )
             return items
 
         raw = self.file_path.read_text(encoding="utf-8")

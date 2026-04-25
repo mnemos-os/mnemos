@@ -982,3 +982,145 @@ def test_import_preserve_owner_rejects_owner_namespace_mismatch(monkeypatch):
         "mem_carol_real" in e and "carol" in e.lower()
         for e in stats.errors
     ), f"expected owner-mismatch rejection, got {stats.errors}"
+
+
+def test_import_compression_manifest_cross_namespace_same_owner_rejected(monkeypatch):
+    """Codex review #2: alice in ns_A submits a compression_manifest
+    referencing alice's OWN memory in ns_B. The previous fix passed
+    require_namespace_match=False because the variants table has no
+    namespace column — but the threat model is that compressed
+    content in ns_B gets poisoned by alice acting from ns_A.
+
+    Validation must use the referenced memory's namespace, not the
+    variants table's lack of one. Allowlist returns mem_alice_in_B
+    as alice/ns_B; the caller is alice/ns_A — namespace mismatch
+    must reject."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_alice_in_B",
+                           owner_id="alice", namespace="ns_B"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _cm_sidecar_entry()
+    bad["record_id"] = "mem_alice_in_B"
+    env = portability.MPFEnvelope(records=[], compression_manifest=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False,
+        user=UserContext(
+            user_id="alice", group_ids=[], role="user",
+            namespace="ns_A", authenticated=True,
+        ),
+    ))
+    assert stats.sidecars_failed == {"compression_manifest": 1}
+    assert any(
+        "ns_B" in e or "ns_A" in e
+        for e in stats.errors
+    ), f"expected ns mismatch rejection, got {stats.errors}"
+    assert not any(
+        "INSERT INTO memory_compressed_variants" in e[0] for e in conn.executes
+    )
+
+
+def test_import_partial_memory_versions_coverage_rejected(monkeypatch):
+    """Codex review #2: if envelope ships memory_versions sidecar
+    that doesn't cover every kind:memory record, the import must
+    reject upfront (before any trigger suppression). Otherwise
+    records without coverage land in `memories` with no v1 — the
+    trigger is suppressed and the sidecar has no entry."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[
+            _memory_record(id="mem_covered"),
+            _memory_record(id="mem_uncovered"),
+        ],
+        memory_versions=[
+            # Only mem_covered has a v1; mem_uncovered does not.
+            {**_mv_sidecar_entry(), "record_id": "mem_covered"},
+        ],
+    )
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=False, user=_alice(),
+        ))
+    assert exc.value.status_code == 400
+    assert "memory_versions sidecar must cover" in exc.value.detail
+    assert "mem_uncovered" in exc.value.detail
+    # Critically: NO INSERTs executed — we rejected before opening
+    # the transaction.
+    assert not any("INSERT INTO" in e[0] for e in conn.executes)
+
+
+def test_import_full_memory_versions_coverage_passes(monkeypatch):
+    """Companion to the partial-coverage rejection test: when every
+    record HAS a v1 in the sidecar, the import proceeds normally."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_a"),
+            _allowlist_row(memory_id="mem_b"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[
+            _memory_record(id="mem_a"),
+            _memory_record(id="mem_b"),
+        ],
+        memory_versions=[
+            {**_mv_sidecar_entry(), "record_id": "mem_a",
+             "id": "00000000-0000-0000-0000-000000000aaa"},
+            {**_mv_sidecar_entry(), "record_id": "mem_b",
+             "id": "00000000-0000-0000-0000-000000000bbb"},
+        ],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 2
+    assert stats.sidecars_imported.get("memory_versions") == 2
+
+
+def test_import_memory_versions_restores_branch_head(monkeypatch):
+    """Codex review #2: after memory_versions sidecar import, the
+    handler must upsert memory_branches with the head version_id
+    per (memory_id, branch). The trigger normally does this on
+    memory INSERT but is suppressed during CHARON imports.
+
+    Verify by checking that an INSERT INTO memory_branches was
+    executed for each imported memory_id."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # _restore_memory_branches issues a DISTINCT ON SELECT
+        # against memory_versions — return the v1 row we'd expect
+        # post-import.
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": "mem_alice1", "branch": "main",
+             "head_version_id": "11111111-1111-1111-1111-111111111111"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported.get("memory_versions") == 1
+    # memory_branches UPSERT must have been executed
+    branch_inserts = [e for e in conn.executes if "INSERT INTO memory_branches" in e[0]]
+    assert len(branch_inserts) == 1, (
+        f"expected one memory_branches UPSERT, got {len(branch_inserts)}: "
+        f"{[e[0][:60] for e in conn.executes]}"
+    )
+    args = branch_inserts[0][1]
+    assert "mem_alice1" in args
+    assert "main" in args

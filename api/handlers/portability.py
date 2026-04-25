@@ -744,6 +744,44 @@ async def _import_kg_triples(
             logger.exception("MPF kg_triples import failed for entry %s", entry.get("id"))
 
 
+async def _restore_memory_branches(conn, memory_ids: List[str]) -> None:
+    """After memory_versions sidecar import, repopulate memory_branches
+    HEAD pointers for the imported records.
+
+    The mnemos_version_snapshot trigger normally upserts memory_branches
+    on every memory INSERT, but during a CHARON import the trigger is
+    suppressed via the mnemos.suppress_version_snapshot GUC. Without
+    this restore step, /log + branch-walk endpoints see the version
+    rows but no HEAD pointer, so DAG queries return empty.
+
+    For each imported (memory_id, branch), the HEAD is the version
+    row with the highest version_num — same rule the trigger applies
+    on update. UPSERT into memory_branches keyed on (memory_id, name).
+    """
+    if not memory_ids:
+        return
+    rows = await conn.fetch(
+        """
+        SELECT DISTINCT ON (memory_id, branch)
+            memory_id, branch, id AS head_version_id
+        FROM memory_versions
+        WHERE memory_id = ANY($1::text[])
+        ORDER BY memory_id, branch, version_num DESC
+        """,
+        memory_ids,
+    )
+    for r in rows:
+        await conn.execute(
+            """
+            INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+            VALUES ($1, $2, $3, NULL)
+            ON CONFLICT (memory_id, name) DO UPDATE
+            SET head_version_id = EXCLUDED.head_version_id
+            """,
+            r["memory_id"], r["branch"], r["head_version_id"],
+        )
+
+
 async def _import_memory_versions(
     conn,
     sidecar: List[Dict[str, Any]],
@@ -863,15 +901,31 @@ async def _import_compression_manifest(
                 preserve_owner=preserve_owner,
                 has_namespace_column=False,
             )
-            # Same tenant-scope check as the other sidecars; namespace
-            # match not required because this table has no namespace
-            # column. Owner-only check is the right granularity.
+            # Tenant-scope check. Even though
+            # memory_compressed_variants has no `namespace` column,
+            # the referenced memories row does — and a same-owner
+            # cross-namespace import (alice.ns_A claiming a variant
+            # for alice.ns_B's memory) would silently poison the
+            # compressed content read paths in ns_B. Validate
+            # against the caller's effective namespace, NOT against
+            # row_ns (which is None here because the table has no
+            # namespace column).
+            #
+            # For preserve_owner=true, fall back to the entry's
+            # stated owner_id matching the memory's actual one;
+            # namespace check uses the memory's actual namespace
+            # since the entry has no namespace field by schema.
+            ref_namespace = (
+                None if preserve_owner else caller_namespace
+            )
             allowed, reason = _is_allowed_reference(
                 entry.get("record_id"),
                 effective_owner=row_owner,
-                effective_namespace=None,
+                effective_namespace=ref_namespace,
                 allowlist=allowlist,
-                require_namespace_match=False,
+                # Skip the namespace match only under preserve_owner,
+                # where the caller is root and migrations span ns.
+                require_namespace_match=not preserve_owner,
             )
             if not allowed:
                 _bump(stats.sidecars_failed, surface)
@@ -992,6 +1046,37 @@ async def import_memories(
         errors=[],
     )
 
+    # Pre-validate memory_versions coverage BEFORE opening the
+    # transaction. When an envelope carries memory_versions, the
+    # records loop runs with the version-snapshot trigger
+    # suppressed — so any record_id that *isn't* covered by the
+    # sidecar would land in `memories` without a v1 history entry
+    # at all. That's worse than the original collision bug:
+    # silently-unversioned production data. Refuse the envelope
+    # up front rather than partially-import broken history.
+    if envelope.memory_versions:
+        memory_record_ids = {
+            r.id for r in envelope.records if r.kind == "memory"
+        }
+        sidecar_versioned_ids = {
+            e.get("record_id") for e in envelope.memory_versions
+            if e.get("record_id")
+        }
+        uncovered = memory_record_ids - sidecar_versioned_ids
+        if uncovered:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "memory_versions sidecar must cover every "
+                    f"kind: memory record being imported. {len(uncovered)} "
+                    f"record(s) have no version entry: "
+                    f"{sorted(uncovered)[:5]}{'...' if len(uncovered) > 5 else ''}. "
+                    "Either ship a complete sidecar or omit the "
+                    "memory_versions array entirely (the trigger will "
+                    "synthesize default v1 history)."
+                ),
+            )
+
     async with _lc._pool.acquire() as conn:
         async with conn.transaction():
             # When the envelope carries its own memory_versions
@@ -1002,11 +1087,12 @@ async def import_memories(
             # idx_mv_main_linear partial unique index `(memory_id,
             # version_num) WHERE branch='main'`. Suppress the trigger
             # for the duration of this transaction; the envelope IS
-            # the version log.
+            # the version log. Pre-validation above guarantees that
+            # every record being inserted has authoritative history.
             #
             # Targeted suppression via the `mnemos.suppress_version_snapshot`
             # custom GUC. The trigger creation in
-            # db/migrations_v3_4_charon_trigger_guard.sql attaches a
+            # db/migrations_charon_trigger_guard.sql attaches a
             # WHEN clause that no-ops the three version-snapshot
             # triggers when this GUC is '1'. Custom dot-namespaced
             # GUCs are settable per-transaction by any role — no
@@ -1129,6 +1215,16 @@ async def import_memories(
                     preserve_owner=preserve_owner,
                     stats=stats,
                     allowlist=allowlist,
+                )
+                # Restore memory_branches HEAD pointers. The trigger
+                # would normally do this on memory INSERT, but it's
+                # suppressed during CHARON imports. Without this,
+                # the imported version rows are orphans from the
+                # branch-walk perspective (DAG endpoints return empty).
+                await _restore_memory_branches(
+                    conn,
+                    [e["record_id"] for e in envelope.memory_versions
+                     if e.get("record_id")],
                 )
             if envelope.compression_manifest:
                 await _import_compression_manifest(
