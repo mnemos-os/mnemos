@@ -1385,6 +1385,45 @@ def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
     )
 
 
+def test_import_rolls_back_when_inserted_memory_has_no_main_branch(monkeypatch):
+    """Codex round-20 finding: INNER JOIN on memory_branches name='main'
+    misses records that have NO main branch entirely. An envelope can
+    ship memory_versions only on branch='feature', land it, and the
+    INNER JOIN returns nothing — divergent stays empty, memory commits
+    without any main-branch history. Verify the LEFT JOIN catches
+    missing main."""
+    derived_id = _ALICE_MEM_ALICE1_DERIVED
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": derived_id},
+        ],
+        # head_check with LEFT JOIN: no main branch for derived_id,
+        # so head_content is NULL. memory was just inserted, so
+        # missing-main is fatal.
+        "JOIN memory_branches b": [
+            {"id": derived_id,
+             "memory_content": "body",
+             "head_content": None},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    feature_only = _mv_sidecar_entry()
+    feature_only["branch"] = "feature"
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[feature_only],
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=False, user=_alice(),
+        ))
+    assert exc.value.status_code == 500
+    assert "no main-branch HEAD" in exc.value.detail
+
+
 def test_import_rolls_back_existing_memory_dag_poisoning(monkeypatch):
     """Codex round-19 finding: round-18's HEAD-content check only
     ran on inserted_record_ids. A sidecar-only import against an

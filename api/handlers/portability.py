@@ -1965,23 +1965,65 @@ async def import_memories(
                 # an authorized pre-existing row).
                 touched_ids = inserted_record_ids | authorized_version_ids
                 if touched_ids:
+                    # LEFT JOIN so records WITHOUT a main branch
+                    # row come back with NULL head_content. Round-20
+                    # finding: an envelope can ship memory_versions
+                    # only on branch='feature', land it, and skip
+                    # this check entirely under the previous INNER
+                    # JOIN — the memory commits without any main-
+                    # branch history.
                     head_check = await conn.fetch(
                         """
                         SELECT m.id, m.content AS memory_content,
                                mv.content AS head_content
                         FROM memories m
-                        JOIN memory_branches b
+                        LEFT JOIN memory_branches b
                           ON b.memory_id = m.id AND b.name = 'main'
-                        JOIN memory_versions mv
+                        LEFT JOIN memory_versions mv
                           ON mv.id = b.head_version_id
                         WHERE m.id = ANY($1::text[])
                         """,
                         list(touched_ids),
                     )
-                    divergent = [
-                        r["id"] for r in head_check
-                        if r["memory_content"] != r["head_content"]
-                    ]
+                    # NEW inserted records MUST have a main HEAD
+                    # whose content matches. Pre-existing records
+                    # that the import only sidecar-touched may not
+                    # have had main updated by this request, so
+                    # missing main is allowed for them iff the
+                    # missing case means we never reached them
+                    # (their existing main is whatever it was
+                    # before, and we didn't touch it).
+                    missing_inserted = []
+                    divergent = []
+                    in_db_inserted = inserted_record_ids
+                    for r in head_check:
+                        rid = r["id"]
+                        head_content = r["head_content"]
+                        memory_content = r["memory_content"]
+                        if head_content is None:
+                            if rid in in_db_inserted:
+                                missing_inserted.append(rid)
+                            # else: pre-existing record without
+                            # main branch; the records loop didn't
+                            # touch it so existing state stands.
+                        elif memory_content != head_content:
+                            divergent.append(rid)
+                    if missing_inserted:
+                        sample = sorted(missing_inserted)[:5]
+                        extra = "..." if len(missing_inserted) > 5 else ""
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "CHARON import inserted "
+                                f"{len(missing_inserted)} memory "
+                                "record(s) with no main-branch HEAD: "
+                                f"{sample}{extra}. The envelope's "
+                                "memory_versions sidecar must include "
+                                "a branch='main' entry for every "
+                                "kind:memory record being imported. "
+                                "Transaction rolled back."
+                            ),
+                        )
                     if divergent:
                         sample = sorted(divergent)[:5]
                         extra = "..." if len(divergent) > 5 else ""
