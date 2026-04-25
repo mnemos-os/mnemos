@@ -986,11 +986,12 @@ async def _import_kg_triples(
                     # INSERT uses COALESCE($N, NOW()) so we only
                     # compare when the envelope explicitly
                     # supplied a value.
-                    or (expected_valid_from is not None and
-                        existing["valid_from"] != expected_valid_from)
+                    # IS NOT DISTINCT FROM semantics for temporal
+                    # columns — round-33 fix. Envelope-NULL must
+                    # match DB-NULL, not be wildcarded.
+                    or existing["valid_from"] != expected_valid_from
                     or existing["valid_until"] != expected_valid_until
-                    or (expected_created is not None and
-                        existing["created"] != expected_created)
+                    or existing["created"] != expected_created
                 ):
                     _bump(stats.sidecars_failed, surface)
                     stats.errors.append(
@@ -1569,7 +1570,13 @@ async def _import_memory_versions(
                         or existing["namespace"] != row_ns
                         or existing["version_num"] != entry["version_num"]
                         or existing["content"] != entry["content"]
-                        or (entry.get("commit_hash") and
+                        # commit_hash is NOT NULL and INSERT uses
+                        # entry.get("commit_hash") verbatim — so an
+                        # entry that hit conflict MUST have a
+                        # truthy commit_hash. Don't wildcard the
+                        # comparison: an empty/missing commit_hash
+                        # means the entry is malformed, reject it.
+                        or (not entry.get("commit_hash") or
                             existing["commit_hash"] != entry["commit_hash"])
                         or existing["parent_version_id"] != expected_parent
                         or existing["branch"] != expected_branch
@@ -1583,8 +1590,10 @@ async def _import_memory_versions(
                         or existing["source_provider"] != entry.get("source_provider")
                         or existing["source_session"] != entry.get("source_session")
                         or existing["source_agent"] != entry.get("source_agent")
-                        or (expected_snapshot_at is not None and
-                            actual_snapshot_at != expected_snapshot_at)
+                        # IS NOT DISTINCT FROM semantics — envelope
+                        # NULL must match DB NULL, not be wildcarded.
+                        # Round-33 fix.
+                        or actual_snapshot_at != expected_snapshot_at
                         or existing["snapshot_by"] != entry.get("snapshot_by")
                         or existing["change_type"] != expected_change_type
                     ):
@@ -1796,8 +1805,8 @@ async def _import_compression_manifest(
                         or existing["composite_score"] != entry.get("composite_score")
                         or existing["scoring_profile"] != expected_scoring
                         or existing["judge_model"] != entry.get("judge_model")
-                        or (expected_selected_at is not None and
-                            existing["selected_at"] != expected_selected_at)
+                        # IS NOT DISTINCT FROM semantics — round-33
+                        or existing["selected_at"] != expected_selected_at
                     ):
                         _bump(stats.sidecars_failed, surface)
                         stats.errors.append(
