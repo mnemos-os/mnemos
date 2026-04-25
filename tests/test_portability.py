@@ -1254,6 +1254,48 @@ def test_topo_sort_handles_forked_branch(monkeypatch):
     ], f"topo sort failed: {ids}"
 
 
+def test_import_memory_versions_rejects_cross_tenant_parent(monkeypatch):
+    """Codex round-11 finding: parent_version_id and merge_parents
+    are FKs to memory_versions(id) but the DB FK only proves the
+    UUID exists — not that it belongs to the same memory or tenant.
+    An adversarial envelope can attach alice's child version to
+    bob's parent UUID, creating a cross-tenant DAG edge that
+    downstream /log traversal follows.
+
+    Verify the import rejects such an entry without inserting."""
+    foreign_parent_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # Parent UUID exists in DB but under bob's memory_id.
+        "FROM memory_versions WHERE id = ANY": [
+            {"id": foreign_parent_uuid, "memory_id": "mem_bob_secret",
+             "owner_id": "bob", "namespace": "bob-ns"},
+        ],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["parent_version_id"] = foreign_parent_uuid
+    env = portability.MPFEnvelope(
+        records=[],
+        memory_versions=[bad],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    assert any(
+        "foreign-tenant" in e or "foreign-record" in e
+        for e in stats.errors
+    ), f"expected cross-tenant parent rejection, got {stats.errors}"
+    assert not any(
+        "INSERT INTO memory_versions" in e[0] for e in conn.executes
+    )
+
+
 def test_topo_sort_treats_external_parents_as_roots(monkeypatch):
     """If parent_version_id points at a UUID that's NOT in the
     envelope (parent already in DB), the entry is a root from

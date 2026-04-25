@@ -858,6 +858,81 @@ async def _restore_memory_branches(conn, memory_ids: List[str]) -> None:
         )
 
 
+async def _validate_version_parents(
+    conn,
+    parent_uuids: List[str],
+    *,
+    expected_record_id: str,
+    effective_owner: str,
+    effective_ns: Optional[str],
+    in_envelope_index: Dict[str, Dict[str, Any]],
+) -> tuple:
+    """Verify that every parent UUID either (a) belongs to an
+    in-envelope memory_versions entry under the same record_id +
+    owner + namespace, or (b) exists in DB under the same
+    record_id + owner + namespace.
+
+    Returns (all_valid, bad_parents_list). bad_parents is a list
+    of UUID strings that failed validation. Caller decides whether
+    to NULL them, reject the row, or surface as an error.
+
+    The DB FK on parent_version_id only proves the UUID exists —
+    NOT that it points at a same-memory, same-tenant row. Without
+    this check, an adversarial sidecar can attach its
+    parent_version_id to ANOTHER tenant's version UUID, creating
+    a cross-tenant DAG edge that downstream `/log` traversal will
+    follow without rechecking tenancy. Codex round-11 finding.
+    """
+    if not parent_uuids:
+        return True, []
+    bad: List[str] = []
+    db_check_ids: List[str] = []
+    for p in parent_uuids:
+        if p in in_envelope_index:
+            ref = in_envelope_index[p]
+            ref_record = ref.get("record_id")
+            ref_owner = ref.get("owner_id")
+            ref_ns = ref.get("namespace")
+            same_record = ref_record == expected_record_id
+            # When the in-envelope ref carries owner/namespace,
+            # require those to match the post-rewrite values for
+            # this entry. When it omits them (caller will rewrite),
+            # the same-record check is sufficient since the
+            # rewrite will land them under the same owner/ns.
+            same_owner = (ref_owner is None) or (ref_owner == effective_owner)
+            same_ns = (ref_ns is None) or (ref_ns == effective_ns)
+            if not (same_record and same_owner and same_ns):
+                bad.append(p)
+        else:
+            db_check_ids.append(p)
+    if db_check_ids:
+        # Bulk SELECT for parents not in this envelope.
+        rows = await conn.fetch(
+            "SELECT id::text AS id, memory_id, owner_id, namespace "
+            "FROM memory_versions WHERE id = ANY($1::uuid[])",
+            db_check_ids,
+        )
+        found: Dict[str, tuple] = {
+            r["id"]: (r["memory_id"], r["owner_id"], r["namespace"])
+            for r in rows
+        }
+        for p in db_check_ids:
+            if p not in found:
+                bad.append(p)
+                continue
+            mem_id, owner, ns = found[p]
+            if mem_id != expected_record_id:
+                bad.append(p)
+                continue
+            if owner != effective_owner:
+                bad.append(p)
+                continue
+            if ns != effective_ns:
+                bad.append(p)
+                continue
+    return (not bad), bad
+
+
 def _topo_sort_versions(sidecar: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Kahn's-algorithm topological sort over a memory_versions
     sidecar list, treating parent_version_id + merge_parents as
@@ -993,6 +1068,13 @@ async def _import_memory_versions(
     # (treated as roots, their FK will resolve at INSERT time).
     # Pop zero-in-degree nodes in ties broken by version_num.
     sidecar = _topo_sort_versions(sidecar)
+    # Index in-envelope entries by id for parent-validation
+    # lookups. parent_version_id and merge_parents may point at
+    # entries inside this envelope OR at rows already in DB; the
+    # validator falls back to a SELECT for the latter.
+    in_envelope_index = {
+        str(e["id"]): e for e in sidecar if e.get("id")
+    }
     for entry in sidecar:
         # Capture record_id even when other required fields are
         # missing — we need it for the failure-tracking set so the
@@ -1027,6 +1109,37 @@ async def _import_memory_versions(
                 stats.errors.append(f"[{surface}] {entry['id']}: {reason}")
                 failed_record_ids.add(entry["record_id"])
                 continue
+
+            # Tenant-scope every parent UUID. parent_version_id and
+            # merge_parents both reference memory_versions(id) — the
+            # DB FK only proves the UUID exists, NOT that it points
+            # at a same-memory, same-tenant row. Validate explicitly
+            # so an adversarial sidecar can't link its child commit
+            # to another tenant's parent (Codex round-11 finding).
+            parent_uuids: List[str] = []
+            if entry.get("parent_version_id"):
+                parent_uuids.append(str(entry["parent_version_id"]))
+            for mp in entry.get("merge_parents") or []:
+                if mp:
+                    parent_uuids.append(str(mp))
+            if parent_uuids:
+                ok, bad = await _validate_version_parents(
+                    conn, parent_uuids,
+                    expected_record_id=entry["record_id"],
+                    effective_owner=row_owner,
+                    effective_ns=row_ns,
+                    in_envelope_index=in_envelope_index,
+                )
+                if not ok:
+                    _bump(stats.sidecars_failed, surface)
+                    stats.errors.append(
+                        f"[{surface}] {entry['id']}: parent_version_id/"
+                        f"merge_parents reference foreign-tenant or "
+                        f"foreign-record version(s) {bad}; rejected"
+                    )
+                    failed_record_ids.add(entry["record_id"])
+                    continue
+
             metadata = entry.get("metadata") or {}
             # Per-row SAVEPOINT — same reasoning as kg_triples loop.
             try:
