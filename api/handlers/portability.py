@@ -719,6 +719,32 @@ def _is_allowed_reference(
     return True, ""
 
 
+def _derive_caller_scoped_uuid(
+    envelope_id: str,
+    *,
+    caller_owner: str,
+    caller_namespace: str,
+    extra: str = "",
+) -> str:
+    """Derive a deterministic UUID from caller identity + envelope
+    id (+ optional extra payload for content-binding).
+
+    Used for sidecar primary keys (memory_versions.id,
+    kg_triples.id) under non-root imports. Without this,
+    sidecar PKs are envelope-supplied UUIDs that collide globally
+    when the same envelope is imported by multiple non-root callers
+    (Codex round-15 finding). Caller-scoping makes each importer's
+    sidecar id space disjoint, identical to the records-loop fix.
+
+    Returns a string-formatted UUID (uuid.UUID(...)). The hash is
+    sha1-based via uuid.uuid5; collision odds are negligible for
+    the input scale.
+    """
+    namespace = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")  # uuid.NAMESPACE_DNS
+    name = "\x00".join([caller_owner, caller_namespace, envelope_id, extra])
+    return str(uuid.uuid5(namespace, name))
+
+
 def _derive_caller_scoped_id(
     envelope_id: str,
     *,
@@ -800,6 +826,22 @@ async def _import_kg_triples(
     *_type tags persist as discriminators.
     """
     surface = "kg_triples"
+    # Caller-scoped PK rewrite for non-root imports — same as the
+    # memory_versions helper (Codex round-15 finding). kg_triples
+    # has no FK self-references, so we only remap entry["id"]
+    # itself; subject_id / object_id are free-form references
+    # that the consumer can interpret.
+    if not preserve_owner:
+        for entry in sidecar:
+            eid = entry.get("id")
+            if eid:
+                entry["id"] = _derive_caller_scoped_uuid(
+                    str(eid),
+                    caller_owner=caller_user_id,
+                    caller_namespace=caller_namespace,
+                    extra="kg_triples",
+                )
+
     for entry in sidecar:
         if not entry.get("id") or not entry.get("predicate"):
             _bump(stats.sidecars_failed, surface)
@@ -929,6 +971,7 @@ async def _validate_version_parents(
     effective_owner: str,
     effective_ns: Optional[str],
     in_envelope_index: Dict[str, Dict[str, Any]],
+    preserve_owner: bool = True,
 ) -> tuple:
     """Verify every parent UUID points at a row under the same
     record_id + owner + namespace as the entry being imported.
@@ -985,11 +1028,28 @@ async def _validate_version_parents(
         if p in in_envelope_index:
             ref = in_envelope_index[p]
             ref_record = ref.get("record_id")
-            ref_owner = ref.get("owner_id")
-            ref_ns = ref.get("namespace")
             same_record = ref_record == expected_record_id
-            same_owner = (ref_owner is None) or (ref_owner == effective_owner)
-            same_ns = (ref_ns is None) or (ref_ns == effective_ns)
+            if preserve_owner:
+                # Root + preserve_owner=true: envelope owner/ns
+                # are honored on insert. Validate against them.
+                ref_owner = ref.get("owner_id")
+                ref_ns = ref.get("namespace")
+                same_owner = (ref_owner is None) or (ref_owner == effective_owner)
+                same_ns = (ref_ns is None) or (ref_ns == effective_ns)
+            else:
+                # Non-root: every in-envelope parent will be
+                # persisted under the caller's identity by the
+                # owner-rewrite, so its post-INSERT owner/ns ARE
+                # the caller's. The envelope's raw owner/ns fields
+                # are about to be overwritten — don't validate
+                # against them. Only the same-record_id constraint
+                # matters here. Codex round-15 finding: previous
+                # code rejected legitimate non-root cross-system
+                # imports because bob's exported envelope carries
+                # owner=bob in sidecar entries, but alice will
+                # land them under owner=alice.
+                same_owner = True
+                same_ns = True
             if not (same_record and same_owner and same_ns):
                 bad.append(p)
             continue
@@ -1118,6 +1178,38 @@ async def _import_memory_versions(
     surface = "memory_versions"
     authorized_record_ids: set = set()
     failed_record_ids: set = set()
+
+    # Caller-scoped PK rewrite for non-root imports. Each entry's
+    # `id` plus every parent_version_id/merge_parents reference
+    # gets translated through this map so two different non-root
+    # callers importing the same envelope land in disjoint id
+    # spaces (Codex round-15 finding). Root + preserve_owner=true
+    # keeps envelope ids verbatim — the admin migration path.
+    non_root_pk_rewrite = not (preserve_owner)
+    version_id_remap: Dict[str, str] = {}
+    if non_root_pk_rewrite:
+        for entry in sidecar:
+            eid = entry.get("id")
+            if eid:
+                version_id_remap[str(eid)] = _derive_caller_scoped_uuid(
+                    str(eid),
+                    caller_owner=caller_user_id,
+                    caller_namespace=caller_namespace,
+                    extra="memory_versions",
+                )
+        # Translate the entry's own id and any parent references.
+        for entry in sidecar:
+            if entry.get("id") in version_id_remap:
+                entry["id"] = version_id_remap[entry["id"]]
+            pv = entry.get("parent_version_id")
+            if pv and str(pv) in version_id_remap:
+                entry["parent_version_id"] = version_id_remap[str(pv)]
+            mp_list = entry.get("merge_parents")
+            if mp_list:
+                entry["merge_parents"] = [
+                    version_id_remap.get(str(mp), str(mp)) for mp in mp_list
+                ]
+
     # Real topological sort over parent_version_id + merge_parents
     # so parent rows are inserted before children regardless of
     # envelope order or branch name. The previous (record_id,
@@ -1194,6 +1286,7 @@ async def _import_memory_versions(
                     effective_owner=row_owner,
                     effective_ns=row_ns,
                     in_envelope_index=in_envelope_index,
+                    preserve_owner=preserve_owner,
                 )
                 if not ok:
                     _bump(stats.sidecars_failed, surface)

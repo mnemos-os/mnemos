@@ -1378,6 +1378,50 @@ def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
     )
 
 
+def test_import_non_root_sidecar_pks_are_caller_scoped(monkeypatch):
+    """Codex round-15 finding: sidecar primary keys (memory_versions.id,
+    kg_triples.id) were envelope-supplied UUIDs. Two different
+    non-root callers importing the same envelope into one DB would
+    collide on the global id space. Verify the persisted sidecar id
+    differs from the envelope-supplied id under non-root."""
+    captured: list = []
+
+    class _CaptureConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            captured.append((sql, args))
+            return "INSERT 0 1"
+
+    conn = _CaptureConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": _ALICE_MEM_ALICE1_DERIVED},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    envelope_version_id = "00000000-0000-0000-0000-000000000001"
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[
+            {**_mv_sidecar_entry(), "id": envelope_version_id},
+        ],
+    )
+    asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    mv_insert = next(
+        e for e in captured if "INSERT INTO memory_versions" in e[0]
+    )
+    persisted_id = mv_insert[1][0]
+    # The persisted sidecar id must be a derived UUID, NOT the
+    # envelope-supplied one. Two different callers importing the
+    # same envelope land in disjoint id spaces.
+    assert str(persisted_id) != envelope_version_id, (
+        f"non-root sidecar PK must be remapped; got envelope id verbatim"
+    )
+
+
 def test_import_non_root_record_id_is_caller_scoped_not_envelope_verbatim(monkeypatch):
     """Codex round-14 finding: a non-root caller could probe for
     foreign memory_ids via the records-loop's imported-vs-skipped
