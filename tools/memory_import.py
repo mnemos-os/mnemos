@@ -543,6 +543,27 @@ class JsonImporter(BaseImporter):
             )
             if has_sidecars and self.preserve_metadata:
                 self.source_envelope = data
+            elif has_sidecars and not self.preserve_metadata:
+                # Symmetric with the JSONL trailer warning — the
+                # records-only path can't carry sidecars, so we'd
+                # silently drop kg_triples / memory_versions /
+                # compression_manifest. Emit a loud warning so the
+                # operator knows their export+import round-trip
+                # lost data (Codex round-27 finding). Mirror's the
+                # JSONL trailer-without-preserve-metadata warning.
+                kinds = ", ".join(
+                    k for k in
+                    ("kg_triples", "memory_versions", "compression_manifest")
+                    if data.get(k)
+                )
+                print(
+                    f"WARNING: input MPF envelope contains sidecars "
+                    f"({kinds}) but --preserve-metadata is not set; "
+                    "sidecars will NOT be imported. Re-run with "
+                    "--preserve-metadata to use the CHARON envelope "
+                    "passthrough path.",
+                    file=sys.stderr,
+                )
             return flat
 
         # Wrapped export format: {"memories": [...]}
