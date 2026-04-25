@@ -1296,6 +1296,63 @@ def test_import_memory_versions_rejects_cross_tenant_parent(monkeypatch):
     )
 
 
+def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
+    """Codex round-12 finding: ON CONFLICT (id) DO NOTHING means
+    an envelope-supplied 'parent' entry with a UUID that already
+    exists in DB gets SKIPPED. If the adversary crafts a fake
+    parent entry labeled with their own tenancy but using a
+    known-foreign UUID, the conflict-skip path bypasses the
+    in-envelope check and the child's FK resolves to the foreign
+    DB row. DB-truth lookup is now authoritative — verify the
+    shadow attack is rejected."""
+    foreign_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # Parent UUID exists in DB under bob — even though the
+        # envelope's fake-parent entry claims it for alice.
+        "FROM memory_versions WHERE id = ANY": [
+            {"id": foreign_uuid, "memory_id": "mem_bob_secret",
+             "owner_id": "bob", "namespace": "bob-ns"},
+        ],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    # Adversary's envelope: a fake parent entry claiming alice's
+    # tenancy with bob's UUID, plus a child entry pointing at it.
+    fake_parent = {**_mv_sidecar_entry(),
+                   "id": foreign_uuid,
+                   "version_num": 1,
+                   "owner_id": "alice", "namespace": "alice-ns"}
+    child = {**_mv_sidecar_entry(),
+             "id": "00000000-0000-0000-0000-00000000000c",
+             "version_num": 2,
+             "parent_version_id": foreign_uuid}
+    env = portability.MPFEnvelope(
+        records=[],
+        memory_versions=[fake_parent, child],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    # Both entries should fail: parent because DB-truth says
+    # mem_bob_secret/bob, child because its parent UUID resolves
+    # to bob's row.
+    assert stats.sidecars_failed.get("memory_versions", 0) >= 1
+    # No INSERT for the child (its parent validation rejected it).
+    insert_args = [
+        e[1] for e in conn.executes
+        if "INSERT INTO memory_versions" in e[0]
+        and child["id"] in e[1]
+    ]
+    assert insert_args == [], (
+        f"child must not insert when its parent shadows a foreign UUID; "
+        f"found {len(insert_args)} INSERTs"
+    )
+
+
 def test_topo_sort_treats_external_parents_as_roots(monkeypatch):
     """If parent_version_id points at a UUID that's NOT in the
     envelope (parent already in DB), the entry is a root from

@@ -867,69 +867,71 @@ async def _validate_version_parents(
     effective_ns: Optional[str],
     in_envelope_index: Dict[str, Dict[str, Any]],
 ) -> tuple:
-    """Verify that every parent UUID either (a) belongs to an
-    in-envelope memory_versions entry under the same record_id +
-    owner + namespace, or (b) exists in DB under the same
-    record_id + owner + namespace.
+    """Verify every parent UUID points at a row under the same
+    record_id + owner + namespace as the entry being imported.
 
-    Returns (all_valid, bad_parents_list). bad_parents is a list
-    of UUID strings that failed validation. Caller decides whether
-    to NULL them, reject the row, or surface as an error.
+    DB IS THE SOURCE OF TRUTH. The in-envelope index alone is not
+    enough — INSERT ... ON CONFLICT (id) DO NOTHING means an
+    envelope-supplied "parent" entry with an id that already exists
+    in DB will be SKIPPED. The pre-existing DB row's tenancy is
+    what the child's FK actually resolves to. So if an adversary
+    crafts a fake parent entry labeled with their tenancy but
+    using a known-foreign UUID, the conflict-skip path bypasses
+    the in-envelope check and the child links to the foreign row.
+    (Codex round-12 finding.)
 
-    The DB FK on parent_version_id only proves the UUID exists —
-    NOT that it points at a same-memory, same-tenant row. Without
-    this check, an adversarial sidecar can attach its
-    parent_version_id to ANOTHER tenant's version UUID, creating
-    a cross-tenant DAG edge that downstream `/log` traversal will
-    follow without rechecking tenancy. Codex round-11 finding.
+    Algorithm:
+      1. SELECT every parent UUID from memory_versions in DB.
+      2. For UUIDs found in DB: DB tenancy is authoritative;
+         reject if it doesn't match the entry's effective owner+ns
+         + record_id.
+      3. For UUIDs only in the envelope (truly new parents):
+         the envelope's claim is checked; topological sort guarantees
+         these will be inserted before children, so once persisted
+         the DB row will reflect the envelope's claim.
+      4. UUIDs in neither DB nor envelope: reject (dangling).
+
+    Returns (all_valid, bad_parents_list).
     """
     if not parent_uuids:
         return True, []
+    # DB-truth lookup over every parent UUID — including those
+    # also referenced by the envelope. The envelope's claim only
+    # matters when the UUID is GENUINELY new (not in DB yet).
+    rows = await conn.fetch(
+        "SELECT id::text AS id, memory_id, owner_id, namespace "
+        "FROM memory_versions WHERE id = ANY($1::uuid[])",
+        parent_uuids,
+    )
+    db_truth: Dict[str, tuple] = {
+        r["id"]: (r["memory_id"], r["owner_id"], r["namespace"])
+        for r in rows
+    }
     bad: List[str] = []
-    db_check_ids: List[str] = []
     for p in parent_uuids:
+        if p in db_truth:
+            # DB has this parent. Tenancy is whatever's in DB,
+            # NOT what the envelope claims (the envelope's INSERT
+            # would no-op via ON CONFLICT). Validate against DB.
+            mem_id, owner, ns = db_truth[p]
+            if (mem_id != expected_record_id
+                    or owner != effective_owner
+                    or ns != effective_ns):
+                bad.append(p)
+            continue
         if p in in_envelope_index:
             ref = in_envelope_index[p]
             ref_record = ref.get("record_id")
             ref_owner = ref.get("owner_id")
             ref_ns = ref.get("namespace")
             same_record = ref_record == expected_record_id
-            # When the in-envelope ref carries owner/namespace,
-            # require those to match the post-rewrite values for
-            # this entry. When it omits them (caller will rewrite),
-            # the same-record check is sufficient since the
-            # rewrite will land them under the same owner/ns.
             same_owner = (ref_owner is None) or (ref_owner == effective_owner)
             same_ns = (ref_ns is None) or (ref_ns == effective_ns)
             if not (same_record and same_owner and same_ns):
                 bad.append(p)
-        else:
-            db_check_ids.append(p)
-    if db_check_ids:
-        # Bulk SELECT for parents not in this envelope.
-        rows = await conn.fetch(
-            "SELECT id::text AS id, memory_id, owner_id, namespace "
-            "FROM memory_versions WHERE id = ANY($1::uuid[])",
-            db_check_ids,
-        )
-        found: Dict[str, tuple] = {
-            r["id"]: (r["memory_id"], r["owner_id"], r["namespace"])
-            for r in rows
-        }
-        for p in db_check_ids:
-            if p not in found:
-                bad.append(p)
-                continue
-            mem_id, owner, ns = found[p]
-            if mem_id != expected_record_id:
-                bad.append(p)
-                continue
-            if owner != effective_owner:
-                bad.append(p)
-                continue
-            if ns != effective_ns:
-                bad.append(p)
-                continue
+            continue
+        # Not in DB, not in envelope — dangling reference.
+        bad.append(p)
     return (not bad), bad
 
 
