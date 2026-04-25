@@ -615,19 +615,27 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
 async def _build_referenced_memory_allowlist(
     conn,
     envelope: "MPFEnvelope",
+    *,
+    scope_owner: Optional[str] = None,
+    scope_namespace: Optional[str] = None,
 ) -> Dict[str, tuple]:
-    """Return {memory_id: (owner_id, namespace)} for every memory_id
-    a sidecar in this envelope claims to attach to, looked up in DB.
+    """Return {memory_id: (owner_id, namespace)} for every sidecar-
+    referenced memory_id, looked up in DB.
 
-    This is the set of memories the caller is *capable of* attaching
-    sidecars to. Each sidecar import helper then checks per-entry
-    whether the effective (post-rewrite) owner/namespace matches
-    what's in the DB — that's what blocks a malicious envelope from
-    smuggling kg_triples / version history / compressed-content onto
-    another tenant's memory_id.
+    When `scope_owner` and/or `scope_namespace` are provided, the
+    SELECT is filtered to that tenancy. Non-root callers always
+    pass their own identity here so the lookup is structurally
+    scoped — a foreign memory_id simply doesn't appear in the
+    result, indistinguishable from a non-existent id (Codex
+    round-13 finding: an unscoped lookup combined with a
+    descriptive rejection error lets a non-root caller probe
+    foreign tenants' memory_ids and learn their owners).
+
+    Root callers with preserve_owner=true pass scope_owner=None
+    so the migration/admin path can resolve any memory_id.
 
     First-class kg_triples (memory_id absent) are not subject to
-    this check. They have no FK to a memory record by design.
+    this check.
     """
     referenced: set = set()
     for entry in envelope.kg_triples or []:
@@ -644,10 +652,18 @@ async def _build_referenced_memory_allowlist(
             referenced.add(rid)
     if not referenced:
         return {}
-    rows = await conn.fetch(
-        "SELECT id, owner_id, namespace FROM memories WHERE id = ANY($1::text[])",
-        list(referenced),
-    )
+    sql = "SELECT id, owner_id, namespace FROM memories WHERE id = ANY($1::text[])"
+    params: List[Any] = [list(referenced)]
+    if scope_owner is not None:
+        sql += " AND owner_id = $2"
+        params.append(scope_owner)
+        if scope_namespace is not None:
+            sql += " AND namespace = $3"
+            params.append(scope_namespace)
+    elif scope_namespace is not None:
+        sql += " AND namespace = $2"
+        params.append(scope_namespace)
+    rows = await conn.fetch(sql, *params)
     return {r["id"]: (r["owner_id"], r["namespace"]) for r in rows}
 
 
@@ -671,11 +687,22 @@ def _is_allowed_reference(
     if memory_id is None:
         return True, ""
     if memory_id not in allowlist:
+        # Generic message for both nonexistent and foreign-tenant
+        # ids. The caller's allowlist SELECT is structurally scoped
+        # to their tenancy (see _build_referenced_memory_allowlist),
+        # so the two cases are indistinguishable from here — which
+        # is the point: a non-root attacker can't probe for foreign
+        # memory_ids via rejection-message inference.
         return False, (
             f"record_id {memory_id!r} not in caller-owned memory id set; "
             "skipped (cross-tenant attachment refused)"
         )
     actual_owner, actual_ns = allowlist[memory_id]
+    # The remaining branches only fire for root callers with
+    # preserve_owner=true (the unscoped allowlist path). Their
+    # descriptive messages are intentional — root is doing
+    # migration work and needs the diagnostic to debug envelope
+    # tenancy mismatches.
     if actual_owner != effective_owner:
         return False, (
             f"record_id {memory_id!r} belongs to owner {actual_owner!r}, "
@@ -1561,8 +1588,24 @@ async def import_memories(
             # cannot smuggle sidecars onto another tenant's
             # memory_id by labeling them with the caller's
             # identity. This is the cross-tenant-attachment fix.
+            # Scope the allowlist SELECT structurally so a non-root
+            # caller can't probe for foreign memory_ids via
+            # rejection-message inference (Codex round-13 finding).
+            # Non-root: SELECT is filtered to caller's owner+ns;
+            # foreign ids simply don't appear, identical to
+            # nonexistent ids. Root with preserve_owner=true: lookup
+            # is unscoped — that's the migration/admin path where
+            # cross-tenant resolution is the intended behavior.
+            if _is_root(user) and preserve_owner:
+                scope_owner: Optional[str] = None
+                scope_namespace: Optional[str] = None
+            else:
+                scope_owner = user.user_id
+                scope_namespace = user.namespace
             allowlist = await _build_referenced_memory_allowlist(
                 conn, envelope,
+                scope_owner=scope_owner,
+                scope_namespace=scope_namespace,
             )
 
             # Sidecars run inside the same transaction so a partial

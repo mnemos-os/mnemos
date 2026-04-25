@@ -1353,6 +1353,59 @@ def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
     )
 
 
+def test_import_non_root_cannot_probe_foreign_memory_ids(monkeypatch):
+    """Codex round-13 finding: a non-root caller submits a sidecar
+    referencing a guessed `mem_bob_secret` and uses the rejection
+    message to learn whether the id exists and who owns it.
+
+    With the scoped allowlist SELECT + unified rejection message,
+    foreign ids are indistinguishable from nonexistent ids from
+    the caller's POV — both surface as 'not in caller-owned
+    memory id set'."""
+
+    captured_sql: list = []
+
+    class _CaptureConn(_Conn):
+        async def fetch(self, sql, *args):
+            captured_sql.append((sql, args))
+            return await super().fetch(sql, *args)
+
+    # Allowlist: scoped to alice. Even though mem_bob_secret
+    # exists in DB under bob, the scoped query returns nothing.
+    conn = _CaptureConn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _kg_sidecar_entry(id="kg_probe")
+    bad["memory_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], kg_triples=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+
+    # Allowlist SELECT must include alice's tenancy filter, NOT
+    # an unscoped lookup.
+    allowlist_sql = next(
+        s for s, _ in captured_sql
+        if "FROM memories WHERE id = ANY" in s
+    )
+    assert "owner_id" in allowlist_sql, (
+        f"allowlist SELECT must scope by owner_id; got: {allowlist_sql}"
+    )
+
+    # Error must be the generic "not in caller-owned" form.
+    # The caller-supplied memory_id echoes back (fine — it's their
+    # own input); what must NOT leak is the actual OWNER of the
+    # foreign memory or the language "belongs to owner X".
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    err = stats.errors[0]
+    assert "not in caller-owned" in err
+    assert "belongs to owner" not in err
+    assert "bob-ns" not in err  # no namespace leak either
+
+
 def test_topo_sort_treats_external_parents_as_roots(monkeypatch):
     """If parent_version_id points at a UUID that's NOT in the
     envelope (parent already in DB), the entry is a root from
