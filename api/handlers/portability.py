@@ -1032,6 +1032,7 @@ async def _validate_version_parents(
     in_envelope_index: Dict[str, Dict[str, Any]],
     preserve_owner: bool = True,
     require_in_envelope: bool = False,
+    freshly_inserted_uuids: Optional[set] = None,
 ) -> tuple:
     """Verify every parent UUID points at a row under the same
     record_id + owner + namespace as the entry being imported.
@@ -1075,20 +1076,23 @@ async def _validate_version_parents(
     }
     bad: List[str] = []
     for p in parent_uuids:
-        if require_in_envelope and p not in in_envelope_index:
-            # For NEW records being inserted in this request,
-            # parent UUIDs must be either NULL or also in the
-            # current envelope. A stale prior-lifetime row left
-            # behind by a delete (memory_versions survives memory
-            # deletion by design) could otherwise be grafted as a
-            # parent of the freshly-inserted memory's history,
-            # producing a DAG that walks back into deleted state
-            # while the live row shows fresh content. Codex
-            # round-28 finding. The constraint says: if you're
-            # creating a memory now, its history must be self-
-            # contained in this import.
-            bad.append(p)
-            continue
+        if require_in_envelope:
+            # Parent must be FRESHLY INSERTED in this transaction —
+            # not just present in in_envelope_index. An in-envelope
+            # parent entry can ON CONFLICT skip onto a stale prior-
+            # lifetime row (Codex round-29 finding), which the
+            # equality check passes but the row is NOT a row this
+            # transaction wrote. The freshly_inserted_uuids set is
+            # populated only when an INSERT actually returned
+            # INSERT 0 1, never when ON CONFLICT skipped.
+            #
+            # Topo sort guarantees parents come before children,
+            # so when this child is being validated, the parent
+            # has already been processed and (if legitimately
+            # freshly inserted) is in the set.
+            if freshly_inserted_uuids is None or p not in freshly_inserted_uuids:
+                bad.append(p)
+                continue
         if p in db_truth:
             # DB has this parent. Tenancy is whatever's in DB,
             # NOT what the envelope claims (the envelope's INSERT
@@ -1259,6 +1263,14 @@ async def _import_memory_versions(
     # caller's tenancy). Used to scope _restore_memory_branches
     # so prior-lifetime stale rows can't be selected as HEAD.
     authorized_version_uuids: set = set()
+    # Subset of authorized_version_uuids: UUIDs that THIS request
+    # actually INSERTed (not ON CONFLICT skipped against a pre-
+    # existing row). Used for the round-29 stale-via-conflict
+    # bypass guard: parents of newly-inserted records must come
+    # from this set, not just from in_envelope_index, because an
+    # in-envelope parent entry can ON CONFLICT skip onto a stale
+    # prior-lifetime row.
+    freshly_inserted_version_uuids: set = set()
 
     # Caller-scoped PK rewrite for non-root imports. Each entry's
     # `id` plus every parent_version_id/merge_parents reference
@@ -1394,6 +1406,7 @@ async def _import_memory_versions(
                     in_envelope_index=in_envelope_index,
                     preserve_owner=preserve_owner,
                     require_in_envelope=require_in_envelope,
+                    freshly_inserted_uuids=freshly_inserted_version_uuids,
                 )
                 if not ok:
                     _bump(stats.sidecars_failed, surface)
@@ -1536,6 +1549,14 @@ async def _import_memory_versions(
                     _bump(stats.sidecars_skipped, surface)
                 else:
                     _bump(stats.sidecars_imported, surface)
+                    # ONLY freshly-inserted (non-conflict) entries
+                    # count as fresh. Conflict-skipped entries
+                    # passed the equality check (so they're
+                    # authorized) but are NOT freshly written by
+                    # this transaction — they could be from a
+                    # prior lifetime that survived. Round-29 fix.
+                    if entry.get("id"):
+                        freshly_inserted_version_uuids.add(str(entry["id"]))
                 # Authorized only after match-verification above
                 # (or successful insert). Stale rows are no longer
                 # treated as safe because of the equality check.
