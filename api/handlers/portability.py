@@ -1118,6 +1118,14 @@ async def import_memories(
                     "SET LOCAL mnemos.suppress_version_snapshot = '1'"
                 )
 
+            # Track which memory IDs this import actually INSERTed
+            # (vs which hit ON CONFLICT DO NOTHING and were
+            # pre-existing). The post-import v1 verification scopes
+            # to THIS set, not envelope.records — otherwise a
+            # pre-existing legacy memory with no v1 history would
+            # roll back an unrelated import (Codex round-4 finding).
+            inserted_record_ids: set = set()
+
             for record in envelope.records:
                 if record.kind != "memory":
                     stats.unsupported_kinds[record.kind] = (
@@ -1189,6 +1197,7 @@ async def import_memories(
                         stats.skipped += 1
                     else:
                         stats.imported += 1
+                        inserted_record_ids.add(record.id)
                 except Exception as exc:
                     stats.failed += 1
                     stats.errors.append(f"{record.id}: {type(exc).__name__}: {exc}")
@@ -1256,48 +1265,35 @@ async def import_memories(
                     allowlist=allowlist,
                 )
 
-            # Post-import v1 verification: when trigger suppression
-            # is in effect, every kind:memory record from this
-            # envelope MUST end up with at least one row in
-            # memory_versions. The pre-coverage check rejects
-            # envelopes whose record_id list isn't covered by the
-            # sidecar, but it does NOT prove the sidecar entries
-            # are importable — empty content, allowlist rejection,
-            # or any other per-row failure could leave a record
-            # committed without v1. Catch that here and roll back.
-            if envelope.memory_versions:
-                memory_ids = [
-                    r.id for r in envelope.records if r.kind == "memory"
-                ]
-                if memory_ids:
-                    in_db = await conn.fetch(
-                        "SELECT id FROM memories WHERE id = ANY($1::text[])",
-                        memory_ids,
+            # Post-import v1 verification: every memory THIS request
+            # actually INSERTed (under trigger suppression) must
+            # have at least one row in memory_versions. Pre-existing
+            # rows that hit ON CONFLICT DO NOTHING are NOT verified
+            # here — their v1 history is whatever it already was;
+            # this transaction didn't touch them.
+            if envelope.memory_versions and inserted_record_ids:
+                covered = await conn.fetch(
+                    "SELECT DISTINCT memory_id FROM memory_versions "
+                    "WHERE memory_id = ANY($1::text[])",
+                    list(inserted_record_ids),
+                )
+                covered_ids = {r["memory_id"] for r in covered}
+                uncovered = inserted_record_ids - covered_ids
+                if uncovered:
+                    sample = sorted(uncovered)[:5]
+                    extra = "..." if len(uncovered) > 5 else ""
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "CHARON import inserted "
+                            f"{len(uncovered)} memory record(s) "
+                            "without version history under "
+                            f"trigger suppression: {sample}{extra}. "
+                            "Sidecar likely contained malformed or "
+                            "rejected entries that did not produce "
+                            "rows. Transaction rolled back."
+                        ),
                     )
-                    in_db_ids = {r["id"] for r in in_db}
-                    if in_db_ids:
-                        covered = await conn.fetch(
-                            "SELECT DISTINCT memory_id FROM memory_versions "
-                            "WHERE memory_id = ANY($1::text[])",
-                            list(in_db_ids),
-                        )
-                        covered_ids = {r["memory_id"] for r in covered}
-                        uncovered = in_db_ids - covered_ids
-                        if uncovered:
-                            sample = sorted(uncovered)[:5]
-                            extra = "..." if len(uncovered) > 5 else ""
-                            raise HTTPException(
-                                status_code=500,
-                                detail=(
-                                    "CHARON import left "
-                                    f"{len(uncovered)} memory record(s) "
-                                    "without version history under "
-                                    f"trigger suppression: {sample}{extra}. "
-                                    "Sidecar likely contained malformed or "
-                                    "rejected entries that did not produce "
-                                    "rows. Transaction rolled back."
-                                ),
-                            )
 
     logger.info(
         "[MPF] import: user=%s imported=%d skipped=%d failed=%d unsupported=%s sidecars_imported=%s",

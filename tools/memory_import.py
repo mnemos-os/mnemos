@@ -343,7 +343,16 @@ class JsonImporter(BaseImporter):
         """Return a list of raw memory dicts regardless of input shape."""
         if self.jsonl:
             items = []
+            # mpf_records — lines that were already MPF-shaped
+            # ({id, kind, payload_version, payload}). Pass through
+            # verbatim when building the passthrough envelope.
             mpf_records: list = []
+            # flat_memory_lines — flat memory-dict lines with no
+            # MPF wrapping. If a sidecar trailer arrives later,
+            # these get converted to MPF records on the fly so
+            # they reach the passthrough envelope (Codex round-4
+            # finding: silently dropping these is wrong).
+            flat_memory_lines: list = []
             jsonl_sidecars: Dict[str, list] = {}
             with self.file_path.open(encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
@@ -394,6 +403,11 @@ class JsonImporter(BaseImporter):
                         mpf_records.append(parsed)
                     else:
                         items.append(parsed)
+                        # Track flat memory dicts in case a trailer
+                        # arrives later and we need to lift them
+                        # into MPF shape.
+                        if isinstance(parsed, dict) and parsed.get("content"):
+                            flat_memory_lines.append(parsed)
             # Trailer-aware source_envelope construction (Codex
             # round-3 finding): always materialize the passthrough
             # envelope when sidecars are present in preserve_metadata
@@ -402,21 +416,61 @@ class JsonImporter(BaseImporter):
             # MPF record lines. Otherwise sidecars get silently
             # dropped on these shapes.
             if jsonl_sidecars and self.preserve_metadata:
+                # When a sidecar trailer is present, both MPF-shaped
+                # lines AND flat memory dicts must reach the
+                # passthrough envelope. Lift the flat dicts into MPF
+                # records here using the same wrapping logic the
+                # JSON envelope path uses, so a flat-records-plus-
+                # trailer JSONL imports identically to one-shot JSON.
+                lifted: list = []
+                for mem in flat_memory_lines:
+                    payload = {
+                        k: v for k, v in {
+                            "content": mem.get("content"),
+                            "category": mem.get("category") or self.category,
+                            "subcategory": mem.get("subcategory"),
+                            "created": mem.get("created"),
+                            "updated": mem.get("updated"),
+                            "owner_id": mem.get("owner_id") or "default",
+                            "namespace": mem.get("namespace") or "default",
+                            "permission_mode": mem.get("permission_mode"),
+                            "quality_rating": mem.get("quality_rating"),
+                            "metadata": mem.get("metadata") or {},
+                            "source_model": mem.get("source_model"),
+                            "source_provider": mem.get("source_provider"),
+                            "source_session": mem.get("source_session"),
+                            "source_agent": mem.get("source_agent"),
+                        }.items() if v is not None
+                    }
+                    lifted.append({
+                        "id": mem.get("id") or f"imported_{id(mem):x}",
+                        "kind": "memory",
+                        "payload_version": self.MEMORY_PAYLOAD_VERSION,
+                        "payload": payload,
+                    })
+
+                all_records = mpf_records + lifted
                 self.source_envelope = {
                     "mpf_version": self.MPF_VERSION,
                     "source_system": "memory_import",
                     "source_version": self.MEMORY_PAYLOAD_VERSION,
                     "exported_at": datetime.now(timezone.utc).isoformat(),
-                    # Carry whatever record-shaped lines we saw; may
-                    # be empty for trailer-only inputs. The server
+                    # Carry MPF-shaped + lifted-flat records. May be
+                    # empty for trailer-only inputs. The server
                     # accepts records=[] as valid (sidecar-only
                     # imports are a documented use-case).
-                    "records": mpf_records,
+                    "records": all_records,
                     **jsonl_sidecars,
                 }
-                if not mpf_records:
+                if not all_records:
                     print(
                         f"  passthrough: trailer-only ({', '.join(jsonl_sidecars)})",
+                        file=sys.stderr,
+                    )
+                elif lifted:
+                    print(
+                        f"  passthrough: {len(mpf_records)} MPF records + "
+                        f"{len(lifted)} flat-memory-records lifted into MPF",
                         file=sys.stderr,
                     )
             elif jsonl_sidecars and not self.preserve_metadata:

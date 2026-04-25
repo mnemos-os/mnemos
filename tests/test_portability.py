@@ -1179,6 +1179,42 @@ def test_import_post_verification_rolls_back_when_memory_unversioned(monkeypatch
     assert "mem_alice1" in exc.value.detail
 
 
+def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkeypatch):
+    """Codex review #4: post-verification must scope to records THIS
+    request actually INSERTed, not the full envelope.records list.
+    Otherwise a pre-existing legacy memory with no v1 history (which
+    this transaction did not create) could roll back an unrelated
+    import. _DupeConn returns INSERT 0 0 for everything → nothing
+    new was inserted → no post-verification rollback even though
+    the coverage SELECT comes back empty."""
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # Coverage SELECT: returns empty (the pre-existing memory has
+        # no v1 — legacy data). Without the inserted-set scope, this
+        # would trigger the 500 rollback.
+        "SELECT DISTINCT memory_id FROM memory_versions": [],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    # No HTTPException — conflict means we didn't insert, so verification skips.
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 0
+    assert stats.skipped == 1
+    # Sidecar imports still ran but landed under skipped-via-conflict
+    # (the dupe conn returns INSERT 0 0 for everything).
+    assert stats.sidecars_skipped.get("memory_versions") == 1
+
+
 def test_import_branch_restore_skips_rejected_record_ids(monkeypatch):
     """Codex review #3: if a memory_versions sidecar entry is
     rejected by the allowlist gate, _restore_memory_branches must
