@@ -974,8 +974,12 @@ async def _import_kg_triples(
                     or existing["subject_type"] != entry.get("subject_type")
                     or existing["object_type"] != entry.get("object_type")
                     or existing["memory_id"] != entry.get("memory_id")
-                    or (entry.get("confidence") is not None and
-                        existing["confidence"] != entry["confidence"])
+                    # confidence: INSERT uses COALESCE($N, 1.0)
+                    # so an omitted value persists as 1.0 — compare
+                    # against that default explicitly. Round-34 fix.
+                    or existing["confidence"] != (
+                        entry["confidence"] if entry.get("confidence") is not None else 1.0
+                    )
                     or existing["owner_id"] != row_owner
                     or existing["namespace"] != row_ns
                     # Temporal columns (round-31): a corrected
@@ -2102,6 +2106,37 @@ async def import_memories(
                             _parse_iso_naive(p.get("updated")),
                         )
                     if row == "INSERT 0 0":
+                        # Conflict-skip on memories table: verify
+                        # the existing row matches the envelope's
+                        # claim before treating it as authorized
+                        # for sidecar attachment. Otherwise a
+                        # root+preserve import into a non-empty
+                        # target with a same-id-different-content
+                        # memory could land sidecars (kg_triples /
+                        # compression_manifest) against the stale
+                        # memory body. Round-34 finding.
+                        existing_mem = await conn.fetchrow(
+                            "SELECT content, category, owner_id, "
+                            "namespace FROM memories WHERE id = $1",
+                            persisted_id,
+                        )
+                        if existing_mem is None or (
+                            existing_mem["content"] != content
+                            or existing_mem["owner_id"] != imported_owner
+                            or existing_mem["namespace"] != imported_ns
+                        ):
+                            stats.failed += 1
+                            stats.errors.append(
+                                f"{record.id}: existing memory row "
+                                "doesn't match envelope payload "
+                                "(content/owner/namespace differ); "
+                                "sidecar attachment refused"
+                            )
+                            # Don't add to inserted_record_ids — the
+                            # allowlist will reject sidecars referencing
+                            # this id since it's not under the caller's
+                            # post-rewrite identity.
+                            continue
                         stats.skipped += 1
                     else:
                         stats.imported += 1

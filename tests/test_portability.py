@@ -564,7 +564,14 @@ def test_import_idempotent_on_id_collision(monkeypatch):
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"  # always conflict
-    conn = _DupeConn()
+    # Round-34 fix: ON CONFLICT path now verifies existing memory
+    # row matches. Seed a matching row.
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = $1": [
+            {"content": "body", "category": "solutions",
+             "owner_id": "alice", "namespace": "alice-ns"},
+        ],
+    })
     _install(monkeypatch, conn)
 
     env = _envelope([_memory_record(id="mem_dupe")])
@@ -1338,6 +1345,13 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
         # would trigger the 500 rollback.
         "SELECT DISTINCT memory_id FROM memory_versions": [],
         "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
+        # Round-34: records-loop conflict-row verification SELECT.
+        # Seed a matching memory row so the conflict-skip branch
+        # treats the test's existing memory as authorized.
+        "SELECT content, category, owner_id, namespace FROM memories WHERE id = $1": [
+            {"content": "body", "category": "solutions",
+             "owner_id": "alice", "namespace": "alice-ns"},
+        ],
     })
     _install(monkeypatch, conn)
 
