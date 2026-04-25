@@ -51,7 +51,7 @@ def _fetch_export(
     category: Optional[str],
     limit: int,
     include_sidecars: bool = False,
-    include_unattached_kg: bool = True,
+    include_unattached_kg: bool = False,
 ) -> Dict[str, Any]:
     """Call ``GET /v1/export`` and return the MPF envelope as a dict.
 
@@ -70,12 +70,11 @@ def _fetch_export(
         params["category"] = category
     if include_sidecars:
         params["include_sidecars"] = "true"
-        # CLI default differs from HTTP default (true vs false)
-        # because the typical CLI use case is migration / full
-        # corpus export, where dropping unattached kg_triples
-        # would silently lose first-class facts. The HTTP API
-        # default is false because typical web clients want a
-        # strict slice.
+        # CLI default matches HTTP default (false). Common CLI
+        # use case is a sliced export (--category, --limit), where
+        # tenant-wide first-class kg_triples would leak unrelated
+        # facts. Migration / full-corpus export is the rarer case
+        # and opts in explicitly via --include-unattached-kg.
         if include_unattached_kg:
             params["include_unattached_kg"] = "true"
     url = f"{endpoint}/v1/export?{urllib.parse.urlencode(params)}"
@@ -129,7 +128,7 @@ def cmd_json(args: argparse.Namespace) -> None:
     envelope = _fetch_export(
         args.endpoint, args.api_key, args.category, args.limit,
         include_sidecars=getattr(args, "include_sidecars", False),
-        include_unattached_kg=getattr(args, "include_unattached_kg", True),
+        include_unattached_kg=getattr(args, "include_unattached_kg", False),
     )
     out = Path(args.out)
     out.write_text(json.dumps(envelope, indent=2, ensure_ascii=False),
@@ -148,7 +147,7 @@ def cmd_jsonl(args: argparse.Namespace) -> None:
     envelope = _fetch_export(
         args.endpoint, args.api_key, args.category, args.limit,
         include_sidecars=getattr(args, "include_sidecars", False),
-        include_unattached_kg=getattr(args, "include_unattached_kg", True),
+        include_unattached_kg=getattr(args, "include_unattached_kg", False),
     )
     records = envelope.get("records") or []
     out = Path(args.out)
@@ -263,12 +262,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "sidecars in the envelope (CHARON v0.2). Off by default.",
     )
     p_json.add_argument(
-        "--no-include-unattached-kg",
-        dest="include_unattached_kg", action="store_false", default=True,
-        help="Skip first-class kg_triples (memory_id IS NULL) when emitting "
-             "the kg_triples sidecar. Default: include them, since the "
-             "typical CLI use case is full-corpus migration where "
-             "unattached facts are part of the scope.",
+        "--include-unattached-kg",
+        action="store_true", default=False,
+        help="Include first-class kg_triples (memory_id IS NULL) in "
+             "the kg_triples sidecar. Off by default — matches the "
+             "HTTP API default. Use this for full-corpus migrations "
+             "where standalone Graphiti/Cognee-style facts are part "
+             "of the scope. NOT for sliced exports (--category, "
+             "--limit) — that combination would emit tenant-wide "
+             "facts alongside the slice.",
     )
     p_json.set_defaults(func=cmd_json)
 
@@ -281,10 +283,10 @@ def _build_parser() -> argparse.ArgumentParser:
              "sidecars as a final trailer line (CHARON v0.2). Off by default.",
     )
     p_jsonl.add_argument(
-        "--no-include-unattached-kg",
-        dest="include_unattached_kg", action="store_false", default=True,
-        help="Skip first-class kg_triples (memory_id IS NULL). See json "
-             "subcommand help.",
+        "--include-unattached-kg",
+        action="store_true", default=False,
+        help="Include first-class kg_triples (memory_id IS NULL). "
+             "See json subcommand help.",
     )
     p_jsonl.set_defaults(func=cmd_jsonl)
 

@@ -548,7 +548,17 @@ async def export_memories(
                 # the matching defensive sort. Codex round-8 finding.
                 order_by="memory_id ASC, branch ASC, version_num ASC",
             )
-            memory_versions_out = [_memory_version_to_entry(dict(r)) for r in mv_rows]
+            # SQL ORDER BY (memory_id, branch, version_num) is a
+            # heuristic that breaks for forked branches — feature/v1
+            # whose parent_version_id points at main/vN sorts before
+            # main/vN. Apply the real Kahn's-algorithm topo sort
+            # (defined alongside _import_memory_versions) before
+            # emitting, so consumers that import in received order
+            # get a topologically-correct envelope without needing
+            # the defensive sort our own importer applies.
+            memory_versions_out = _topo_sort_versions(
+                [_memory_version_to_entry(dict(r)) for r in mv_rows]
+            )
 
             cv_rows = await _fetch_sidecar(
                 conn,
