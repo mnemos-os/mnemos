@@ -39,6 +39,7 @@ Preserve-metadata mode (the cross-version-migration path):
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -47,6 +48,29 @@ import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Optional
+
+
+def _stable_id_from_mem(mem: dict) -> str:
+    """Derive a deterministic, content-addressed id for a memory dict
+    that came in without one. Hashing the canonical payload keeps
+    re-imports of the same source idempotent — same input yields
+    same id, so ON CONFLICT DO NOTHING does the right thing.
+
+    Older versions used `f"imported_{id(mem):x}"` which is a Python
+    process-local pointer address. Two runs against the same JSONL
+    produced different ids and bypassed ON CONFLICT — Codex round-5
+    finding. The hash is content-only (no timestamp, no source path),
+    so it's stable across machines and Python versions, and identical
+    content from any source dedupes naturally.
+    """
+    canonical = json.dumps(
+        {k: mem.get(k) for k in sorted(mem.keys()) if mem.get(k) is not None},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return f"imported_{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -186,7 +210,7 @@ class BaseImporter:
                 "source_agent": mem.get("source_agent"),
             }.items() if v is not None}
             return {
-                "id": mem.get("id") or f"imported_{id(mem):x}",
+                "id": mem.get("id") or _stable_id_from_mem(mem),
                 "kind": "memory",
                 "payload_version": self.MEMORY_PAYLOAD_VERSION,
                 "payload": payload,
@@ -443,7 +467,7 @@ class JsonImporter(BaseImporter):
                         }.items() if v is not None
                     }
                     lifted.append({
-                        "id": mem.get("id") or f"imported_{id(mem):x}",
+                        "id": mem.get("id") or _stable_id_from_mem(mem),
                         "kind": "memory",
                         "payload_version": self.MEMORY_PAYLOAD_VERSION,
                         "payload": payload,

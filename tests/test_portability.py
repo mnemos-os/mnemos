@@ -379,8 +379,11 @@ def test_export_sidecars_constrained_to_exported_memory_ids(monkeypatch):
     assert "memory_id = ANY" in mv_sql
     assert ["mem_42"] in (list(mv_args) or [])
     assert "memory_id = ANY" in cv_sql
-    # KG triples are not bound to memory_ids — must NOT have ANY clause
-    assert "memory_id = ANY" not in kg_sql
+    # KG triples are bound (null_ok) — first-class triples (memory_id
+    # NULL) AND attached triples scoped to the export slice. The SQL
+    # has both a NULL check and the ANY clause (Codex round-5 fix).
+    assert "memory_id IS NULL" in kg_sql
+    assert "memory_id = ANY" in kg_sql
 
 
 def test_export_empty_memory_set_yields_empty_sidecars(monkeypatch):

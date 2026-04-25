@@ -316,29 +316,48 @@ async def _fetch_sidecar(
     effective_owner: Optional[str],
     effective_ns: Optional[str],
     bound_to_memories: bool,
+    null_ok: bool = False,
 ) -> Any:
     """Build and execute a sidecar SELECT with optional owner /
     namespace / memory_id filters. Centralizes the placeholder math
     so each sidecar query stays declarative.
 
     `bound_to_memories=True` means the sidecar rows must reference an
-    id in `memory_ids` — this is correct for memory_versions and
-    memory_compressed_variants, both of which only exist as
-    children of a parent memory. `False` is for tables like
-    kg_triples whose rows are first-class (memory_id may be NULL).
+    id in `memory_ids`. `null_ok=True` extends that to also include
+    rows whose `memory_id_column` is NULL — used by kg_triples,
+    where some triples are first-class (no memory FK) and some are
+    extracted from a specific memory. With `null_ok=False` (default)
+    only rows with a matching memory_id come back.
 
-    Empty `memory_ids` with `bound_to_memories=True` short-circuits
-    to no rows without hitting the DB.
+    `bound_to_memories=False` drops the memory-id filter entirely —
+    NOT what kg_triples wants in a category-filtered export, since
+    that lets attached triples for non-exported memories slip
+    through (Codex round-5 finding). Use `True + null_ok=True`
+    instead.
+
+    Empty `memory_ids` with `bound_to_memories=True, null_ok=False`
+    short-circuits to no rows without hitting the DB. With
+    `null_ok=True` the query still runs (NULL memory_ids may match).
     """
-    if bound_to_memories and not memory_ids:
+    if bound_to_memories and not memory_ids and not null_ok:
         return []
     conditions: List[str] = []
     params: List[Any] = []
     idx = 1
     if bound_to_memories:
-        conditions.append(f"{memory_id_column} = ANY(${idx}::text[])")
-        params.append(memory_ids)
-        idx += 1
+        if null_ok and memory_ids:
+            conditions.append(
+                f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))"
+            )
+            params.append(memory_ids)
+            idx += 1
+        elif null_ok:
+            # No exported memory_ids; only first-class (NULL) triples.
+            conditions.append(f"{memory_id_column} IS NULL")
+        else:
+            conditions.append(f"{memory_id_column} = ANY(${idx}::text[])")
+            params.append(memory_ids)
+            idx += 1
     if effective_owner:
         conditions.append(f"owner_id = ${idx}")
         params.append(effective_owner)
@@ -460,11 +479,16 @@ async def export_memories(
                 memory_ids=memory_ids,
                 effective_owner=effective_owner,
                 effective_ns=effective_ns,
-                # KG triples can stand alone (memory_id NULL when the
-                # triple wasn't extracted from a specific memory), so
-                # we filter on owner/namespace only — not on the
-                # exported memory id list.
-                bound_to_memories=False,
+                # KG triples have two flavors: first-class (memory_id
+                # NULL, e.g. external Graphiti-style facts) and
+                # attached (memory_id pointing at a specific memory
+                # they were extracted from). The export must include
+                # both classes — but only attached triples whose
+                # memory_id is in the exported slice. Otherwise a
+                # category-filtered export leaks foreign-memory
+                # triples (Codex round-5 finding).
+                bound_to_memories=True,
+                null_ok=True,
             )
             kg_triples_out = [_kg_triple_to_entry(dict(r)) for r in kg_rows]
 
@@ -705,35 +729,38 @@ async def _import_kg_triples(
             _bump(stats.sidecars_failed, surface)
             stats.errors.append(f"[{surface}] {entry['id']}: {reason}")
             continue
+        # Per-row SAVEPOINT — a Postgres error on one kg_triple
+        # mustn't abort the surrounding import transaction.
         try:
-            row = await conn.execute(
-                """
-                INSERT INTO kg_triples (
-                    id, subject, predicate, object,
-                    subject_type, object_type,
-                    valid_from, valid_until,
-                    memory_id, confidence, created,
-                    owner_id, namespace
+            async with conn.transaction():
+                row = await conn.execute(
+                    """
+                    INSERT INTO kg_triples (
+                        id, subject, predicate, object,
+                        subject_type, object_type,
+                        valid_from, valid_until,
+                        memory_id, confidence, created,
+                        owner_id, namespace
+                    )
+                    VALUES (
+                        $1, $2, $3, $4,
+                        $5, $6,
+                        COALESCE($7, NOW()), $8,
+                        $9, COALESCE($10, 1.0),
+                        COALESCE($11, NOW()),
+                        $12, $13
+                    )
+                    ON CONFLICT (id) DO NOTHING
+                    """,
+                    entry["id"], subject, entry["predicate"], obj,
+                    entry.get("subject_type"), entry.get("object_type"),
+                    _parse_iso(entry.get("valid_from")),
+                    _parse_iso(entry.get("valid_until")),
+                    entry.get("memory_id"),
+                    entry.get("confidence"),
+                    _parse_iso(entry.get("created")),
+                    row_owner, row_ns,
                 )
-                VALUES (
-                    $1, $2, $3, $4,
-                    $5, $6,
-                    COALESCE($7, NOW()), $8,
-                    $9, COALESCE($10, 1.0),
-                    COALESCE($11, NOW()),
-                    $12, $13
-                )
-                ON CONFLICT (id) DO NOTHING
-                """,
-                entry["id"], subject, entry["predicate"], obj,
-                entry.get("subject_type"), entry.get("object_type"),
-                _parse_iso(entry.get("valid_from")),
-                _parse_iso(entry.get("valid_until")),
-                entry.get("memory_id"),
-                entry.get("confidence"),
-                _parse_iso(entry.get("created")),
-                row_owner, row_ns,
-            )
             if row == "INSERT 0 0":
                 _bump(stats.sidecars_skipped, surface)
             else:
@@ -833,38 +860,40 @@ async def _import_memory_versions(
                 stats.errors.append(f"[{surface}] {entry['id']}: {reason}")
                 continue
             metadata = entry.get("metadata") or {}
+            # Per-row SAVEPOINT — same reasoning as kg_triples loop.
             try:
-                row = await conn.execute(
-                    """
-                    INSERT INTO memory_versions (
-                        id, memory_id, version_num, content,
-                        category, subcategory, metadata, verbatim_content,
-                        owner_id, namespace, permission_mode,
-                        source_model, source_provider, source_session, source_agent,
-                        snapshot_at, snapshot_by, change_type,
-                        commit_hash, parent_version_id, branch, merge_parents
+                async with conn.transaction():
+                    row = await conn.execute(
+                        """
+                        INSERT INTO memory_versions (
+                            id, memory_id, version_num, content,
+                            category, subcategory, metadata, verbatim_content,
+                            owner_id, namespace, permission_mode,
+                            source_model, source_provider, source_session, source_agent,
+                            snapshot_at, snapshot_by, change_type,
+                            commit_hash, parent_version_id, branch, merge_parents
+                        )
+                        VALUES (
+                            $1::uuid, $2, $3, $4,
+                            $5, $6, $7::jsonb, $8,
+                            $9, $10, COALESCE($11, 600),
+                            $12, $13, $14, $15,
+                            COALESCE($16, NOW()), $17, COALESCE($18, 'create'),
+                            $19, $20::uuid, COALESCE($21, 'main'), $22::uuid[]
+                        )
+                        ON CONFLICT (id) DO NOTHING
+                        """,
+                        entry["id"], entry["record_id"], entry["version_num"], entry["content"],
+                        entry.get("category"), entry.get("subcategory"),
+                        json.dumps(metadata), entry.get("verbatim_content"),
+                        row_owner, row_ns, entry.get("permission_mode"),
+                        entry.get("source_model"), entry.get("source_provider"),
+                        entry.get("source_session"), entry.get("source_agent"),
+                        _parse_iso(entry.get("snapshot_at")), entry.get("snapshot_by"),
+                        entry.get("change_type"),
+                        entry.get("commit_hash"), entry.get("parent_version_id"),
+                        entry.get("branch"), entry.get("merge_parents"),
                     )
-                    VALUES (
-                        $1::uuid, $2, $3, $4,
-                        $5, $6, $7::jsonb, $8,
-                        $9, $10, COALESCE($11, 600),
-                        $12, $13, $14, $15,
-                        COALESCE($16, NOW()), $17, COALESCE($18, 'create'),
-                        $19, $20::uuid, COALESCE($21, 'main'), $22::uuid[]
-                    )
-                    ON CONFLICT (id) DO NOTHING
-                    """,
-                    entry["id"], entry["record_id"], entry["version_num"], entry["content"],
-                    entry.get("category"), entry.get("subcategory"),
-                    json.dumps(metadata), entry.get("verbatim_content"),
-                    row_owner, row_ns, entry.get("permission_mode"),
-                    entry.get("source_model"), entry.get("source_provider"),
-                    entry.get("source_session"), entry.get("source_agent"),
-                    _parse_iso(entry.get("snapshot_at")), entry.get("snapshot_by"),
-                    entry.get("change_type"),
-                    entry.get("commit_hash"), entry.get("parent_version_id"),
-                    entry.get("branch"), entry.get("merge_parents"),
-                )
                 if row == "INSERT 0 0":
                     _bump(stats.sidecars_skipped, surface)
                 else:
@@ -961,37 +990,39 @@ async def _import_compression_manifest(
                 )
                 if not exists:
                     winner_id = None
+            # Per-row SAVEPOINT — same reasoning as the other sidecars.
             try:
-                row = await conn.execute(
-                    """
-                    INSERT INTO memory_compressed_variants (
-                        memory_id, owner_id, winner_candidate_id,
-                        engine_id, engine_version, compressed_content,
-                        compressed_tokens, compression_ratio,
-                        quality_score, composite_score,
-                        scoring_profile, judge_model, selected_at
+                async with conn.transaction():
+                    row = await conn.execute(
+                        """
+                        INSERT INTO memory_compressed_variants (
+                            memory_id, owner_id, winner_candidate_id,
+                            engine_id, engine_version, compressed_content,
+                            compressed_tokens, compression_ratio,
+                            quality_score, composite_score,
+                            scoring_profile, judge_model, selected_at
+                        )
+                        VALUES (
+                            $1, $2, $3::uuid,
+                            $4, $5, $6,
+                            $7, $8,
+                            $9, $10,
+                            COALESCE($11, 'balanced'), $12,
+                            COALESCE($13, NOW())
+                        )
+                        ON CONFLICT (memory_id) DO NOTHING
+                        """,
+                        entry["record_id"], row_owner, winner_id,
+                        entry["engine_id"], entry.get("engine_version"),
+                        entry.get("compressed_content"),
+                        entry.get("compressed_tokens"),
+                        entry.get("compression_ratio"),
+                        entry.get("quality_score"),
+                        entry.get("composite_score"),
+                        entry.get("scoring_profile"),
+                        entry.get("judge_model"),
+                        _parse_iso(entry.get("selected_at")),
                     )
-                    VALUES (
-                        $1, $2, $3::uuid,
-                        $4, $5, $6,
-                        $7, $8,
-                        $9, $10,
-                        COALESCE($11, 'balanced'), $12,
-                        COALESCE($13, NOW())
-                    )
-                    ON CONFLICT (memory_id) DO NOTHING
-                    """,
-                    entry["record_id"], row_owner, winner_id,
-                    entry["engine_id"], entry.get("engine_version"),
-                    entry.get("compressed_content"),
-                    entry.get("compressed_tokens"),
-                    entry.get("compression_ratio"),
-                    entry.get("quality_score"),
-                    entry.get("composite_score"),
-                    entry.get("scoring_profile"),
-                    entry.get("judge_model"),
-                    _parse_iso(entry.get("selected_at")),
-                )
                 if row == "INSERT 0 0":
                     _bump(stats.sidecars_skipped, surface)
                 else:
@@ -1168,31 +1199,41 @@ async def import_memories(
                 # Use the envelope-provided id verbatim. ON CONFLICT DO NOTHING
                 # gives us idempotent re-imports — running /v1/export followed
                 # by /v1/import against the same DB is a no-op.
+                #
+                # Wrap the per-row INSERT in a SAVEPOINT (asyncpg's
+                # nested transaction context) so a Postgres-level
+                # error on one row aborts ONLY that row, not the
+                # whole import transaction. Without this, a single
+                # constraint violation poisons the outer transaction
+                # and every subsequent statement (allowlist SELECT,
+                # sidecar INSERTs, post-verification SELECT) fails
+                # with InFailedSQLTransaction. Codex round-5 finding.
                 try:
-                    row = await conn.execute(
-                        """
-                        INSERT INTO memories (
-                            id, content, category, subcategory, metadata,
-                            quality_rating, owner_id, namespace, permission_mode,
-                            source_model, source_provider, source_session, source_agent,
-                            created, updated
+                    async with conn.transaction():
+                        row = await conn.execute(
+                            """
+                            INSERT INTO memories (
+                                id, content, category, subcategory, metadata,
+                                quality_rating, owner_id, namespace, permission_mode,
+                                source_model, source_provider, source_session, source_agent,
+                                created, updated
+                            )
+                            VALUES (
+                                $1, $2, $3, $4, $5::jsonb,
+                                $6, $7, $8, $9,
+                                $10, $11, $12, $13,
+                                COALESCE($14, NOW()), COALESCE($15, NOW())
+                            )
+                            ON CONFLICT (id) DO NOTHING
+                            """,
+                            record.id, content, category, subcategory,
+                            json.dumps(metadata),
+                            quality_rating, imported_owner, imported_ns, permission_mode,
+                            p.get("source_model"), p.get("source_provider"),
+                            p.get("source_session"), p.get("source_agent"),
+                            _parse_iso(p.get("created")),
+                            _parse_iso(p.get("updated")),
                         )
-                        VALUES (
-                            $1, $2, $3, $4, $5::jsonb,
-                            $6, $7, $8, $9,
-                            $10, $11, $12, $13,
-                            COALESCE($14, NOW()), COALESCE($15, NOW())
-                        )
-                        ON CONFLICT (id) DO NOTHING
-                        """,
-                        record.id, content, category, subcategory,
-                        json.dumps(metadata),
-                        quality_rating, imported_owner, imported_ns, permission_mode,
-                        p.get("source_model"), p.get("source_provider"),
-                        p.get("source_session"), p.get("source_agent"),
-                        _parse_iso(p.get("created")),
-                        _parse_iso(p.get("updated")),
-                    )
                     if row == "INSERT 0 0":
                         stats.skipped += 1
                     else:
