@@ -71,6 +71,17 @@ from _version import __version__ as SOURCE_VERSION
 # full-table export from pinning memory.
 _EXPORT_HARD_LIMIT = 10_000
 
+# Per-sidecar hard cap. The `limit` parameter only caps the
+# memories rows — without a separate sidecar cap a non-root caller
+# could accumulate a long memory_versions / kg_triples history on
+# a single memory and request `limit=1&include_sidecars=true` to
+# materialize unbounded rows into one JSON envelope (Codex round-40
+# DoS finding). When a sidecar would exceed this cap, the API
+# returns 413 Payload Too Large with guidance to use the CLI
+# streaming exporter, which paginates internally and is the right
+# tool for whole-corpus exports.
+_EXPORT_SIDECAR_HARD_LIMIT = 50_000
+
 
 # ─── Pydantic models (wire shape) ────────────────────────────────────────────
 
@@ -392,7 +403,12 @@ async def _fetch_sidecar(
         idx += 1
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
     order = f"ORDER BY {order_by}" if order_by else ""
-    sql = f"SELECT {columns} FROM {table} {where} {order}"
+    # Append `LIMIT cap+1` so the caller can detect overflow without
+    # materializing more than one row past the limit (Codex round-40).
+    # The over-fetch sentinel is checked at the call site so each
+    # sidecar can produce a surface-specific 413 message.
+    limit_clause = f"LIMIT {_EXPORT_SIDECAR_HARD_LIMIT + 1}"
+    sql = f"SELECT {columns} FROM {table} {where} {order} {limit_clause}"
     return await conn.fetch(sql, *params)
 
 
@@ -505,6 +521,24 @@ async def export_memories(
             # identity by the time we get here. Sidecars also constrain
             # to the exported memory_ids, so a category-filtered
             # export only carries the sidecar rows for those memories.
+            def _enforce_sidecar_cap(rows, surface: str):
+                # Codex round-40 DoS guard: _fetch_sidecar fetches
+                # cap+1 rows so we can detect overflow without
+                # materializing more. Bail with 413 here rather
+                # than building the giant JSON envelope.
+                if len(rows) > _EXPORT_SIDECAR_HARD_LIMIT:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=(
+                            f"{surface} export exceeds the per-surface "
+                            f"hard limit of {_EXPORT_SIDECAR_HARD_LIMIT} "
+                            "rows for one envelope. Narrow the slice "
+                            "(filter by category, owner_id, namespace, "
+                            "or a smaller `limit`) and re-export, or "
+                            "split the export into multiple chunks."
+                        ),
+                    )
+
             kg_rows = await _fetch_sidecar(
                 conn,
                 table="kg_triples",
@@ -536,6 +570,7 @@ async def export_memories(
                 bound_to_memories=True,
                 null_ok=include_unattached_kg,
             )
+            _enforce_sidecar_cap(kg_rows, "kg_triples")
             kg_triples_out = [_kg_triple_to_entry(dict(r)) for r in kg_rows]
 
             mv_rows = await _fetch_sidecar(
@@ -561,6 +596,7 @@ async def export_memories(
                 # the matching defensive sort. Codex round-8 finding.
                 order_by="memory_id ASC, branch ASC, version_num ASC",
             )
+            _enforce_sidecar_cap(mv_rows, "memory_versions")
             # SQL ORDER BY (memory_id, branch, version_num) is a
             # heuristic that breaks for forked branches — feature/v1
             # whose parent_version_id points at main/vN sorts before
@@ -590,6 +626,7 @@ async def export_memories(
                 effective_ns=None,
                 bound_to_memories=True,
             )
+            _enforce_sidecar_cap(cv_rows, "compression_manifest")
             compression_manifest_out = [_compression_variant_to_entry(dict(r)) for r in cv_rows]
 
     return MPFEnvelope(

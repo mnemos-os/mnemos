@@ -352,6 +352,45 @@ def test_export_with_sidecars_emits_three_arrays(monkeypatch):
     assert cm["compressed_tokens"] == 4
 
 
+def test_export_returns_413_when_sidecar_exceeds_hard_cap(monkeypatch):
+    """Round-40 finding: include_sidecars=true had no per-surface
+    cap, so a non-root caller could accumulate a long
+    memory_versions / kg_triples history on a single memory and
+    ask for limit=1+include_sidecars=true to materialize unbounded
+    rows into one JSON envelope, bypassing _EXPORT_HARD_LIMIT and
+    risking worker memory/latency DoS.
+
+    The fix appends ``LIMIT cap+1`` to each sidecar SELECT and
+    raises HTTPException 413 when cap+1 rows come back. This test
+    seeds a fake conn that returns cap+1 memory_versions rows and
+    asserts the API rejects with 413 + a guidance message rather
+    than building the giant envelope.
+    """
+    cap = portability._EXPORT_SIDECAR_HARD_LIMIT
+    over = [_mv_row(id=f"ver_{i}") for i in range(cap + 1)]
+
+    conn = _Conn(
+        rows=[_memory_row()],
+        routed_rows={
+            "FROM kg_triples": [],
+            "FROM memory_versions": over,
+            "FROM memory_compressed_variants": [],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(portability.export_memories(
+            category=None, limit=1, offset=0,
+            owner_id=None, namespace=None,
+            include_sidecars=True, user=_alice(),
+        ))
+    assert exc_info.value.status_code == 413
+    assert "memory_versions" in exc_info.value.detail
+    assert "Narrow the slice" in exc_info.value.detail
+
+
 def test_export_sidecars_constrained_to_exported_memory_ids(monkeypatch):
     """memory_versions / memory_compressed_variants queries must
     restrict to the exported memory id set so a category-filtered
