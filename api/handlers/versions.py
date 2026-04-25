@@ -249,8 +249,17 @@ async def revert_memory(
             meta_str = "{}"
 
         async with conn.transaction():
-            # Set session variable for trigger to use correct branch
-            await conn.execute(f"SET mnemos.current_branch = '{branch}'")
+            # Transaction-local GUC for the version-snapshot trigger.
+            # Uses set_config(name, value, true) — the `true` flag scopes
+            # the setting to the current transaction, equivalent to
+            # SET LOCAL. Prior code used plain `SET ...` interpolated via
+            # f-string, which (a) leaked the branch onto the pooled
+            # connection for subsequent requests, and (b) bypassed
+            # parameter binding. Caught in the GUC audit before v3.4 tag.
+            await conn.execute(
+                "SELECT set_config('mnemos.current_branch', $1, true)",
+                branch,
+            )
 
             await conn.execute(
                 "UPDATE memories SET "
