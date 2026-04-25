@@ -905,7 +905,9 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         "confidence": kg_entry.get("confidence"),
         "owner_id": "alice",
         "namespace": "alice-ns",
+        "valid_from": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
         "valid_until": None,
+        "created": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
     }
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],

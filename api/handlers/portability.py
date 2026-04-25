@@ -960,10 +960,13 @@ async def _import_kg_triples(
                 existing = await conn.fetchrow(
                     "SELECT subject, predicate, object, subject_type, "
                     "object_type, memory_id, confidence, owner_id, "
-                    "namespace, valid_until "
+                    "namespace, valid_from, valid_until, created "
                     "FROM kg_triples WHERE id = $1",
                     entry["id"],
                 )
+                expected_valid_from = _parse_iso(entry.get("valid_from"))
+                expected_valid_until = _parse_iso(entry.get("valid_until"))
+                expected_created = _parse_iso(entry.get("created"))
                 if existing is None or (
                     existing["subject"] != subject
                     or existing["predicate"] != entry["predicate"]
@@ -975,6 +978,19 @@ async def _import_kg_triples(
                         existing["confidence"] != entry["confidence"])
                     or existing["owner_id"] != row_owner
                     or existing["namespace"] != row_ns
+                    # Temporal columns (round-31): a corrected
+                    # temporal edge with the same id but different
+                    # valid_from / valid_until / created window
+                    # must NOT be counted as skipped. Note: when
+                    # the envelope omits a temporal field, the
+                    # INSERT uses COALESCE($N, NOW()) so we only
+                    # compare when the envelope explicitly
+                    # supplied a value.
+                    or (expected_valid_from is not None and
+                        existing["valid_from"] != expected_valid_from)
+                    or existing["valid_until"] != expected_valid_until
+                    or (expected_created is not None and
+                        existing["created"] != expected_created)
                 ):
                     _bump(stats.sidecars_failed, surface)
                     stats.errors.append(
