@@ -395,6 +395,19 @@ async def export_memories(
             "common cross-system case."
         ),
     ),
+    include_unattached_kg: bool = Query(
+        False,
+        description=(
+            "When true (and include_sidecars=true), also include "
+            "kg_triples whose memory_id IS NULL — first-class facts "
+            "not extracted from a specific memory. Defaults false: "
+            "an export of memories M1, M2 carries only triples "
+            "attached to M1 or M2, NOT every standalone fact in the "
+            "owner/namespace. Set to true for full-corpus exports "
+            "(e.g. cross-system migration) where unattached facts "
+            "are part of the migration scope."
+        ),
+    ),
     user: UserContext = Depends(get_current_user),
 ):
     """Export memories as an MPF v0.1.x envelope.
@@ -489,13 +502,21 @@ async def export_memories(
                 # KG triples have two flavors: first-class (memory_id
                 # NULL, e.g. external Graphiti-style facts) and
                 # attached (memory_id pointing at a specific memory
-                # they were extracted from). The export must include
-                # both classes — but only attached triples whose
-                # memory_id is in the exported slice. Otherwise a
-                # category-filtered export leaks foreign-memory
-                # triples (Codex round-5 finding).
+                # they were extracted from).
+                #
+                # Default behavior (include_unattached_kg=False):
+                # only attached triples whose memory_id is in the
+                # exported slice. A category- or limit-filtered
+                # export of M1+M2 does NOT carry every standalone
+                # fact in the owner/namespace, which would leak
+                # unrelated data into a partial export.
+                #
+                # Opt-in (include_unattached_kg=True): also include
+                # the NULL-memory_id rows. Used for full-corpus
+                # exports / cross-system migrations where first-
+                # class facts are part of the intended scope.
                 bound_to_memories=True,
-                null_ok=True,
+                null_ok=include_unattached_kg,
             )
             kg_triples_out = [_kg_triple_to_entry(dict(r)) for r in kg_rows]
 
@@ -825,27 +846,42 @@ async def _import_memory_versions(
     preserve_owner: bool,
     stats: ImportStats,
     allowlist: Dict[str, tuple],
-) -> set:
+) -> tuple:
     """Upsert MPF memory_version_entry sidecar entries into
     memory_versions. Idempotent on `id`. Carries the full DAG
     triplet (commit_hash, parent_version_id, branch); merge_parents
     flows through verbatim as a UUID[].
 
-    Returns the set of `record_id`s for which at least one version
-    row was successfully imported OR was already present (skipped
-    via ON CONFLICT). The caller uses that set to scope downstream
-    operations like memory_branches HEAD restoration — only memory
-    ids the caller was actually authorized to write get touched.
+    Returns ``(authorized_record_ids, failed_record_ids)``:
+      - authorized_record_ids: record_ids whose version row was
+        successfully imported OR was already present (skipped via
+        ON CONFLICT). Used downstream for memory_branches HEAD
+        restoration — only memory ids the caller was actually
+        authorized to write get touched.
+      - failed_record_ids: record_ids that had at least one entry
+        rejected (allowlist failure, validation failure, DB error,
+        missing required field). The caller uses this to enforce
+        the all-or-nothing-history contract: if a record was
+        INSERTed in this request AND any of its memory_versions
+        entries failed, the import must roll back. Otherwise the
+        record commits with partial / inconsistent history.
     """
     surface = "memory_versions"
     authorized_record_ids: set = set()
+    failed_record_ids: set = set()
     for entry in sidecar:
+        # Capture record_id even when other required fields are
+        # missing — we need it for the failure-tracking set so the
+        # caller can decide whether to roll back.
+        record_id_for_tracking = entry.get("record_id")
         for required in ("id", "record_id", "version_num", "content"):
             if entry.get(required) in (None, ""):
                 _bump(stats.sidecars_failed, surface)
                 stats.errors.append(
                     f"[{surface}] missing required field {required!r}; skipped"
                 )
+                if record_id_for_tracking:
+                    failed_record_ids.add(record_id_for_tracking)
                 break
         else:
             row_owner, row_ns = _row_owner_ns(
@@ -865,6 +901,7 @@ async def _import_memory_versions(
             if not allowed:
                 _bump(stats.sidecars_failed, surface)
                 stats.errors.append(f"[{surface}] {entry['id']}: {reason}")
+                failed_record_ids.add(entry["record_id"])
                 continue
             metadata = entry.get("metadata") or {}
             # Per-row SAVEPOINT — same reasoning as kg_triples loop.
@@ -913,7 +950,8 @@ async def _import_memory_versions(
                 _bump(stats.sidecars_failed, surface)
                 stats.errors.append(f"[{surface}] {entry['id']}: {type(exc).__name__}: {exc}")
                 logger.exception("MPF memory_versions import failed for entry %s", entry.get("id"))
-    return authorized_record_ids
+                failed_record_ids.add(entry["record_id"])
+    return authorized_record_ids, failed_record_ids
 
 
 async def _import_compression_manifest(
@@ -1007,11 +1045,20 @@ async def _import_compression_manifest(
             try:
                 async with conn.transaction():
                     if winner_id is not None:
-                        # Existence check is now scoped to the savepoint,
-                        # so a Postgres error rolls back only this row.
+                        # Tenancy-scoped existence check (Codex round-7
+                        # finding): the candidate row must belong to
+                        # THIS memory_id AND THIS owner. Without that
+                        # constraint, an envelope can point its
+                        # winner_candidate_id at another tenant's
+                        # candidate UUID (if known), creating cross-
+                        # tenant linkage in the audit log. The check
+                        # also runs inside the savepoint so a malformed
+                        # input or DB error rolls back only this row.
                         exists = await conn.fetchval(
-                            "SELECT 1 FROM memory_compression_candidates WHERE id = $1::uuid",
-                            winner_id,
+                            "SELECT 1 FROM memory_compression_candidates "
+                            "WHERE id = $1::uuid AND memory_id = $2 "
+                            "AND owner_id = $3",
+                            winner_id, entry["record_id"], row_owner,
                         )
                         if not exists:
                             winner_id = None
@@ -1293,27 +1340,50 @@ async def import_memories(
                     allowlist=allowlist,
                 )
             if envelope.memory_versions:
-                authorized_version_ids = await _import_memory_versions(
-                    conn, envelope.memory_versions,
-                    caller_user_id=user.user_id,
-                    caller_namespace=user.namespace,
-                    preserve_owner=preserve_owner,
-                    stats=stats,
-                    allowlist=allowlist,
+                authorized_version_ids, failed_version_record_ids = (
+                    await _import_memory_versions(
+                        conn, envelope.memory_versions,
+                        caller_user_id=user.user_id,
+                        caller_namespace=user.namespace,
+                        preserve_owner=preserve_owner,
+                        stats=stats,
+                        allowlist=allowlist,
+                    )
                 )
+                # All-or-nothing per record (Codex round-7 finding):
+                # if a record was INSERTed in this transaction AND
+                # any of its memory_versions sidecar entries failed,
+                # roll back the whole import. Otherwise the record
+                # commits with partial / inconsistent history and
+                # the API returns a 200 with sidecars_failed >0,
+                # which is a silent integrity violation.
+                fatal_record_ids = inserted_record_ids & failed_version_record_ids
+                if fatal_record_ids:
+                    sample = sorted(fatal_record_ids)[:5]
+                    extra = "..." if len(fatal_record_ids) > 5 else ""
+                    raise HTTPException(
+                        status_code=500,
+                        detail=(
+                            "CHARON import: memory_versions sidecar had "
+                            f"failed entries for {len(fatal_record_ids)} "
+                            f"newly inserted record(s): {sample}{extra}. "
+                            "Authoritative history is all-or-nothing per "
+                            "record under trigger suppression — partial "
+                            "history would be inconsistent. Transaction "
+                            "rolled back; fix the sidecar and retry."
+                        ),
+                    )
+
                 # Restore memory_branches HEAD pointers. The trigger
                 # would normally do this on memory INSERT, but it's
                 # suppressed during CHARON imports. Without this,
                 # the imported version rows are orphans from the
                 # branch-walk perspective (DAG endpoints return empty).
                 #
-                # Critically: only restore branches for record_ids
-                # that the import was authorized to write. Rejected
-                # cross-tenant entries already failed the allowlist
-                # gate; passing their record_ids here would let an
-                # adversarial envelope drive an UPSERT against
-                # memory_branches for a memory_id the caller cannot
-                # mutate (Codex round-3 finding).
+                # Only restore branches for record_ids the import
+                # was authorized to write — rejected cross-tenant
+                # entries must not drive memory_branches mutations
+                # for memories the caller can't touch.
                 if authorized_version_ids:
                     await _restore_memory_branches(
                         conn, list(authorized_version_ids),

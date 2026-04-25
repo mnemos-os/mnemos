@@ -1178,7 +1178,11 @@ def test_import_post_verification_rolls_back_when_memory_unversioned(monkeypatch
             envelope=env, preserve_owner=False, user=_alice(),
         ))
     assert exc.value.status_code == 500
-    assert "without version history" in exc.value.detail
+    # Round-7 fix: failed memory_versions for an inserted record is
+    # caught by the all-or-nothing check, NOT only by the post-
+    # verification SELECT. Either path satisfies the integrity
+    # contract; check the unifying property: "rolled back".
+    assert "rolled back" in exc.value.detail
     assert "mem_alice1" in exc.value.detail
 
 
