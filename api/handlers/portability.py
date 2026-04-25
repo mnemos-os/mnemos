@@ -852,6 +852,7 @@ async def _import_kg_triples(
     preserve_owner: bool,
     stats: ImportStats,
     allowlist: Dict[str, tuple],
+    inserted_record_ids: Optional[set] = None,
 ) -> None:
     """Upsert MPF kg_triples sidecar entries into the kg_triples
     table. Idempotent on `id`. Subject/object literals and id
@@ -975,8 +976,28 @@ async def _import_kg_triples(
                 # (existing != None) would falsely reject the retry.
                 # valid_until is plain $N (no COALESCE) so strict
                 # NULL=NULL comparison stays correct there.
-                tolerate_valid_from = entry.get("valid_from") is None
-                tolerate_created = entry.get("created") is None
+                #
+                # Round-39 escalation: tolerance is ONLY safe when
+                # the referenced memory was NOT just inserted in
+                # this transaction. For a fresh memory, an
+                # INSERT 0 0 on kg_triples cannot be an idempotent
+                # retry — kg_triples lacks an FK to memories so a
+                # stale prior-lifetime row can survive deletion of
+                # its memory. Without the gate, the omitted-NOW()
+                # tolerance would let that stale row attach to
+                # the freshly inserted memory.
+                referenced_memory_id = entry.get("memory_id")
+                fresh_memory = (
+                    inserted_record_ids is not None
+                    and referenced_memory_id is not None
+                    and referenced_memory_id in inserted_record_ids
+                )
+                tolerate_valid_from = (
+                    not fresh_memory and entry.get("valid_from") is None
+                )
+                tolerate_created = (
+                    not fresh_memory and entry.get("created") is None
+                )
                 if existing is None or (
                     existing["subject"] != subject
                     or existing["predicate"] != entry["predicate"]
@@ -1581,7 +1602,24 @@ async def _import_memory_versions(
                     # DB stores NOW(); on retry the envelope still
                     # has None so strict equality would falsely
                     # reject the retry (round-38).
-                    tolerate_snapshot_at = entry.get("snapshot_at") is None
+                    #
+                    # Round-39 escalation: tolerance is ONLY safe
+                    # when the referenced memory was NOT freshly
+                    # inserted in this transaction. memory_versions
+                    # intentionally survives memory deletion (audit
+                    # / branch-restore guarantee), so a fresh
+                    # memory hitting INSERT 0 0 on memory_versions
+                    # is a retained prior-lifetime row, NOT an
+                    # idempotent retry. Without the gate, omitted
+                    # snapshot_at would let stale history attach to
+                    # the new memory.
+                    fresh_memory = (
+                        inserted_record_ids is not None
+                        and entry.get("record_id") in inserted_record_ids
+                    )
+                    tolerate_snapshot_at = (
+                        not fresh_memory and entry.get("snapshot_at") is None
+                    )
                     if existing is None or (
                         existing["memory_id"] != entry["record_id"]
                         or existing["owner_id"] != row_owner
@@ -1658,6 +1696,7 @@ async def _import_compression_manifest(
     preserve_owner: bool,
     stats: ImportStats,
     allowlist: Dict[str, tuple],
+    inserted_record_ids: Optional[set] = None,
 ) -> None:
     """Upsert MPF compression_manifest_entry sidecar entries into
     memory_compressed_variants. Primary key is `memory_id` (one
@@ -1817,7 +1856,20 @@ async def _import_compression_manifest(
                     # DB stores NOW(); on retry the envelope still
                     # has None so strict equality would falsely
                     # reject the retry (round-38).
-                    tolerate_selected_at = entry.get("selected_at") is None
+                    #
+                    # Round-39 escalation: tolerance is ONLY safe
+                    # when the referenced memory was NOT freshly
+                    # inserted in this transaction. Without the
+                    # gate, omitted selected_at would let a stale
+                    # prior-lifetime variant attach to a new memory
+                    # with the same record_id.
+                    fresh_memory = (
+                        inserted_record_ids is not None
+                        and entry.get("record_id") in inserted_record_ids
+                    )
+                    tolerate_selected_at = (
+                        not fresh_memory and entry.get("selected_at") is None
+                    )
                     if existing is None or (
                         existing["owner_id"] != row_owner
                         or existing["winner_candidate_id"] != expected_winner
@@ -2361,6 +2413,7 @@ async def import_memories(
                     preserve_owner=preserve_owner,
                     stats=stats,
                     allowlist=allowlist,
+                    inserted_record_ids=inserted_record_ids,
                 )
             if envelope.memory_versions:
                 (
@@ -2444,6 +2497,7 @@ async def import_memories(
                     preserve_owner=preserve_owner,
                     stats=stats,
                     allowlist=allowlist,
+                    inserted_record_ids=inserted_record_ids,
                 )
 
             # Post-import v1 verification: every memory THIS request

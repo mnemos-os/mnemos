@@ -746,6 +746,89 @@ def test_import_rejects_conflict_on_stale_permission_mode(monkeypatch):
     )
 
 
+def test_import_disables_timestamp_tolerance_for_freshly_inserted_records(monkeypatch):
+    """Round-39 finding: round-38's COALESCE-tolerance for omitted
+    sidecar timestamps was over-broad. For a memory just inserted
+    in this transaction, an INSERT 0 0 on memory_versions /
+    kg_triples / compression_manifest cannot be an idempotent
+    retry — those tables retain prior-lifetime rows that survive
+    memory deletion. The omitted-timestamp tolerance lets stale
+    history attach to fresh memories. Round-39 fix gates the
+    tolerance on whether the referenced record_id is in the
+    inserted_record_ids set populated by the records loop.
+
+    Setup: envelope inserts a brand-new memory (first INSERT 1)
+    AND its memory_versions sidecar entry has snapshot_at omitted
+    AND the DB simulates a retained prior-lifetime memory_versions
+    row that matches every other column. Without the round-39
+    gate, round-38 tolerance would skip the snapshot_at compare
+    and the stale row would land on authorized_version_ids,
+    handing branch-restore a stale HEAD. With the round-39 gate,
+    snapshot_at compare runs strictly, the row is rejected, AND
+    because the record was freshly inserted the all-or-nothing
+    rule rolls back the whole transaction with a 500.
+    """
+    class _StaleMVConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memory_versions" in sql:
+                return "INSERT 0 0"  # collision with retained row
+            if "INSERT INTO memories" in sql:
+                return "INSERT 0 1"  # the memory itself is fresh
+            return "INSERT 0 1"
+
+    mv_entry = _mv_sidecar_entry()
+    mv_entry.pop("snapshot_at", None)
+
+    stale_prior_lifetime = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+        "merge_parents": None,
+        "category": mv_entry.get("category"),
+        "subcategory": mv_entry.get("subcategory"),
+        "metadata": mv_entry.get("metadata") or {},
+        "verbatim_content": mv_entry.get("verbatim_content"),
+        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "source_model": mv_entry.get("source_model"),
+        "source_provider": mv_entry.get("source_provider"),
+        "source_session": mv_entry.get("source_session"),
+        "source_agent": mv_entry.get("source_agent"),
+        # The single divergence — DB has a NOW() value the envelope
+        # cannot have produced, because this is a retained
+        # prior-lifetime row, not an idempotent retry of the
+        # current import.
+        "snapshot_at": datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc),
+        "snapshot_by": mv_entry.get("snapshot_by"),
+        "change_type": mv_entry.get("change_type") or "create",
+    }
+    conn = _StaleMVConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "FROM memory_versions WHERE id = $1::uuid": [stale_prior_lifetime],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[mv_entry],
+    )
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    # All-or-nothing rule fires because mem_alice1 was freshly
+    # inserted AND its memory_versions sidecar entry failed.
+    assert exc_info.value.status_code == 500
+    assert "memory_versions sidecar had failed entries" in exc_info.value.detail
+
+
 def test_import_idempotent_when_sidecar_envelopes_omit_optional_timestamps(monkeypatch):
     """Round-38 finding: kg_triples (valid_from, created),
     memory_versions (snapshot_at), and compression_manifest
