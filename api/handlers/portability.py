@@ -2127,21 +2127,91 @@ async def import_memories(
                         # memory could land sidecars (kg_triples /
                         # compression_manifest) against the stale
                         # memory body. Round-34 finding.
+                        #
+                        # Round-36 finding extended this: the prior
+                        # check only compared content/owner/namespace,
+                        # leaving stale permission_mode (federation
+                        # visibility), category, metadata,
+                        # quality_rating, source_*, subcategory able
+                        # to authorize sidecar attachment. Now we
+                        # compare every envelope-bound column. For
+                        # the COALESCE'd timestamp fields
+                        # (created/updated) we tolerate a non-match
+                        # only when the envelope didn't provide a
+                        # value — because the prior INSERT used
+                        # NOW() in that case and re-imports without
+                        # those fields are legitimately idempotent.
                         existing_mem = await conn.fetchrow(
-                            "SELECT content, category, owner_id, "
-                            "namespace FROM memories WHERE id = $1",
+                            "SELECT content, category, subcategory, "
+                            "metadata, quality_rating, owner_id, "
+                            "namespace, permission_mode, "
+                            "source_model, source_provider, "
+                            "source_session, source_agent, "
+                            "created, updated "
+                            "FROM memories WHERE id = $1",
                             persisted_id,
                         )
-                        if existing_mem is None or (
-                            existing_mem["content"] != content
-                            or existing_mem["owner_id"] != imported_owner
-                            or existing_mem["namespace"] != imported_ns
-                        ):
+                        envelope_metadata_json = json.dumps(
+                            metadata, sort_keys=True,
+                        )
+                        existing_metadata_json = (
+                            json.dumps(
+                                existing_mem["metadata"]
+                                if isinstance(
+                                    existing_mem["metadata"], dict,
+                                )
+                                else json.loads(
+                                    existing_mem["metadata"] or "{}"
+                                ),
+                                sort_keys=True,
+                            )
+                            if existing_mem is not None
+                            else None
+                        )
+                        envelope_created = _parse_iso_naive(
+                            p.get("created")
+                        )
+                        envelope_updated = _parse_iso_naive(
+                            p.get("updated")
+                        )
+                        mismatched_fields: list[str] = []
+                        if existing_mem is None:
+                            mismatched_fields.append("row missing")
+                        else:
+                            checks = [
+                                ("content", existing_mem["content"], content),
+                                ("category", existing_mem["category"], category),
+                                ("subcategory", existing_mem["subcategory"], subcategory),
+                                ("metadata", existing_metadata_json, envelope_metadata_json),
+                                ("quality_rating", existing_mem["quality_rating"], quality_rating),
+                                ("owner_id", existing_mem["owner_id"], imported_owner),
+                                ("namespace", existing_mem["namespace"], imported_ns),
+                                ("permission_mode", existing_mem["permission_mode"], permission_mode),
+                                ("source_model", existing_mem["source_model"], p.get("source_model")),
+                                ("source_provider", existing_mem["source_provider"], p.get("source_provider")),
+                                ("source_session", existing_mem["source_session"], p.get("source_session")),
+                                ("source_agent", existing_mem["source_agent"], p.get("source_agent")),
+                            ]
+                            for col, db_val, env_val in checks:
+                                if db_val != env_val:
+                                    mismatched_fields.append(col)
+                            # COALESCE-tolerance: only assert
+                            # timestamp match when envelope provided
+                            # a value. Without this, every legitimate
+                            # idempotent re-import that omits
+                            # created/updated would fail because the
+                            # original INSERT used NOW().
+                            if envelope_created is not None and existing_mem["created"] != envelope_created:
+                                mismatched_fields.append("created")
+                            if envelope_updated is not None and existing_mem["updated"] != envelope_updated:
+                                mismatched_fields.append("updated")
+
+                        if mismatched_fields:
                             stats.failed += 1
                             stats.errors.append(
                                 f"{record.id}: existing memory row "
                                 "doesn't match envelope payload "
-                                "(content/owner/namespace differ); "
+                                f"({', '.join(mismatched_fields)} differ); "
                                 "sidecar attachment refused"
                             )
                             # Codex round-35 finding: id_remap was

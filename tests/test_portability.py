@@ -564,12 +564,30 @@ def test_import_idempotent_on_id_collision(monkeypatch):
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"  # always conflict
-    # Round-34 fix: ON CONFLICT path now verifies existing memory
-    # row matches. Seed a matching row.
+    # Round-34 + Round-36: ON CONFLICT path now verifies existing
+    # memory row matches across all envelope-bound columns. Seed a
+    # row that matches the handler's defaulted values
+    # (permission_mode=600, quality_rating=75, metadata={},
+    # subcategory/source_*=None) — the test uses _memory_record's
+    # defaults which omit those fields.
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = $1": [
-            {"content": "body", "category": "solutions",
-             "owner_id": "alice", "namespace": "alice-ns"},
+            {
+                "content": "body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
         ],
     })
     _install(monkeypatch, conn)
@@ -607,10 +625,26 @@ def test_import_rejected_conflict_blocks_sidecar_attachment(monkeypatch):
 
     conn = _MismatchConn(routed_rows={
         # The conflict-row verification SELECT — DB content does NOT
-        # match envelope's "new body" claim.
+        # match envelope's "new body" claim. Other envelope-bound
+        # columns match the defaults so only `content` triggers the
+        # rejection.
         "FROM memories WHERE id = $1": [
-            {"content": "stale body", "category": "solutions",
-             "owner_id": "alice", "namespace": "alice-ns"},
+            {
+                "content": "stale body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
         ],
         # Allowlist SELECT (unscoped under root + preserve_owner)
         # would normally find the existing row.
@@ -639,6 +673,76 @@ def test_import_rejected_conflict_blocks_sidecar_attachment(monkeypatch):
     ), (
         "kg_triples must not be inserted when its referenced memory "
         "record was rejected by the conflict-row verification"
+    )
+
+
+def test_import_rejects_conflict_on_stale_permission_mode(monkeypatch):
+    """Round-36 finding: round-34 conflict-row check only compared
+    content/owner/namespace, leaving stale permission_mode (used
+    for federation visibility per the schema), category, metadata,
+    quality_rating, source_*, and subcategory free to authorize
+    sidecar attachment after a mismatch.
+
+    Setup: envelope claims memory id ``mem_alice1`` with the
+    default permission_mode (600 / private). DB has the same id +
+    same content + same owner/ns BUT permission_mode=644 (a
+    federation-visible value). Without the round-36 fix the
+    conflict-row check passes (content/owner/ns all match) and
+    sidecars attach to the federation-visible row. With the fix
+    the permission_mode mismatch rejects the record AND refuses
+    the kg_triples sidecar.
+    """
+    class _MismatchConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memories" in sql:
+                return "INSERT 0 0"
+            return "INSERT 0 1"
+
+    conn = _MismatchConn(routed_rows={
+        "FROM memories WHERE id = $1": [
+            {
+                "content": "body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                # Mismatch — envelope defaults to 600, DB has 644.
+                "permission_mode": 644,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
+        ],
+        "SELECT id, owner_id, namespace FROM memories": [
+            _allowlist_row(memory_id="mem_alice1"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.0",
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry()],
+    )
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.failed >= 1
+    assert any(
+        "permission_mode" in err for err in stats.errors
+    ), f"expected permission_mode mismatch error in {stats.errors!r}"
+    assert stats.sidecars_imported.get("kg_triples", 0) == 0
+    assert all(
+        "INSERT INTO kg_triples" not in sql
+        for sql, _ in conn.executes
     )
 
 
@@ -1405,12 +1509,27 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
         # would trigger the 500 rollback.
         "SELECT DISTINCT memory_id FROM memory_versions": [],
         "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
-        # Round-34: records-loop conflict-row verification SELECT.
-        # Seed a matching memory row so the conflict-skip branch
-        # treats the test's existing memory as authorized.
-        "SELECT content, category, owner_id, namespace FROM memories WHERE id = $1": [
-            {"content": "body", "category": "solutions",
-             "owner_id": "alice", "namespace": "alice-ns"},
+        # Round-34 + Round-36: records-loop conflict-row
+        # verification now selects all envelope-bound columns. Seed
+        # a matching row across the full surface so the conflict-skip
+        # branch treats the test's existing memory as authorized.
+        "SELECT content, category, subcategory, metadata": [
+            {
+                "content": "body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
         ],
     })
     _install(monkeypatch, conn)
