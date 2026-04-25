@@ -73,6 +73,15 @@ class _Conn:
         # simulate ON CONFLICT DO NOTHING (INSERT 0 0) or failures.
         return "INSERT 0 1"
 
+    async def fetchrow(self, sql: str, *args):
+        """Like fetch but returns a single row (or None). Mirrors
+        asyncpg.Connection.fetchrow."""
+        self.fetch_calls.append((sql, args))
+        for needle, payload in self._routed.items():
+            if needle in sql:
+                return payload[0] if payload else None
+        return self._rows[0] if self._rows else None
+
     def transaction(self):
         class _NullCtx:
             async def __aenter__(self_): return self_
@@ -853,20 +862,35 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"
-    # records=[] → no id remap → sidecars reference verbatim mem_alice1
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1.
+    # Round-23 fix: ON CONFLICT skip path now verifies the existing
+    # memory_versions row matches the envelope claim. Seed a matching
+    # row so the idempotent re-import test still passes.
+    mv_entry = _mv_sidecar_entry()
+    matching_existing = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+    }
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
     })
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
         records=[],
         kg_triples=[_kg_sidecar_entry()],
-        memory_versions=[_mv_sidecar_entry()],
+        memory_versions=[mv_entry],
         compression_manifest=[_cm_sidecar_entry()],
     )
     stats = asyncio.run(portability.import_memories(
-        envelope=env, preserve_owner=False, user=_alice(),
+        envelope=env, preserve_owner=True, user=_root(),
     ))
     assert stats.sidecars_imported == {}
     assert stats.sidecars_skipped == {
@@ -1231,22 +1255,37 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"
+    # Round-23: ON CONFLICT skip path now verifies existing row
+    # matches the envelope. Seed the matching row so the test's
+    # idempotent re-import flow still works.
+    mv_entry = _mv_sidecar_entry()
+    matching_existing = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+    }
     conn = _DupeConn(routed_rows={
-        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         # Coverage SELECT: returns empty (the pre-existing memory has
         # no v1 — legacy data). Without the inserted-set scope, this
         # would trigger the 500 rollback.
         "SELECT DISTINCT memory_id FROM memory_versions": [],
+        "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
     })
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
         records=[_memory_record(id="mem_alice1")],
-        memory_versions=[_mv_sidecar_entry()],
+        memory_versions=[mv_entry],
     )
     # No HTTPException — conflict means we didn't insert, so verification skips.
     stats = asyncio.run(portability.import_memories(
-        envelope=env, preserve_owner=False, user=_alice(),
+        envelope=env, preserve_owner=True, user=_root(),
     ))
     assert stats.imported == 0
     assert stats.skipped == 1

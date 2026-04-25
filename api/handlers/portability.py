@@ -1414,12 +1414,51 @@ async def _import_memory_versions(
                         entry.get("branch"), entry.get("merge_parents"),
                     )
                 if row == "INSERT 0 0":
+                    # Conflict-skip: the row already exists in DB.
+                    # Verify it MATCHES the envelope's claim before
+                    # trusting it as authorized — a stale prior-
+                    # lifetime row with the same deterministic UUID
+                    # but different memory_id/owner/version_num/
+                    # content/etc. would otherwise pass through and
+                    # let prior-lifetime DAG state survive a
+                    # delete + re-import (Codex round-23 finding).
+                    existing = await conn.fetchrow(
+                        "SELECT memory_id, owner_id, namespace, "
+                        "version_num, content, commit_hash, "
+                        "parent_version_id::text AS parent_version_id, "
+                        "branch FROM memory_versions WHERE id = $1::uuid",
+                        entry["id"],
+                    )
+                    expected_parent = (
+                        str(entry["parent_version_id"])
+                        if entry.get("parent_version_id") else None
+                    )
+                    expected_branch = entry.get("branch") or "main"
+                    if existing is None or (
+                        existing["memory_id"] != entry["record_id"]
+                        or existing["owner_id"] != row_owner
+                        or existing["namespace"] != row_ns
+                        or existing["version_num"] != entry["version_num"]
+                        or existing["content"] != entry["content"]
+                        or (entry.get("commit_hash") and
+                            existing["commit_hash"] != entry["commit_hash"])
+                        or existing["parent_version_id"] != expected_parent
+                        or existing["branch"] != expected_branch
+                    ):
+                        _bump(stats.sidecars_failed, surface)
+                        stats.errors.append(
+                            f"[{surface}] {entry['id']}: existing row "
+                            "doesn't match envelope claim (likely "
+                            "prior-lifetime stale row); rejected"
+                        )
+                        failed_record_ids.add(entry["record_id"])
+                        continue
                     _bump(stats.sidecars_skipped, surface)
                 else:
                     _bump(stats.sidecars_imported, surface)
-                # Either way, the row IS in memory_versions for this
-                # record_id (just inserted or already there). It's
-                # safe and necessary to restore branches for it.
+                # Authorized only after match-verification above
+                # (or successful insert). Stale rows are no longer
+                # treated as safe because of the equality check.
                 authorized_record_ids.add(entry["record_id"])
                 if entry.get("id"):
                     authorized_version_uuids.add(str(entry["id"]))
