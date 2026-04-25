@@ -958,7 +958,12 @@ async def _import_kg_triples(
             logger.exception("MPF kg_triples import failed for entry %s", entry.get("id"))
 
 
-async def _restore_memory_branches(conn, memory_ids: List[str]) -> None:
+async def _restore_memory_branches(
+    conn,
+    memory_ids: List[str],
+    *,
+    authorized_version_uuids: Optional[List[str]] = None,
+) -> None:
     """After memory_versions sidecar import, repopulate memory_branches
     HEAD pointers for the imported records.
 
@@ -968,22 +973,43 @@ async def _restore_memory_branches(conn, memory_ids: List[str]) -> None:
     this restore step, /log + branch-walk endpoints see the version
     rows but no HEAD pointer, so DAG queries return empty.
 
-    For each imported (memory_id, branch), the HEAD is the version
-    row with the highest version_num — same rule the trigger applies
-    on update. UPSERT into memory_branches keyed on (memory_id, name).
+    `authorized_version_uuids` scopes the SELECT to ONLY the version
+    rows that were imported / authorized in THIS request — pre-existing
+    stale rows from a prior lifetime (e.g. from a memory that was
+    deleted and is now being re-imported) DO NOT participate in HEAD
+    selection. Without this scope, an attacker could re-import a
+    deterministic id and have the prior lifetime's main HEAD survive
+    into the new memory's branch state. (Codex round-21 finding.)
+    Pass None to fall back to all-DB-rows behavior for callers that
+    don't have a sidecar-derived authorized set.
     """
     if not memory_ids:
         return
-    rows = await conn.fetch(
-        """
-        SELECT DISTINCT ON (memory_id, branch)
-            memory_id, branch, id AS head_version_id
-        FROM memory_versions
-        WHERE memory_id = ANY($1::text[])
-        ORDER BY memory_id, branch, version_num DESC
-        """,
-        memory_ids,
-    )
+    if authorized_version_uuids is not None and not authorized_version_uuids:
+        return
+    if authorized_version_uuids is not None:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (memory_id, branch)
+                memory_id, branch, id AS head_version_id
+            FROM memory_versions
+            WHERE memory_id = ANY($1::text[])
+              AND id = ANY($2::uuid[])
+            ORDER BY memory_id, branch, version_num DESC
+            """,
+            memory_ids, authorized_version_uuids,
+        )
+    else:
+        rows = await conn.fetch(
+            """
+            SELECT DISTINCT ON (memory_id, branch)
+                memory_id, branch, id AS head_version_id
+            FROM memory_versions
+            WHERE memory_id = ANY($1::text[])
+            ORDER BY memory_id, branch, version_num DESC
+            """,
+            memory_ids,
+        )
     for r in rows:
         await conn.execute(
             """
@@ -1211,6 +1237,12 @@ async def _import_memory_versions(
     surface = "memory_versions"
     authorized_record_ids: set = set()
     failed_record_ids: set = set()
+    # Set of memory_versions.id UUIDs that successfully landed in
+    # THIS request's transaction (or hit ON CONFLICT against a
+    # row that already represented this exact version under the
+    # caller's tenancy). Used to scope _restore_memory_branches
+    # so prior-lifetime stale rows can't be selected as HEAD.
+    authorized_version_uuids: set = set()
 
     # Caller-scoped PK rewrite for non-root imports. Each entry's
     # `id` plus every parent_version_id/merge_parents reference
@@ -1389,12 +1421,14 @@ async def _import_memory_versions(
                 # record_id (just inserted or already there). It's
                 # safe and necessary to restore branches for it.
                 authorized_record_ids.add(entry["record_id"])
+                if entry.get("id"):
+                    authorized_version_uuids.add(str(entry["id"]))
             except Exception as exc:
                 _bump(stats.sidecars_failed, surface)
                 stats.errors.append(f"[{surface}] {entry['id']}: {type(exc).__name__}: {exc}")
                 logger.exception("MPF memory_versions import failed for entry %s", entry.get("id"))
                 failed_record_ids.add(entry["record_id"])
-    return authorized_record_ids, failed_record_ids
+    return authorized_record_ids, failed_record_ids, authorized_version_uuids
 
 
 async def _import_compression_manifest(
@@ -1856,15 +1890,17 @@ async def import_memories(
                     allowlist=allowlist,
                 )
             if envelope.memory_versions:
-                authorized_version_ids, failed_version_record_ids = (
-                    await _import_memory_versions(
-                        conn, envelope.memory_versions,
-                        caller_user_id=user.user_id,
-                        caller_namespace=user.namespace,
-                        preserve_owner=preserve_owner,
-                        stats=stats,
-                        allowlist=allowlist,
-                    )
+                (
+                    authorized_version_ids,
+                    failed_version_record_ids,
+                    authorized_version_uuids,
+                ) = await _import_memory_versions(
+                    conn, envelope.memory_versions,
+                    caller_user_id=user.user_id,
+                    caller_namespace=user.namespace,
+                    preserve_owner=preserve_owner,
+                    stats=stats,
+                    allowlist=allowlist,
                 )
                 # All-or-nothing per record (Codex round-7 finding):
                 # if a record was INSERTed in this transaction AND
@@ -1903,6 +1939,12 @@ async def import_memories(
                 if authorized_version_ids:
                     await _restore_memory_branches(
                         conn, list(authorized_version_ids),
+                        # Scope HEAD selection to THIS request's
+                        # version UUIDs only — stale rows from a
+                        # prior lifetime of the same memory_id
+                        # (post-delete + re-import via deterministic
+                        # id) cannot become the new HEAD.
+                        authorized_version_uuids=list(authorized_version_uuids),
                     )
             if envelope.compression_manifest:
                 await _import_compression_manifest(
