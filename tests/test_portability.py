@@ -892,9 +892,25 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         "snapshot_by": mv_entry.get("snapshot_by"),
         "change_type": mv_entry.get("change_type") or "create",
     }
+    # Round-30: kg_triples ON CONFLICT now does exact-match too,
+    # so seed a matching kg row for the dupe-conn test.
+    kg_entry = _kg_sidecar_entry()
+    matching_kg = {
+        "subject": kg_entry["subject_literal"],
+        "predicate": kg_entry["predicate"],
+        "object": kg_entry["object_literal"],
+        "subject_type": kg_entry.get("subject_type"),
+        "object_type": kg_entry.get("object_type"),
+        "memory_id": kg_entry.get("memory_id"),
+        "confidence": kg_entry.get("confidence"),
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "valid_until": None,
+    }
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
+        "FROM kg_triples WHERE id = $1": [matching_kg],
     })
     _install(monkeypatch, conn)
 

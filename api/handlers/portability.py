@@ -949,6 +949,40 @@ async def _import_kg_triples(
                     row_owner, row_ns,
                 )
             if row == "INSERT 0 0":
+                # Conflict-skip: verify the existing row matches
+                # the envelope's claim. kg_triples.memory_id has no
+                # FK so prior-lifetime / orphan rows can survive a
+                # memory delete, and the round-23 pattern (exact
+                # match on every column) applies here too —
+                # otherwise re-imports of corrected triples
+                # silently leave stale facts in place. Codex
+                # round-30 finding.
+                existing = await conn.fetchrow(
+                    "SELECT subject, predicate, object, subject_type, "
+                    "object_type, memory_id, confidence, owner_id, "
+                    "namespace, valid_until "
+                    "FROM kg_triples WHERE id = $1",
+                    entry["id"],
+                )
+                if existing is None or (
+                    existing["subject"] != subject
+                    or existing["predicate"] != entry["predicate"]
+                    or existing["object"] != obj
+                    or existing["subject_type"] != entry.get("subject_type")
+                    or existing["object_type"] != entry.get("object_type")
+                    or existing["memory_id"] != entry.get("memory_id")
+                    or (entry.get("confidence") is not None and
+                        existing["confidence"] != entry["confidence"])
+                    or existing["owner_id"] != row_owner
+                    or existing["namespace"] != row_ns
+                ):
+                    _bump(stats.sidecars_failed, surface)
+                    stats.errors.append(
+                        f"[{surface}] {entry['id']}: existing row "
+                        "doesn't match envelope claim (likely "
+                        "stale or orphaned triple); rejected"
+                    )
+                    continue
                 _bump(stats.sidecars_skipped, surface)
             else:
                 _bump(stats.sidecars_imported, surface)
