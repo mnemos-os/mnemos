@@ -1936,6 +1936,22 @@ async def import_memories(
                 # was authorized to write — rejected cross-tenant
                 # entries must not drive memory_branches mutations
                 # for memories the caller can't touch.
+                # Clear stale memory_branches rows for newly
+                # inserted records before restoring. memory_branches
+                # has no FK cascade with memories, so prior-lifetime
+                # branch rows can survive a delete + re-import even
+                # if memory_versions is now scoped to authorized
+                # UUIDs — the stale branch row would still point at
+                # a stale (or now-stranded) head and let the post-
+                # verification accept it (Codex round-22 finding).
+                # Wipe the slate per inserted record_id, then
+                # restore only authorized branches.
+                if inserted_record_ids:
+                    await conn.execute(
+                        "DELETE FROM memory_branches "
+                        "WHERE memory_id = ANY($1::text[])",
+                        list(inserted_record_ids),
+                    )
                 if authorized_version_ids:
                     await _restore_memory_branches(
                         conn, list(authorized_version_ids),
