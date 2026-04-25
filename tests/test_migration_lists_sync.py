@@ -84,3 +84,55 @@ def test_every_migration_list_entry_exists_on_disk():
         f"Migration entries reference files that don't exist in db/: {missing}. "
         "Either remove the entry or add the SQL file."
     )
+
+
+def _extract_docker_compose_migrations(compose_path: Path) -> list[str]:
+    """Pull migration filenames from docker-compose.yml's volume
+    mounts. Each mount looks like:
+      - ./db/migrations_*.sql:/docker-entrypoint-initdb.d/NN-name.sql
+    """
+    text = compose_path.read_text()
+    out: list[str] = []
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line.startswith("- ./db/"):
+            continue
+        if "/docker-entrypoint-initdb.d/" not in line:
+            continue
+        # `- ./db/<file>.sql:/docker-entrypoint-initdb.d/...`
+        host_path = line.split(":", 1)[0]  # `- ./db/<file>.sql`
+        host_path = host_path.removeprefix("- ").strip()
+        out.append(Path(host_path).name)
+    return out
+
+
+def test_docker_compose_migration_list_matches_installer():
+    """Codex round-26 finding: docker-compose.yml maintained its
+    own migration init list and drifted behind installer/db.py
+    (stopped at v3_1_versioning_fix while CHARON v0.2 added 9
+    more migrations through migrations_charon_trigger_guard.sql).
+    Fresh `docker compose up` databases would have kg_triples
+    without owner_id/namespace and no trigger guard, breaking
+    /v1/export?include_sidecars=true.
+
+    The Docker init list must be a (possibly proper) prefix of
+    the installer/db.py list — never strictly less if a newer
+    migration is required by shipped code paths. We assert exact
+    equality so a future drift is caught immediately."""
+    repo_root = Path(__file__).resolve().parents[1]
+    installer_list = _extract_migration_list(
+        repo_root / "installer" / "db.py", "run_migrations",
+    )
+    compose_list = _extract_docker_compose_migrations(
+        repo_root / "docker-compose.yml",
+    )
+    assert installer_list == compose_list, (
+        "docker-compose.yml migration list has drifted from "
+        "installer/db.py.\n"
+        f"  installer/db.py ({len(installer_list)} entries):    "
+        f"{installer_list}\n"
+        f"  docker-compose.yml ({len(compose_list)} entries): "
+        f"{compose_list}\n"
+        "When adding a new migration, append to ALL THREE: "
+        "install.py, installer/db.py, AND docker-compose.yml."
+    )
