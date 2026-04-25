@@ -791,12 +791,20 @@ async def _import_memory_versions(
     preserve_owner: bool,
     stats: ImportStats,
     allowlist: Dict[str, tuple],
-) -> None:
+) -> set:
     """Upsert MPF memory_version_entry sidecar entries into
     memory_versions. Idempotent on `id`. Carries the full DAG
     triplet (commit_hash, parent_version_id, branch); merge_parents
-    flows through verbatim as a UUID[]."""
+    flows through verbatim as a UUID[].
+
+    Returns the set of `record_id`s for which at least one version
+    row was successfully imported OR was already present (skipped
+    via ON CONFLICT). The caller uses that set to scope downstream
+    operations like memory_branches HEAD restoration — only memory
+    ids the caller was actually authorized to write get touched.
+    """
     surface = "memory_versions"
+    authorized_record_ids: set = set()
     for entry in sidecar:
         for required in ("id", "record_id", "version_num", "content"):
             if entry.get(required) in (None, ""):
@@ -861,10 +869,15 @@ async def _import_memory_versions(
                     _bump(stats.sidecars_skipped, surface)
                 else:
                     _bump(stats.sidecars_imported, surface)
+                # Either way, the row IS in memory_versions for this
+                # record_id (just inserted or already there). It's
+                # safe and necessary to restore branches for it.
+                authorized_record_ids.add(entry["record_id"])
             except Exception as exc:
                 _bump(stats.sidecars_failed, surface)
                 stats.errors.append(f"[{surface}] {entry['id']}: {type(exc).__name__}: {exc}")
                 logger.exception("MPF memory_versions import failed for entry %s", entry.get("id"))
+    return authorized_record_ids
 
 
 async def _import_compression_manifest(
@@ -1208,7 +1221,7 @@ async def import_memories(
                     allowlist=allowlist,
                 )
             if envelope.memory_versions:
-                await _import_memory_versions(
+                authorized_version_ids = await _import_memory_versions(
                     conn, envelope.memory_versions,
                     caller_user_id=user.user_id,
                     caller_namespace=user.namespace,
@@ -1221,11 +1234,18 @@ async def import_memories(
                 # suppressed during CHARON imports. Without this,
                 # the imported version rows are orphans from the
                 # branch-walk perspective (DAG endpoints return empty).
-                await _restore_memory_branches(
-                    conn,
-                    [e["record_id"] for e in envelope.memory_versions
-                     if e.get("record_id")],
-                )
+                #
+                # Critically: only restore branches for record_ids
+                # that the import was authorized to write. Rejected
+                # cross-tenant entries already failed the allowlist
+                # gate; passing their record_ids here would let an
+                # adversarial envelope drive an UPSERT against
+                # memory_branches for a memory_id the caller cannot
+                # mutate (Codex round-3 finding).
+                if authorized_version_ids:
+                    await _restore_memory_branches(
+                        conn, list(authorized_version_ids),
+                    )
             if envelope.compression_manifest:
                 await _import_compression_manifest(
                     conn, envelope.compression_manifest,
@@ -1235,6 +1255,49 @@ async def import_memories(
                     stats=stats,
                     allowlist=allowlist,
                 )
+
+            # Post-import v1 verification: when trigger suppression
+            # is in effect, every kind:memory record from this
+            # envelope MUST end up with at least one row in
+            # memory_versions. The pre-coverage check rejects
+            # envelopes whose record_id list isn't covered by the
+            # sidecar, but it does NOT prove the sidecar entries
+            # are importable — empty content, allowlist rejection,
+            # or any other per-row failure could leave a record
+            # committed without v1. Catch that here and roll back.
+            if envelope.memory_versions:
+                memory_ids = [
+                    r.id for r in envelope.records if r.kind == "memory"
+                ]
+                if memory_ids:
+                    in_db = await conn.fetch(
+                        "SELECT id FROM memories WHERE id = ANY($1::text[])",
+                        memory_ids,
+                    )
+                    in_db_ids = {r["id"] for r in in_db}
+                    if in_db_ids:
+                        covered = await conn.fetch(
+                            "SELECT DISTINCT memory_id FROM memory_versions "
+                            "WHERE memory_id = ANY($1::text[])",
+                            list(in_db_ids),
+                        )
+                        covered_ids = {r["memory_id"] for r in covered}
+                        uncovered = in_db_ids - covered_ids
+                        if uncovered:
+                            sample = sorted(uncovered)[:5]
+                            extra = "..." if len(uncovered) > 5 else ""
+                            raise HTTPException(
+                                status_code=500,
+                                detail=(
+                                    "CHARON import left "
+                                    f"{len(uncovered)} memory record(s) "
+                                    "without version history under "
+                                    f"trigger suppression: {sample}{extra}. "
+                                    "Sidecar likely contained malformed or "
+                                    "rejected entries that did not produce "
+                                    "rows. Transaction rolled back."
+                                ),
+                            )
 
     logger.info(
         "[MPF] import: user=%s imported=%d skipped=%d failed=%d unsupported=%s sidecars_imported=%s",

@@ -727,7 +727,14 @@ def test_import_kg_triples_missing_predicate_failed(monkeypatch):
 
 
 def test_import_memory_versions_sidecar_imports(monkeypatch):
-    conn = _Conn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # Post-import v1 verification SELECT — return mem_alice1 as
+        # covered so the rollback path doesn't fire.
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -785,7 +792,12 @@ def test_import_all_three_sidecars_under_one_envelope(monkeypatch):
     """Most realistic scenario: a CHARON round-trip envelope with one
     memory + a triple + a version + a compression entry. Per-surface
     counters break out cleanly."""
-    conn = _Conn(routed_rows={"FROM memories WHERE id = ANY": [_allowlist_row()]})
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
     _install(monkeypatch, conn)
 
     env = portability.MPFEnvelope(
@@ -1065,6 +1077,9 @@ def test_import_full_memory_versions_coverage_passes(monkeypatch):
             _allowlist_row(memory_id="mem_a"),
             _allowlist_row(memory_id="mem_b"),
         ],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_a"}, {"memory_id": "mem_b"},
+        ],
     })
     _install(monkeypatch, conn)
 
@@ -1104,6 +1119,10 @@ def test_import_memory_versions_restores_branch_head(monkeypatch):
             {"memory_id": "mem_alice1", "branch": "main",
              "head_version_id": "11111111-1111-1111-1111-111111111111"},
         ],
+        # Post-import v1 verification needs to find the imported memory.
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
     })
     _install(monkeypatch, conn)
 
@@ -1124,3 +1143,80 @@ def test_import_memory_versions_restores_branch_head(monkeypatch):
     args = branch_inserts[0][1]
     assert "mem_alice1" in args
     assert "main" in args
+
+
+def test_import_post_verification_rolls_back_when_memory_unversioned(monkeypatch):
+    """Codex review #3: even with full pre-coverage, a per-row
+    failure in memory_versions sidecar (e.g. allowlist rejection or
+    UUID format error) can leave a memory committed without v1
+    under trigger suppression. Post-import verification must SELECT
+    memory_versions and rollback if any imported memory is uncovered."""
+    conn = _Conn(routed_rows={
+        # Allowlist returns the memory under a DIFFERENT owner so the
+        # sidecar entry's allowlist check fails — the memory record
+        # itself still inserts (the records loop runs first).
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_alice1",
+                           owner_id="charlie", namespace="charlie-ns"),
+        ],
+        # Post-verification SELECT: memory exists in DB...
+        # but coverage SELECT returns NOTHING — uncovered.
+        "SELECT DISTINCT memory_id FROM memory_versions": [],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=False, user=_alice(),
+        ))
+    assert exc.value.status_code == 500
+    assert "without version history" in exc.value.detail
+    assert "mem_alice1" in exc.value.detail
+
+
+def test_import_branch_restore_skips_rejected_record_ids(monkeypatch):
+    """Codex review #3: if a memory_versions sidecar entry is
+    rejected by the allowlist gate, _restore_memory_branches must
+    NOT issue an UPSERT for that record_id — even if the underlying
+    DB has prior versions for it. Otherwise an adversarial envelope
+    could trigger writes against another tenant's memory_branches."""
+    conn = _Conn(routed_rows={
+        # Allowlist: the only memory we know about is owned by bob,
+        # so alice's sidecar entry referencing mem_bob_secret will
+        # fail the allowlist check.
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_bob_secret",
+                           owner_id="bob", namespace="bob-ns"),
+        ],
+        # Post-verification: alice's records loop didn't insert
+        # anything (no records in envelope), so this returns empty.
+        "SELECT DISTINCT memory_id FROM memory_versions": [],
+        # Branch restore would issue a SELECT DISTINCT ON if called.
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": "mem_bob_secret", "branch": "main",
+             "head_version_id": "ffffffff-ffff-ffff-ffff-ffffffffffff"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["record_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    # The rejected entry must NOT have driven a memory_branches UPSERT.
+    branch_inserts = [
+        e for e in conn.executes if "INSERT INTO memory_branches" in e[0]
+    ]
+    assert branch_inserts == [], (
+        f"expected no memory_branches UPSERT for rejected entry; "
+        f"got {len(branch_inserts)}: {[e[0][:60] for e in branch_inserts]}"
+    )

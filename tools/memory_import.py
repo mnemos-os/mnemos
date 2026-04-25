@@ -394,19 +394,31 @@ class JsonImporter(BaseImporter):
                         mpf_records.append(parsed)
                     else:
                         items.append(parsed)
-            # If a trailer was seen and we're in preserve_metadata
-            # mode, materialize a single passthrough envelope so the
-            # CLI POSTs records + sidecars together. Otherwise the
-            # sidecars would be silently dropped on import.
-            if jsonl_sidecars and self.preserve_metadata and mpf_records:
+            # Trailer-aware source_envelope construction (Codex
+            # round-3 finding): always materialize the passthrough
+            # envelope when sidecars are present in preserve_metadata
+            # mode, even if the records list is empty (sidecar-only
+            # input) or the JSONL has flat memory dicts rather than
+            # MPF record lines. Otherwise sidecars get silently
+            # dropped on these shapes.
+            if jsonl_sidecars and self.preserve_metadata:
                 self.source_envelope = {
                     "mpf_version": self.MPF_VERSION,
                     "source_system": "memory_import",
                     "source_version": self.MEMORY_PAYLOAD_VERSION,
                     "exported_at": datetime.now(timezone.utc).isoformat(),
+                    # Carry whatever record-shaped lines we saw; may
+                    # be empty for trailer-only inputs. The server
+                    # accepts records=[] as valid (sidecar-only
+                    # imports are a documented use-case).
                     "records": mpf_records,
                     **jsonl_sidecars,
                 }
+                if not mpf_records:
+                    print(
+                        f"  passthrough: trailer-only ({', '.join(jsonl_sidecars)})",
+                        file=sys.stderr,
+                    )
             elif jsonl_sidecars and not self.preserve_metadata:
                 # Without preserve_metadata the per-record path is
                 # used, which can't carry sidecars. Warn loudly so
