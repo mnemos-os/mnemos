@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import json
 import logging
+import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -339,21 +340,27 @@ async def _fetch_sidecar(
     short-circuits to no rows without hitting the DB. With
     `null_ok=True` the query still runs (NULL memory_ids may match).
     """
-    if bound_to_memories and not memory_ids and not null_ok:
+    # Empty memory slice → no sidecars, even under null_ok.
+    # Otherwise a category-filtered export with no matching memories
+    # would return ALL first-class kg_triples in the owner/namespace,
+    # leaking unrelated data outside the requested slice (Codex
+    # round-6 finding). The export is "memories + their attached
+    # surfaces"; first-class triples without an associated memory
+    # are by definition NOT part of that scope on a per-export
+    # basis. A future explicit `?include_unattached_kg=true` could
+    # opt-in to the broader behavior, but it's not the default.
+    if bound_to_memories and not memory_ids:
         return []
     conditions: List[str] = []
     params: List[Any] = []
     idx = 1
     if bound_to_memories:
-        if null_ok and memory_ids:
+        if null_ok:
             conditions.append(
                 f"({memory_id_column} IS NULL OR {memory_id_column} = ANY(${idx}::text[]))"
             )
             params.append(memory_ids)
             idx += 1
-        elif null_ok:
-            # No exported memory_ids; only first-class (NULL) triples.
-            conditions.append(f"{memory_id_column} IS NULL")
         else:
             conditions.append(f"{memory_id_column} = ANY(${idx}::text[])")
             params.append(memory_ids)
@@ -977,22 +984,37 @@ async def _import_compression_manifest(
             # ON DELETE SET NULL. The manifest sidecar carries the
             # winner ID for traceability but CHARON does not also
             # ship the candidate row, so the FK target may be absent
-            # after import. NULL-out when missing so the import
-            # doesn't fail on a back-pointer to data that doesn't
-            # exist; it can be repaired later by re-running a
-            # compression contest. Lossless on the manifest's
-            # primary content (engine_id, compressed_content, scores).
-            winner_id = entry.get("winner_contest_id")
-            if winner_id:
-                exists = await conn.fetchval(
-                    "SELECT 1 FROM memory_compression_candidates WHERE id = $1::uuid",
-                    winner_id,
-                )
-                if not exists:
+            # after import. Pre-validate format in Python (rejecting
+            # malformed UUIDs without a SQL roundtrip), then check
+            # existence INSIDE the per-row SAVEPOINT so a Postgres
+            # error there can't abort the surrounding import
+            # transaction (Codex round-6 finding).
+            #
+            # Lossless on the manifest's primary content (engine_id,
+            # compressed_content, scores) — only the back-pointer
+            # to which contest produced this winner gets nulled when
+            # the candidate row isn't carried.
+            winner_id_raw = entry.get("winner_contest_id")
+            winner_id: Optional[str] = None
+            if winner_id_raw:
+                try:
+                    # uuid.UUID() raises ValueError on malformed input —
+                    # pure Python, no SQL hit.
+                    winner_id = str(uuid.UUID(str(winner_id_raw)))
+                except (ValueError, AttributeError):
                     winner_id = None
             # Per-row SAVEPOINT — same reasoning as the other sidecars.
             try:
                 async with conn.transaction():
+                    if winner_id is not None:
+                        # Existence check is now scoped to the savepoint,
+                        # so a Postgres error rolls back only this row.
+                        exists = await conn.fetchval(
+                            "SELECT 1 FROM memory_compression_candidates WHERE id = $1::uuid",
+                            winner_id,
+                        )
+                        if not exists:
+                            winner_id = None
                     row = await conn.execute(
                         """
                         INSERT INTO memory_compressed_variants (

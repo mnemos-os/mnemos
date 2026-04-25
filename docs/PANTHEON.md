@@ -22,6 +22,12 @@ Every existing tool keeps working — PANTHEON is OpenAI-shape. The win is the c
 
 ---
 
+## What we are NOT building
+
+- **A new message queue.** PANTHEON uses **NATS JetStream** (Apache 2.0, single binary, ~30MB RAM, native Python client). Building bespoke MQ infrastructure is not the project. Same posture as MNEMOS choosing pgvector over a custom vector store: pick the boring proven option, focus engineering on the layer that's actually novel.
+- **A new provider catalog.** PANTHEON auto-populates from GRAEAE's existing provider/muses database. GRAEAE already knows which providers have keys configured, which models each one offers, and recent health stats. PANTHEON's catalog is a *view* over GRAEAE's provider table plus per-worker advertisements. See "Catalog auto-population" below.
+- **A new auth system.** Tokens map to existing MNEMOS owner_id + namespace identity. The same auth that gates `/v1/memories` gates `/v1/chat/completions` here.
+
 ## Position in the fleet
 
 ```
@@ -107,6 +113,35 @@ Stock OpenAI returns `{id, object, created, owned_by}`. PANTHEON returns the sam
   ]
 }
 ```
+
+### Catalog auto-population from GRAEAE
+
+GRAEAE already maintains a provider database (the muses registry) — which providers have keys configured, what models each one offers, recent health from consultation runs. PANTHEON does NOT duplicate this. The catalog is computed at startup and refreshed on heartbeat:
+
+```
+                  ┌─────────────────────────────┐
+                  │ GRAEAE muses_api_keys.json  │
+                  │ + provider/muse registry    │
+                  │ (existing on PYTHIA)        │
+                  └─────────────┬───────────────┘
+                                │ read on PANTHEON startup
+                                │ + on `catalog reload` event
+                                ▼
+                  ┌─────────────────────────────┐
+                  │ PANTHEON catalog cache      │
+                  │ - provider list             │
+                  │ - models per provider       │
+                  │ - usage_tier per model      │
+                  └─────────────┬───────────────┘
+                                │ + per-worker `catalog.advertise`
+                                │   for live model availability
+                                ▼
+                          /v1/models response
+```
+
+Adding a new provider becomes a one-step operation: drop the key into GRAEAE's existing key store + register the muse. PANTHEON picks it up next reload (or on a SIGHUP). No PANTHEON-side config changes.
+
+The `usage_tier` annotation per model is configured once in the GRAEAE registry (e.g. Anthropic models tagged `consultation_only`). PANTHEON reads that tag verbatim — it's not a separate file to keep in sync.
 
 ### Required fields per entry
 
@@ -296,6 +331,35 @@ Stored centrally in PANTHEON's vault. Default: encrypted at rest under a master 
 A new tool integrating with PANTHEON gets ONE token. Adding a new backend = dropping a key file in the vault + starting a new worker. No client config changes anywhere.
 
 ---
+
+## Client-side: agent model discovery is the hard problem
+
+The single-API-config-on-the-client pitch only delivers if the agent ALSO knows how to use that single config to discover and pick from many models. Most existing agents don't:
+
+| Agent | Model discovery today | What needs to change |
+|---|---|---|
+| **OpenClaw** | Hardcoded model list at compile time. `models.providers.<name>.model = "..."` in config. | Add `discover-from-endpoint` mode: on connect, GET `/v1/models`, populate the available-model list. Honor PANTHEON catalog metadata (cost_tier, usage_tier, capabilities). Allow runtime model switching in the active session. |
+| **Hermes** | Similar — provider config has a fixed model name per provider. | Same patch: discover-from-endpoint, runtime switching, capability-aware aliases (`auto:reasoning`). |
+| **zterm** | Talks to whatever its single configured backend exposes. | Already simple; can use PANTHEON's `auto:` aliases without code changes. |
+| **Cursor / Continue / langchain** | Custom-provider config takes a base URL and a model name. They DO call `/v1/models` for autocomplete but don't use the result for live switching. | Lighter touch: PANTHEON works today with a static model name; capability aliases need an extension on their side. |
+
+### The contribution work
+
+PANTHEON ships with PR-ready patches for the agents we own/influence:
+
+1. **OpenClaw model-discovery PR** — adds a `discovery: auto` config option. When set, the agent calls `/v1/models` at startup, builds its model list dynamically, and exposes a `/model <name>` slash command for runtime switching. Catalog metadata (`pantheon.cost_tier`, `pantheon.usage_tier`) drives the agent's filter (e.g. agentic-mode auto-skips `consultation_only`).
+
+2. **Hermes model-discovery PR** — same shape, different file.
+
+3. **MCP-aware agents (Claude Code, etc.)** — the MCP front-door is the easier path here. Agent calls `pantheon_list_models(filter_capabilities)` via MCP, gets a typed response with metadata baked in.
+
+4. **OpenAI-shape ecosystem (langchain, openai-python)** — these aren't ours to patch. PANTHEON's solution is the alias convention: clients pass `model="auto:reasoning"` and the resolution happens server-side. No client changes required.
+
+The PRs land before PANTHEON's v4 cut, ideally upstream-merged. If upstream is slow, ship the patch as a doc + sidecar branch that operators can apply manually.
+
+### Why client-side changes matter
+
+Without them, PANTHEON degrades to "single endpoint with one default model." That's still useful (key-vault consolidation, audit, cost cap) but it's not the unlock. The unlock is the agent treating PANTHEON as a fleet of capabilities and switching across them based on the task at hand. That requires the agent to KNOW it can switch — which means it has to discover.
 
 ## MCP front-door
 
