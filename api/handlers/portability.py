@@ -1415,18 +1415,18 @@ async def _import_memory_versions(
                     )
                 if row == "INSERT 0 0":
                     # Conflict-skip: the row already exists in DB.
-                    # Verify it MATCHES the envelope's claim before
-                    # trusting it as authorized — a stale prior-
+                    # Verify EVERY persisted column matches the
+                    # envelope's claim — including merge_parents
+                    # (Codex round-24 finding). A stale prior-
                     # lifetime row with the same deterministic UUID
-                    # but different memory_id/owner/version_num/
-                    # content/etc. would otherwise pass through and
-                    # let prior-lifetime DAG state survive a
-                    # delete + re-import (Codex round-23 finding).
+                    # but different secondary merge edges would
+                    # otherwise pass through.
                     existing = await conn.fetchrow(
                         "SELECT memory_id, owner_id, namespace, "
                         "version_num, content, commit_hash, "
                         "parent_version_id::text AS parent_version_id, "
-                        "branch FROM memory_versions WHERE id = $1::uuid",
+                        "branch, merge_parents "
+                        "FROM memory_versions WHERE id = $1::uuid",
                         entry["id"],
                     )
                     expected_parent = (
@@ -1434,6 +1434,18 @@ async def _import_memory_versions(
                         if entry.get("parent_version_id") else None
                     )
                     expected_branch = entry.get("branch") or "main"
+                    expected_merge_parents = entry.get("merge_parents") or None
+                    actual_merge_parents = (
+                        existing["merge_parents"] if existing else None
+                    )
+                    # Normalize None vs empty-list for comparison —
+                    # the DB can store either depending on insert
+                    # path. Compare element-wise as strings since
+                    # the envelope ships UUIDs as strings.
+                    def _norm_mp(mp):
+                        if not mp:
+                            return None
+                        return [str(x) for x in mp]
                     if existing is None or (
                         existing["memory_id"] != entry["record_id"]
                         or existing["owner_id"] != row_owner
@@ -1444,6 +1456,7 @@ async def _import_memory_versions(
                             existing["commit_hash"] != entry["commit_hash"])
                         or existing["parent_version_id"] != expected_parent
                         or existing["branch"] != expected_branch
+                        or _norm_mp(actual_merge_parents) != _norm_mp(expected_merge_parents)
                     ):
                         _bump(stats.sidecars_failed, surface)
                         stats.errors.append(

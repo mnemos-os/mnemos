@@ -876,6 +876,7 @@ def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
         "commit_hash": mv_entry["commit_hash"],
         "parent_version_id": None,
         "branch": mv_entry["branch"],
+        "merge_parents": None,
     }
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
@@ -1268,6 +1269,7 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
         "commit_hash": mv_entry["commit_hash"],
         "parent_version_id": None,
         "branch": mv_entry["branch"],
+        "merge_parents": None,
     }
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
