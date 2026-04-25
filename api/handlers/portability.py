@@ -318,6 +318,7 @@ async def _fetch_sidecar(
     effective_ns: Optional[str],
     bound_to_memories: bool,
     null_ok: bool = False,
+    order_by: Optional[str] = None,
 ) -> Any:
     """Build and execute a sidecar SELECT with optional owner /
     namespace / memory_id filters. Centralizes the placeholder math
@@ -374,7 +375,8 @@ async def _fetch_sidecar(
         params.append(effective_ns)
         idx += 1
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
-    sql = f"SELECT {columns} FROM {table} {where}"
+    order = f"ORDER BY {order_by}" if order_by else ""
+    sql = f"SELECT {columns} FROM {table} {where} {order}"
     return await conn.fetch(sql, *params)
 
 
@@ -536,6 +538,12 @@ async def export_memories(
                 effective_owner=effective_owner,
                 effective_ns=effective_ns,
                 bound_to_memories=True,
+                # Topological-stable order — parent rows ship before
+                # child rows so the import-side parent_version_id FK
+                # check passes even on consumers that import in
+                # received order. See _import_memory_versions for
+                # the matching defensive sort. Codex round-8 finding.
+                order_by="memory_id ASC, branch ASC, version_num ASC",
             )
             memory_versions_out = [_memory_version_to_entry(dict(r)) for r in mv_rows]
 
@@ -869,6 +877,23 @@ async def _import_memory_versions(
     surface = "memory_versions"
     authorized_record_ids: set = set()
     failed_record_ids: set = set()
+    # Topological-stable order: (memory_id, branch, version_num ASC).
+    # parent_version_id is a self-referential FK in memory_versions —
+    # if a child v2 row is inserted before its parent v1, the FK
+    # check fails. Envelopes from a friendly export already arrive
+    # in this order (the server export query has ORDER BY), but the
+    # contract is that import is order-independent: a hand-crafted
+    # or cross-system envelope might arrive in any order. Sort here
+    # so the import is robust to whatever the envelope's order is.
+    # Codex round-8 finding.
+    sidecar = sorted(
+        sidecar,
+        key=lambda e: (
+            str(e.get("record_id") or ""),
+            str(e.get("branch") or "main"),
+            int(e.get("version_num") or 0),
+        ),
+    )
     for entry in sidecar:
         # Capture record_id even when other required fields are
         # missing — we need it for the failure-tracking set so the

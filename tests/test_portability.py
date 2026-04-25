@@ -366,7 +366,8 @@ def test_export_sidecars_constrained_to_exported_memory_ids(monkeypatch):
 
     asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, include_sidecars=True, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=True,
+        include_unattached_kg=False, user=_alice(),
     ))
 
     mv_sql, mv_args = next((s, a) for s, a in rows if "FROM memory_versions" in s)
@@ -379,11 +380,12 @@ def test_export_sidecars_constrained_to_exported_memory_ids(monkeypatch):
     assert "memory_id = ANY" in mv_sql
     assert ["mem_42"] in (list(mv_args) or [])
     assert "memory_id = ANY" in cv_sql
-    # KG triples are bound (null_ok) — first-class triples (memory_id
-    # NULL) AND attached triples scoped to the export slice. The SQL
-    # has both a NULL check and the ANY clause (Codex round-5 fix).
-    assert "memory_id IS NULL" in kg_sql
+    # KG triples bound to the slice. First-class triples (memory_id
+    # NULL) are opt-in via include_unattached_kg; default (which
+    # this test does not pass) is False, so the query has the ANY
+    # clause but NOT the NULL branch (Codex round-7 fix).
     assert "memory_id = ANY" in kg_sql
+    assert "memory_id IS NULL" not in kg_sql
 
 
 def test_export_empty_memory_set_yields_empty_sidecars(monkeypatch):
@@ -1220,6 +1222,49 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
     # Sidecar imports still ran but landed under skipped-via-conflict
     # (the dupe conn returns INSERT 0 0 for everything).
     assert stats.sidecars_skipped.get("memory_versions") == 1
+
+
+def test_import_memory_versions_handles_v2_before_v1(monkeypatch):
+    """Codex round-8 finding: parent_version_id is a self-referential
+    FK. If a child version arrives in the envelope before its parent,
+    the FK check fails — but a friendly export ought to be order-
+    independent. Sort the sidecar by (memory_id, branch, version_num)
+    on import so v1 always lands before v2 regardless of envelope
+    order."""
+    seen_inserts: list = []
+
+    class _OrderTrackingConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memory_versions" in sql:
+                # version_num is positional arg #3 in the INSERT
+                seen_inserts.append(args[2])
+            return "INSERT 0 1"
+
+    conn = _OrderTrackingConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    # Envelope deliberately has v2 BEFORE v1 — adversarial order.
+    v2 = {**_mv_sidecar_entry(),
+          "id": "00000000-0000-0000-0000-00000000000b", "version_num": 2}
+    v1 = {**_mv_sidecar_entry(),
+          "id": "00000000-0000-0000-0000-00000000000a", "version_num": 1}
+    env = portability.MPFEnvelope(
+        records=[],
+        memory_versions=[v2, v1],
+    )
+    asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    # The import sort must have flipped them: v1 inserted first, then v2.
+    assert seen_inserts == [1, 2], (
+        f"expected version_num inserts in [1, 2] order; got {seen_inserts}"
+    )
 
 
 def test_import_branch_restore_skips_rejected_record_ids(monkeypatch):
