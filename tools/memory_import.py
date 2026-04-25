@@ -46,7 +46,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict
+from typing import Any, Dict, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -78,11 +78,18 @@ class BaseImporter:
         # with preserve_owner=true, which requires a root bearer token
         # and keeps id/owner_id/namespace/timestamps verbatim.
         self.preserve_metadata = preserve_metadata
-        # CHARON v0.2: when the input file is an MPF envelope with
-        # kg_triples / memory_versions / compression_manifest sidecars
-        # populated, _parse_source stashes them here so _post_mpf can
-        # forward them in a trailing envelope after the record batches.
-        self.sidecars: Dict[str, list] = {}
+        # CHARON sidecar passthrough: when the input file is an MPF
+        # envelope with kg_triples / memory_versions /
+        # compression_manifest populated, _parse_source stashes the
+        # ORIGINAL envelope here so the import path can POST it
+        # verbatim as a single request. The earlier design (post
+        # records first, then a sidecar trailer) created an ordering
+        # bug — the version-snapshot trigger fired during the records
+        # batch and the sidecar's authoritative v1 then collided on
+        # the partial unique index. Single-envelope POST lets the
+        # server's per-transaction trigger guard (mnemos_charon_trigger_guard
+        # migration) cover the whole import in one shot.
+        self.source_envelope: Optional[Dict[str, Any]] = None
 
     def _post(self, memories: list) -> tuple:
         """POST a list of memories to MNEMOS.
@@ -97,6 +104,15 @@ class BaseImporter:
             (ok_count, fail_count)
         """
         if self.preserve_metadata:
+            # CHARON sidecar passthrough: if the source was an MPF
+            # envelope WITH sidecars, post it verbatim as a single
+            # request. The reconstruct-and-batch path (_post_mpf)
+            # would split records and sidecars across multiple POSTs,
+            # which leaves a window where the version-snapshot
+            # trigger fires on the records batch before the sidecar
+            # trailer arrives — collisions on (memory_id, version_num).
+            if self.source_envelope is not None:
+                return self._post_mpf_passthrough(memories)
             return self._post_mpf(memories)
 
         ok = 0
@@ -221,46 +237,70 @@ class BaseImporter:
                 print(f"  WARNING  /v1/import exception: {exc}")
                 fail += len(batch)
 
-        # CHARON v0.2 sidecar trailer — sent as a single envelope after
-        # all record batches so per-record-id idempotency still applies.
-        # Sidecars don't batch the way records do (they're typically
-        # smaller in count and self-keyed), so a single POST is fine.
-        if self.sidecars and not self.dry_run:
-            trailer = {
-                "mpf_version": self.MPF_VERSION,
-                "source_system": "memory_import",
-                "source_version": self.MEMORY_PAYLOAD_VERSION,
-                "exported_at": datetime.now(timezone.utc).isoformat(),
-                "records": [],
-                **self.sidecars,
-            }
-            data = json.dumps(trailer).encode("utf-8")
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
-            try:
-                with urllib.request.urlopen(req, timeout=120) as resp:
-                    body = json.loads(resp.read())
-                    s_imp = body.get("sidecars_imported") or {}
-                    s_skip = body.get("sidecars_skipped") or {}
-                    s_fail = body.get("sidecars_failed") or {}
-                    parts = []
-                    for k in ("kg_triples", "memory_versions", "compression_manifest"):
-                        if k in self.sidecars:
-                            parts.append(
-                                f"{k}: imported={s_imp.get(k, 0)} "
-                                f"skipped={s_skip.get(k, 0)} "
-                                f"failed={s_fail.get(k, 0)}"
-                            )
-                    if parts:
-                        print("  sidecars: " + " | ".join(parts))
-            except urllib.error.HTTPError as exc:
-                detail = exc.read().decode("utf-8", "replace")[:300]
-                print(f"  WARNING  /v1/import (sidecars) HTTP {exc.code}: {detail}")
-            except urllib.error.URLError as exc:
-                print(f"  WARNING  /v1/import (sidecars) error: {exc.reason}")
-            except Exception as exc:
-                print(f"  WARNING  /v1/import (sidecars) exception: {exc}")
-
         return ok, fail
+
+    def _post_mpf_passthrough(self, memories: list) -> tuple:
+        """POST the source MPF envelope verbatim as a single request.
+
+        Used when the parsed source was an MPF envelope WITH sidecars.
+        The records-and-sidecars-together posture is required for the
+        server's per-transaction version-snapshot trigger guard to
+        scope correctly — a separate sidecar trailer would arrive
+        AFTER the trigger has already fired on the records batch.
+
+        We don't batch here. Envelopes large enough to need batching
+        also need a chunking design that splits sidecars by referenced
+        memory_id; that's out of scope for this CLI.
+        """
+        url = f"{self.endpoint}/v1/import?preserve_owner=true"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if self.dry_run:
+            for mem in memories:
+                preview = str(mem.get("content", ""))[:80].replace("\n", " ")
+                print(f"  DRY RUN  id={mem.get('id')!r}  content={preview!r}")
+            sidecar_summary = ", ".join(
+                f"{k}={len(self.source_envelope.get(k) or [])}"
+                for k in ("kg_triples", "memory_versions", "compression_manifest")
+                if self.source_envelope.get(k)
+            )
+            if sidecar_summary:
+                print(f"  DRY RUN  sidecars: {sidecar_summary}")
+            return len(memories), 0
+
+        data = json.dumps(self.source_envelope).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read())
+                imported = int(body.get("imported", 0))
+                skipped = int(body.get("skipped", 0))
+                failed = int(body.get("failed", 0))
+                s_imp = body.get("sidecars_imported") or {}
+                s_skip = body.get("sidecars_skipped") or {}
+                s_fail = body.get("sidecars_failed") or {}
+                print(
+                    f"  envelope: imported={imported} skipped={skipped} failed={failed}"
+                )
+                for k in ("kg_triples", "memory_versions", "compression_manifest"):
+                    if (s_imp.get(k) or s_skip.get(k) or s_fail.get(k)):
+                        print(
+                            f"  sidecar  {k}: imported={s_imp.get(k, 0)} "
+                            f"skipped={s_skip.get(k, 0)} failed={s_fail.get(k, 0)}"
+                        )
+                return imported, failed
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            print(f"  WARNING  /v1/import HTTP {exc.code}: {detail}")
+            return 0, len(memories)
+        except urllib.error.URLError as exc:
+            print(f"  WARNING  /v1/import error: {exc.reason}")
+            return 0, len(memories)
+        except Exception as exc:
+            print(f"  WARNING  /v1/import exception: {exc}")
+            return 0, len(memories)
 
     def run(self) -> dict:
         """Execute the import. Override in subclasses.
@@ -356,12 +396,18 @@ class JsonImporter(BaseImporter):
                 if "id" in rec:
                     payload.setdefault("id", rec["id"])
                 flat.append(payload)
-            # CHARON v0.2 sidecars come along when present. Stash them
-            # for _post_mpf to forward in a trailing envelope.
-            for key in ("kg_triples", "memory_versions", "compression_manifest"):
-                sidecar = data.get(key)
-                if isinstance(sidecar, list) and sidecar:
-                    self.sidecars[key] = sidecar
+            # CHARON sidecar passthrough: if any sidecar array is
+            # present in the source envelope, stash the WHOLE envelope
+            # so the import POSTs it verbatim as a single request.
+            # This is what guarantees the records and the sidecars hit
+            # the server inside one transaction — required for the
+            # version-snapshot-trigger guard to scope correctly.
+            has_sidecars = any(
+                isinstance(data.get(k), list) and data.get(k)
+                for k in ("kg_triples", "memory_versions", "compression_manifest")
+            )
+            if has_sidecars and self.preserve_metadata:
+                self.source_envelope = data
             return flat
 
         # Wrapped export format: {"memories": [...]}
