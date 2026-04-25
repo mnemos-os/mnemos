@@ -1415,17 +1415,23 @@ async def _import_memory_versions(
                     )
                 if row == "INSERT 0 0":
                     # Conflict-skip: the row already exists in DB.
-                    # Verify EVERY persisted column matches the
-                    # envelope's claim — including merge_parents
-                    # (Codex round-24 finding). A stale prior-
-                    # lifetime row with the same deterministic UUID
-                    # but different secondary merge edges would
-                    # otherwise pass through.
+                    # Verify EVERY column populated by the INSERT
+                    # matches the envelope's claim. A stale prior-
+                    # lifetime row could otherwise survive a delete
+                    # + re-import on the root migration path
+                    # (Codex round-25 finding). Includes secondary
+                    # fields: category, subcategory, metadata,
+                    # verbatim_content, permission_mode, source_*,
+                    # snapshot_at, snapshot_by, change_type.
                     existing = await conn.fetchrow(
                         "SELECT memory_id, owner_id, namespace, "
                         "version_num, content, commit_hash, "
                         "parent_version_id::text AS parent_version_id, "
-                        "branch, merge_parents "
+                        "branch, merge_parents, category, subcategory, "
+                        "metadata, verbatim_content, permission_mode, "
+                        "source_model, source_provider, source_session, "
+                        "source_agent, snapshot_at, snapshot_by, "
+                        "change_type "
                         "FROM memory_versions WHERE id = $1::uuid",
                         entry["id"],
                     )
@@ -1435,17 +1441,38 @@ async def _import_memory_versions(
                     )
                     expected_branch = entry.get("branch") or "main"
                     expected_merge_parents = entry.get("merge_parents") or None
+                    expected_change_type = entry.get("change_type") or "create"
+                    expected_permission_mode = entry.get("permission_mode") or 600
                     actual_merge_parents = (
                         existing["merge_parents"] if existing else None
                     )
-                    # Normalize None vs empty-list for comparison —
-                    # the DB can store either depending on insert
-                    # path. Compare element-wise as strings since
-                    # the envelope ships UUIDs as strings.
+
                     def _norm_mp(mp):
                         if not mp:
                             return None
                         return [str(x) for x in mp]
+
+                    def _norm_jsonb(j):
+                        # asyncpg returns JSONB as str or dict
+                        # depending on codec config; normalize both
+                        # sides through json.loads if str.
+                        if j is None:
+                            return None
+                        if isinstance(j, str):
+                            try:
+                                return json.loads(j)
+                            except Exception:
+                                return j
+                        return j
+
+                    expected_metadata = entry.get("metadata") or {}
+                    actual_metadata = (
+                        _norm_jsonb(existing["metadata"]) if existing else None
+                    )
+                    expected_snapshot_at = _parse_iso(entry.get("snapshot_at"))
+                    actual_snapshot_at = (
+                        existing["snapshot_at"] if existing else None
+                    )
                     if existing is None or (
                         existing["memory_id"] != entry["record_id"]
                         or existing["owner_id"] != row_owner
@@ -1457,6 +1484,19 @@ async def _import_memory_versions(
                         or existing["parent_version_id"] != expected_parent
                         or existing["branch"] != expected_branch
                         or _norm_mp(actual_merge_parents) != _norm_mp(expected_merge_parents)
+                        or existing["category"] != entry.get("category")
+                        or existing["subcategory"] != entry.get("subcategory")
+                        or actual_metadata != expected_metadata
+                        or existing["verbatim_content"] != entry.get("verbatim_content")
+                        or existing["permission_mode"] != expected_permission_mode
+                        or existing["source_model"] != entry.get("source_model")
+                        or existing["source_provider"] != entry.get("source_provider")
+                        or existing["source_session"] != entry.get("source_session")
+                        or existing["source_agent"] != entry.get("source_agent")
+                        or (expected_snapshot_at is not None and
+                            actual_snapshot_at != expected_snapshot_at)
+                        or existing["snapshot_by"] != entry.get("snapshot_by")
+                        or existing["change_type"] != expected_change_type
                     ):
                         _bump(stats.sidecars_failed, surface)
                         stats.errors.append(
