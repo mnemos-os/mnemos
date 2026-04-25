@@ -45,13 +45,26 @@ def _root() -> UserContext:
 
 
 class _Conn:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, *, routed_rows=None):
+        """Mock asyncpg connection.
+
+        ``rows`` is the default row set for any fetch.
+        ``routed_rows`` is an optional dict mapping a substring (e.g.
+        the table name "kg_triples") to the rows that should be
+        returned when the SQL contains that substring. Used by the
+        sidecar tests to seed different row sets per query without
+        building a full SQL parser.
+        """
         self._rows = rows or []
+        self._routed = routed_rows or {}
         self.fetch_calls: list[tuple[str, tuple]] = []
         self.executes: list[tuple[str, tuple]] = []
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
+        for needle, payload in self._routed.items():
+            if needle in sql:
+                return payload
         return self._rows
 
     async def execute(self, sql: str, *args):
@@ -108,7 +121,7 @@ def test_export_filters_by_caller_owner_and_namespace_for_non_root(monkeypatch):
 
     asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
     ))
 
     sql, args = conn.fetch_calls[-1]
@@ -126,7 +139,7 @@ def test_export_non_root_cross_owner_param_rejected(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(portability.export_memories(
             category=None, limit=1000, offset=0,
-            owner_id="bob", namespace=None, user=_alice(),
+            owner_id="bob", namespace=None, include_sidecars=False, user=_alice(),
         ))
     assert exc.value.status_code == 403
     # No DB fetch should have happened
@@ -141,7 +154,7 @@ def test_export_non_root_cross_namespace_param_rejected(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(portability.export_memories(
             category=None, limit=1000, offset=0,
-            owner_id=None, namespace="other-ns", user=_alice(),
+            owner_id=None, namespace="other-ns", include_sidecars=False, user=_alice(),
         ))
     assert exc.value.status_code == 403
 
@@ -152,7 +165,7 @@ def test_export_root_may_target_arbitrary_slice(monkeypatch):
 
     result = asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id="bob", namespace="bob-ns", user=_root(),
+        owner_id="bob", namespace="bob-ns", include_sidecars=False, user=_root(),
     ))
     sql, args = conn.fetch_calls[-1]
     assert "bob" in args
@@ -167,10 +180,10 @@ def test_export_envelope_shape(monkeypatch):
 
     env = asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
     ))
 
-    assert env.mpf_version == "0.1.0"
+    assert env.mpf_version == "0.1.1"
     assert env.source_system == "mnemos"
     assert len(env.records) == 1
     rec = env.records[0]
@@ -191,11 +204,206 @@ def test_export_strips_none_payload_fields(monkeypatch):
 
     env = asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
     ))
     payload = env.records[0].payload
     assert "source_model" not in payload
     assert "source_provider" not in payload
+
+
+# ─── /v1/export — sidecar emission (CHARON v0.2) ────────────────────────────
+
+
+def _kg_row(id: str = "kg_1", memory_id: str = "mem_alice1"):
+    return {
+        "id": id,
+        "subject": "Paris",
+        "predicate": "capitalOf",
+        "object": "France",
+        "subject_type": "place",
+        "object_type": "place",
+        "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "valid_until": None,
+        "memory_id": memory_id,
+        "confidence": 0.95,
+        "created": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+    }
+
+
+def _mv_row(id: str = "ver_1", memory_id: str = "mem_alice1"):
+    return {
+        "id": id,
+        "memory_id": memory_id,
+        "version_num": 1,
+        "content": "hello",
+        "category": "solutions",
+        "subcategory": None,
+        "metadata": {"src": "test"},
+        "verbatim_content": "hello verbatim",
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "permission_mode": 600,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+        "snapshot_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "snapshot_by": "alice",
+        "change_type": "create",
+        "commit_hash": "abc123",
+        "parent_version_id": None,
+        "branch": "main",
+        "merge_parents": None,
+    }
+
+
+def _cv_row(memory_id: str = "mem_alice1"):
+    return {
+        "memory_id": memory_id,
+        "owner_id": "alice",
+        "winner_candidate_id": None,
+        "engine_id": "apollo",
+        "engine_version": "1.0",
+        "compressed_content": "compressed:hello",
+        "compressed_tokens": 4,
+        "compression_ratio": 2.5,
+        "quality_score": 0.87,
+        "composite_score": 0.81,
+        "scoring_profile": "balanced",
+        "judge_model": "claude-opus-4-7",
+        "selected_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+    }
+
+
+def test_export_omits_sidecars_by_default(monkeypatch):
+    """include_sidecars=False (the default) must not even SELECT from
+    sidecar tables — old envelopes stay byte-identical."""
+    conn = _Conn(rows=[_memory_row()])
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
+    ))
+
+    sql_seen = " | ".join(s for s, _ in conn.fetch_calls)
+    assert "kg_triples" not in sql_seen
+    assert "memory_versions" not in sql_seen
+    assert "memory_compressed_variants" not in sql_seen
+    assert env.kg_triples is None
+    assert env.memory_versions is None
+    assert env.compression_manifest is None
+
+
+def test_export_with_sidecars_emits_three_arrays(monkeypatch):
+    """include_sidecars=True emits all three sidecar arrays, scoped
+    to the same owner+namespace as the memories query."""
+    conn = _Conn(
+        rows=[_memory_row()],
+        routed_rows={
+            "FROM kg_triples": [_kg_row()],
+            "FROM memory_versions": [_mv_row()],
+            "FROM memory_compressed_variants": [_cv_row()],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=True, user=_alice(),
+    ))
+
+    assert env.kg_triples is not None and len(env.kg_triples) == 1
+    assert env.memory_versions is not None and len(env.memory_versions) == 1
+    assert env.compression_manifest is not None and len(env.compression_manifest) == 1
+
+    # KG triple shape
+    kg = env.kg_triples[0]
+    assert kg["predicate"] == "capitalOf"
+    assert kg["subject_literal"] == "Paris"
+    assert kg["object_literal"] == "France"
+    assert kg["subject_type"] == "place"
+    assert kg["confidence"] == 0.95
+
+    # memory_version shape carries DAG + snapshot fields
+    mv = env.memory_versions[0]
+    assert mv["record_id"] == "mem_alice1"
+    assert mv["commit_hash"] == "abc123"
+    assert mv["branch"] == "main"
+    assert mv["change_type"] == "create"
+    assert mv["verbatim_content"] == "hello verbatim"
+
+    # compression_manifest shape carries judge + ratio fields
+    cm = env.compression_manifest[0]
+    assert cm["record_id"] == "mem_alice1"
+    assert cm["engine_id"] == "apollo"
+    assert cm["quality_score"] == 0.87
+    assert cm["compressed_tokens"] == 4
+
+
+def test_export_sidecars_constrained_to_exported_memory_ids(monkeypatch):
+    """memory_versions / memory_compressed_variants queries must
+    restrict to the exported memory id set so a category-filtered
+    export doesn't drag in all-time DAG history."""
+    rows: list[tuple[str, tuple]] = []
+
+    class _CapturingConn(_Conn):
+        async def fetch(self, sql, *args):
+            rows.append((sql, args))
+            return await super().fetch(sql, *args)
+
+    conn = _CapturingConn(
+        rows=[_memory_row(id="mem_42")],
+        routed_rows={
+            "FROM kg_triples": [],
+            "FROM memory_versions": [],
+            "FROM memory_compressed_variants": [],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=True, user=_alice(),
+    ))
+
+    mv_sql, mv_args = next((s, a) for s, a in rows if "FROM memory_versions" in s)
+    cv_sql, cv_args = next((s, a) for s, a in rows if "FROM memory_compressed_variants" in s)
+    kg_sql, _ = next((s, a) for s, a in rows if "FROM kg_triples" in s)
+
+    # memory_versions + compression_manifest must include the
+    # memory_id IN (...) clause and the exported id alice's
+    # mem_42 must appear in the params.
+    assert "memory_id = ANY" in mv_sql
+    assert ["mem_42"] in (list(mv_args) or [])
+    assert "memory_id = ANY" in cv_sql
+    # KG triples are not bound to memory_ids — must NOT have ANY clause
+    assert "memory_id = ANY" not in kg_sql
+
+
+def test_export_empty_memory_set_yields_empty_sidecars(monkeypatch):
+    """Empty memory result skips bound-to-memories sidecar queries
+    entirely (no DB hit) and returns empty arrays."""
+    conn = _Conn(rows=[])  # no memories
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=True, user=_alice(),
+    ))
+
+    assert env.records == []
+    # kg_triples is still queried (not bound to memories), so empty list ≠ None
+    assert env.kg_triples == []
+    assert env.memory_versions == []
+    assert env.compression_manifest == []
+
+    # Verify no SELECT FROM memory_versions or memory_compressed_variants
+    sql_seen = " | ".join(s for s, _ in conn.fetch_calls)
+    assert "FROM memory_versions" not in sql_seen
+    assert "FROM memory_compressed_variants" not in sql_seen
 
 
 # ─── /v1/import ──────────────────────────────────────────────────────────────
@@ -351,3 +559,276 @@ def test_import_idempotent_on_id_collision(monkeypatch):
     ))
     assert stats.imported == 0
     assert stats.skipped == 1
+
+
+def test_import_accepts_011_envelope(monkeypatch):
+    """Forward-compat ratchet: 0.1.1 envelopes import cleanly against
+    the same handler. The required-fields contract didn't change in
+    the patch bump."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.1",
+        records=[_memory_record(id="mem_011")],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+
+
+# ─── /v1/import — sidecar consumption (CHARON v0.2) ─────────────────────────
+
+
+def _kg_sidecar_entry(
+    id: str = "kg_1",
+    predicate: str = "capitalOf",
+    subject: str = "Paris",
+    obj: str = "France",
+    owner_id: str = "alice",
+    namespace: str = "alice-ns",
+):
+    return {
+        "id": id,
+        "predicate": predicate,
+        "subject_literal": subject,
+        "object_literal": obj,
+        "subject_type": "place",
+        "object_type": "place",
+        "memory_id": "mem_alice1",
+        "confidence": 0.9,
+        "valid_from": "2026-01-01T00:00:00+00:00",
+        "created": "2026-01-01T00:00:00+00:00",
+        "owner_id": owner_id,
+        "namespace": namespace,
+    }
+
+
+def _mv_sidecar_entry(
+    id: str = "00000000-0000-0000-0000-000000000001",
+    record_id: str = "mem_alice1",
+    owner_id: str = "alice",
+    namespace: str = "alice-ns",
+):
+    return {
+        "id": id,
+        "record_id": record_id,
+        "version_num": 1,
+        "content": "version body",
+        "category": "solutions",
+        "verbatim_content": "verbatim",
+        "owner_id": owner_id,
+        "namespace": namespace,
+        "permission_mode": 600,
+        "snapshot_at": "2026-01-01T00:00:00+00:00",
+        "change_type": "create",
+        "commit_hash": "abc123",
+        "branch": "main",
+    }
+
+
+def _cm_sidecar_entry(
+    record_id: str = "mem_alice1",
+    owner_id: str = "alice",
+):
+    return {
+        "record_id": record_id,
+        "engine_id": "apollo",
+        "engine_version": "1.0",
+        "compressed_content": "compressed:body",
+        "compressed_tokens": 4,
+        "compression_ratio": 2.5,
+        "quality_score": 0.87,
+        "composite_score": 0.81,
+        "scoring_profile": "balanced",
+        "judge_model": "claude-opus-4-7",
+        "selected_at": "2026-01-01T00:00:00+00:00",
+        "owner_id": owner_id,
+    }
+
+
+def test_import_kg_triples_sidecar_imports_with_caller_owner_for_non_root(monkeypatch):
+    """Same anti-smuggling rule as memories — non-root rewrites
+    owner_id + namespace on every kg_triple to the caller's identity."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry(owner_id="bob", namespace="bob-ns")],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+    assert stats.sidecars_imported == {"kg_triples": 1}
+
+    kg_insert = next(e for e in conn.executes if "INSERT INTO kg_triples" in e[0])
+    args = kg_insert[1]
+    # Caller identity wins; the bob/bob-ns labels in the envelope are dropped.
+    assert "alice" in args
+    assert "alice-ns" in args
+    assert "bob" not in args
+    assert "bob-ns" not in args
+
+
+def test_import_kg_triples_root_preserve_owner_honors_envelope(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry(owner_id="bob", namespace="bob-ns")],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_imported == {"kg_triples": 1}
+    kg_insert = next(e for e in conn.executes if "INSERT INTO kg_triples" in e[0])
+    args = kg_insert[1]
+    assert "bob" in args
+    assert "bob-ns" in args
+
+
+def test_import_kg_triples_missing_predicate_failed(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    bad = _kg_sidecar_entry()
+    bad.pop("predicate")
+    env = portability.MPFEnvelope(records=[], kg_triples=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {}
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert any("missing required" in e and "kg_triples" in e for e in stats.errors)
+    # Critically: no INSERT executed for the malformed row.
+    assert not any("INSERT INTO kg_triples" in e[0] for e in conn.executes)
+
+
+def test_import_memory_versions_sidecar_imports(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {"memory_versions": 1}
+    mv_insert = next(e for e in conn.executes if "INSERT INTO memory_versions" in e[0])
+    args = mv_insert[1]
+    assert "mem_alice1" in args
+    assert "abc123" in args  # commit_hash
+    assert "main" in args    # branch
+
+
+def test_import_memory_versions_missing_required_fails(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["content"] = ""  # required field empty
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    assert not any("INSERT INTO memory_versions" in e[0] for e in conn.executes)
+
+
+def test_import_compression_manifest_sidecar_imports(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        compression_manifest=[_cm_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {"compression_manifest": 1}
+    cm_insert = next(e for e in conn.executes if "INSERT INTO memory_compressed_variants" in e[0])
+    args = cm_insert[1]
+    assert "mem_alice1" in args
+    assert "apollo" in args
+    # No namespace column on this table — caller's namespace must NOT
+    # appear in the args list (only owner_id is bound).
+    assert "alice-ns" not in args
+
+
+def test_import_all_three_sidecars_under_one_envelope(monkeypatch):
+    """Most realistic scenario: a CHARON round-trip envelope with one
+    memory + a triple + a version + a compression entry. Per-surface
+    counters break out cleanly."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry()],
+        memory_versions=[_mv_sidecar_entry()],
+        compression_manifest=[_cm_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+    assert stats.sidecars_imported == {
+        "kg_triples": 1,
+        "memory_versions": 1,
+        "compression_manifest": 1,
+    }
+
+
+def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
+    """Re-importing the same kg_triples / memory_versions /
+    compression_manifest envelope is a no-op — counts as skipped,
+    not imported."""
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+    conn = _DupeConn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[],
+        kg_triples=[_kg_sidecar_entry()],
+        memory_versions=[_mv_sidecar_entry()],
+        compression_manifest=[_cm_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {}
+    assert stats.sidecars_skipped == {
+        "kg_triples": 1,
+        "memory_versions": 1,
+        "compression_manifest": 1,
+    }
+
+
+def test_import_no_sidecars_means_no_sidecar_inserts(monkeypatch):
+    """A 0.1.0-shape envelope with sidecar fields absent must not
+    trigger any sidecar INSERTs."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = _envelope([_memory_record(id="mem_alice1")])
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+    assert stats.sidecars_imported == {}
+    assert not any("kg_triples" in e[0] or
+                   "memory_versions" in e[0] or
+                   "memory_compressed_variants" in e[0]
+                   for e in conn.executes)

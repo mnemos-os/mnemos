@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 
-MPF_VERSION = "0.1.0"
+MPF_VERSION = "0.1.1"
 MEMORY_PAYLOAD_VERSION = "mnemos-3.1"
 SOURCE_SYSTEM = "memory_export"
 
@@ -50,17 +50,25 @@ def _fetch_export(
     api_key: Optional[str],
     category: Optional[str],
     limit: int,
+    include_sidecars: bool = False,
 ) -> Dict[str, Any]:
     """Call ``GET /v1/export`` and return the MPF envelope as a dict.
 
     The server-side handler already returns an MPF envelope with
     ``records[*].kind == "memory"`` and ``payload_version`` set; this
     function only manages the HTTP round-trip.
+
+    With ``include_sidecars=True`` the envelope also carries the
+    `kg_triples`, `memory_versions`, and `compression_manifest`
+    sidecar arrays. Used by the CHARON v0.2 round-trip path; the
+    default stays False so existing scripts emit unchanged envelopes.
     """
     endpoint = endpoint.rstrip("/")
     params: Dict[str, str] = {"limit": str(limit)}
     if category:
         params["category"] = category
+    if include_sidecars:
+        params["include_sidecars"] = "true"
     url = f"{endpoint}/v1/export?{urllib.parse.urlencode(params)}"
 
     headers: Dict[str, str] = {}
@@ -109,16 +117,28 @@ def _fetch_memories_legacy(
 
 
 def cmd_json(args: argparse.Namespace) -> None:
-    envelope = _fetch_export(args.endpoint, args.api_key, args.category, args.limit)
+    envelope = _fetch_export(
+        args.endpoint, args.api_key, args.category, args.limit,
+        include_sidecars=getattr(args, "include_sidecars", False),
+    )
     out = Path(args.out)
     out.write_text(json.dumps(envelope, indent=2, ensure_ascii=False),
                    encoding="utf-8")
     n = len(envelope.get("records") or [])
-    print(f"Wrote {n} records as MPF envelope → {out}")
+    extras = []
+    for key in ("kg_triples", "memory_versions", "compression_manifest"):
+        sidecar = envelope.get(key)
+        if sidecar:
+            extras.append(f"{key}={len(sidecar)}")
+    suffix = (" + " + ", ".join(extras)) if extras else ""
+    print(f"Wrote {n} records as MPF envelope → {out}{suffix}")
 
 
 def cmd_jsonl(args: argparse.Namespace) -> None:
-    envelope = _fetch_export(args.endpoint, args.api_key, args.category, args.limit)
+    envelope = _fetch_export(
+        args.endpoint, args.api_key, args.category, args.limit,
+        include_sidecars=getattr(args, "include_sidecars", False),
+    )
     records = envelope.get("records") or []
     out = Path(args.out)
     with out.open("w", encoding="utf-8") as f:
@@ -127,7 +147,20 @@ def cmd_jsonl(args: argparse.Namespace) -> None:
             # memory_import.py json --jsonl.
             f.write(json.dumps(rec, ensure_ascii=False))
             f.write("\n")
-    print(f"Wrote {len(records)} records as JSONL → {out}")
+        # Sidecars don't fit cleanly into per-record-per-line JSONL, so
+        # we emit them as a single trailer envelope at EOF when
+        # include_sidecars is set. Importers reading the file as JSONL
+        # see a normal record-per-line stream until the final line,
+        # which is the trailer keyed by mpf_sidecars=true.
+        sidecar_keys = ("kg_triples", "memory_versions", "compression_manifest")
+        sidecars = {k: envelope.get(k) for k in sidecar_keys if envelope.get(k)}
+        if sidecars:
+            trailer = {"mpf_sidecars": True, **sidecars}
+            f.write(json.dumps(trailer, ensure_ascii=False))
+            f.write("\n")
+    extras = ", ".join(f"{k}={len(v)}" for k, v in sidecars.items()) if sidecars else ""
+    suffix = f" + sidecars: {extras}" if extras else ""
+    print(f"Wrote {len(records)} records as JSONL → {out}{suffix}")
 
 
 def cmd_markdown(args: argparse.Namespace) -> None:
@@ -213,11 +246,21 @@ def _build_parser() -> argparse.ArgumentParser:
     p_json = sub.add_parser("json", help="Emit MPF envelope (big JSON)")
     _add_common(p_json)
     _add_fetch_args(p_json)
+    p_json.add_argument(
+        "--include-sidecars", action="store_true",
+        help="Include kg_triples / memory_versions / compression_manifest "
+             "sidecars in the envelope (CHARON v0.2). Off by default.",
+    )
     p_json.set_defaults(func=cmd_json)
 
     p_jsonl = sub.add_parser("jsonl", help="Emit JSONL (one MPF record per line)")
     _add_common(p_jsonl)
     _add_fetch_args(p_jsonl)
+    p_jsonl.add_argument(
+        "--include-sidecars", action="store_true",
+        help="Include kg_triples / memory_versions / compression_manifest "
+             "sidecars as a final trailer line (CHARON v0.2). Off by default.",
+    )
     p_jsonl.set_defaults(func=cmd_jsonl)
 
     p_md = sub.add_parser("markdown", help="Emit Markdown (human-readable)")

@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/perlowja/mnemos/blob/master/docs/mpf_v0.1.json",
   "title": "Memory Portability Format (MPF) v0.1",
-  "description": "Cross-system agent-memory interchange format. Envelope-level schema version with per-record payload versions; discriminated union of record kinds (document, memory, fact, event). Designed to be emitted by Mem0, Letta, Graphiti, Cognee, MNEMOS, and consumed by any of the same. See docs/MEMORY_EXPORT_FORMAT.md for the prose spec.",
+  "description": "Cross-system agent-memory interchange format. Envelope-level schema version with per-record payload versions; discriminated union of record kinds (document, memory, fact, event). Designed to be emitted by Mem0, Letta, Graphiti, Cognee, MNEMOS, and consumed by any of the same. See docs/MEMORY_EXPORT_FORMAT.md for the prose spec. Schema patch level 0.1.1 added optional pass-through fields on kg_triple, memory_version_entry, and compression_manifest_entry to support lossless round-trip of MNEMOS DB columns that 0.1.0 left under additionalProperties.",
   "type": "object",
   "required": ["mpf_version", "exported_at", "records"],
   "additionalProperties": true,
@@ -273,6 +273,24 @@
           "type": "string",
           "description": "Free-form object when not a record. Mutually exclusive with object_id."
         },
+        "subject_type": {
+          "type": ["string", "null"],
+          "description": "Optional type tag for the subject (e.g. 'person', 'concept', 'memory'). Producer-defined. MNEMOS uses this to discriminate record-id references from literals when the producer didn't honor the subject_id/literal split."
+        },
+        "object_type": {
+          "type": ["string", "null"],
+          "description": "Optional type tag for the object. Same semantics as subject_type."
+        },
+        "memory_id": {
+          "type": ["string", "null"],
+          "description": "Optional pointer to the source memory record this triple was extracted from. Distinct from subject_id/object_id (which model the triple's content); memory_id models its provenance."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Extraction/assertion confidence in [0, 1]. Defaults to 1.0 when absent."
+        },
         "valid_from": {
           "type": "string",
           "format": "date-time",
@@ -347,11 +365,30 @@
         "engine_id": { "type": "string" },
         "engine_version": { "type": "string" },
         "compressed_content": { "type": "string" },
+        "compressed_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Token count of compressed_content per the engine's tokenizer. Null if the engine doesn't measure."
+        },
         "compression_ratio": { "type": "number", "minimum": 0 },
+        "quality_score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Judge-derived quality score in [0, 1]. Null if no judge ran. Distinct from composite_score, which folds quality + ratio + speed under a scoring_profile."
+        },
         "composite_score": { "type": "number" },
         "scoring_profile": { "type": "string" },
+        "judge_model": {
+          "type": ["string", "null"],
+          "description": "Model identifier of the judge that produced quality_score. Null when quality_score is null."
+        },
         "selected_at": { "type": "string", "format": "date-time" },
-        "winner_contest_id": { "type": "string" }
+        "winner_contest_id": { "type": "string" },
+        "owner_id": {
+          "type": ["string", "null"],
+          "description": "Tenancy owner of the source record. Importers MUST keep this aligned with the corresponding memory record's owner_id."
+        }
       }
     },
 
@@ -359,7 +396,7 @@
       "type": "object",
       "required": ["id", "record_id", "version_num", "content"],
       "additionalProperties": true,
-      "description": "One snapshot in a record's DAG history. content-addressed via commit_hash when present.",
+      "description": "One snapshot in a record's DAG history. Content-addressed via commit_hash when present. Carries the full tenancy + provenance fields of the parent record so a snapshot is round-trippable on its own (the linked record may not be present in a partial export).",
       "properties": {
         "id": { "type": "string" },
         "record_id": { "type": "string" },
@@ -367,8 +404,49 @@
         "commit_hash": { "type": "string" },
         "branch": { "type": "string" },
         "parent_version_id": { "type": ["string", "null"] },
+        "merge_parents": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "Additional parent version ids for merge commits (parent_version_id is the primary parent; this lists secondary parents)."
+        },
         "content": { "type": "string" },
+        "category": {
+          "type": ["string", "null"],
+          "description": "Snapshot of the parent record's category at the time of this version."
+        },
+        "subcategory": {
+          "type": ["string", "null"],
+          "description": "Snapshot of the parent record's subcategory at the time of this version."
+        },
+        "metadata": {
+          "type": ["object", "null"],
+          "description": "Snapshot of the parent record's metadata blob at the time of this version."
+        },
+        "verbatim_content": {
+          "type": ["string", "null"],
+          "description": "Original verbatim copy of the content before any compression/distillation; preserved for provenance even when content has been replaced by a distilled form."
+        },
+        "owner_id": {
+          "type": ["string", "null"],
+          "description": "Tenancy owner snapshot. Importers honor caller-identity rewrite rules same as memory records."
+        },
+        "namespace": {
+          "type": ["string", "null"],
+          "description": "Tenancy namespace snapshot."
+        },
+        "permission_mode": {
+          "type": ["integer", "null"],
+          "description": "Unix-style permission mode snapshot (e.g. 600, 400)."
+        },
+        "source_model": { "type": ["string", "null"] },
+        "source_provider": { "type": ["string", "null"] },
+        "source_session": { "type": ["string", "null"] },
+        "source_agent": { "type": ["string", "null"] },
         "snapshot_at": { "type": "string", "format": "date-time" },
+        "snapshot_by": {
+          "type": ["string", "null"],
+          "description": "User identifier of who triggered the snapshot. Diagnostic; not used for authorization on import."
+        },
         "change_type": {
           "type": "string",
           "enum": ["create", "update", "delete", "revert", "merge", "branch"]

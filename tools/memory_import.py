@@ -46,6 +46,7 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Dict
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +57,7 @@ class BaseImporter:
     """Shared HTTP posting logic for all importers."""
 
     # MPF envelope constants (must match api/handlers/portability.py).
-    MPF_VERSION = "0.1.0"
+    MPF_VERSION = "0.1.1"
     MEMORY_PAYLOAD_VERSION = "mnemos-3.1"
     # Keep envelope bodies small enough to avoid request-size limits.
     MPF_BATCH_SIZE = 200
@@ -77,6 +78,11 @@ class BaseImporter:
         # with preserve_owner=true, which requires a root bearer token
         # and keeps id/owner_id/namespace/timestamps verbatim.
         self.preserve_metadata = preserve_metadata
+        # CHARON v0.2: when the input file is an MPF envelope with
+        # kg_triples / memory_versions / compression_manifest sidecars
+        # populated, _parse_source stashes them here so _post_mpf can
+        # forward them in a trailing envelope after the record batches.
+        self.sidecars: Dict[str, list] = {}
 
     def _post(self, memories: list) -> tuple:
         """POST a list of memories to MNEMOS.
@@ -215,6 +221,45 @@ class BaseImporter:
                 print(f"  WARNING  /v1/import exception: {exc}")
                 fail += len(batch)
 
+        # CHARON v0.2 sidecar trailer — sent as a single envelope after
+        # all record batches so per-record-id idempotency still applies.
+        # Sidecars don't batch the way records do (they're typically
+        # smaller in count and self-keyed), so a single POST is fine.
+        if self.sidecars and not self.dry_run:
+            trailer = {
+                "mpf_version": self.MPF_VERSION,
+                "source_system": "memory_import",
+                "source_version": self.MEMORY_PAYLOAD_VERSION,
+                "exported_at": datetime.now(timezone.utc).isoformat(),
+                "records": [],
+                **self.sidecars,
+            }
+            data = json.dumps(trailer).encode("utf-8")
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    body = json.loads(resp.read())
+                    s_imp = body.get("sidecars_imported") or {}
+                    s_skip = body.get("sidecars_skipped") or {}
+                    s_fail = body.get("sidecars_failed") or {}
+                    parts = []
+                    for k in ("kg_triples", "memory_versions", "compression_manifest"):
+                        if k in self.sidecars:
+                            parts.append(
+                                f"{k}: imported={s_imp.get(k, 0)} "
+                                f"skipped={s_skip.get(k, 0)} "
+                                f"failed={s_fail.get(k, 0)}"
+                            )
+                    if parts:
+                        print("  sidecars: " + " | ".join(parts))
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode("utf-8", "replace")[:300]
+                print(f"  WARNING  /v1/import (sidecars) HTTP {exc.code}: {detail}")
+            except urllib.error.URLError as exc:
+                print(f"  WARNING  /v1/import (sidecars) error: {exc.reason}")
+            except Exception as exc:
+                print(f"  WARNING  /v1/import (sidecars) exception: {exc}")
+
         return ok, fail
 
     def run(self) -> dict:
@@ -311,6 +356,12 @@ class JsonImporter(BaseImporter):
                 if "id" in rec:
                     payload.setdefault("id", rec["id"])
                 flat.append(payload)
+            # CHARON v0.2 sidecars come along when present. Stash them
+            # for _post_mpf to forward in a trailing envelope.
+            for key in ("kg_triples", "memory_versions", "compression_manifest"):
+                sidecar = data.get(key)
+                if isinstance(sidecar, list) and sidecar:
+                    self.sidecars[key] = sidecar
             return flat
 
         # Wrapped export format: {"memories": [...]}
