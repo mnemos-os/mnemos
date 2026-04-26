@@ -354,8 +354,28 @@ async def revert_memory(
             meta_str = "{}"
 
         async with conn.transaction():
-            # Authorize against the live row up front — atomic with
-            # the write below.
+            # Lock-order discipline (round 27): for FEATURE-BRANCH
+            # reverts, take the branch advisory lock FIRST, then the
+            # live-row lock. dag.merge_branch takes locks in the
+            # same order (advisory → row). Reversing them here
+            # would deadlock: revert holds row, merge holds
+            # advisory, each waits on the other.
+            #
+            # Main-branch reverts don't take the advisory lock
+            # because the snapshot trigger handles main HEAD updates
+            # transactionally and we don't race main-vs-feature
+            # writers (memories tracks main only). Take just the
+            # row lock for main.
+            if branch != "main":
+                from api.handlers.dag import _branch_advisory_lock_key
+                _lock_key = _branch_advisory_lock_key(memory_id, branch)
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)", _lock_key,
+                )
+
+            # Authorize against the live row — atomic with the write
+            # below. Lock acquired AFTER the advisory lock per the
+            # ordering above.
             if _is_root(user):
                 live = await conn.fetchrow(
                     f"SELECT {_lc._MEMORY_COLS} FROM memories "
@@ -398,20 +418,9 @@ async def revert_memory(
                 # Feature-branch revert: PURE DAG operation (per
                 # round-25 fix). MNEMOS convention is `memories`
                 # always tracks main; feature branches diverge only
-                # in memory_versions + memory_branches.
-                #
-                # Round-26: take the same branch-level advisory
-                # lock that dag.merge_branch takes, so concurrent
-                # merge + revert against the same (memory, branch)
-                # serialize. Without this, merge could read
-                # target_head, revert could insert a new HEAD, then
-                # merge resumes with stale target_head and
-                # overwrites the revert's HEAD update.
-                from api.handlers.dag import _branch_advisory_lock_key
-                _lock_key = _branch_advisory_lock_key(memory_id, branch)
-                await conn.execute(
-                    "SELECT pg_advisory_xact_lock($1)", _lock_key,
-                )
+                # in memory_versions + memory_branches. Branch
+                # advisory lock was already taken above (advisory
+                # → row order, matching merge_branch).
                 import hashlib as _hashlib_local
                 import time as _time_local
                 next_version_num = await conn.fetchval(
