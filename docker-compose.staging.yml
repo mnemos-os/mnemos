@@ -70,7 +70,7 @@ services:
       - ./db/migrations_v3_3_recall_tracking.sql:/docker-entrypoint-initdb.d/21-recall-tracking.sql
       - ./db/migrations_charon_trigger_guard.sql:/docker-entrypoint-initdb.d/22-charon-trigger-guard.sql
     ports:
-      - '127.0.0.1:5432:5432'
+      - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U mnemos_user -d mnemos"]
       interval: 5s
