@@ -55,6 +55,16 @@ async def _require_federation_role(
 
 
 def _to_peer(row) -> FederationPeer:
+    # compat_mode + peer_mnemos_version + last_schema_check_at landed in
+    # migrations_v3_4_federation_compat.sql. Older rows / older test
+    # mocks won't have them — fall back rather than KeyError.
+    def _opt(key, default=None):
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return default
+
+    last_schema = _opt("last_schema_check_at")
     return FederationPeer(
         id=str(row["id"]),
         name=row["name"],
@@ -68,9 +78,54 @@ def _to_peer(row) -> FederationPeer:
         last_error=row["last_error"],
         last_error_at=row["last_error_at"].isoformat() if row["last_error_at"] else None,
         total_pulled=row["total_pulled"],
+        compat_mode=_opt("compat_mode", "strict"),
+        peer_mnemos_version=_opt("peer_mnemos_version"),
+        last_schema_check_at=last_schema.isoformat() if last_schema else None,
         created=row["created"].isoformat(),
         updated=row["updated"].isoformat(),
     )
+
+
+# ── Schema discovery (peers query this before deciding to sync) ──────────────
+
+
+@router.get("/schema")
+async def federation_schema(
+    _: UserContext = Depends(_require_federation_role),
+):
+    """Return this node's mnemos_version + a coarse schema signature.
+
+    Federation peers query this endpoint at the start of each sync to
+    decide whether the local schema is compatible with theirs. The
+    `signature` is the major.minor of mnemos_version — e.g. peers
+    on different minor versions are flagged for the operator's
+    `compat_mode` decision (strict vs permissive).
+
+    A future v3.5/v4.0 evolution per docs/V3_5_CHARTER.md replaces
+    this with a "core fields + extensions" contract; today's check
+    is the minimum safe surface.
+
+    `migrations_fingerprint` is a SHA256-prefix of the deployed
+    migration filename list — peers compare this layered on top of
+    `schema_signature` to catch branch-skew within a major.minor.
+    """
+    from _version import __version__ as _v
+    from api.federation import _local_migrations_fingerprint
+    parts = _v.split(".")
+    major_minor = f"{parts[0]}.{parts[1]}" if len(parts) >= 2 else _v
+    return {
+        "mnemos_version": _v,
+        "schema_signature": major_minor,
+        "migrations_fingerprint": _local_migrations_fingerprint(),
+        # Optional informational fields — peers may inspect to decide
+        # whether their schema matches enough to pull. Not used as a
+        # hard gate yet.
+        "core_fields": [
+            "id", "content", "category", "subcategory",
+            "owner_id", "namespace", "permission_mode",
+            "quality_rating", "created", "updated",
+        ],
+    }
 
 
 # ── Admin: peer CRUD ─────────────────────────────────────────────────────────
@@ -106,6 +161,11 @@ async def register_peer(
 ):
     """Register a remote peer to pull from."""
     _validate_peer_base_url(request.base_url)
+    if request.compat_mode not in ("strict", "permissive"):
+        raise HTTPException(
+            status_code=422,
+            detail="compat_mode must be 'strict' or 'permissive'",
+        )
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -114,15 +174,19 @@ async def register_peer(
             """
             INSERT INTO federation_peers
               (name, base_url, auth_token, namespace_filter, category_filter,
-               enabled, sync_interval_secs)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
+               enabled, sync_interval_secs, compat_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
             RETURNING *
             """,
             request.name, request.base_url, request.auth_token,
             request.namespace_filter, request.category_filter,
             request.enabled, request.sync_interval_secs,
+            request.compat_mode,
         )
-    logger.info("federation: peer registered name=%s", request.name)
+    logger.info(
+        "federation: peer registered name=%s compat_mode=%s",
+        request.name, request.compat_mode,
+    )
     return _to_peer(row)
 
 
@@ -164,12 +228,17 @@ async def update_peer(
         raise HTTPException(status_code=422, detail="no fields to update")
     if "base_url" in updates:
         _validate_peer_base_url(updates["base_url"])
+    if "compat_mode" in updates and updates["compat_mode"] not in ("strict", "permissive"):
+        raise HTTPException(
+            status_code=422,
+            detail="compat_mode must be 'strict' or 'permissive'",
+        )
     # Defense-in-depth: allow only whitelisted column names in the dynamic SET
     # clause. Keys come from a Pydantic model today but this prevents future
     # additions from accidentally enabling injection.
     _ALLOWED_PEER_COLS = {
         "name", "base_url", "auth_token", "namespace_filter", "category_filter",
-        "enabled", "sync_interval_secs",
+        "enabled", "sync_interval_secs", "compat_mode",
     }
     bad = set(updates.keys()) - _ALLOWED_PEER_COLS
     if bad:
@@ -211,7 +280,23 @@ async def trigger_sync(
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
         pulled, new, updated = await _fed.sync_peer(_lc._pool, peer_id)
+    except _fed.FederationSchemaIncompatible as e:
+        # Confirmed mismatch (signature or fingerprint differs, or
+        # peer durably 4xx-rejects /schema). Operator config issue —
+        # 409 Conflict is the right shape for "I see the resource but
+        # it conflicts with my expectations."
+        raise HTTPException(status_code=409, detail=str(e))
+    except _fed.FederationSchemaUnverifiable as e:
+        # Peer responded with parseable error (e.g. /schema returns 200
+        # but missing fields). 409 — the resource exists but the
+        # contract is broken.
+        raise HTTPException(status_code=409, detail=str(e))
+    except _fed.FederationSchemaTransient as e:
+        # Network/timeout/5xx — peer-side transient infra issue.
+        # 503 is the right "try again later" shape.
+        raise HTTPException(status_code=503, detail=str(e))
     except ValueError as e:
+        # Genuinely missing peer (UUID not in federation_peers).
         raise HTTPException(status_code=404, detail=str(e))
     return FederationSyncTriggerResponse(
         pulled=pulled, new=new, updated=updated,
