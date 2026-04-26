@@ -134,6 +134,25 @@ def test_slice2_vector_search_with_group_ids_uses_full_visibility(monkeypatch):
     assert "group_id = ANY(" in sql
 
 
+def test_slice2_cache_key_no_delimiter_collision():
+    """Codex round 7: distinct argument tuples must not collide on
+    the cache key digest. The old ':'.join() encoding made
+    (category='a:b', subcategory='c') and (category='a',
+    subcategory='b:c') hash to the same key, so a request with
+    one filter combo could replay the other's cached result. JSON
+    encoding fixes this — quoted/escaped values are unambiguous."""
+    from api.lifecycle import _get_cache_key
+
+    k1 = _get_cache_key("search", "a:b", "c")
+    k2 = _get_cache_key("search", "a", "b:c")
+    assert k1 != k2, "delimiter collision regressed: distinct args produced same key"
+
+    # Also verify group_ids list with embedded commas is safe.
+    k3 = _get_cache_key("search", '["a,b","c"]')
+    k4 = _get_cache_key("search", '["a","b,c"]')
+    assert k3 != k4, "group_ids with comma must produce distinct keys"
+
+
 def test_h1_gateway_context_search_includes_federation(monkeypatch):
     """/v1/chat/completions _search_mnemos_context uses an inline
     SELECT (not the shared helpers because it has a category-OR).

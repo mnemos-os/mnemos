@@ -332,9 +332,18 @@ def _get_cache_key(prefix: str, *args) -> str:
 
     The namespace prefix ("mnemos:<prefix>:") is preserved so a pattern-based
     invalidation (SCAN MATCH "mnemos:search:*") can target only our keys.
+
+    Args are serialized as a JSON list with stable separators before
+    hashing. JSON's quoted strings + escaped delimiters mean two
+    distinct argument tuples can never collide on the wire — e.g.
+    (category='a:b', subcategory='c') and (category='a',
+    subcategory='b:c') were previously both joined to "a:b:c" via
+    the old ':'.join encoding and produced the same MD5 digest;
+    JSON encoding produces ["a:b","c"] vs ["a","b:c"], distinct
+    even before hashing.
     """
-    raw = prefix + ":" + ":".join(str(a) for a in args)
-    digest = hashlib.md5(raw.encode(), usedforsecurity=False).hexdigest()
+    serialized = json.dumps(list(args), separators=(",", ":"), default=str)
+    digest = hashlib.md5(serialized.encode(), usedforsecurity=False).hexdigest()
     return f"mnemos:{prefix}:{digest}"
 
 
