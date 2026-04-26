@@ -186,29 +186,42 @@ async def add_session_message(
         )
 
     # Get conversation history for the provider:
-    #   1. ALL pinned system messages (initial_context plus any later
-    #      system directives the API has accepted) — system rows
-    #      represent durable policy/context, never the conversational
-    #      tail, so we keep all of them regardless of recency.
-    #   2. The 10 most recent non-system messages, chronologically.
+    #   1. Up to 5 most recent role='system' rows (initial_context
+    #      plus any later system directives), chronological.
+    #   2. The 10 most recent non-system messages, chronological.
     #
-    # Earlier code used `ORDER BY timestamp ASC LIMIT 10` over all
-    # rows — wrong direction (returned the 10 OLDEST). A naive fix
-    # to DESC LIMIT 10 across all rows still loses the initial
-    # system row once enough chat turns accumulate. Pinning only
-    # the FIRST system row also drops later system updates in
-    # multi-system sessions. The CTE below pins every role='system'
-    # row (k=0, chronological) and appends the 10 most recent
-    # non-system rows (k=1, chronological). All system messages
-    # appear in their original order, then the recent conversational
-    # window.
+    # The audit-quick-wins iteration uncovered three layers:
+    #   - Original query: ORDER BY timestamp ASC LIMIT 10 (returned
+    #     the 10 OLDEST messages — wrong direction).
+    #   - First fix: DESC LIMIT 10 + outer ASC reorder. Correct
+    #     recency, but in long sessions the initial_context system
+    #     row falls outside the 10-row window — provider loses
+    #     session-level instructions.
+    #   - Second fix: pin earliest system row + 10 recent non-system.
+    #     But add_session_message accepts role='system'; later system
+    #     updates were dropped.
+    #   - Third fix (this code): pin ALL system rows. Codex caught
+    #     this as an unbounded prompt-surface — adversarial or buggy
+    #     callers writing many/large system rows could blow up the
+    #     provider context budget on every turn.
+    #   - Current shape: cap pinned to the 5 most recent system rows.
+    #     Covers typical multi-system policy updates; bounds the
+    #     pathological case at a small constant. Token-aware
+    #     truncation + privilege-gating role='system' on
+    #     add_session_message is a separate redesign tracked
+    #     elsewhere.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
             WITH pinned AS (
                 SELECT role, content, timestamp, 0 AS k
-                  FROM session_messages
-                 WHERE session_id = $1 AND role = 'system'
+                  FROM (
+                      SELECT role, content, timestamp
+                        FROM session_messages
+                       WHERE session_id = $1 AND role = 'system'
+                       ORDER BY timestamp DESC
+                       LIMIT 5
+                  ) recent_system
             ),
             recent AS (
                 SELECT role, content, timestamp, 1 AS k
