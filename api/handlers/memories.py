@@ -702,34 +702,42 @@ async def update_memory(
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             async with conn.transaction():
-                # Defense-in-depth: don't rely exclusively on RLS. Explicitly
-                # check ownership so that an install with rls_enabled=false
-                # still prevents cross-user edits.
+                # Authorization + mutation in a single statement to
+                # close the TOCTOU window. The earlier shape was a
+                # SELECT-then-UPDATE pair where the SELECT proved
+                # owner+namespace but the UPDATE filtered by id alone
+                # — between the two, a concurrent admin/repair path
+                # could have changed ownership and the caller would
+                # still complete the update. Folding the predicate
+                # into the UPDATE … RETURNING makes the authorization
+                # atomic with the mutation: if the row no longer
+                # satisfies the predicate at write time, the update
+                # affects zero rows and we 404.
+                set_sql = ", ".join(set_clauses)
                 if user.role == "root":
                     row = await conn.fetchrow(
-                        "SELECT id FROM memories WHERE id=$1", memory_id,
+                        f"UPDATE memories SET {set_sql} "
+                        f"WHERE id=$1 RETURNING {_lc._MEMORY_COLS}",
+                        memory_id, *values,
                     )
                 else:
-                    # Two-dimensional check: owner_id AND namespace.
-                    # RLS enforces the former when enabled; we add the
-                    # latter as app-layer defense.
+                    # Append owner_id + namespace placeholders after
+                    # the existing $1 (id) + values placeholders.
+                    owner_ph = f"${len(values) + 2}"
+                    ns_ph = f"${len(values) + 3}"
                     row = await conn.fetchrow(
-                        "SELECT id FROM memories "
-                        "WHERE id=$1 AND owner_id=$2 AND namespace=$3",
-                        memory_id, user.user_id, user.namespace,
+                        f"UPDATE memories SET {set_sql} "
+                        f"WHERE id=$1 AND owner_id={owner_ph} "
+                        f"AND namespace={ns_ph} "
+                        f"RETURNING {_lc._MEMORY_COLS}",
+                        memory_id, *values, user.user_id, user.namespace,
                     )
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-                # The mnemos_version_snapshot AFTER UPDATE trigger writes the
-                # new memory_versions row (commit_hash + bumped version_num);
-                # the handler must not duplicate that INSERT.
-                await conn.execute(
-                    f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
-                    memory_id, *values,
-                )
-                row = await conn.fetchrow(
-                    f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
-                )
+                # mnemos_version_snapshot AFTER UPDATE trigger writes
+                # the new memory_versions row (commit_hash + bumped
+                # version_num); the handler must not duplicate that
+                # INSERT.
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
