@@ -350,22 +350,41 @@ async def get_commit(
                 )
             else:
                 from api.visibility import version_visibility_predicate
-                vis_clause, vis_params = version_visibility_predicate(
+                # Two visibility predicates: one for the requested
+                # row (alias mv), one for the parent subquery
+                # (alias mv2). Codex round 16 flagged the parent
+                # subquery as ungated — a public child whose parent
+                # was a private snapshot would still leak the
+                # parent's commit_hash, exposing hidden DAG
+                # topology. Gate the parent equally; emit NULL for
+                # parent_hash when the parent is invisible.
+                vis_mv, vis_mv_params = version_visibility_predicate(
                     user.user_id, start_param_idx=3, table_alias="mv",
                 )
-                ns_ph = f"${len(vis_params) + 3}"
+                ns_mv_ph = f"${len(vis_mv_params) + 3}"
+                # Parent predicate takes the same user_id; placeholder
+                # offsets continue after the row's namespace param.
+                vis_mv2, vis_mv2_params = version_visibility_predicate(
+                    user.user_id,
+                    start_param_idx=len(vis_mv_params) + 4,
+                    table_alias="mv2",
+                )
+                ns_mv2_ph = f"${len(vis_mv_params) + len(vis_mv2_params) + 4}"
                 row = await conn.fetchrow(
                     f"""
                     SELECT
                         mv.commit_hash, mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
-                        (SELECT commit_hash FROM memory_versions mv2
-                         WHERE mv2.id = mv.parent_version_id) AS parent_hash
+                        (SELECT mv2.commit_hash FROM memory_versions mv2
+                         WHERE mv2.id = mv.parent_version_id
+                           AND {vis_mv2} AND mv2.namespace = {ns_mv2_ph}) AS parent_hash
                     FROM memory_versions mv
                     WHERE mv.memory_id = $1 AND mv.commit_hash = $2
-                      AND {vis_clause} AND mv.namespace = {ns_ph}
+                      AND {vis_mv} AND mv.namespace = {ns_mv_ph}
                     """,
-                    memory_id, commit_hash, *vis_params, user.namespace,
+                    memory_id, commit_hash,
+                    *vis_mv_params, user.namespace,
+                    *vis_mv2_params, user.namespace,
                 )
 
             if not row:
@@ -462,7 +481,7 @@ async def merge_branch(
                     )
                 target_head = await conn.fetchrow(
                     """
-                    SELECT mv.id, mv.version_num
+                    SELECT mv.id, mv.version_num, mv.commit_hash
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = $2
@@ -484,15 +503,38 @@ async def merge_branch(
                         f"{int(_time.time() * 1_000_000)}".encode()
                     ).hexdigest()
 
+                    # Pre-existing bug Codex flagged in round 16:
+                    #   - target_head SELECT was missing commit_hash
+                    #     (merge_hash now reads it; fixed above).
+                    #   - INSERT omitted memory_versions NOT NULL
+                    #     columns owner_id, namespace, permission_mode
+                    #     — every merge would have FK/constraint-failed
+                    #     since v2 versioning landed.
+                    #   - change_type='merge' violated the CHECK
+                    #     constraint (allowed values: 'create' /
+                    #     'update' / 'delete'). Use 'update' — merge
+                    #     IS an update to the target branch, just
+                    #     with content copied from a source. Adding
+                    #     'merge' to the CHECK is a separate schema
+                    #     migration if/when callers need to filter
+                    #     merges from regular updates.
+                    #   - Tenancy on the merge commit: copy
+                    #     owner_id/namespace/permission_mode from the
+                    #     source snapshot. Slice 2 round-15 already
+                    #     ensured the caller can read the source
+                    #     snapshot (per-snapshot gate); copying the
+                    #     source's tenancy is consistent with that.
                     new_commit_id = await conn.fetchval(
                         """
                         INSERT INTO memory_versions (
                             memory_id, version_num, content, category, subcategory,
+                            owner_id, namespace, permission_mode,
                             branch, commit_hash, parent_version_id, snapshot_by, change_type
                         )
                         SELECT
                             $1, $2, $3, category, subcategory,
-                            $4, $5, $6, $7, 'merge'
+                            owner_id, namespace, permission_mode,
+                            $4, $5, $6, $7, 'update'
                         FROM memory_versions WHERE id = $8
                         RETURNING id
                         """,
