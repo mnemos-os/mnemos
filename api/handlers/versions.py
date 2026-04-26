@@ -354,25 +354,34 @@ async def revert_memory(
             meta_str = "{}"
 
         async with conn.transaction():
-            # Transaction-local GUC for the version-snapshot trigger.
-            # Uses set_config(name, value, true) — the `true` flag scopes
-            # the setting to the current transaction, equivalent to
-            # SET LOCAL. Prior code used plain `SET ...` interpolated via
-            # f-string, which (a) leaked the branch onto the pooled
-            # connection for subsequent requests, and (b) bypassed
-            # parameter binding. Caught in the GUC audit before v3.4 tag.
-            await conn.execute(
-                "SELECT set_config('mnemos.current_branch', $1, true)",
-                branch,
-            )
-
-            # Authorization + mutation atomic via UPDATE ... RETURNING.
-            # Non-root callers MUST satisfy the owner+namespace
-            # predicate at write time — closes the cross-tenant
-            # write hole Codex round 10 flagged. Root callers can
-            # revert any memory (operational tier, expected per the
-            # rest of the contract).
+            # Authorize against the live row up front — atomic with
+            # the write below.
             if _is_root(user):
+                live = await conn.fetchrow(
+                    f"SELECT {_lc._MEMORY_COLS} FROM memories "
+                    "WHERE id=$1 FOR UPDATE",
+                    memory_id,
+                )
+            else:
+                live = await conn.fetchrow(
+                    f"SELECT {_lc._MEMORY_COLS} FROM memories "
+                    "WHERE id=$1 AND owner_id=$2 AND namespace=$3 FOR UPDATE",
+                    memory_id, user.user_id, user.namespace,
+                )
+            if live is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Memory {memory_id} not found",
+                )
+
+            if branch == "main":
+                # Main-branch revert: UPDATE memories under the main
+                # GUC and let mnemos_version_snapshot create the
+                # revert version row + advance memory_branches HEAD
+                # for main. Preserves the live-row/main-HEAD invariant.
+                await conn.execute(
+                    "SELECT set_config('mnemos.current_branch', 'main', true)"
+                )
                 row = await conn.fetchrow(
                     "UPDATE memories SET "
                     "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
@@ -386,27 +395,70 @@ async def revert_memory(
                     memory_id,
                 )
             else:
-                row = await conn.fetchrow(
-                    "UPDATE memories SET "
-                    "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
-                    "verbatim_content=$5, updated=NOW() "
-                    "WHERE id=$6 AND owner_id=$7 AND namespace=$8 "
-                    f"RETURNING {_lc._MEMORY_COLS}",
-                    ver_row["content"],
-                    ver_row["category"],
-                    ver_row["subcategory"],
-                    meta_str,
-                    ver_row["verbatim_content"],
-                    memory_id, user.user_id, user.namespace,
+                # Feature-branch revert: PURE DAG operation (per
+                # round-25 fix). MNEMOS convention is `memories`
+                # always tracks main; feature branches diverge only
+                # in memory_versions + memory_branches. Reverting on
+                # a feature branch must NOT mutate the live row, or
+                # we re-introduce the branch-skew bug Codex flagged
+                # in dag.py merge. Instead: explicit INSERT of the
+                # revert version row + advance memory_branches HEAD
+                # for the feature branch.
+                import hashlib as _hashlib_local
+                import time as _time_local
+                next_version_num = await conn.fetchval(
+                    "SELECT COALESCE(MAX(version_num), 0) + 1 "
+                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2",
+                    memory_id, branch,
                 )
-            if row is None:
-                # Either memory was deleted between read and write,
-                # or the caller doesn't own it. 404 in either case
-                # to avoid leaking existence.
-                raise HTTPException(
-                    status_code=404,
-                    detail=f"Memory {memory_id} not found",
+                # Get current HEAD for parent linkage
+                target_head_id = await conn.fetchval(
+                    "SELECT head_version_id FROM memory_branches "
+                    "WHERE memory_id = $1 AND name = $2",
+                    memory_id, branch,
                 )
+                if target_head_id is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Branch '{branch}' not found",
+                    )
+                revert_hash = _hashlib_local.sha256(
+                    f"{memory_id}|{next_version_num}|{ver_row['content']}|"
+                    f"revert-to-v{version_num}-{int(_time_local.time() * 1_000_000)}"
+                    .encode()
+                ).hexdigest()
+                new_version_id = await conn.fetchval(
+                    """
+                    INSERT INTO memory_versions (
+                        memory_id, version_num, content, category, subcategory,
+                        metadata, verbatim_content,
+                        owner_id, namespace, permission_mode,
+                        source_model, source_provider, source_session, source_agent,
+                        branch, commit_hash, parent_version_id,
+                        snapshot_by, change_type
+                    ) VALUES (
+                        $1, $2, $3, $4, $5,
+                        $6::jsonb, $7,
+                        $8, $9, $10,
+                        $11, $12, $13, $14,
+                        $15, $16, $17, $18, 'update'
+                    )
+                    RETURNING id
+                    """,
+                    memory_id, next_version_num,
+                    ver_row["content"], ver_row["category"], ver_row["subcategory"],
+                    meta_str, ver_row["verbatim_content"],
+                    ver_row["owner_id"], ver_row["namespace"], ver_row["permission_mode"],
+                    ver_row["source_model"], ver_row["source_provider"],
+                    ver_row["source_session"], ver_row["source_agent"],
+                    branch, revert_hash, target_head_id, user.user_id,
+                )
+                await conn.execute(
+                    "UPDATE memory_branches SET head_version_id = $1 "
+                    "WHERE memory_id = $2 AND name = $3",
+                    new_version_id, memory_id, branch,
+                )
+                row = live  # live row unchanged; return the existing live state
 
     logger.info(
         f"[VERSION] Reverted {memory_id} to v{version_num} on branch '{branch}' "
