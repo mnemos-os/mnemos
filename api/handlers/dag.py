@@ -539,45 +539,52 @@ async def merge_branch(
                                 f"modified"
                             ),
                         )
-                    # Implement merge as an UPDATE on `memories` under
-                    # the target_branch GUC. This ensures three
-                    # invariants the prior manual-INSERT path violated
-                    # (Codex round 17):
-                    #
-                    #   1. memories.content stays in sync with the
-                    #      main-branch HEAD (or whichever branch is
-                    #      target). The prior code wrote a new
-                    #      memory_versions row + bumped
-                    #      memory_branches.head_version_id but never
-                    #      touched `memories`, so /memories/{id} and
-                    #      search/rehydrate kept returning the OLD
-                    #      live content.
-                    #   2. The new version row has a complete column
-                    #      set (metadata, verbatim_content, source_*,
-                    #      etc.). The mnemos_version_snapshot trigger
-                    #      copies all of OLD.* into the new
-                    #      memory_versions row; the manual INSERT
-                    #      omitted nearly everything, so an
-                    #      export/revert of the merge commit could
-                    #      erase snapshot data.
-                    #   3. parent_version_id is set to the previous
-                    #      target HEAD by the trigger automatically.
-                    #
-                    # The trigger generates its own commit_hash; we
-                    # fetch it after to return to the caller.
-                    await conn.execute(
-                        "SELECT set_config('mnemos.current_branch', $1, true)",
-                        target_branch,
-                    )
-                    # Authorize-and-mutate atomically. The earlier
-                    # _assert_memory_access ran outside the txn; if
-                    # an admin/import path reassigned ownership
-                    # between precheck and UPDATE, a non-root caller
-                    # could still overwrite a now-foreign memory.
-                    # UPDATE ... WHERE id+owner+namespace RETURNING
-                    # makes the predicate hold AT WRITE TIME; if no
-                    # row is returned, 404 (matches update_memory and
-                    # revert_memory).
+                    # Authorize against the live row before doing any
+                    # write. UPDATE-via-trigger doesn't work for the
+                    # cross-branch case (live row may already equal
+                    # source_head; trigger only fires on
+                    # OLD-vs-NEW change). Instead: explicitly
+                    # INSERT the target_branch's new memory_versions
+                    # row, advance memory_branches HEAD, then
+                    # conditionally UPDATE memories only if the live
+                    # row was tracking target_branch (so we preserve
+                    # the live-row/HEAD invariant for whichever
+                    # branch is materialized).
+                    if user.role == "root":
+                        live = await conn.fetchrow(
+                            "SELECT id, owner_id, namespace, content "
+                            "FROM memories WHERE id = $1 FOR UPDATE",
+                            memory_id,
+                        )
+                    else:
+                        live = await conn.fetchrow(
+                            "SELECT id, owner_id, namespace, content "
+                            "FROM memories WHERE id = $1 "
+                            "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
+                            memory_id, user.user_id, user.namespace,
+                        )
+                    if live is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Memory {memory_id} not found",
+                        )
+                    merge_owner_id = live["owner_id"]
+                    merge_namespace = live["namespace"]
+                    live_tracks_target = live["content"] == target_head["content"]
+
+                    # Compute merge commit_hash. Same shape as the
+                    # mnemos_version_snapshot trigger
+                    # (sha256 over id|version|content|now) so the
+                    # commit identity is consistent regardless of
+                    # whether the trigger or this handler created it.
+                    import hashlib as _hashlib_local
+                    next_version = target_head["version_num"] + 1
+                    merge_hash = _hashlib_local.sha256(
+                        f"{memory_id}|{next_version}|{source_head['content']}|"
+                        f"merge-{request.source_branch}->{target_branch}-{int(__import__('time').time() * 1_000_000)}"
+                        .encode()
+                    ).hexdigest()
+
                     meta_val = source_head["metadata"]
                     if isinstance(meta_val, str):
                         meta_str = meta_val
@@ -586,101 +593,86 @@ async def merge_branch(
                         meta_str = _json.dumps(dict(meta_val))
                     else:
                         meta_str = "{}"
-                    if user.role == "root":
-                        updated = await conn.fetchrow(
+
+                    # Explicit INSERT into memory_versions for the
+                    # merge commit. Pulls owner_id/namespace/
+                    # permission_mode from the source snapshot
+                    # (per slice-2 round-15 source-head visibility
+                    # gate), copies content + provenance fields,
+                    # parents off target_head.id, change_type=update
+                    # (the v2 CHECK constraint doesn't allow 'merge';
+                    # see migration_v2_versioning).
+                    new_version_id = await conn.fetchval(
+                        """
+                        INSERT INTO memory_versions (
+                            memory_id, version_num, content, category, subcategory,
+                            metadata, verbatim_content,
+                            owner_id, namespace, permission_mode,
+                            source_model, source_provider, source_session, source_agent,
+                            branch, commit_hash, parent_version_id,
+                            snapshot_by, change_type
+                        )
+                        SELECT
+                            $1, $2, $3, $4, $5,
+                            $6::jsonb, $7,
+                            owner_id, namespace, permission_mode,
+                            $8, $9, $10, $11,
+                            $12, $13, $14, $15, 'update'
+                        FROM memory_versions WHERE id = $16
+                        RETURNING id
+                        """,
+                        memory_id, next_version,
+                        source_head["content"], source_head["category"],
+                        source_head["subcategory"],
+                        meta_str, source_head["verbatim_content"],
+                        source_head["source_model"],
+                        source_head["source_provider"],
+                        source_head["source_session"],
+                        source_head["source_agent"],
+                        target_branch, merge_hash, target_head["id"],
+                        user.user_id, source_head["id"],
+                    )
+
+                    # Advance the target branch HEAD pointer.
+                    await conn.execute(
+                        "UPDATE memory_branches SET head_version_id = $1 "
+                        "WHERE memory_id = $2 AND name = $3",
+                        new_version_id, memory_id, target_branch,
+                    )
+
+                    # If the live row was tracking target_branch
+                    # (its content matched target_head's), advance
+                    # the live row too so the live-row/HEAD invariant
+                    # holds for the now-materialized branch.
+                    # Suppress the version-snapshot trigger here so
+                    # we don't double-version (we already did the
+                    # explicit INSERT above). Use the existing
+                    # mnemos.suppress_version_snapshot GUC which the
+                    # trigger consults via its WHEN clause (per
+                    # migrations_charon_trigger_guard).
+                    if live_tracks_target:
+                        await conn.execute(
+                            "SELECT set_config('mnemos.suppress_version_snapshot', '1', true)"
+                        )
+                        await conn.execute(
                             """
                             UPDATE memories SET
-                                content = $1,
-                                category = $2,
-                                subcategory = $3,
-                                metadata = $4::jsonb,
-                                verbatim_content = $5,
-                                source_model = $6,
-                                source_provider = $7,
-                                source_session = $8,
-                                source_agent = $9,
+                                content = $1, category = $2, subcategory = $3,
+                                metadata = $4::jsonb, verbatim_content = $5,
+                                source_model = $6, source_provider = $7,
+                                source_session = $8, source_agent = $9,
                                 updated = NOW()
                             WHERE id = $10
-                            RETURNING id, owner_id, namespace
                             """,
-                            source_head["content"],
-                            source_head["category"],
+                            source_head["content"], source_head["category"],
                             source_head["subcategory"],
-                            meta_str,
-                            source_head["verbatim_content"],
+                            meta_str, source_head["verbatim_content"],
                             source_head["source_model"],
                             source_head["source_provider"],
                             source_head["source_session"],
                             source_head["source_agent"],
                             memory_id,
                         )
-                    else:
-                        updated = await conn.fetchrow(
-                            """
-                            UPDATE memories SET
-                                content = $1,
-                                category = $2,
-                                subcategory = $3,
-                                metadata = $4::jsonb,
-                                verbatim_content = $5,
-                                source_model = $6,
-                                source_provider = $7,
-                                source_session = $8,
-                                source_agent = $9,
-                                updated = NOW()
-                            WHERE id = $10
-                              AND owner_id = $11
-                              AND namespace = $12
-                            RETURNING id, owner_id, namespace
-                            """,
-                            source_head["content"],
-                            source_head["category"],
-                            source_head["subcategory"],
-                            meta_str,
-                            source_head["verbatim_content"],
-                            source_head["source_model"],
-                            source_head["source_provider"],
-                            source_head["source_session"],
-                            source_head["source_agent"],
-                            memory_id, user.user_id, user.namespace,
-                        )
-                    if updated is None:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Memory {memory_id} not found",
-                        )
-                    new_row = await conn.fetchrow(
-                        "SELECT mv.commit_hash FROM memory_branches mb "
-                        "INNER JOIN memory_versions mv ON mv.id = mb.head_version_id "
-                        "WHERE mb.memory_id = $1 AND mb.name = $2",
-                        memory_id, target_branch,
-                    )
-                    merge_hash = new_row["commit_hash"] if new_row else ""
-                    # Defensive backstop: the pre-flight check above
-                    # should have caught the no-op case before we
-                    # touched memories. If we still see merge_hash
-                    # unchanged here, something raced or the
-                    # equality semantics didn't match the trigger's;
-                    # surface this as an error rather than silently
-                    # claim success or pretend it's a no-op (the
-                    # UPDATE has already committed at this point).
-                    if merge_hash == target_head["commit_hash"]:
-                        logger.error(
-                            f"[DAG] Merge invariant violation: pre-flight "
-                            f"versioned-equality check passed BUT trigger "
-                            f"did not advance branch HEAD for {memory_id} "
-                            f"({request.source_branch} -> {target_branch}). "
-                            f"Live row may have been mutated; investigate."
-                        )
-                        raise HTTPException(
-                            status_code=500,
-                            detail="merge invariant violation",
-                        )
-                    # Capture target tenancy from the UPDATE's
-                    # RETURNING — owner_id/namespace are needed for
-                    # the post-txn webhook scope.
-                    merge_owner_id = updated["owner_id"]
-                    merge_namespace = updated["namespace"]
                 else:  # manual
                     return MergeResult(
                         success=False,
