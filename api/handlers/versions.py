@@ -98,6 +98,46 @@ async def _assert_memory_exists(conn, memory_id: str) -> None:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
 
 
+def _is_root(user: UserContext) -> bool:
+    return user.role == "root"
+
+
+async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> None:
+    """Tenancy gate for version-history reads.
+
+    Version snapshots in memory_versions inherit the live memory's
+    tenancy — if a non-root caller can't read the live memory via
+    list/get/search/rehydrate, they must not see its history,
+    diffs, or per-version content here either. Older code only
+    checked existence in memory_versions, which let any authenticated
+    caller read every other tenant's full history by guessing
+    memory_id.
+
+    Root bypasses; non-root must pass the same shared
+    read_visibility_predicate that gates list/get/search/rehydrate
+    PLUS the namespace pin.
+    """
+    if _is_root(user):
+        # Root still needs the existence check so we 404 cleanly.
+        await _assert_memory_exists(conn, memory_id)
+        return
+
+    from api.visibility import read_visibility_predicate
+    vis_clause, vis_params = read_visibility_predicate(
+        user.user_id, list(user.group_ids), start_param_idx=2,
+    )
+    # $1 = memory_id; $2..$N = visibility params; $N+1 = namespace
+    ns_ph = f"${len(vis_params) + 2}"
+    row = await conn.fetchrow(
+        f"SELECT 1 FROM memories WHERE id = $1 "
+        f"AND {vis_clause} AND namespace = {ns_ph} LIMIT 1",
+        memory_id, *vis_params, user.namespace,
+    )
+    if not row:
+        # 404 (not 403) keeps cross-tenant existence invisible.
+        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+
+
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
 @router.get("/memories/{memory_id}/versions", response_model=List[VersionSummary])
@@ -113,7 +153,7 @@ async def list_versions(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        await _assert_memory_exists(conn, memory_id)
+        await _assert_memory_readable(conn, memory_id, user)
         rows = await conn.fetch(
             "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
             "FROM memory_versions WHERE memory_id = $1 AND branch = $2 ORDER BY version_num ASC",
@@ -144,6 +184,7 @@ async def get_version(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
+        await _assert_memory_readable(conn, memory_id, user)
         row = await conn.fetchrow(
             "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
             "verbatim_content, owner_id, namespace, permission_mode, "
@@ -175,6 +216,7 @@ async def diff_versions(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
+        await _assert_memory_readable(conn, memory_id, user)
         rows = await conn.fetch(
             "SELECT version_num, content FROM memory_versions "
             "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3",
@@ -217,6 +259,12 @@ async def revert_memory(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
+        # Tenancy gate first — fail-closed before any version SELECT.
+        # Without this a non-root caller could read other tenants'
+        # historical content via the ver_row select alone, even if
+        # the eventual UPDATE failed.
+        await _assert_memory_readable(conn, memory_id, user)
+
         ver_row = await conn.fetchrow(
             "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
             "verbatim_content, owner_id, namespace, permission_mode, "
@@ -229,15 +277,6 @@ async def revert_memory(
             raise HTTPException(
                 status_code=404,
                 detail=f"Version {version_num} not found for memory {memory_id} on branch '{branch}'",
-            )
-        # Confirm the live memory still exists
-        live = await conn.fetchrow(
-            "SELECT id FROM memories WHERE id = $1", memory_id
-        )
-        if not live:
-            raise HTTPException(
-                status_code=409,
-                detail=f"Memory {memory_id} has been deleted; cannot revert",
             )
 
         meta_val = ver_row["metadata"]
@@ -261,21 +300,47 @@ async def revert_memory(
                 branch,
             )
 
-            await conn.execute(
-                "UPDATE memories SET "
-                "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
-                "verbatim_content=$5, updated=NOW() "
-                "WHERE id=$6",
-                ver_row["content"],
-                ver_row["category"],
-                ver_row["subcategory"],
-                meta_str,
-                ver_row["verbatim_content"],
-                memory_id,
-            )
-            row = await conn.fetchrow(
-                f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id
-            )
+            # Authorization + mutation atomic via UPDATE ... RETURNING.
+            # Non-root callers MUST satisfy the owner+namespace
+            # predicate at write time — closes the cross-tenant
+            # write hole Codex round 10 flagged. Root callers can
+            # revert any memory (operational tier, expected per the
+            # rest of the contract).
+            if _is_root(user):
+                row = await conn.fetchrow(
+                    "UPDATE memories SET "
+                    "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
+                    "verbatim_content=$5, updated=NOW() "
+                    f"WHERE id=$6 RETURNING {_lc._MEMORY_COLS}",
+                    ver_row["content"],
+                    ver_row["category"],
+                    ver_row["subcategory"],
+                    meta_str,
+                    ver_row["verbatim_content"],
+                    memory_id,
+                )
+            else:
+                row = await conn.fetchrow(
+                    "UPDATE memories SET "
+                    "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
+                    "verbatim_content=$5, updated=NOW() "
+                    "WHERE id=$6 AND owner_id=$7 AND namespace=$8 "
+                    f"RETURNING {_lc._MEMORY_COLS}",
+                    ver_row["content"],
+                    ver_row["category"],
+                    ver_row["subcategory"],
+                    meta_str,
+                    ver_row["verbatim_content"],
+                    memory_id, user.user_id, user.namespace,
+                )
+            if row is None:
+                # Either memory was deleted between read and write,
+                # or the caller doesn't own it. 404 in either case
+                # to avoid leaking existence.
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"Memory {memory_id} not found",
+                )
 
     logger.info(
         f"[VERSION] Reverted {memory_id} to v{version_num} on branch '{branch}' "
