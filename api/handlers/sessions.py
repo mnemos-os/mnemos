@@ -186,18 +186,22 @@ async def add_session_message(
         )
 
     # Get conversation history for the provider:
-    #   1. The pinned system message (initial_context written at
-    #      create_session time as role='system') — must always be
-    #      present, even after the user has sent more than 10 turns,
-    #      or session-level instructions silently disappear.
+    #   1. ALL pinned system messages (initial_context plus any later
+    #      system directives the API has accepted) — system rows
+    #      represent durable policy/context, never the conversational
+    #      tail, so we keep all of them regardless of recency.
     #   2. The 10 most recent non-system messages, chronologically.
     #
-    # Earlier code used `ORDER BY timestamp ASC LIMIT 10`, which
-    # returned the 10 OLDEST messages — wrong direction. A naive fix
-    # to DESC LIMIT 10 over all rows would still drop the pinned
-    # system row once enough chat turns accumulated. The CTE keeps
-    # the system row pinned (k=0) and surfaces only the recent
-    # non-system tail (k=1, last 10) regardless of session length.
+    # Earlier code used `ORDER BY timestamp ASC LIMIT 10` over all
+    # rows — wrong direction (returned the 10 OLDEST). A naive fix
+    # to DESC LIMIT 10 across all rows still loses the initial
+    # system row once enough chat turns accumulate. Pinning only
+    # the FIRST system row also drops later system updates in
+    # multi-system sessions. The CTE below pins every role='system'
+    # row (k=0, chronological) and appends the 10 most recent
+    # non-system rows (k=1, chronological). All system messages
+    # appear in their original order, then the recent conversational
+    # window.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
@@ -205,8 +209,6 @@ async def add_session_message(
                 SELECT role, content, timestamp, 0 AS k
                   FROM session_messages
                  WHERE session_id = $1 AND role = 'system'
-                 ORDER BY timestamp ASC
-                 LIMIT 1
             ),
             recent AS (
                 SELECT role, content, timestamp, 1 AS k
