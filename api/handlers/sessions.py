@@ -185,22 +185,42 @@ async def add_session_message(
             request.model or session["model"],
         )
 
-    # Get conversation history (last 10 messages for context).
-    # Subquery picks the 10 most recent (DESC LIMIT 10); outer ORDER
-    # BY ASC re-chronologizes so the provider sees them oldest-first.
-    # The earlier `ORDER BY ASC LIMIT 10` returned the 10 OLDEST
-    # messages, so long sessions lost their recent context entirely.
+    # Get conversation history for the provider:
+    #   1. The pinned system message (initial_context written at
+    #      create_session time as role='system') — must always be
+    #      present, even after the user has sent more than 10 turns,
+    #      or session-level instructions silently disappear.
+    #   2. The 10 most recent non-system messages, chronologically.
+    #
+    # Earlier code used `ORDER BY timestamp ASC LIMIT 10`, which
+    # returned the 10 OLDEST messages — wrong direction. A naive fix
+    # to DESC LIMIT 10 over all rows would still drop the pinned
+    # system row once enough chat turns accumulated. The CTE keeps
+    # the system row pinned (k=0) and surfaces only the recent
+    # non-system tail (k=1, last 10) regardless of session length.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
+            WITH pinned AS (
+                SELECT role, content, timestamp, 0 AS k
+                  FROM session_messages
+                 WHERE session_id = $1 AND role = 'system'
+                 ORDER BY timestamp ASC
+                 LIMIT 1
+            ),
+            recent AS (
+                SELECT role, content, timestamp, 1 AS k
+                  FROM session_messages
+                 WHERE session_id = $1 AND role <> 'system'
+                 ORDER BY timestamp DESC
+                 LIMIT 10
+            )
             SELECT role, content FROM (
-                SELECT role, content, timestamp
-                FROM session_messages
-                WHERE session_id = $1
-                ORDER BY timestamp DESC
-                LIMIT 10
-            ) recent
-            ORDER BY timestamp ASC
+                SELECT * FROM pinned
+                UNION ALL
+                SELECT * FROM recent
+            ) all_msgs
+            ORDER BY k, timestamp ASC
             """,
             session_id,
         )
