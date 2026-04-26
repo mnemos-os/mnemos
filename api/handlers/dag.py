@@ -506,6 +506,45 @@ async def merge_branch(
                     raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
 
                 if request.strategy == "latest-wins":
+                    # Pre-flight: are the source and target's
+                    # VERSIONED fields actually different? The
+                    # mnemos_version_snapshot trigger only versions
+                    # changes to content / category / subcategory /
+                    # metadata / verbatim_content / permission_mode /
+                    # namespace / owner_id (round-19 finding). If the
+                    # versioned set is identical, doing the UPDATE
+                    # would still mutate non-versioned columns
+                    # (source_*, updated) and commit them — diverging
+                    # the live row from the DAG history. Detect
+                    # equality BEFORE the UPDATE and return a clean
+                    # no-op (round-20 fix).
+                    target_versioned = await conn.fetchrow(
+                        "SELECT content, category, subcategory, metadata, "
+                        "verbatim_content FROM memories WHERE id = $1",
+                        memory_id,
+                    )
+                    if (target_versioned is not None
+                            and source_head["content"] == target_versioned["content"]
+                            and source_head["category"] == target_versioned["category"]
+                            and source_head["subcategory"] == target_versioned["subcategory"]
+                            and source_head["metadata"] == target_versioned["metadata"]
+                            and source_head["verbatim_content"] == target_versioned["verbatim_content"]):
+                        logger.info(
+                            f"[DAG] Merge no-op (pre-update): "
+                            f"{request.source_branch} -> {target_branch} for "
+                            f"{memory_id} (versioned fields identical; live "
+                            f"row not touched)"
+                        )
+                        return MergeResult(
+                            success=False,
+                            new_commit_hash=target_head["commit_hash"],
+                            message=(
+                                f"Source branch '{request.source_branch}' has "
+                                f"no versioned changes vs '{target_branch}'; "
+                                f"no merge commit created and live row not "
+                                f"modified"
+                            ),
+                        )
                     # Implement merge as an UPDATE on `memories` under
                     # the target_branch GUC. This ensures three
                     # invariants the prior manual-INSERT path violated
@@ -623,32 +662,25 @@ async def merge_branch(
                         memory_id, target_branch,
                     )
                     merge_hash = new_row["commit_hash"] if new_row else ""
-                    # Verify the merge actually advanced the DAG. The
-                    # mnemos_version_snapshot trigger only fires on
-                    # content/category/subcategory/metadata/verbatim/
-                    # owner/namespace/permission changes — NOT on
-                    # source_* changes alone (round-19 finding). If
-                    # source and target have identical content but
-                    # different provenance, memories.source_* gets
-                    # updated but no new memory_versions row is
-                    # created and merge_hash == target_head's hash.
-                    # That would silently mutate live state without
-                    # an auditable DAG record. Return a no-op
-                    # MergeResult instead.
+                    # Defensive backstop: the pre-flight check above
+                    # should have caught the no-op case before we
+                    # touched memories. If we still see merge_hash
+                    # unchanged here, something raced or the
+                    # equality semantics didn't match the trigger's;
+                    # surface this as an error rather than silently
+                    # claim success or pretend it's a no-op (the
+                    # UPDATE has already committed at this point).
                     if merge_hash == target_head["commit_hash"]:
-                        logger.info(
-                            f"[DAG] Merge no-op: {request.source_branch} -> "
-                            f"{target_branch} for {memory_id} (versioned "
-                            f"fields identical; no new commit created)"
+                        logger.error(
+                            f"[DAG] Merge invariant violation: pre-flight "
+                            f"versioned-equality check passed BUT trigger "
+                            f"did not advance branch HEAD for {memory_id} "
+                            f"({request.source_branch} -> {target_branch}). "
+                            f"Live row may have been mutated; investigate."
                         )
-                        return MergeResult(
-                            success=False,
-                            new_commit_hash=merge_hash,
-                            message=(
-                                f"Source branch '{request.source_branch}' "
-                                f"has no versioned changes vs '{target_branch}'; "
-                                f"no merge commit created"
-                            ),
+                        raise HTTPException(
+                            status_code=500,
+                            detail="merge invariant violation",
                         )
                     # Capture target tenancy from the UPDATE's
                     # RETURNING — owner_id/namespace are needed for
