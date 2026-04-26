@@ -106,6 +106,12 @@ def test_list_memories_filters_by_namespace_for_non_root(monkeypatch):
     args = _fetched_args(conn)
     assert "namespace=$" in sql
     assert "alice-ns" in args
+    # v3.5 audit slice 2: list_memories must also scope by owner_id
+    # for non-root callers, matching search/update/delete. Without
+    # this, a non-root user could list other users' rows in the
+    # same namespace.
+    assert "owner_id=$" in sql
+    assert "alice" in args
 
 
 def test_list_memories_no_namespace_filter_for_root(monkeypatch):
@@ -116,6 +122,8 @@ def test_list_memories_no_namespace_filter_for_root(monkeypatch):
 
     sql = _fetched_sql(conn)
     assert "namespace=$" not in sql
+    # Root bypasses both namespace and owner_id scoping.
+    assert "owner_id=$" not in sql
 
 
 def test_list_memories_combines_namespace_with_category(monkeypatch):
@@ -130,8 +138,10 @@ def test_list_memories_combines_namespace_with_category(monkeypatch):
     args = _fetched_args(conn)
     assert "category=$" in sql
     assert "namespace=$" in sql
+    assert "owner_id=$" in sql
     assert "solutions" in args
     assert "alice-ns" in args
+    assert "alice" in args
 
 
 def test_list_memories_combines_namespace_with_subcategory(monkeypatch):
@@ -146,8 +156,10 @@ def test_list_memories_combines_namespace_with_subcategory(monkeypatch):
     args = _fetched_args(conn)
     assert "subcategory=$" in sql
     assert "namespace=$" in sql
+    assert "owner_id=$" in sql
     assert "pipeline" in args
     assert "alice-ns" in args
+    assert "alice" in args
 
 
 def test_list_memories_combines_namespace_with_category_and_subcategory(monkeypatch):
@@ -164,7 +176,8 @@ def test_list_memories_combines_namespace_with_category_and_subcategory(monkeypa
     assert "category=$" in sql
     assert "subcategory=$" in sql
     assert "namespace=$" in sql
-    assert all(v in args for v in ("solutions", "pipeline", "alice-ns"))
+    assert "owner_id=$" in sql
+    assert all(v in args for v in ("solutions", "pipeline", "alice-ns", "alice"))
 
 
 # ---- get_memory ------------------------------------------------------------
@@ -179,6 +192,11 @@ def test_get_memory_filters_by_namespace_for_non_root(monkeypatch):
     sql, args = conn.fetchrow_calls[-1]
     assert "namespace=$" in sql
     assert "alice-ns" in args
+    # v3.5 audit slice 2: get_memory must also scope by owner_id —
+    # otherwise any non-root caller in the same namespace could read
+    # other users' rows by guessing memory_id.
+    assert "owner_id=$" in sql
+    assert "alice" in args
 
 
 def test_get_memory_no_namespace_filter_for_root(monkeypatch):
@@ -189,6 +207,7 @@ def test_get_memory_no_namespace_filter_for_root(monkeypatch):
 
     sql, _ = conn.fetchrow_calls[-1]
     assert "namespace=$" not in sql
+    assert "owner_id=$" not in sql
 
 
 def test_get_memory_returns_404_when_namespace_mismatch(monkeypatch):
