@@ -21,7 +21,10 @@ class ConsultationRequest(BaseModel):
 
 
 class StatsResponse(BaseModel):
-    total_memories: int
+    total_memories: int                              # native + federated
+    native_memories: int = 0                         # locally-created (federation_source IS NULL)
+    federated_memories: int = 0                      # pulled from peers (federation_source IS NOT NULL)
+    memories_by_peer: Dict[str, int] = {}            # per-peer count of pulled memories
     total_compressions: int
     average_compression_ratio: float
     average_quality_rating: int
