@@ -451,12 +451,19 @@ async def merge_branch(
                 # content via merge. Target head needs no per-snapshot
                 # gate because we're WRITING new content, not exposing
                 # the existing target HEAD.
+                # Pull source_* provenance columns too — round-18
+                # caught that omitting them made every merge commit
+                # inherit the TARGET's pre-merge provenance instead
+                # of the source's, so export/revert/audit on a merge
+                # commit was misleading.
                 if user.role == "root":
                     source_head = await conn.fetchrow(
                         """
                         SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
                                mv.category, mv.subcategory, mv.metadata,
-                               mv.verbatim_content
+                               mv.verbatim_content,
+                               mv.source_model, mv.source_provider,
+                               mv.source_session, mv.source_agent
                         FROM memory_versions mv
                         INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                         WHERE mv.memory_id = $1 AND mb.name = $2
@@ -473,7 +480,9 @@ async def merge_branch(
                         f"""
                         SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
                                mv.category, mv.subcategory, mv.metadata,
-                               mv.verbatim_content
+                               mv.verbatim_content,
+                               mv.source_model, mv.source_provider,
+                               mv.source_session, mv.source_agent
                         FROM memory_versions mv
                         INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                         WHERE mv.memory_id = $1 AND mb.name = $2
@@ -527,12 +536,15 @@ async def merge_branch(
                         "SELECT set_config('mnemos.current_branch', $1, true)",
                         target_branch,
                     )
-                    # Update memories with the source HEAD's
-                    # content + structural columns. The version-
-                    # snapshot trigger fires on UPDATE and creates
-                    # the new memory_versions row + bumps
-                    # memory_branches.head_version_id for
-                    # target_branch.
+                    # Authorize-and-mutate atomically. The earlier
+                    # _assert_memory_access ran outside the txn; if
+                    # an admin/import path reassigned ownership
+                    # between precheck and UPDATE, a non-root caller
+                    # could still overwrite a now-foreign memory.
+                    # UPDATE ... WHERE id+owner+namespace RETURNING
+                    # makes the predicate hold AT WRITE TIME; if no
+                    # row is returned, 404 (matches update_memory and
+                    # revert_memory).
                     meta_val = source_head["metadata"]
                     if isinstance(meta_val, str):
                         meta_str = meta_val
@@ -541,24 +553,69 @@ async def merge_branch(
                         meta_str = _json.dumps(dict(meta_val))
                     else:
                         meta_str = "{}"
-                    await conn.execute(
-                        """
-                        UPDATE memories SET
-                            content = $1,
-                            category = $2,
-                            subcategory = $3,
-                            metadata = $4::jsonb,
-                            verbatim_content = $5,
-                            updated = NOW()
-                        WHERE id = $6
-                        """,
-                        source_head["content"],
-                        source_head["category"],
-                        source_head["subcategory"],
-                        meta_str,
-                        source_head["verbatim_content"],
-                        memory_id,
-                    )
+                    if user.role == "root":
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE memories SET
+                                content = $1,
+                                category = $2,
+                                subcategory = $3,
+                                metadata = $4::jsonb,
+                                verbatim_content = $5,
+                                source_model = $6,
+                                source_provider = $7,
+                                source_session = $8,
+                                source_agent = $9,
+                                updated = NOW()
+                            WHERE id = $10
+                            RETURNING id
+                            """,
+                            source_head["content"],
+                            source_head["category"],
+                            source_head["subcategory"],
+                            meta_str,
+                            source_head["verbatim_content"],
+                            source_head["source_model"],
+                            source_head["source_provider"],
+                            source_head["source_session"],
+                            source_head["source_agent"],
+                            memory_id,
+                        )
+                    else:
+                        updated = await conn.fetchrow(
+                            """
+                            UPDATE memories SET
+                                content = $1,
+                                category = $2,
+                                subcategory = $3,
+                                metadata = $4::jsonb,
+                                verbatim_content = $5,
+                                source_model = $6,
+                                source_provider = $7,
+                                source_session = $8,
+                                source_agent = $9,
+                                updated = NOW()
+                            WHERE id = $10
+                              AND owner_id = $11
+                              AND namespace = $12
+                            RETURNING id
+                            """,
+                            source_head["content"],
+                            source_head["category"],
+                            source_head["subcategory"],
+                            meta_str,
+                            source_head["verbatim_content"],
+                            source_head["source_model"],
+                            source_head["source_provider"],
+                            source_head["source_session"],
+                            source_head["source_agent"],
+                            memory_id, user.user_id, user.namespace,
+                        )
+                    if updated is None:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Memory {memory_id} not found",
+                        )
                     new_row = await conn.fetchrow(
                         "SELECT mv.commit_hash FROM memory_branches mb "
                         "INNER JOIN memory_versions mv ON mv.id = mb.head_version_id "
@@ -566,21 +623,59 @@ async def merge_branch(
                         memory_id, target_branch,
                     )
                     merge_hash = new_row["commit_hash"] if new_row else ""
-
-                    logger.info(
-                        f"[DAG] Merged {request.source_branch} -> {target_branch} "
-                        f"for {memory_id} (merge_hash={merge_hash[:12] if merge_hash else '?'}...)"
-                    )
-                    return MergeResult(
-                        success=True,
-                        new_commit_hash=merge_hash,
-                        message=f"Merged {request.source_branch} into {target_branch}",
-                    )
                 else:  # manual
                     return MergeResult(
                         success=False,
                         message="Manual merge strategy not yet implemented",
                     )
+
+        # Cache invalidation outside the txn — same pattern as
+        # update_memory / delete_memory. A successful merge changed
+        # `memories.content`, so any cached /memories/search hits
+        # or stats:global rollups are stale; if we don't sweep,
+        # search keeps serving pre-merge content for the 300s TTL.
+        if _lc._cache:
+            try:
+                await _lc._cache.delete("stats:global")
+                try:
+                    async for _k in _lc._cache.scan_iter(
+                        match="mnemos:search:*", count=500,
+                    ):
+                        await _lc._cache.delete(_k)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+
+        # Webhook parity with update_memory: downstream consumers
+        # subscribed to memory.updated should see merges too (they
+        # materially changed the live row).
+        try:
+            from api.webhook_dispatcher import dispatch as _dispatch_webhook
+            async with _lc._pool.acquire() as _wh_conn:
+                await _dispatch_webhook(_wh_conn, "memory.updated", {
+                    "memory_id": memory_id,
+                    "category": source_head["category"],
+                    "subcategory": source_head["subcategory"],
+                    "content": source_head["content"],
+                    "merge_source": request.source_branch,
+                    "merge_target": target_branch,
+                })
+        except Exception:
+            logger.warning(
+                "webhook dispatch failed for memory.updated %s",
+                memory_id, exc_info=True,
+            )
+
+        logger.info(
+            f"[DAG] Merged {request.source_branch} -> {target_branch} "
+            f"for {memory_id} (merge_hash={merge_hash[:12] if merge_hash else '?'}...)"
+        )
+        return MergeResult(
+            success=True,
+            new_commit_hash=merge_hash,
+            message=f"Merged {request.source_branch} into {target_branch}",
+        )
 
     except HTTPException:
         raise
