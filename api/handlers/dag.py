@@ -9,7 +9,6 @@ Implements git-like operations on memory history:
 """
 
 import logging
-import time as _time
 from typing import Optional, List
 
 from fastapi import APIRouter, HTTPException, Depends, Query
@@ -455,7 +454,9 @@ async def merge_branch(
                 if user.role == "root":
                     source_head = await conn.fetchrow(
                         """
-                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
+                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
+                               mv.category, mv.subcategory, mv.metadata,
+                               mv.verbatim_content
                         FROM memory_versions mv
                         INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                         WHERE mv.memory_id = $1 AND mb.name = $2
@@ -470,7 +471,9 @@ async def merge_branch(
                     ns_ph = f"${len(vis_params) + 3}"
                     source_head = await conn.fetchrow(
                         f"""
-                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
+                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
+                               mv.category, mv.subcategory, mv.metadata,
+                               mv.verbatim_content
                         FROM memory_versions mv
                         INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                         WHERE mv.memory_id = $1 AND mb.name = $2
@@ -494,64 +497,79 @@ async def merge_branch(
                     raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
 
                 if request.strategy == "latest-wins":
-                    next_version = target_head["version_num"] + 1
-                    # Full SHA-256 (64 hex chars) — previously truncated to 16 which
-                    # reduced collision tolerance from ~2^128 to ~2^32.
-                    merge_hash = _hashlib.sha256(
-                        f"{source_head['commit_hash']}"
-                        f"{target_head['commit_hash']}"
-                        f"{int(_time.time() * 1_000_000)}".encode()
-                    ).hexdigest()
-
-                    # Pre-existing bug Codex flagged in round 16:
-                    #   - target_head SELECT was missing commit_hash
-                    #     (merge_hash now reads it; fixed above).
-                    #   - INSERT omitted memory_versions NOT NULL
-                    #     columns owner_id, namespace, permission_mode
-                    #     — every merge would have FK/constraint-failed
-                    #     since v2 versioning landed.
-                    #   - change_type='merge' violated the CHECK
-                    #     constraint (allowed values: 'create' /
-                    #     'update' / 'delete'). Use 'update' — merge
-                    #     IS an update to the target branch, just
-                    #     with content copied from a source. Adding
-                    #     'merge' to the CHECK is a separate schema
-                    #     migration if/when callers need to filter
-                    #     merges from regular updates.
-                    #   - Tenancy on the merge commit: copy
-                    #     owner_id/namespace/permission_mode from the
-                    #     source snapshot. Slice 2 round-15 already
-                    #     ensured the caller can read the source
-                    #     snapshot (per-snapshot gate); copying the
-                    #     source's tenancy is consistent with that.
-                    new_commit_id = await conn.fetchval(
-                        """
-                        INSERT INTO memory_versions (
-                            memory_id, version_num, content, category, subcategory,
-                            owner_id, namespace, permission_mode,
-                            branch, commit_hash, parent_version_id, snapshot_by, change_type
-                        )
-                        SELECT
-                            $1, $2, $3, category, subcategory,
-                            owner_id, namespace, permission_mode,
-                            $4, $5, $6, $7, 'update'
-                        FROM memory_versions WHERE id = $8
-                        RETURNING id
-                        """,
-                        memory_id, next_version, source_head["content"],
-                        target_branch, merge_hash, target_head["id"],
-                        user.user_id, source_head["id"],
-                    )
-
+                    # Implement merge as an UPDATE on `memories` under
+                    # the target_branch GUC. This ensures three
+                    # invariants the prior manual-INSERT path violated
+                    # (Codex round 17):
+                    #
+                    #   1. memories.content stays in sync with the
+                    #      main-branch HEAD (or whichever branch is
+                    #      target). The prior code wrote a new
+                    #      memory_versions row + bumped
+                    #      memory_branches.head_version_id but never
+                    #      touched `memories`, so /memories/{id} and
+                    #      search/rehydrate kept returning the OLD
+                    #      live content.
+                    #   2. The new version row has a complete column
+                    #      set (metadata, verbatim_content, source_*,
+                    #      etc.). The mnemos_version_snapshot trigger
+                    #      copies all of OLD.* into the new
+                    #      memory_versions row; the manual INSERT
+                    #      omitted nearly everything, so an
+                    #      export/revert of the merge commit could
+                    #      erase snapshot data.
+                    #   3. parent_version_id is set to the previous
+                    #      target HEAD by the trigger automatically.
+                    #
+                    # The trigger generates its own commit_hash; we
+                    # fetch it after to return to the caller.
                     await conn.execute(
-                        "UPDATE memory_branches SET head_version_id = $1 "
-                        "WHERE memory_id = $2 AND name = $3",
-                        new_commit_id, memory_id, target_branch,
+                        "SELECT set_config('mnemos.current_branch', $1, true)",
+                        target_branch,
                     )
+                    # Update memories with the source HEAD's
+                    # content + structural columns. The version-
+                    # snapshot trigger fires on UPDATE and creates
+                    # the new memory_versions row + bumps
+                    # memory_branches.head_version_id for
+                    # target_branch.
+                    meta_val = source_head["metadata"]
+                    if isinstance(meta_val, str):
+                        meta_str = meta_val
+                    elif meta_val is not None:
+                        import json as _json
+                        meta_str = _json.dumps(dict(meta_val))
+                    else:
+                        meta_str = "{}"
+                    await conn.execute(
+                        """
+                        UPDATE memories SET
+                            content = $1,
+                            category = $2,
+                            subcategory = $3,
+                            metadata = $4::jsonb,
+                            verbatim_content = $5,
+                            updated = NOW()
+                        WHERE id = $6
+                        """,
+                        source_head["content"],
+                        source_head["category"],
+                        source_head["subcategory"],
+                        meta_str,
+                        source_head["verbatim_content"],
+                        memory_id,
+                    )
+                    new_row = await conn.fetchrow(
+                        "SELECT mv.commit_hash FROM memory_branches mb "
+                        "INNER JOIN memory_versions mv ON mv.id = mb.head_version_id "
+                        "WHERE mb.memory_id = $1 AND mb.name = $2",
+                        memory_id, target_branch,
+                    )
+                    merge_hash = new_row["commit_hash"] if new_row else ""
 
                     logger.info(
                         f"[DAG] Merged {request.source_branch} -> {target_branch} "
-                        f"for {memory_id} (merge_hash={merge_hash[:12]}...)"
+                        f"for {memory_id} (merge_hash={merge_hash[:12] if merge_hash else '?'}...)"
                     )
                     return MergeResult(
                         success=True,
