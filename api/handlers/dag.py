@@ -464,22 +464,48 @@ async def merge_branch(
         async with pool.acquire() as conn:
             await _assert_memory_access(conn, memory_id, user)
             async with conn.transaction():
-                # Serialize concurrent merges on this (memory, branch).
+                # Lock acquisition order: advisory FIRST, row lock
+                # SECOND. Both DAG writers (merge_branch + feature-
+                # branch revert) follow this order so they can't
+                # deadlock against each other.
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", _lock_key)
 
-                # Per-snapshot tenancy gate on the SOURCE head (slice
-                # 2 round 15). Merge copies the source snapshot's
-                # content into a new target-branch version — if the
-                # caller can't read the source snapshot directly via
-                # get_commit, they can't be allowed to copy its
-                # content via merge. Target head needs no per-snapshot
-                # gate because we're WRITING new content, not exposing
-                # the existing target HEAD.
-                # Pull source_* provenance columns too — round-18
-                # caught that omitting them made every merge commit
-                # inherit the TARGET's pre-merge provenance instead
-                # of the source's, so export/revert/audit on a merge
-                # commit was misleading.
+                if request.strategy == "manual":
+                    return MergeResult(
+                        success=False,
+                        message="Manual merge strategy not yet implemented",
+                    )
+
+                # latest-wins from here. Acquire the row lock + read
+                # both source_head and target_head UNDER the lock so
+                # neither can race a concurrent writer (rounds 28,
+                # 29, 30). The advisory lock above also serializes
+                # against other DAG writers on the same branch.
+                if user.role == "root":
+                    live = await conn.fetchrow(
+                        "SELECT id, owner_id, namespace "
+                        "FROM memories WHERE id = $1 FOR UPDATE",
+                        memory_id,
+                    )
+                else:
+                    live = await conn.fetchrow(
+                        "SELECT id, owner_id, namespace "
+                        "FROM memories WHERE id = $1 "
+                        "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
+                        memory_id, user.user_id, user.namespace,
+                    )
+                if live is None:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Memory {memory_id} not found",
+                    )
+
+                # Per-snapshot tenancy on source_head — caller must
+                # be allowed to read the source snapshot directly
+                # via get_commit before merge can copy its content.
+                # Pull source_* provenance fields (round 18). Now
+                # under the row lock so source_head can't drift
+                # mid-transaction (round 30).
                 if user.role == "root":
                     source_head = await conn.fetchrow(
                         """
@@ -515,6 +541,17 @@ async def merge_branch(
                         memory_id, request.source_branch,
                         *vis_params, user.namespace,
                     )
+                if not source_head:
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Source branch '{request.source_branch}' not found",
+                    )
+
+                # target_head also under the lock. Reading it AFTER
+                # FOR UPDATE on memories serializes against
+                # update_memory and main-revert's row-level locks
+                # (round 28). source vs target both freshly read
+                # at the same serialization point.
                 target_head = await conn.fetchrow(
                     """
                     SELECT mv.id, mv.version_num, mv.commit_hash,
@@ -526,67 +563,16 @@ async def merge_branch(
                     """,
                     memory_id, target_branch,
                 )
-                if not source_head:
-                    raise HTTPException(status_code=404, detail=f"Source branch '{request.source_branch}' not found")
                 if not target_head:
-                    raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
-
-                if request.strategy == "latest-wins":
-                    # Authorize against the live row before doing any
-                    # work. We then re-read target_head under the
-                    # row lock and do the AUTHORITATIVE no-op check
-                    # against THAT (round-29 fix). The earlier
-                    # pre-flight against the unlocked target_head
-                    # was racy: a concurrent update_memory or
-                    # main-revert between the early read and lock
-                    # acquisition could change main's HEAD, leaving
-                    # the no-op decision stale.
-                    if user.role == "root":
-                        live = await conn.fetchrow(
-                            "SELECT id, owner_id, namespace "
-                            "FROM memories WHERE id = $1 FOR UPDATE",
-                            memory_id,
-                        )
-                    else:
-                        live = await conn.fetchrow(
-                            "SELECT id, owner_id, namespace "
-                            "FROM memories WHERE id = $1 "
-                            "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
-                            memory_id, user.user_id, user.namespace,
-                        )
-                    # Re-read target_head AFTER acquiring the row
-                    # lock (round-28 fix). The earlier fetch happened
-                    # before FOR UPDATE, so concurrent update_memory
-                    # or main-branch revert could have advanced
-                    # main's HEAD between the read and our INSERT,
-                    # leaving us with stale version_num/parent. Now
-                    # the row lock serializes against those writers
-                    # (their UPDATE on memories acquires the same
-                    # row lock implicitly), so target_head is fresh
-                    # under the lock.
-                    target_head = await conn.fetchrow(
-                        """
-                        SELECT mv.id, mv.version_num, mv.commit_hash,
-                               mv.content, mv.category, mv.subcategory,
-                               mv.metadata, mv.verbatim_content
-                        FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
-                        WHERE mv.memory_id = $1 AND mb.name = $2
-                        """,
-                        memory_id, target_branch,
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Target branch '{target_branch}' not found",
                     )
-                    if not target_head:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Target branch '{target_branch}' not found",
-                        )
-                    if live is None:
-                        raise HTTPException(
-                            status_code=404,
-                            detail=f"Memory {memory_id} not found",
-                        )
 
-                    # Authoritative no-op check (round-29 fix). Run
+                # latest-wins continues here — manual already
+                # returned at the top after lock acquisition.
+
+                # Authoritative no-op check (round-29 fix). Run
                     # this AFTER acquiring the row lock and re-reading
                     # target_head so the decision reflects the current
                     # state of main, not a pre-lock snapshot. Compare
@@ -736,11 +722,6 @@ async def merge_branch(
                             source_head["source_agent"],
                             memory_id,
                         )
-                else:  # manual
-                    return MergeResult(
-                        success=False,
-                        message="Manual merge strategy not yet implemented",
-                    )
 
         # Cache invalidation + memory.updated webhook ONLY when the
         # live row was actually mutated. Branch-only merges (where
