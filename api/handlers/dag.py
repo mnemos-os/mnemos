@@ -552,17 +552,13 @@ async def merge_branch(
                     # branch is materialized).
                     if user.role == "root":
                         live = await conn.fetchrow(
-                            "SELECT id, owner_id, namespace, "
-                            "content, category, subcategory, metadata, "
-                            "verbatim_content "
+                            "SELECT id, owner_id, namespace "
                             "FROM memories WHERE id = $1 FOR UPDATE",
                             memory_id,
                         )
                     else:
                         live = await conn.fetchrow(
-                            "SELECT id, owner_id, namespace, "
-                            "content, category, subcategory, metadata, "
-                            "verbatim_content "
+                            "SELECT id, owner_id, namespace "
                             "FROM memories WHERE id = $1 "
                             "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
                             memory_id, user.user_id, user.namespace,
@@ -574,22 +570,23 @@ async def merge_branch(
                         )
                     merge_owner_id = live["owner_id"]
                     merge_namespace = live["namespace"]
-                    # Live-row tracks target_branch only when ALL of
-                    # the trigger's versioned fields match. Content-
-                    # only equality is unsafe — two branches can
-                    # share content but differ in metadata/category/
-                    # etc., which would falsely classify the live
-                    # row as tracking target and either skip a
-                    # required HEAD advance or overwrite the wrong
-                    # branch's materialized state (round-23
-                    # finding).
-                    live_tracks_target = (
-                        live["content"] == target_head["content"]
-                        and live["category"] == target_head["category"]
-                        and live["subcategory"] == target_head["subcategory"]
-                        and live["metadata"] == target_head["metadata"]
-                        and live["verbatim_content"] == target_head["verbatim_content"]
-                    )
+                    # Materialized-branch identity is determined by
+                    # NAME, not by content equality. The MNEMOS
+                    # convention is `memories` always tracks 'main':
+                    # v1 of every memory is created on 'main' by
+                    # the trigger; update_memory writes via the
+                    # trigger with mnemos.current_branch GUC default
+                    # 'main'. Feature branches diverge in
+                    # memory_versions / memory_branches but never in
+                    # `memories`. So the live row is updated only
+                    # when target_branch is 'main'. Earlier rounds
+                    # tried to infer this from content equality
+                    # (round 22) and full versioned-field equality
+                    # (round 23); both are false-positive on
+                    # newly-branched-from-main memories where the
+                    # branch initially points at the same versioned
+                    # state as main.
+                    live_tracks_target = (target_branch == "main")
 
                     # Compute merge commit_hash. Same shape as the
                     # mnemos_version_snapshot trigger
