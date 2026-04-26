@@ -398,12 +398,20 @@ async def revert_memory(
                 # Feature-branch revert: PURE DAG operation (per
                 # round-25 fix). MNEMOS convention is `memories`
                 # always tracks main; feature branches diverge only
-                # in memory_versions + memory_branches. Reverting on
-                # a feature branch must NOT mutate the live row, or
-                # we re-introduce the branch-skew bug Codex flagged
-                # in dag.py merge. Instead: explicit INSERT of the
-                # revert version row + advance memory_branches HEAD
-                # for the feature branch.
+                # in memory_versions + memory_branches.
+                #
+                # Round-26: take the same branch-level advisory
+                # lock that dag.merge_branch takes, so concurrent
+                # merge + revert against the same (memory, branch)
+                # serialize. Without this, merge could read
+                # target_head, revert could insert a new HEAD, then
+                # merge resumes with stale target_head and
+                # overwrites the revert's HEAD update.
+                from api.handlers.dag import _branch_advisory_lock_key
+                _lock_key = _branch_advisory_lock_key(memory_id, branch)
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)", _lock_key,
+                )
                 import hashlib as _hashlib_local
                 import time as _time_local
                 next_version_num = await conn.fetchval(

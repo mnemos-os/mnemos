@@ -18,6 +18,28 @@ import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 
 
+def _branch_advisory_lock_key(memory_id: str, branch: str, _hashlib_mod=None) -> int:
+    """Stable signed-int64 advisory lock key for a (memory_id, branch).
+
+    All DAG writers — merge_branch + revert_memory feature-branch path —
+    must take pg_advisory_xact_lock on the same key for the same
+    (memory, branch) pair so they serialize against each other and
+    a revert can't orphan a concurrent merge (or vice versa). The
+    "dag-branch" prefix is generic across mutation kinds; the
+    function lives here in dag.py and is imported by
+    api/handlers/versions.py.
+    """
+    if _hashlib_mod is None:
+        import hashlib as _hashlib_mod
+    digest = _hashlib_mod.sha256(
+        f"dag-branch:{memory_id}:{branch}".encode("utf-8")
+    ).digest()[:8]
+    key = int.from_bytes(digest, "big", signed=False)
+    if key >= 2**63:
+        key -= 2**64
+    return key
+
+
 async def _assert_memory_access(conn, memory_id: str, user: UserContext) -> None:
     """Ensure the caller can read/modify this memory. Raises 404 otherwise.
 
@@ -426,15 +448,17 @@ async def merge_branch(
     if request.strategy not in ("latest-wins", "manual"):
         raise HTTPException(status_code=400, detail="Invalid merge strategy")
 
-    # Pre-compute advisory lock key from (memory_id, target_branch) so concurrent
-    # merges against the same branch serialize. Signed int64 range for postgres.
+    # Pre-compute advisory lock key from (memory_id, target_branch) so all
+    # DAG writers (merge AND revert) serialize on the same branch.
+    # Round-26: previous prefix "dag-merge" was merge-specific and didn't
+    # collide with revert's locks; a feature-branch revert could orphan
+    # a concurrent merge into the same branch (or vice versa). Generic
+    # "dag-branch" prefix means both paths compute the same key for the
+    # same (memory_id, branch) and pg_advisory_xact_lock serializes
+    # them. The revert path in api/handlers/versions.py uses an
+    # identical key.
     import hashlib as _hashlib
-    _lock_bytes = _hashlib.sha256(
-        f"dag-merge:{memory_id}:{target_branch}".encode("utf-8")
-    ).digest()[:8]
-    _lock_key = int.from_bytes(_lock_bytes, "big", signed=False)
-    if _lock_key >= 2**63:
-        _lock_key -= 2**64
+    _lock_key = _branch_advisory_lock_key(memory_id, target_branch, _hashlib)
 
     try:
         async with pool.acquire() as conn:
