@@ -418,7 +418,27 @@ async def revert_memory(
                     """,
                     memory_id,
                 )
-                if main_head is not None and (
+                # Fail-closed if main HEAD is absent. The trigger
+                # only ADVANCES an existing memory_branches row; an
+                # UPDATE here without a main HEAD would mutate the
+                # live row and silently create an unreachable
+                # version row. Reject the request and let the
+                # operator reconstruct main HEAD first.
+                if main_head is None:
+                    logger.error(
+                        f"[VERSION] Revert aborted: memory {memory_id} "
+                        f"has no main HEAD in memory_branches. Refusing "
+                        f"to mutate live row when main HEAD is broken/missing."
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"main branch HEAD missing for memory "
+                            f"{memory_id}; manual reconciliation required "
+                            f"before revert can proceed"
+                        ),
+                    )
+                if (
                     live["content"] != main_head["content"]
                     or live["category"] != main_head["category"]
                     or live["subcategory"] != main_head["subcategory"]
