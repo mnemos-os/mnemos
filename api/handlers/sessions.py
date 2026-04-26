@@ -185,12 +185,22 @@ async def add_session_message(
             request.model or session["model"],
         )
 
-    # Get conversation history (last 10 messages for context)
+    # Get conversation history (last 10 messages for context).
+    # Subquery picks the 10 most recent (DESC LIMIT 10); outer ORDER
+    # BY ASC re-chronologizes so the provider sees them oldest-first.
+    # The earlier `ORDER BY ASC LIMIT 10` returned the 10 OLDEST
+    # messages, so long sessions lost their recent context entirely.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
-            SELECT role, content FROM session_messages
-            WHERE session_id = $1 ORDER BY timestamp ASC LIMIT 10
+            SELECT role, content FROM (
+                SELECT role, content, timestamp
+                FROM session_messages
+                WHERE session_id = $1
+                ORDER BY timestamp DESC
+                LIMIT 10
+            ) recent
+            ORDER BY timestamp ASC
             """,
             session_id,
         )
