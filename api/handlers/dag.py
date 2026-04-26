@@ -573,104 +573,146 @@ async def merge_branch(
                 # returned at the top after lock acquisition.
 
                 # Authoritative no-op check (round-29 fix). Run
-                    # this AFTER acquiring the row lock and re-reading
-                    # target_head so the decision reflects the current
-                    # state of main, not a pre-lock snapshot. Compare
-                    # ALL of the trigger's versioned fields (round-23
-                    # extended this from content-only to the full
-                    # set: content / category / subcategory /
-                    # metadata / verbatim_content).
-                    if (source_head["content"] == target_head["content"]
-                            and source_head["category"] == target_head["category"]
-                            and source_head["subcategory"] == target_head["subcategory"]
-                            and source_head["metadata"] == target_head["metadata"]
-                            and source_head["verbatim_content"] == target_head["verbatim_content"]):
-                        logger.info(
-                            f"[DAG] Merge no-op (locked): "
-                            f"{request.source_branch} -> {target_branch} for "
-                            f"{memory_id} (versioned fields identical at "
-                            f"locked target_head)"
-                        )
-                        return MergeResult(
-                            success=False,
-                            new_commit_hash=target_head["commit_hash"],
-                            message=(
-                                f"Source branch '{request.source_branch}' has "
-                                f"no versioned changes vs '{target_branch}'; "
-                                f"no merge commit created"
-                            ),
-                        )
+                # this AFTER acquiring the row lock and re-reading
+                # target_head so the decision reflects the current
+                # state of main, not a pre-lock snapshot. Compare
+                # ALL of the trigger's versioned fields (round-23
+                # extended this from content-only to the full
+                # set: content / category / subcategory /
+                # metadata / verbatim_content).
+                if (source_head["content"] == target_head["content"]
+                        and source_head["category"] == target_head["category"]
+                        and source_head["subcategory"] == target_head["subcategory"]
+                        and source_head["metadata"] == target_head["metadata"]
+                        and source_head["verbatim_content"] == target_head["verbatim_content"]):
+                    logger.info(
+                        f"[DAG] Merge no-op (locked): "
+                        f"{request.source_branch} -> {target_branch} for "
+                        f"{memory_id} (versioned fields identical at "
+                        f"locked target_head)"
+                    )
+                    return MergeResult(
+                        success=False,
+                        new_commit_hash=target_head["commit_hash"],
+                        message=(
+                            f"Source branch '{request.source_branch}' has "
+                            f"no versioned changes vs '{target_branch}'; "
+                            f"no merge commit created"
+                        ),
+                    )
 
-                    merge_owner_id = live["owner_id"]
-                    merge_namespace = live["namespace"]
-                    # Materialized-branch identity is determined by
-                    # NAME, not by content equality. The MNEMOS
-                    # convention is `memories` always tracks 'main':
-                    # v1 of every memory is created on 'main' by
-                    # the trigger; update_memory writes via the
-                    # trigger with mnemos.current_branch GUC default
-                    # 'main'. Feature branches diverge in
-                    # memory_versions / memory_branches but never in
-                    # `memories`. So the live row is updated only
-                    # when target_branch is 'main'. Earlier rounds
-                    # tried to infer this from content equality
-                    # (round 22) and full versioned-field equality
-                    # (round 23); both are false-positive on
-                    # newly-branched-from-main memories where the
-                    # branch initially points at the same versioned
-                    # state as main.
-                    live_tracks_target = (target_branch == "main")
+                merge_owner_id = live["owner_id"]
+                merge_namespace = live["namespace"]
+                # Materialized-branch identity is determined by
+                # NAME, not by content equality. The MNEMOS
+                # convention is `memories` always tracks 'main':
+                # v1 of every memory is created on 'main' by
+                # the trigger; update_memory writes via the
+                # trigger with mnemos.current_branch GUC default
+                # 'main'. Feature branches diverge in
+                # memory_versions / memory_branches but never in
+                # `memories`. So the live row is updated only
+                # when target_branch is 'main'. Earlier rounds
+                # tried to infer this from content equality
+                # (round 22) and full versioned-field equality
+                # (round 23); both are false-positive on
+                # newly-branched-from-main memories where the
+                # branch initially points at the same versioned
+                # state as main.
+                live_tracks_target = (target_branch == "main")
 
-                    # Compute merge commit_hash. Same shape as the
-                    # mnemos_version_snapshot trigger
-                    # (sha256 over id|version|content|now) so the
-                    # commit identity is consistent regardless of
-                    # whether the trigger or this handler created it.
-                    import hashlib as _hashlib_local
-                    next_version = target_head["version_num"] + 1
-                    merge_hash = _hashlib_local.sha256(
-                        f"{memory_id}|{next_version}|{source_head['content']}|"
-                        f"merge-{request.source_branch}->{target_branch}-{int(__import__('time').time() * 1_000_000)}"
-                        .encode()
-                    ).hexdigest()
+                # Compute merge commit_hash. Same shape as the
+                # mnemos_version_snapshot trigger
+                # (sha256 over id|version|content|now) so the
+                # commit identity is consistent regardless of
+                # whether the trigger or this handler created it.
+                import hashlib as _hashlib_local
+                next_version = target_head["version_num"] + 1
+                merge_hash = _hashlib_local.sha256(
+                    f"{memory_id}|{next_version}|{source_head['content']}|"
+                    f"merge-{request.source_branch}->{target_branch}-{int(__import__('time').time() * 1_000_000)}"
+                    .encode()
+                ).hexdigest()
 
-                    meta_val = source_head["metadata"]
-                    if isinstance(meta_val, str):
-                        meta_str = meta_val
-                    elif meta_val is not None:
-                        import json as _json
-                        meta_str = _json.dumps(dict(meta_val))
-                    else:
-                        meta_str = "{}"
+                meta_val = source_head["metadata"]
+                if isinstance(meta_val, str):
+                    meta_str = meta_val
+                elif meta_val is not None:
+                    import json as _json
+                    meta_str = _json.dumps(dict(meta_val))
+                else:
+                    meta_str = "{}"
 
-                    # Explicit INSERT into memory_versions for the
-                    # merge commit. Pulls owner_id/namespace/
-                    # permission_mode from the source snapshot
-                    # (per slice-2 round-15 source-head visibility
-                    # gate), copies content + provenance fields,
-                    # parents off target_head.id, change_type=update
-                    # (the v2 CHECK constraint doesn't allow 'merge';
-                    # see migration_v2_versioning).
-                    new_version_id = await conn.fetchval(
+                # Explicit INSERT into memory_versions for the
+                # merge commit. Pulls owner_id/namespace/
+                # permission_mode from the source snapshot
+                # (per slice-2 round-15 source-head visibility
+                # gate), copies content + provenance fields,
+                # parents off target_head.id, change_type=update
+                # (the v2 CHECK constraint doesn't allow 'merge';
+                # see migration_v2_versioning).
+                new_version_id = await conn.fetchval(
+                    """
+                    INSERT INTO memory_versions (
+                        memory_id, version_num, content, category, subcategory,
+                        metadata, verbatim_content,
+                        owner_id, namespace, permission_mode,
+                        source_model, source_provider, source_session, source_agent,
+                        branch, commit_hash, parent_version_id,
+                        snapshot_by, change_type
+                    )
+                    SELECT
+                        $1, $2, $3, $4, $5,
+                        $6::jsonb, $7,
+                        owner_id, namespace, permission_mode,
+                        $8, $9, $10, $11,
+                        $12, $13, $14, $15, 'update'
+                    FROM memory_versions WHERE id = $16
+                    RETURNING id
+                    """,
+                    memory_id, next_version,
+                    source_head["content"], source_head["category"],
+                    source_head["subcategory"],
+                    meta_str, source_head["verbatim_content"],
+                    source_head["source_model"],
+                    source_head["source_provider"],
+                    source_head["source_session"],
+                    source_head["source_agent"],
+                    target_branch, merge_hash, target_head["id"],
+                    user.user_id, source_head["id"],
+                )
+
+                # Advance the target branch HEAD pointer.
+                await conn.execute(
+                    "UPDATE memory_branches SET head_version_id = $1 "
+                    "WHERE memory_id = $2 AND name = $3",
+                    new_version_id, memory_id, target_branch,
+                )
+
+                # If the live row was tracking target_branch
+                # (its content matched target_head's), advance
+                # the live row too so the live-row/HEAD invariant
+                # holds for the now-materialized branch.
+                # Suppress the version-snapshot trigger here so
+                # we don't double-version (we already did the
+                # explicit INSERT above). Use the existing
+                # mnemos.suppress_version_snapshot GUC which the
+                # trigger consults via its WHEN clause (per
+                # migrations_charon_trigger_guard).
+                if live_tracks_target:
+                    await conn.execute(
+                        "SELECT set_config('mnemos.suppress_version_snapshot', '1', true)"
+                    )
+                    await conn.execute(
                         """
-                        INSERT INTO memory_versions (
-                            memory_id, version_num, content, category, subcategory,
-                            metadata, verbatim_content,
-                            owner_id, namespace, permission_mode,
-                            source_model, source_provider, source_session, source_agent,
-                            branch, commit_hash, parent_version_id,
-                            snapshot_by, change_type
-                        )
-                        SELECT
-                            $1, $2, $3, $4, $5,
-                            $6::jsonb, $7,
-                            owner_id, namespace, permission_mode,
-                            $8, $9, $10, $11,
-                            $12, $13, $14, $15, 'update'
-                        FROM memory_versions WHERE id = $16
-                        RETURNING id
+                        UPDATE memories SET
+                            content = $1, category = $2, subcategory = $3,
+                            metadata = $4::jsonb, verbatim_content = $5,
+                            source_model = $6, source_provider = $7,
+                            source_session = $8, source_agent = $9,
+                            updated = NOW()
+                        WHERE id = $10
                         """,
-                        memory_id, next_version,
                         source_head["content"], source_head["category"],
                         source_head["subcategory"],
                         meta_str, source_head["verbatim_content"],
@@ -678,50 +720,8 @@ async def merge_branch(
                         source_head["source_provider"],
                         source_head["source_session"],
                         source_head["source_agent"],
-                        target_branch, merge_hash, target_head["id"],
-                        user.user_id, source_head["id"],
+                        memory_id,
                     )
-
-                    # Advance the target branch HEAD pointer.
-                    await conn.execute(
-                        "UPDATE memory_branches SET head_version_id = $1 "
-                        "WHERE memory_id = $2 AND name = $3",
-                        new_version_id, memory_id, target_branch,
-                    )
-
-                    # If the live row was tracking target_branch
-                    # (its content matched target_head's), advance
-                    # the live row too so the live-row/HEAD invariant
-                    # holds for the now-materialized branch.
-                    # Suppress the version-snapshot trigger here so
-                    # we don't double-version (we already did the
-                    # explicit INSERT above). Use the existing
-                    # mnemos.suppress_version_snapshot GUC which the
-                    # trigger consults via its WHEN clause (per
-                    # migrations_charon_trigger_guard).
-                    if live_tracks_target:
-                        await conn.execute(
-                            "SELECT set_config('mnemos.suppress_version_snapshot', '1', true)"
-                        )
-                        await conn.execute(
-                            """
-                            UPDATE memories SET
-                                content = $1, category = $2, subcategory = $3,
-                                metadata = $4::jsonb, verbatim_content = $5,
-                                source_model = $6, source_provider = $7,
-                                source_session = $8, source_agent = $9,
-                                updated = NOW()
-                            WHERE id = $10
-                            """,
-                            source_head["content"], source_head["category"],
-                            source_head["subcategory"],
-                            meta_str, source_head["verbatim_content"],
-                            source_head["source_model"],
-                            source_head["source_provider"],
-                            source_head["source_session"],
-                            source_head["source_agent"],
-                            memory_id,
-                        )
 
         # Cache invalidation + memory.updated webhook ONLY when the
         # live row was actually mutated. Branch-only merges (where
