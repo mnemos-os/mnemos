@@ -2064,7 +2064,6 @@ def test_import_rolls_back_existing_memory_dag_poisoning(monkeypatch):
     EXISTING caller-owned memory can move that memory's HEAD to
     stale content while the live row stays unchanged. Verify the
     extended check catches this."""
-    derived_id = "mem_alice1"
     conn = _Conn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         "SELECT DISTINCT ON (memory_id, branch)": [

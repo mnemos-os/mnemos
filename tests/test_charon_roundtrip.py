@@ -27,7 +27,6 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict
-from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
