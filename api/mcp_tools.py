@@ -100,7 +100,9 @@ async def tool_log_memory(
                     SELECT
                         mv.id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
-                        mv.change_type, mv.snapshot_at, mv.snapshot_by, 1 AS depth
+                        mv.change_type, mv.snapshot_at, mv.snapshot_by,
+                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        1 AS depth
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON (
                         mb.memory_id = mv.memory_id AND
@@ -112,7 +114,9 @@ async def tool_log_memory(
                     SELECT
                         mv.id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
-                        mv.change_type, mv.snapshot_at, mv.snapshot_by, cw.depth + 1
+                        mv.change_type, mv.snapshot_at, mv.snapshot_by,
+                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        cw.depth + 1
                     FROM memory_versions mv
                     INNER JOIN commit_walk cw ON mv.id = cw.parent_version_id
                     WHERE cw.depth < $4
@@ -231,18 +235,50 @@ async def tool_branch_memory(
                 if not start:
                     return {"success": False, "error": "main branch not found"}
 
-            # Create branch
+            # Create branch — CREATE-ONLY semantics. The earlier
+            # `ON CONFLICT DO UPDATE SET head_version_id = ...` was
+            # described as "create a branch" but silently rewrote
+            # the existing branch's head pointer on a duplicate
+            # name (including 'main'). That's a write-path data-
+            # integrity hole: a retry, an accidental re-run, or a
+            # caller passing name='main' would move the branch
+            # head with no audit boundary, breaking subsequent
+            # logs/diffs/merges.
+            #
+            # New semantics: idempotent success when the existing
+            # branch already points at the same head_version_id
+            # (safe re-run); 409-shaped failure when a branch with
+            # that name exists at a DIFFERENT head (caller must use
+            # an explicit branch-move op, which doesn't exist yet).
+            existing = await conn.fetchrow(
+                "SELECT head_version_id FROM memory_branches "
+                "WHERE memory_id = $1 AND name = $2",
+                memory_id, name,
+            )
+            if existing is not None:
+                if existing["head_version_id"] == start["id"]:
+                    return {
+                        "success": True,
+                        "memory_id": memory_id,
+                        "branch": name,
+                        "commit_hash": start["commit_hash"],
+                        "created_by": user.user_id,
+                        "idempotent": True,
+                    }
+                return {
+                    "success": False,
+                    "error": (
+                        f"branch '{name}' already exists at a different "
+                        f"head; refusing to silently move it"
+                    ),
+                }
+
             await conn.execute(
                 """
                 INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
                 VALUES ($1, $2, $3, $4)
-                ON CONFLICT (memory_id, name) DO UPDATE
-                SET head_version_id = EXCLUDED.head_version_id
                 """,
-                memory_id,
-                name,
-                start["id"],
-                user.user_id if user else None,
+                memory_id, name, start["id"], user.user_id,
             )
 
             return {
@@ -250,7 +286,7 @@ async def tool_branch_memory(
                 "memory_id": memory_id,
                 "branch": name,
                 "commit_hash": start["commit_hash"],
-                "created_by": user.user_id if user else None,
+                "created_by": user.user_id,
             }
 
     except Exception as e:
