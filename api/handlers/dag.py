@@ -568,7 +568,7 @@ async def merge_branch(
                                 source_agent = $9,
                                 updated = NOW()
                             WHERE id = $10
-                            RETURNING id
+                            RETURNING id, owner_id, namespace
                             """,
                             source_head["content"],
                             source_head["category"],
@@ -598,7 +598,7 @@ async def merge_branch(
                             WHERE id = $10
                               AND owner_id = $11
                               AND namespace = $12
-                            RETURNING id
+                            RETURNING id, owner_id, namespace
                             """,
                             source_head["content"],
                             source_head["category"],
@@ -623,6 +623,38 @@ async def merge_branch(
                         memory_id, target_branch,
                     )
                     merge_hash = new_row["commit_hash"] if new_row else ""
+                    # Verify the merge actually advanced the DAG. The
+                    # mnemos_version_snapshot trigger only fires on
+                    # content/category/subcategory/metadata/verbatim/
+                    # owner/namespace/permission changes — NOT on
+                    # source_* changes alone (round-19 finding). If
+                    # source and target have identical content but
+                    # different provenance, memories.source_* gets
+                    # updated but no new memory_versions row is
+                    # created and merge_hash == target_head's hash.
+                    # That would silently mutate live state without
+                    # an auditable DAG record. Return a no-op
+                    # MergeResult instead.
+                    if merge_hash == target_head["commit_hash"]:
+                        logger.info(
+                            f"[DAG] Merge no-op: {request.source_branch} -> "
+                            f"{target_branch} for {memory_id} (versioned "
+                            f"fields identical; no new commit created)"
+                        )
+                        return MergeResult(
+                            success=False,
+                            new_commit_hash=merge_hash,
+                            message=(
+                                f"Source branch '{request.source_branch}' "
+                                f"has no versioned changes vs '{target_branch}'; "
+                                f"no merge commit created"
+                            ),
+                        )
+                    # Capture target tenancy from the UPDATE's
+                    # RETURNING — owner_id/namespace are needed for
+                    # the post-txn webhook scope.
+                    merge_owner_id = updated["owner_id"]
+                    merge_namespace = updated["namespace"]
                 else:  # manual
                     return MergeResult(
                         success=False,
@@ -649,7 +681,11 @@ async def merge_branch(
 
         # Webhook parity with update_memory: downstream consumers
         # subscribed to memory.updated should see merges too (they
-        # materially changed the live row).
+        # materially changed the live row). MUST pass owner_id +
+        # namespace as scope — without those the dispatcher treats
+        # the event as system-wide and fans out to every tenant's
+        # subscription, leaking the merged content cross-tenant
+        # (round-19 critical).
         try:
             from api.webhook_dispatcher import dispatch as _dispatch_webhook
             async with _lc._pool.acquire() as _wh_conn:
@@ -658,9 +694,11 @@ async def merge_branch(
                     "category": source_head["category"],
                     "subcategory": source_head["subcategory"],
                     "content": source_head["content"],
+                    "owner_id": merge_owner_id,
+                    "namespace": merge_namespace,
                     "merge_source": request.source_branch,
                     "merge_target": target_branch,
-                })
+                }, owner_id=merge_owner_id, namespace=merge_namespace)
         except Exception:
             logger.warning(
                 "webhook dispatch failed for memory.updated %s",
