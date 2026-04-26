@@ -2,12 +2,160 @@
 
 All notable changes to MNEMOS are documented here.
 
-## [Unreleased]
+## [3.4.1] — 2026-04-26
 
-Post-3.2.0 work not yet tagged.
+Federation schema-compat preflight + dev↔prod MPF restore drill.
+Cross-version federation safety is the headline: peers now exchange
+schema fingerprints before opening sync, refusing to pair when their
+migration sets diverge unless an operator explicitly opts in via
+`compat_mode=permissive`. Eight rounds of Codex adversarial review
+on the federation handshake (verdict: SHIP). Restore-drill runbook
+validated end-to-end on 10k records (~13s, 770 rec/sec) PYTHIA →
+PROTEUS.
+
+### Added
+
+- **`GET /v1/federation/schema`** — preflight endpoint returning
+  `mnemos_version`, `schema_signature` (`major.minor`), and
+  `migrations_fingerprint` (sha256 over filename + content of
+  `db/migrations*.sql`). Peers call this before opening sync and
+  refuse to pair on mismatch.
+- **`federation_peers` columns** — `compat_mode`
+  (`strict|permissive`, default `strict`), `peer_mnemos_version`,
+  `last_schema_check_at`. `strict` blocks sync on schema mismatch
+  with HTTP 409 + operator-action message; `permissive` allows it
+  through with a logged warning.
+- **Typed exceptions** — `FederationSchemaIncompatible` /
+  `Unverifiable` / `Transient` map to HTTP 409 / 409 / 503 so
+  peers can distinguish "your schema is wrong" from "I can't
+  reach you right now."
+- **Native vs federated memory counts in `/stats`** — top-level
+  totals plus a per-peer breakdown so operators can see at a
+  glance which peer contributed which slice of the catalog.
+- **`docs/RESTORE-DRILL.md`** — step-by-step dev↔prod MPF
+  round-trip runbook: 5MB body cap on `/v1/import` means the CLI
+  tool is the production path; `--preserve-metadata` is the
+  dev↔prod lever; three-step DELETE + orphan sweep cleanup
+  pattern documented.
 
 ### Changed
 
+- **Worker queue ordering changed to next-due-time.** Previous FIFO
+  starved peers with shorter `sync_interval_secs` when a longer-
+  interval peer queued a large batch. New ORDER BY balances
+  fairness across heterogeneous intervals.
+- **`FEDERATION_ALLOW_INSECURE` plumbed through staging compose env.**
+  Required for cross-version smoke tests on PROTEUS without
+  full TLS termination.
+- **MORPHEUS / APOLLO S-IVB naming locked** — no rename in v3.4.x.
+  Both names appear in code, docs, and ops procedures by design;
+  see `docs/PANTHEON.md`.
+
+### Verified
+
+- PROTEUS staging upgraded to v3.4.0, cross-version tested against
+  PYTHIA v3.3.0 — `strict` returns 409 with operator-action message;
+  `permissive` flip succeeds with 200. FK rollback applied during
+  the v3.4 migration audit (issue #1 mnemos-os/mnemos rescoped to
+  v3.5).
+
+## [3.4.0] — 2026-04-26
+
+CHARON v0.2 release: full MPF v0.1 sidecar round-trip, plus
+staging-deploy infrastructure for PROTEUS as the cross-version
+proving ground. Forty-four rounds of Codex adversarial review on the
+sidecar attachment paths (cross-tenant attack surface, DAG
+poisoning, version-DAG divergence, timestamp-shift, commit-hash
+collision, conflict-row equality semantics, snapshot-consistent
+export under REPEATABLE READ READ ONLY).
+
+### Added
+
+- **CHARON v0.2 sidecar round-trip** — full MPF v0.1 import + export
+  with `--preserve-metadata` flag as the dev↔prod lever. Sidecar
+  surfaces: `kg_triples`, `documents`, `facts`, `events`,
+  `compression_manifest`, `memory_versions`. Tenant-scoped record
+  IDs prevent cross-tenant sidecar attachment. Memory-versions
+  sidecar requires root + `preserve_owner=true` (architectural
+  restriction). Per-surface hard cap on sidecar export to bound
+  memory consumption on large catalogs.
+- **`docker-compose.staging.yml`** — PROTEUS staging compose,
+  Postgres bound to :5433 (host-Postgres collision avoidance),
+  pre-init `mnemos` role for fresh DB initialization.
+- **v3.4 planning charters + ops doc** — `docs/V3_5_CHARTER.md`,
+  `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md`, `docs/OPERATIONS.md`,
+  `docs/PANTHEON.md` (extended with charter-bound sidecar
+  ownership rules), `ROADMAP.md` cut.
+
+### Changed
+
+- **`OLLAMA_EMBED_*` env vars renamed to `INFERENCE_EMBED_*`.**
+  Ollama is one of several inference backends; the variable name
+  was misleading. Old names not honored — operators must update
+  env files on upgrade.
+- **GUC scope tightened on branch context.** Branch-scoped GUC now
+  set within transaction only, parameterized to prevent injection.
+  Same fix cherry-picked to v3.3.0 release as `8058666` (pre-v3.4
+  audit).
+
+### Audit
+
+- Forty-four-round Codex adversarial review on sidecar paths.
+  Closed: cross-tenant DAG-edge attack, shadow-parent attack,
+  memory-ID oracle attack (records-loop), commit_hash collision,
+  timestamp-shift, DAG-divergence integrity check, existing-memory
+  DAG poisoning, no-main-branch import bypass, stale-version DAG
+  poisoning, stale memory_branches not cleared before restore,
+  version verification ON CONFLICT exact-match,
+  `kg_triples` / `compression_manifest` ON CONFLICT exact-match,
+  IS-NOT-DISTINCT-FROM semantics in conflict checks, in-envelope
+  parents required for newly-inserted records, freshly-inserted vs
+  conflict-skipped UUID tracking, JSON sidecars warn without
+  `--preserve-metadata`, root-path conflict-row equality extension,
+  conflict-row check covers all envelope-bound columns, pre-insert
+  validation rejections block sidecar attachment, gated sidecar
+  timestamp tolerance on freshness, COALESCE-tolerance for sidecar
+  timestamp retries, snapshot-consistent export via REPEATABLE
+  READ READ ONLY.
+
+## [3.3.0] — 2026-04-26
+
+Compression-stack settlement, CI policy flip to GitLab, MORPHEUS
+slice 2 (real cluster + synthesise), and the EVOLUTION.md origin
+narrative. Closes the v3.2 compression-stack open question by
+retiring ALETHEIA from the default contest.
+
+### Added
+
+- **MORPHEUS slice 2 — real cluster + synthesise phases.** Phase 1
+  foundation shipped in v3.3.0-alpha.1; slice 2 adds the cluster
+  pass (semantic grouping over the working set) and the synthesise
+  pass (LLM-mediated synthesis of cross-memory patterns into
+  derived facts). Three audit-log items closed: namespace scope on
+  cluster output, cluster introspection endpoint, FastAPI
+  deprecation cleanup. 31 tests in `tests/test_knossos.py` cover
+  the phase-1 tool surface (0.46s).
+- **`recall_count` + `last_recalled_at` on memory search hits.**
+  Every search result increments the recall counter and updates
+  the timestamp. Useful for downstream "warmest" / "coldest"
+  prioritization queries.
+- **`docs/EVOLUTION.md`** — five-month development timeline from
+  v0.1 design review through v3.2 compression-stack settlement.
+  Restructured to put origin story in v1.0 section + ADR block
+  for release-gate decisions.
+- **GitLab CI** (`.gitlab-ci.yml`) — three stages (`lint`, `test`,
+  `build`) running against real Postgres + pgvector service. See
+  `~/.claude/rules/gitlab-ci-policy.md` for the full rationale.
+- **GitHub `pr-check.yml`** — slim PR-only lint + unit test
+  workflow so external contributors get green/red signal on PR
+  without maintainer-side GitLab pre-flight.
+
+### Changed
+
+- **`/kg` and `/sessions` routers moved to `/v1/` prefix.** The
+  v2 endpoints stayed in place during the v3.0–3.2 transition;
+  v3.3 finishes the migration. Old paths return 410 with the new
+  path in the response body.
 - **ALETHEIA retired from the default compression stack.** The
   going-forward stack is LETHE + ANAMNESIS + APOLLO (APOLLO in
   v3.3+ per ROADMAP.md Apollo Program). ALETHEIA won 0 contests in
@@ -24,6 +172,22 @@ Post-3.2.0 work not yet tagged.
   engine class stays importable; v4.0 removes it entirely. See
   `docs/benchmarks/compression-2026-04-23.md` for measured rationale
   and the niche audit captured in-session.
+
+### Removed
+
+- **LETHE / ANAMNESIS / ALETHEIA modules and `CompressionManager`
+  removed from the active code path.** Engine classes stay
+  importable for backward compatibility; the manager is gone. The
+  contest harness instantiates engines directly.
+
+### Fixed
+
+- **`install.py` / `installer/db.py` migration loaders include
+  v3.2.2 + v3.3 migrations.** Two newer migration files were
+  silently absent from the canonical loader.
+- **CI pre-creates `mnemos_user` + `mnemos` roles** before applying
+  migrations, eliminating a flaky CI failure mode where migrations
+  ran before role provisioning completed.
 
 ## [3.2.0] — 2026-04-23
 
