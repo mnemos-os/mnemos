@@ -96,6 +96,44 @@ def test_h1_fts_fetch_no_owner_filter_leaves_query_clean(monkeypatch):
     assert "federation_source IS NOT NULL" not in sql
 
 
+def test_slice2_fts_fetch_with_group_ids_uses_full_visibility(monkeypatch):
+    """When group_ids is also passed, _fts_fetch emits the full
+    v1_multiuser-mirror predicate: owner / federation / world /
+    group-readable. Slice 2.1 closure — search now matches list/get
+    visibility."""
+    from api.lifecycle import _fts_fetch
+
+    conn = _Conn()
+    asyncio.run(_fts_fetch(
+        conn, "query", 10, owner_id="alice", group_ids=["g1", "g2"],
+    ))
+
+    sql = conn.fetches[-1][0]
+    args = conn.fetches[-1][1]
+    assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql           # world-readable
+    assert "permission_mode >= 640" in sql         # group-readable threshold
+    assert "group_id = ANY(" in sql                # group-membership branch
+    assert "alice" in args
+    assert ["g1", "g2"] in args                    # group_ids array passed
+
+
+def test_slice2_vector_search_with_group_ids_uses_full_visibility(monkeypatch):
+    """Same closure for the pgvector path."""
+    from api.lifecycle import _vector_search
+
+    conn = _Conn()
+    asyncio.run(_vector_search(
+        conn, [0.1, 0.2], 10, owner_id="alice", group_ids=[],
+    ))
+
+    sql = conn.fetches[-1][0]
+    assert "permission_mode % 10" in sql
+    assert "permission_mode >= 640" in sql
+    assert "group_id = ANY(" in sql
+
+
 def test_h1_gateway_context_search_includes_federation(monkeypatch):
     """/v1/chat/completions _search_mnemos_context uses an inline
     SELECT (not the shared helpers because it has a category-OR).

@@ -427,17 +427,25 @@ async def _vector_search(conn, embedding: list, limit: int,
                          category=None, subcategory=None, select_cols=None,
                          source_provider=None, source_model=None,
                          source_agent=None, namespace=None,
-                         owner_id=None) -> list:
+                         owner_id=None, group_ids=None) -> list:
     """pgvector cosine similarity search. Returns rows ordered by similarity desc.
 
     The vector is always $1 — used in both the SELECT similarity expression and
     the ORDER BY clause.  Passing it as a parameter (not interpolated into the
     query string) eliminates any injection risk from a poisoned embedding response.
     Supports optional provenance filters (source_provider, source_model,
-    source_agent, namespace) ANDed into the WHERE clause. `owner_id` (v3.1.2
-    Tier 3 app-layer filter) similarly scopes the result set when the caller
-    passes it — non-root callers from /memories/search pin this to their
-    user_id for defense-in-depth against RLS being disabled.
+    source_agent, namespace) ANDed into the WHERE clause.
+
+    When the caller passes ``owner_id`` AND ``group_ids`` (a list, possibly
+    empty), the visibility predicate is the full v1_multiuser-mirror from
+    api.visibility — owner / federation / world-readable / group-readable.
+    Non-root callers from /memories/search pin owner_id=user.user_id and
+    pass group_ids=user.group_ids; the same predicate is used by list/get,
+    so a memory visible to one read path is visible to all.
+
+    Backward-compat: callers that pass owner_id alone (without group_ids)
+    keep the older (owner_id OR federation_source) shape — used for any
+    legacy call sites that haven't been audited yet.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
@@ -451,21 +459,25 @@ async def _vector_search(conn, embedding: list, limit: int,
     conditions: list = ["embedding IS NOT NULL"]
     for col, val in [("category", category), ("subcategory", subcategory),
                      ("source_provider", source_provider), ("source_model", source_model),
-                     ("source_agent", source_agent), ("namespace", namespace),
-                     ("owner_id", owner_id)]:
+                     ("source_agent", source_agent), ("namespace", namespace)]:
         if val is not None:
             params.append(val)
-            if col == "owner_id":
-                # v3.2 H1 fix: federated memories carry owner_id='federation'
-                # and must be readable alongside the caller's own rows.
-                # Mutation paths still hard-filter by owner_id (caller
-                # can't update/delete federated rows) — this only affects
-                # the read helpers used by search/rehydrate/gateway.
-                conditions.append(
-                    f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
-                )
-            else:
-                conditions.append(f"{col}=${len(params)}")
+            conditions.append(f"{col}=${len(params)}")
+    if owner_id is not None:
+        if group_ids is not None:
+            # Full v1_multiuser-mirror predicate via the shared module.
+            from api.visibility import read_visibility_predicate
+            clause, vis_params = read_visibility_predicate(
+                owner_id, list(group_ids), len(params) + 1,
+            )
+            conditions.append(clause)
+            params.extend(vis_params)
+        else:
+            # Legacy backward-compat: owner-or-federation only.
+            params.append(owner_id)
+            conditions.append(
+                f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
+            )
     params.append(limit)
     limit_ph = f"${len(params)}"
 
@@ -483,67 +495,69 @@ async def _fts_fetch(conn, query: str, limit: int,
                      category=None, subcategory=None, select_cols=None,
                      source_provider=None, source_model=None,
                      source_agent=None, namespace=None,
-                     owner_id=None):
+                     owner_id=None, group_ids=None):
     """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate.
 
     Uses plainto_tsquery (not to_tsquery) so user input is treated as plain text —
     tsquery operators like |, !, & are not interpreted.  This prevents tsquery
     operator injection while preserving full-text search quality.
     Supports optional provenance filters (source_provider, source_model,
-    source_agent, namespace) ANDed into the WHERE clause. `owner_id` (v3.1.2
-    Tier 3) scopes the result set to a single owner when supplied; callers
-    from non-root /memories/search pin it to user.user_id.
+    source_agent, namespace) ANDed into the WHERE clause.
+
+    When the caller passes ``owner_id`` AND ``group_ids``, the visibility
+    predicate is the full v1_multiuser-mirror — owner / federation /
+    world-readable / group-readable. Same shape used by list/get; consistent
+    across all read paths so a row visible via one path is visible via all.
+    Backward-compat: passing owner_id alone keeps the older (owner_id OR
+    federation_source) shape.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
     clean_query = query.strip()
     rank_col = "ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank"
 
-    # Dynamic WHERE builder: $1=query, $2=limit; filter params at $3+
-    params: list = [clean_query, limit]
-    conditions: list = ["to_tsvector('english', content) @@ plainto_tsquery('english', $1)"]
-    for col, val in [("category", category), ("subcategory", subcategory),
-                     ("source_provider", source_provider), ("source_model", source_model),
-                     ("source_agent", source_agent), ("namespace", namespace),
-                     ("owner_id", owner_id)]:
-        if val is not None:
-            params.append(val)
-            if col == "owner_id":
-                # v3.2 H1 fix: federated memories carry owner_id='federation'
-                # and must be readable alongside the caller's own rows.
-                # Mutation paths still hard-filter by owner_id (caller
-                # can't update/delete federated rows) — this only affects
-                # the read helpers used by search/rehydrate/gateway.
+    def _build_filters(start_params: list) -> tuple[list, list]:
+        """Append provenance + visibility conditions to start_params.
+        Returns (conditions, params) so callers can add their own
+        leading conditions (e.g. the FTS match).
+        """
+        params = list(start_params)
+        conditions: list = []
+        for col, val in [("category", category), ("subcategory", subcategory),
+                         ("source_provider", source_provider), ("source_model", source_model),
+                         ("source_agent", source_agent), ("namespace", namespace)]:
+            if val is not None:
+                params.append(val)
+                conditions.append(f"{col}=${len(params)}")
+        if owner_id is not None:
+            if group_ids is not None:
+                from api.visibility import read_visibility_predicate
+                clause, vis_params = read_visibility_predicate(
+                    owner_id, list(group_ids), len(params) + 1,
+                )
+                conditions.append(clause)
+                params.extend(vis_params)
+            else:
+                params.append(owner_id)
                 conditions.append(
                     f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
                 )
-            else:
-                conditions.append(f"{col}=${len(params)}")
+        return conditions, params
 
-    where = " AND ".join(conditions)
+    # FTS path: $1=query, $2=limit; filter params at $3+
+    fts_conditions, fts_params = _build_filters([clean_query, limit])
+    fts_conditions = ["to_tsvector('english', content) @@ plainto_tsquery('english', $1)"] + fts_conditions
+    where = " AND ".join(fts_conditions)
     sql = (f"SELECT {select_cols}, {rank_col} FROM memories "
            f"WHERE {where} ORDER BY rank DESC LIMIT $2")
     try:
-        return await conn.fetch(sql, *params)
+        return await conn.fetch(sql, *fts_params)
     except Exception:
         logger.warning(f"[FTS] falling back to ILIKE for: {query[:50]!r}")
         like_q = f"%{query}%"
-        # Rebuild for ILIKE: $1=like_q, $2=limit; filter params at $3+
-        ilike_params: list = [like_q, limit]
-        ilike_conditions: list = ["content ILIKE $1"]
-        for col, val in [("category", category), ("subcategory", subcategory),
-                         ("source_provider", source_provider), ("source_model", source_model),
-                         ("source_agent", source_agent), ("namespace", namespace),
-                         ("owner_id", owner_id)]:
-            if val is not None:
-                ilike_params.append(val)
-                if col == "owner_id":
-                    # H1 fix — see _fts_fetch FTS branch above.
-                    ilike_conditions.append(
-                        f"(owner_id=${len(ilike_params)} OR federation_source IS NOT NULL)"
-                    )
-                else:
-                    ilike_conditions.append(f"{col}=${len(ilike_params)}")
+        # ILIKE path: $1=like_q, $2=limit; filter params at $3+
+        ilike_conditions, ilike_params = _build_filters([like_q, limit])
+        ilike_conditions = ["content ILIKE $1"] + ilike_conditions
         ilike_where = " AND ".join(ilike_conditions)
         ilike_sql = (f"SELECT {select_cols} FROM memories "
                      f"WHERE {ilike_where} ORDER BY created DESC LIMIT $2")

@@ -78,40 +78,16 @@ def _is_root(user: UserContext) -> bool:
 def _read_visibility_predicate(
     user: UserContext, start_param_idx: int
 ) -> tuple[str, list]:
-    """Read-visibility WHERE clause for non-root callers, mirroring
-    the v1_multiuser RLS policies (db/migrations_v1_multiuser.sql):
-
-      - mnemos_owner_select:  owner_id = caller
-      - mnemos_world_select:  (permission_mode % 10) >= 4
-      - mnemos_group_select:  permission_mode >= 640
-                              AND group_id IS NOT NULL
-                              AND caller is a member of group_id
-      - federation: federation_source IS NOT NULL — federated rows
-        are explicitly cross-tenant-readable per the v3.2 H1 design
-        (api/lifecycle.py:465 search/rehydrate use the same OR).
-
-    The predicate must live at the app layer because RLS combines
-    with WHERE via AND — RLS cannot re-add rows that the handler's
-    WHERE has rejected. A strict owner-only WHERE would silently
-    hide group/world-readable rows in team/enterprise mode.
-
-    Returns (clause, params). params extend the caller's params
-    list in order. start_param_idx is the next free $N placeholder.
+    """Thin adapter over api.visibility.read_visibility_predicate
+    that takes a UserContext directly. The shared module powers
+    list/get here AND the search/rehydrate helpers in
+    api/lifecycle.py — single source of truth for the predicate
+    that mirrors the v1_multiuser RLS policies.
     """
-    n = start_param_idx
-    # owner / federation: 1 param (user_id)
-    # world-readable: 0 params (literal predicate)
-    # group-readable: 1 param (group_ids array)
-    clause = (
-        "("
-        f"owner_id=${n}"
-        " OR federation_source IS NOT NULL"
-        " OR (permission_mode % 10) >= 4"
-        f" OR (permission_mode >= 640 AND group_id IS NOT NULL "
-        f"AND group_id = ANY(${n + 1}::text[]))"
-        ")"
+    from api.visibility import read_visibility_predicate
+    return read_visibility_predicate(
+        user.user_id, list(user.group_ids), start_param_idx,
     )
-    return clause, [user.user_id, list(user.group_ids)]
 
 
 async def _bump_recall_counters(memory_ids: list) -> None:
@@ -467,12 +443,19 @@ async def search_memories(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
+            # group_ids is set only for non-root callers (search_owner_id
+            # set means the predicate should mirror the v1_multiuser
+            # full read-visibility, including group-readable rows).
+            search_group_ids = (
+                list(user.group_ids) if search_owner_id is not None else None
+            )
             _prov = dict(
                 source_provider=request.source_provider,
                 source_model=request.source_model,
                 source_agent=request.source_agent,
                 namespace=search_namespace,
                 owner_id=search_owner_id,
+                group_ids=search_group_ids,
             )
             if request.semantic:
                 embedding = await _get_embedding(request.query)
