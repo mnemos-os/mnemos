@@ -23,6 +23,7 @@ def read_visibility_predicate(
     user_id: str,
     group_ids: List[str],
     start_param_idx: int,
+    table_alias: str = "",
 ) -> Tuple[str, list]:
     """Build the read-visibility WHERE clause + its params.
 
@@ -44,15 +45,21 @@ def read_visibility_predicate(
     ``group_ids`` is sourced from ``UserContext.group_ids`` (resolved
     at auth time) rather than re-querying ``user_groups`` via EXISTS;
     same authoritative source the RLS policy uses, just pre-resolved.
+
+    ``table_alias`` is prepended to every column reference (e.g.
+    ``"m"`` → ``m.owner_id``) for queries that join multiple tables
+    and need disambiguation. Default empty produces unqualified
+    column names suitable for single-table queries.
     """
     n = start_param_idx
+    p = f"{table_alias}." if table_alias else ""
     clause = (
         "("
-        f"owner_id=${n}"
-        " OR federation_source IS NOT NULL"
-        " OR (permission_mode % 10) >= 4"
-        f" OR (permission_mode >= 640 AND group_id IS NOT NULL "
-        f"AND group_id = ANY(${n + 1}::text[]))"
+        f"{p}owner_id=${n}"
+        f" OR {p}federation_source IS NOT NULL"
+        f" OR ({p}permission_mode % 10) >= 4"
+        f" OR ({p}permission_mode >= 640 AND {p}group_id IS NOT NULL "
+        f"AND {p}group_id = ANY(${n + 1}::text[]))"
         ")"
     )
     return clause, [user_id, list(group_ids)]

@@ -418,6 +418,12 @@ async def search_memories(
     # owner_id — the server-resolved filter values, not the caller's
     # raw request. Using request.namespace (possibly None) would create
     # duplicate cache entries for identical result sets.
+    # Cache key must include the caller's group_ids — search visibility
+    # now depends on group membership (slice 2.1), so caching by
+    # user_id alone would either leak rows after a group revoke or
+    # hide rows after a group grant for the cache TTL window. Hash a
+    # sorted snapshot so order doesn't fragment the cache.
+    group_ids_key = ",".join(sorted(user.group_ids))
     cache_key = _get_cache_key(
         "search",
         user.user_id, user.namespace,
@@ -427,6 +433,7 @@ async def search_memories(
         request.source_provider or "", request.source_model or "",
         request.source_agent or "",
         search_namespace or "", search_owner_id or "",
+        group_ids_key,
     )
 
     if _lc._cache and not request.include_compressed:
@@ -834,13 +841,18 @@ async def rehydrate_memories(
     sql_params: list = [clean_query, request.limit]
     idx = 3
     if rehydrate_owner_id is not None:
-        # Apply the v3.1.2 Tier 3 federation-aware filter: the caller's
-        # own rows OR any row marked federation_source.
-        sql_conditions.append(
-            f"(m.owner_id=${idx} OR m.federation_source IS NOT NULL)"
+        # Slice 2.1: full v1_multiuser-mirror visibility predicate
+        # (owner / federation / world-readable / group-readable),
+        # aliased to the JOIN's `m.` table reference. Same predicate
+        # as list/get/search so a memory visible there is visible
+        # via /memories/rehydrate.
+        from api.visibility import read_visibility_predicate
+        clause, vis_params = read_visibility_predicate(
+            rehydrate_owner_id, list(user.group_ids), idx, table_alias="m",
         )
-        sql_params.append(rehydrate_owner_id)
-        idx += 1
+        sql_conditions.append(clause)
+        sql_params.extend(vis_params)
+        idx += len(vis_params)
     if rehydrate_namespace is not None:
         sql_conditions.append(f"m.namespace=${idx}")
         sql_params.append(rehydrate_namespace)
