@@ -532,48 +532,15 @@ async def merge_branch(
                     raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
 
                 if request.strategy == "latest-wins":
-                    # Pre-flight: are the source and TARGET BRANCH HEAD's
-                    # VERSIONED fields actually different? Compare
-                    # against target_head (the resolved memory_versions
-                    # row for the requested branch), NOT the global
-                    # `memories` live row. If target_branch is not
-                    # the currently-materialized branch in `memories`,
-                    # the live row reflects whichever branch wrote
-                    # most recently — comparing to it would falsely
-                    # detect a no-op when the merge actually needs to
-                    # advance the target branch (round-21 finding).
-                    if (source_head["content"] == target_head["content"]
-                            and source_head["category"] == target_head["category"]
-                            and source_head["subcategory"] == target_head["subcategory"]
-                            and source_head["metadata"] == target_head["metadata"]
-                            and source_head["verbatim_content"] == target_head["verbatim_content"]):
-                        logger.info(
-                            f"[DAG] Merge no-op (pre-update): "
-                            f"{request.source_branch} -> {target_branch} for "
-                            f"{memory_id} (versioned fields identical; live "
-                            f"row not touched)"
-                        )
-                        return MergeResult(
-                            success=False,
-                            new_commit_hash=target_head["commit_hash"],
-                            message=(
-                                f"Source branch '{request.source_branch}' has "
-                                f"no versioned changes vs '{target_branch}'; "
-                                f"no merge commit created and live row not "
-                                f"modified"
-                            ),
-                        )
                     # Authorize against the live row before doing any
-                    # write. UPDATE-via-trigger doesn't work for the
-                    # cross-branch case (live row may already equal
-                    # source_head; trigger only fires on
-                    # OLD-vs-NEW change). Instead: explicitly
-                    # INSERT the target_branch's new memory_versions
-                    # row, advance memory_branches HEAD, then
-                    # conditionally UPDATE memories only if the live
-                    # row was tracking target_branch (so we preserve
-                    # the live-row/HEAD invariant for whichever
-                    # branch is materialized).
+                    # work. We then re-read target_head under the
+                    # row lock and do the AUTHORITATIVE no-op check
+                    # against THAT (round-29 fix). The earlier
+                    # pre-flight against the unlocked target_head
+                    # was racy: a concurrent update_memory or
+                    # main-revert between the early read and lock
+                    # acquisition could change main's HEAD, leaving
+                    # the no-op decision stale.
                     if user.role == "root":
                         live = await conn.fetchrow(
                             "SELECT id, owner_id, namespace "
@@ -618,6 +585,36 @@ async def merge_branch(
                             status_code=404,
                             detail=f"Memory {memory_id} not found",
                         )
+
+                    # Authoritative no-op check (round-29 fix). Run
+                    # this AFTER acquiring the row lock and re-reading
+                    # target_head so the decision reflects the current
+                    # state of main, not a pre-lock snapshot. Compare
+                    # ALL of the trigger's versioned fields (round-23
+                    # extended this from content-only to the full
+                    # set: content / category / subcategory /
+                    # metadata / verbatim_content).
+                    if (source_head["content"] == target_head["content"]
+                            and source_head["category"] == target_head["category"]
+                            and source_head["subcategory"] == target_head["subcategory"]
+                            and source_head["metadata"] == target_head["metadata"]
+                            and source_head["verbatim_content"] == target_head["verbatim_content"]):
+                        logger.info(
+                            f"[DAG] Merge no-op (locked): "
+                            f"{request.source_branch} -> {target_branch} for "
+                            f"{memory_id} (versioned fields identical at "
+                            f"locked target_head)"
+                        )
+                        return MergeResult(
+                            success=False,
+                            new_commit_hash=target_head["commit_hash"],
+                            message=(
+                                f"Source branch '{request.source_branch}' has "
+                                f"no versioned changes vs '{target_branch}'; "
+                                f"no merge commit created"
+                            ),
+                        )
+
                     merge_owner_id = live["owner_id"]
                     merge_namespace = live["namespace"]
                     # Materialized-branch identity is determined by
