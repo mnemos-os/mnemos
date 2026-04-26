@@ -552,13 +552,17 @@ async def merge_branch(
                     # branch is materialized).
                     if user.role == "root":
                         live = await conn.fetchrow(
-                            "SELECT id, owner_id, namespace, content "
+                            "SELECT id, owner_id, namespace, "
+                            "content, category, subcategory, metadata, "
+                            "verbatim_content "
                             "FROM memories WHERE id = $1 FOR UPDATE",
                             memory_id,
                         )
                     else:
                         live = await conn.fetchrow(
-                            "SELECT id, owner_id, namespace, content "
+                            "SELECT id, owner_id, namespace, "
+                            "content, category, subcategory, metadata, "
+                            "verbatim_content "
                             "FROM memories WHERE id = $1 "
                             "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
                             memory_id, user.user_id, user.namespace,
@@ -570,7 +574,22 @@ async def merge_branch(
                         )
                     merge_owner_id = live["owner_id"]
                     merge_namespace = live["namespace"]
-                    live_tracks_target = live["content"] == target_head["content"]
+                    # Live-row tracks target_branch only when ALL of
+                    # the trigger's versioned fields match. Content-
+                    # only equality is unsafe — two branches can
+                    # share content but differ in metadata/category/
+                    # etc., which would falsely classify the live
+                    # row as tracking target and either skip a
+                    # required HEAD advance or overwrite the wrong
+                    # branch's materialized state (round-23
+                    # finding).
+                    live_tracks_target = (
+                        live["content"] == target_head["content"]
+                        and live["category"] == target_head["category"]
+                        and live["subcategory"] == target_head["subcategory"]
+                        and live["metadata"] == target_head["metadata"]
+                        and live["verbatim_content"] == target_head["verbatim_content"]
+                    )
 
                     # Compute merge commit_hash. Same shape as the
                     # mnemos_version_snapshot trigger
@@ -679,49 +698,48 @@ async def merge_branch(
                         message="Manual merge strategy not yet implemented",
                     )
 
-        # Cache invalidation outside the txn — same pattern as
-        # update_memory / delete_memory. A successful merge changed
-        # `memories.content`, so any cached /memories/search hits
-        # or stats:global rollups are stale; if we don't sweep,
-        # search keeps serving pre-merge content for the 300s TTL.
-        if _lc._cache:
-            try:
-                await _lc._cache.delete("stats:global")
+        # Cache invalidation + memory.updated webhook ONLY when the
+        # live row was actually mutated. Branch-only merges (where
+        # live_tracks_target was False) advanced memory_branches
+        # HEAD but left `memories` untouched — the live state did
+        # NOT change, so /memories/search results don't need
+        # invalidation and external subscribers must not be told
+        # the live row was updated. Cross-branch merges are pure
+        # DAG-level operations that callers monitor via the version/
+        # log endpoints, not memory.updated webhooks (round-23
+        # finding).
+        if live_tracks_target:
+            if _lc._cache:
                 try:
-                    async for _k in _lc._cache.scan_iter(
-                        match="mnemos:search:*", count=500,
-                    ):
-                        await _lc._cache.delete(_k)
+                    await _lc._cache.delete("stats:global")
+                    try:
+                        async for _k in _lc._cache.scan_iter(
+                            match="mnemos:search:*", count=500,
+                        ):
+                            await _lc._cache.delete(_k)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
-            except Exception:
-                pass
 
-        # Webhook parity with update_memory: downstream consumers
-        # subscribed to memory.updated should see merges too (they
-        # materially changed the live row). MUST pass owner_id +
-        # namespace as scope — without those the dispatcher treats
-        # the event as system-wide and fans out to every tenant's
-        # subscription, leaking the merged content cross-tenant
-        # (round-19 critical).
-        try:
-            from api.webhook_dispatcher import dispatch as _dispatch_webhook
-            async with _lc._pool.acquire() as _wh_conn:
-                await _dispatch_webhook(_wh_conn, "memory.updated", {
-                    "memory_id": memory_id,
-                    "category": source_head["category"],
-                    "subcategory": source_head["subcategory"],
-                    "content": source_head["content"],
-                    "owner_id": merge_owner_id,
-                    "namespace": merge_namespace,
-                    "merge_source": request.source_branch,
-                    "merge_target": target_branch,
-                }, owner_id=merge_owner_id, namespace=merge_namespace)
-        except Exception:
-            logger.warning(
-                "webhook dispatch failed for memory.updated %s",
-                memory_id, exc_info=True,
-            )
+            try:
+                from api.webhook_dispatcher import dispatch as _dispatch_webhook
+                async with _lc._pool.acquire() as _wh_conn:
+                    await _dispatch_webhook(_wh_conn, "memory.updated", {
+                        "memory_id": memory_id,
+                        "category": source_head["category"],
+                        "subcategory": source_head["subcategory"],
+                        "content": source_head["content"],
+                        "owner_id": merge_owner_id,
+                        "namespace": merge_namespace,
+                        "merge_source": request.source_branch,
+                        "merge_target": target_branch,
+                    }, owner_id=merge_owner_id, namespace=merge_namespace)
+            except Exception:
+                logger.warning(
+                    "webhook dispatch failed for memory.updated %s",
+                    memory_id, exc_info=True,
+                )
 
         logger.info(
             f"[DAG] Merged {request.source_branch} -> {target_branch} "
