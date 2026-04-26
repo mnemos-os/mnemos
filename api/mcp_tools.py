@@ -200,78 +200,90 @@ async def tool_branch_memory(
 
     try:
         async with pool.acquire() as conn:
-            # Branch creation is a WRITE — strict owner_id+namespace
-            # gate, NOT the broader read-visibility predicate. Even
-            # if a non-root caller can READ a world/group-readable
-            # memory, they must not be able to fork its DAG.
-            if not _mcp_is_root(user):
-                live = await conn.fetchrow(
-                    "SELECT 1 FROM memories WHERE id = $1 "
-                    "AND owner_id = $2 AND namespace = $3 LIMIT 1",
-                    memory_id, user.user_id, user.namespace,
-                )
+            async with conn.transaction():
+                # Lock the live memory row for the duration of the
+                # transaction. Pessimistic lock closes the round-14
+                # TOCTOU: between auth check and INSERT, an
+                # admin/import path could reassign owner/namespace
+                # and the old owner could still create a branch row
+                # on a memory they no longer own. SELECT ... FOR
+                # SHARE blocks concurrent UPDATE on the parent for
+                # the txn lifetime; the auth assertion below applies
+                # to the locked row, and the INSERT runs in the same
+                # transaction.
+                if _mcp_is_root(user):
+                    live = await conn.fetchrow(
+                        "SELECT 1 FROM memories WHERE id = $1 FOR SHARE",
+                        memory_id,
+                    )
+                else:
+                    live = await conn.fetchrow(
+                        "SELECT 1 FROM memories WHERE id = $1 "
+                        "AND owner_id = $2 AND namespace = $3 FOR SHARE",
+                        memory_id, user.user_id, user.namespace,
+                    )
                 if not live:
                     return {"success": False, "error": f"Memory {memory_id} not found"}
 
-            # Resolve starting point
-            if from_commit:
-                start = await conn.fetchrow(
-                    "SELECT id, commit_hash FROM memory_versions WHERE memory_id = $1 AND commit_hash = $2",
-                    memory_id,
-                    from_commit,
-                )
-                if not start:
-                    return {"success": False, "error": "Commit not found"}
-            else:
-                start = await conn.fetchrow(
-                    """
-                    SELECT mv.id, mv.commit_hash
-                    FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
-                    WHERE mv.memory_id = $1 AND mb.name = 'main'
-                    """,
-                    memory_id,
-                )
-                if not start:
-                    return {"success": False, "error": "main branch not found"}
+                # Resolve starting point
+                if from_commit:
+                    start = await conn.fetchrow(
+                        "SELECT id, commit_hash FROM memory_versions "
+                        "WHERE memory_id = $1 AND commit_hash = $2",
+                        memory_id, from_commit,
+                    )
+                    if not start:
+                        return {"success": False, "error": "Commit not found"}
+                else:
+                    start = await conn.fetchrow(
+                        """
+                        SELECT mv.id, mv.commit_hash
+                        FROM memory_versions mv
+                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                        WHERE mv.memory_id = $1 AND mb.name = 'main'
+                        """,
+                        memory_id,
+                    )
+                    if not start:
+                        return {"success": False, "error": "main branch not found"}
 
-            # Create branch — CREATE-ONLY semantics with race-safe
-            # idempotency. The earlier ON CONFLICT DO UPDATE silently
-            # rewrote existing branches' heads. The round-12 fix
-            # used check-then-insert, which under concurrent retries
-            # could let two callers both observe "no branch" and
-            # one would lose to the unique constraint with a generic
-            # DB error rather than the advertised idempotent-success
-            # or 409-conflict.
-            #
-            # Race-safe shape: INSERT ... ON CONFLICT DO NOTHING
-            # RETURNING head_version_id. If RETURNING yields a row,
-            # we won the insert (created the branch). If it returns
-            # NULL, a concurrent caller already created it; we then
-            # SELECT the existing head and either return idempotent
-            # success (same head) or 409-shaped conflict (different
-            # head).
-            inserted = await conn.fetchrow(
-                """
-                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
-                VALUES ($1, $2, $3, $4)
-                ON CONFLICT (memory_id, name) DO NOTHING
-                RETURNING head_version_id
-                """,
-                memory_id, name, start["id"], user.user_id,
-            )
+                # Race-safe insert: ON CONFLICT DO NOTHING RETURNING.
+                # If the row already exists (concurrent retry won),
+                # RETURNING is empty and we re-read to classify.
+                inserted = await conn.fetchrow(
+                    """
+                    INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (memory_id, name) DO NOTHING
+                    RETURNING head_version_id
+                    """,
+                    memory_id, name, start["id"], user.user_id,
+                )
+
             if inserted is None:
                 existing = await conn.fetchrow(
-                    "SELECT head_version_id FROM memory_branches "
-                    "WHERE memory_id = $1 AND name = $2",
+                    "SELECT head_version_id, mv.commit_hash "
+                    "FROM memory_branches mb "
+                    "INNER JOIN memory_versions mv ON mv.id = mb.head_version_id "
+                    "WHERE mb.memory_id = $1 AND mb.name = $2",
                     memory_id, name,
                 )
-                if existing is not None and existing["head_version_id"] == start["id"]:
+                if existing is None:
+                    return {"success": False, "error": "branch lookup failed"}
+                # Implicit-HEAD retries (from_commit=None) are
+                # idempotent regardless of whether main has advanced
+                # since the original create — the caller didn't ask
+                # for a specific commit, so any existing branch head
+                # satisfies them. Explicit from_commit retries
+                # require an exact match (otherwise it's a real
+                # conflict on the caller's stated intent).
+                head_matches = existing["head_version_id"] == start["id"]
+                if from_commit is None or head_matches:
                     return {
                         "success": True,
                         "memory_id": memory_id,
                         "branch": name,
-                        "commit_hash": start["commit_hash"],
+                        "commit_hash": existing["commit_hash"],
                         "created_by": user.user_id,
                         "idempotent": True,
                     }
