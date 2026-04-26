@@ -76,3 +76,44 @@ def read_visibility_predicate(
         ")"
     )
     return clause, [user_id, list(group_ids)]
+
+
+def version_visibility_predicate(
+    user_id: str,
+    start_param_idx: int,
+    table_alias: str = "",
+) -> Tuple[str, list]:
+    """Per-snapshot visibility predicate for ``memory_versions`` rows.
+
+    Snapshot tenancy is evaluated against THE SNAPSHOT's own
+    ``owner_id`` / ``namespace`` / ``permission_mode`` columns, NOT
+    the live memory's. This closes a class of bug Codex flagged
+    where a memory created private (mode 600), snapshotted into v1,
+    later relaxed to public (mode 644) lets every reader of v2+ also
+    fetch the v1 private snapshot via ``list_versions`` /
+    ``get_version`` / ``diff_versions``.
+
+    Narrower than ``read_visibility_predicate`` because
+    ``memory_versions`` does NOT carry ``group_id`` or
+    ``federation_source`` columns (introduced after v2 versioning).
+    Snapshots that were group-readable or federated at the time
+    they were taken are NOT visible per-version — fail-closed
+    against missing historical fields. Backfilling those columns
+    onto ``memory_versions`` is a separate migration decision.
+
+    Branches:
+    - owner: ``owner_id = $caller``
+    - world: ``(permission_mode % 10) >= 4``
+
+    The namespace pin (a separate ``namespace = $`` predicate) is
+    expected to be added by the caller alongside this clause.
+    """
+    n = start_param_idx
+    p = f"{table_alias}." if table_alias else ""
+    clause = (
+        "("
+        f"{p}owner_id=${n}"
+        f" OR ({p}permission_mode % 10) >= 4"
+        ")"
+    )
+    return clause, [user_id]

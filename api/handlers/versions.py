@@ -154,12 +154,31 @@ async def list_versions(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
-        rows = await conn.fetch(
-            "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
-            "FROM memory_versions WHERE memory_id = $1 AND branch = $2 ORDER BY version_num ASC",
-            memory_id,
-            branch,
-        )
+        # Per-snapshot tenancy: filter the version rows by THEIR own
+        # owner/namespace/permission_mode, not the live memory's.
+        # A memory that was private at v1 and made public at v2 must
+        # NOT expose v1 to readers who only became authorized after
+        # the permission flip.
+        if _is_root(user):
+            rows = await conn.fetch(
+                "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
+                "FROM memory_versions WHERE memory_id = $1 AND branch = $2 ORDER BY version_num ASC",
+                memory_id,
+                branch,
+            )
+        else:
+            from api.visibility import version_visibility_predicate
+            vis_clause, vis_params = version_visibility_predicate(
+                user.user_id, start_param_idx=3,
+            )
+            ns_ph = f"${len(vis_params) + 3}"
+            rows = await conn.fetch(
+                f"SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
+                f"FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                f"AND {vis_clause} AND namespace = {ns_ph} "
+                f"ORDER BY version_num ASC",
+                memory_id, branch, *vis_params, user.namespace,
+            )
     return [
         VersionSummary(
             version_num=r["version_num"],
@@ -185,14 +204,31 @@ async def get_version(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
-        row = await conn.fetchrow(
-            "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
-            "verbatim_content, owner_id, namespace, permission_mode, "
-            "source_model, source_provider, source_session, source_agent, "
-            "snapshot_at, snapshot_by, change_type "
-            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
-            memory_id, version_num, branch,
-        )
+        if _is_root(user):
+            row = await conn.fetchrow(
+                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type "
+                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
+                memory_id, version_num, branch,
+            )
+        else:
+            # Per-snapshot tenancy on the row itself.
+            from api.visibility import version_visibility_predicate
+            vis_clause, vis_params = version_visibility_predicate(
+                user.user_id, start_param_idx=4,
+            )
+            ns_ph = f"${len(vis_params) + 4}"
+            row = await conn.fetchrow(
+                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type "
+                f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
+                f"AND {vis_clause} AND namespace = {ns_ph}",
+                memory_id, version_num, branch, *vis_params, user.namespace,
+            )
     if not row:
         raise HTTPException(
             status_code=404,
@@ -217,11 +253,25 @@ async def diff_versions(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
-        rows = await conn.fetch(
-            "SELECT version_num, content FROM memory_versions "
-            "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3",
-            memory_id, [from_version, to_version], branch,
-        )
+        if _is_root(user):
+            rows = await conn.fetch(
+                "SELECT version_num, content FROM memory_versions "
+                "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3",
+                memory_id, [from_version, to_version], branch,
+            )
+        else:
+            from api.visibility import version_visibility_predicate
+            vis_clause, vis_params = version_visibility_predicate(
+                user.user_id, start_param_idx=4,
+            )
+            ns_ph = f"${len(vis_params) + 4}"
+            rows = await conn.fetch(
+                f"SELECT version_num, content FROM memory_versions "
+                f"WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3 "
+                f"AND {vis_clause} AND namespace = {ns_ph}",
+                memory_id, [from_version, to_version], branch,
+                *vis_params, user.namespace,
+            )
     versions = {r["version_num"]: r["content"] for r in rows}
     if from_version not in versions:
         raise HTTPException(status_code=404, detail=f"Version {from_version} not found on branch '{branch}'")
@@ -260,19 +310,35 @@ async def revert_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         # Tenancy gate first — fail-closed before any version SELECT.
-        # Without this a non-root caller could read other tenants'
-        # historical content via the ver_row select alone, even if
-        # the eventual UPDATE failed.
         await _assert_memory_readable(conn, memory_id, user)
 
-        ver_row = await conn.fetchrow(
-            "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
-            "verbatim_content, owner_id, namespace, permission_mode, "
-            "source_model, source_provider, source_session, source_agent, "
-            "snapshot_at, snapshot_by, change_type "
-            "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
-            memory_id, version_num, branch,
-        )
+        # Per-snapshot tenancy on the source version too: prevents
+        # reverting TO a private historical snapshot that the caller
+        # wouldn't be allowed to read directly via get_version.
+        if _is_root(user):
+            ver_row = await conn.fetchrow(
+                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type "
+                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
+                memory_id, version_num, branch,
+            )
+        else:
+            from api.visibility import version_visibility_predicate
+            vis_clause, vis_params = version_visibility_predicate(
+                user.user_id, start_param_idx=4,
+            )
+            ns_ph = f"${len(vis_params) + 4}"
+            ver_row = await conn.fetchrow(
+                "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
+                "verbatim_content, owner_id, namespace, permission_mode, "
+                "source_model, source_provider, source_session, source_agent, "
+                "snapshot_at, snapshot_by, change_type "
+                f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
+                f"AND {vis_clause} AND namespace = {ns_ph}",
+                memory_id, version_num, branch, *vis_params, user.namespace,
+            )
         if not ver_row:
             raise HTTPException(
                 status_code=404,

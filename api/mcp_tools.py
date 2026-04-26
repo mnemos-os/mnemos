@@ -14,6 +14,44 @@ from typing import Dict, Any, Optional
 import api.lifecycle as _lc
 from api.auth import UserContext
 
+
+def _mcp_user_required(user: Optional[UserContext]) -> UserContext:
+    """MCP version tools used to accept user=None silently. The HTTP
+    surface always has an authenticated user; the MCP surface MUST
+    too — slice 2 round 11 found this as a parallel cross-tenant
+    read/write hole."""
+    if user is None or not user.authenticated:
+        raise PermissionError("authenticated user required for version tools")
+    return user
+
+
+def _mcp_is_root(user: UserContext) -> bool:
+    return user.role == "root"
+
+
+async def _mcp_assert_memory_readable(conn, memory_id: str, user: UserContext) -> None:
+    """Same chokepoint as api/handlers/versions._assert_memory_readable.
+    Inlined here to avoid circular import; logic must stay in sync."""
+    if _mcp_is_root(user):
+        row = await conn.fetchrow(
+            "SELECT 1 FROM memory_versions WHERE memory_id = $1 LIMIT 1", memory_id,
+        )
+        if not row:
+            raise PermissionError(f"Memory {memory_id} not found")
+        return
+    from api.visibility import read_visibility_predicate
+    vis_clause, vis_params = read_visibility_predicate(
+        user.user_id, list(user.group_ids), start_param_idx=2,
+    )
+    ns_ph = f"${len(vis_params) + 2}"
+    row = await conn.fetchrow(
+        f"SELECT 1 FROM memories WHERE id = $1 "
+        f"AND {vis_clause} AND namespace = {ns_ph} LIMIT 1",
+        memory_id, *vis_params, user.namespace,
+    )
+    if not row:
+        raise PermissionError(f"Memory {memory_id} not found")
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,12 +79,21 @@ async def tool_log_memory(
     Returns:
         Dict with commits list and metadata
     """
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
     pool = _lc._pool
     if not pool:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with pool.acquire() as conn:
+            try:
+                await _mcp_assert_memory_readable(conn, memory_id, user)
+            except PermissionError as e:
+                return {"success": False, "error": str(e)}
             rows = await conn.fetch(
                 """
                 WITH RECURSIVE commit_walk AS (
@@ -72,7 +119,7 @@ async def tool_log_memory(
                 )
                 SELECT
                     commit_hash, version_num, branch, category, change_type,
-                    snapshot_at, snapshot_by
+                    snapshot_at, snapshot_by, owner_id, namespace, permission_mode
                 FROM commit_walk
                 ORDER BY depth ASC
                 LIMIT $4
@@ -82,6 +129,21 @@ async def tool_log_memory(
                 memory_id,
                 limit,
             )
+            # Per-snapshot filter applied client-side because the
+            # recursive CTE doesn't compose cleanly with a WHERE on
+            # the snapshot's own owner/permission_mode. Caller is
+            # already gated by _mcp_assert_memory_readable above;
+            # this is the historical-private-snapshot defense from
+            # round 11.
+            if not _mcp_is_root(user):
+                def _snap_visible(r) -> bool:
+                    if r["namespace"] != user.namespace:
+                        return False
+                    return (
+                        r["owner_id"] == user.user_id
+                        or (r["permission_mode"] % 10) >= 4
+                    )
+                rows = [r for r in rows if _snap_visible(r)]
 
             return {
                 "success": True,
@@ -123,12 +185,30 @@ async def tool_branch_memory(
     Returns:
         Dict with branch creation status and details
     """
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
     pool = _lc._pool
     if not pool:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with pool.acquire() as conn:
+            # Branch creation is a WRITE — strict owner_id+namespace
+            # gate, NOT the broader read-visibility predicate. Even
+            # if a non-root caller can READ a world/group-readable
+            # memory, they must not be able to fork its DAG.
+            if not _mcp_is_root(user):
+                live = await conn.fetchrow(
+                    "SELECT 1 FROM memories WHERE id = $1 "
+                    "AND owner_id = $2 AND namespace = $3 LIMIT 1",
+                    memory_id, user.user_id, user.namespace,
+                )
+                if not live:
+                    return {"success": False, "error": f"Memory {memory_id} not found"}
+
             # Resolve starting point
             if from_commit:
                 start = await conn.fetchrow(
@@ -195,23 +275,46 @@ async def tool_diff_memory_commits(
     Returns:
         Dict with unified diff and metadata
     """
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
     pool = _lc._pool
     if not pool:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with pool.acquire() as conn:
-            # Fetch both commits
-            commit_a_row = await conn.fetchrow(
-                "SELECT content, version_num FROM memory_versions WHERE memory_id = $1 AND commit_hash = $2",
-                memory_id,
-                commit_a,
-            )
-            commit_b_row = await conn.fetchrow(
-                "SELECT content, version_num FROM memory_versions WHERE memory_id = $1 AND commit_hash = $2",
-                memory_id,
-                commit_b,
-            )
+            try:
+                await _mcp_assert_memory_readable(conn, memory_id, user)
+            except PermissionError as e:
+                return {"success": False, "error": str(e)}
+
+            if _mcp_is_root(user):
+                base_sql = (
+                    "SELECT content, version_num FROM memory_versions "
+                    "WHERE memory_id = $1 AND commit_hash = $2"
+                )
+                commit_a_row = await conn.fetchrow(base_sql, memory_id, commit_a)
+                commit_b_row = await conn.fetchrow(base_sql, memory_id, commit_b)
+            else:
+                from api.visibility import version_visibility_predicate
+                vis_clause, vis_params = version_visibility_predicate(
+                    user.user_id, start_param_idx=3,
+                )
+                ns_ph = f"${len(vis_params) + 3}"
+                gated_sql = (
+                    "SELECT content, version_num FROM memory_versions "
+                    "WHERE memory_id = $1 AND commit_hash = $2 "
+                    f"AND {vis_clause} AND namespace = {ns_ph}"
+                )
+                commit_a_row = await conn.fetchrow(
+                    gated_sql, memory_id, commit_a, *vis_params, user.namespace,
+                )
+                commit_b_row = await conn.fetchrow(
+                    gated_sql, memory_id, commit_b, *vis_params, user.namespace,
+                )
 
             if not commit_a_row or not commit_b_row:
                 return {"success": False, "error": "One or both commits not found"}
@@ -254,23 +357,50 @@ async def tool_checkout_memory(
     Returns:
         Dict with commit content and metadata
     """
+    try:
+        user = _mcp_user_required(user)
+    except PermissionError as e:
+        return {"success": False, "error": str(e)}
+
     pool = _lc._pool
     if not pool:
         return {"success": False, "error": "Database unavailable"}
 
     try:
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    commit_hash, version_num, branch, category, subcategory,
-                    content, change_type, snapshot_at, snapshot_by
-                FROM memory_versions
-                WHERE memory_id = $1 AND commit_hash = $2
-                """,
-                memory_id,
-                commit_hash,
-            )
+            try:
+                await _mcp_assert_memory_readable(conn, memory_id, user)
+            except PermissionError as e:
+                return {"success": False, "error": str(e)}
+            # Per-snapshot tenancy gate on the actual ver row.
+            if _mcp_is_root(user):
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        commit_hash, version_num, branch, category, subcategory,
+                        content, change_type, snapshot_at, snapshot_by
+                    FROM memory_versions
+                    WHERE memory_id = $1 AND commit_hash = $2
+                    """,
+                    memory_id, commit_hash,
+                )
+            else:
+                from api.visibility import version_visibility_predicate
+                vis_clause, vis_params = version_visibility_predicate(
+                    user.user_id, start_param_idx=3,
+                )
+                ns_ph = f"${len(vis_params) + 3}"
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT
+                        commit_hash, version_num, branch, category, subcategory,
+                        content, change_type, snapshot_at, snapshot_by
+                    FROM memory_versions
+                    WHERE memory_id = $1 AND commit_hash = $2
+                      AND {vis_clause} AND namespace = {ns_ph}
+                    """,
+                    memory_id, commit_hash, *vis_params, user.namespace,
+                )
 
             if not row:
                 return {"success": False, "error": "Commit not found"}
