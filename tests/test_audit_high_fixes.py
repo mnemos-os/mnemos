@@ -178,8 +178,11 @@ def test_slice2_cache_key_distinguishes_none_from_empty_string():
 def test_h1_gateway_context_search_includes_federation(monkeypatch):
     """/v1/chat/completions _search_mnemos_context uses an inline
     SELECT (not the shared helpers because it has a category-OR).
-    That SQL must also match federated rows within the caller's
-    namespace."""
+    Slice 2 round 9: must use the full v1_multiuser-mirror
+    visibility predicate via the shared module — owner / federation
+    / world-readable / group-readable — same as list/get/search/
+    rehydrate. Otherwise group/world-readable rows visible elsewhere
+    silently disappear from gateway context injection."""
     from api.handlers import openai_compat
 
     conn = _Conn()
@@ -188,11 +191,12 @@ def test_h1_gateway_context_search_includes_federation(monkeypatch):
     asyncio.run(openai_compat._search_mnemos_context("hello", _alice(), limit=5))
 
     sql = conn.fetches[-1][0]
-    # v3.2 compression-in-hot-paths added table aliases (`m.`, `v.`)
-    # and a LEFT JOIN to memory_compressed_variants. The federation
-    # clause now reads `m.owner_id = $1 OR m.federation_source IS NOT NULL`.
-    assert "owner_id = $1 OR" in sql
-    assert "federation_source IS NOT NULL" in sql
+    # All four predicate branches present, aliased to m.
+    assert "m.owner_id=$" in sql
+    assert "m.federation_source IS NOT NULL" in sql
+    assert "(m.permission_mode % 10)" in sql           # world-readable
+    assert "((m.permission_mode / 10) % 10)" in sql    # group-readable
+    assert "m.group_id = ANY(" in sql                  # group-membership
 
 
 # ─── H2: consensus fields populated ──────────────────────────────────────────

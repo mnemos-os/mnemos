@@ -148,13 +148,26 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
                     limit,
                 )
             else:
-                # v3.2 H1 fix: federated memories carry owner_id='federation'.
-                # Include them alongside the caller's own rows so gateway
-                # context injection surfaces knowledge pulled from peers.
-                # Mutation paths keep the owner_id=$1 hard filter so
-                # federated rows aren't writable by non-root.
+                # Slice 2.1: full v1_multiuser-mirror visibility
+                # predicate (owner / federation / world / group) via
+                # the shared module, aliased to the JOIN's m. table
+                # reference. Same predicate as list/get/search/
+                # rehydrate so a memory visible elsewhere also lands
+                # in gateway context injection. Mutation paths keep
+                # strict owner_id scoping; only reads honor the
+                # broader contract.
+                from api.visibility import read_visibility_predicate
+                vis_clause, vis_params = read_visibility_predicate(
+                    user.user_id, list(user.group_ids),
+                    start_param_idx=1, table_alias="m",
+                )
+                # Visibility params occupy $1..$N; namespace, query,
+                # limit follow at $N+1, $N+2, $N+3.
+                ns_ph = f"${len(vis_params) + 1}"
+                q_ph = f"${len(vis_params) + 2}"
+                lim_ph = f"${len(vis_params) + 3}"
                 memories = await conn.fetch(
-                    """
+                    f"""
                     SELECT m.id, m.category,
                            COALESCE(v.compressed_content,
                                     m.compressed_content,
@@ -162,16 +175,16 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
                         ON v.memory_id = m.id
-                    WHERE (m.owner_id = $1 OR m.federation_source IS NOT NULL)
-                      AND m.namespace = $2
+                    WHERE {vis_clause}
+                      AND m.namespace = {ns_ph}
                       AND (
-                          to_tsvector('english', m.content) @@ plainto_tsquery('english', $3)
+                          to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})
                           OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
                       )
                     ORDER BY m.updated DESC NULLS LAST
-                    LIMIT $4
+                    LIMIT {lim_ph}
                     """,
-                    user.user_id,
+                    *vis_params,
                     user.namespace,
                     query,
                     limit,
