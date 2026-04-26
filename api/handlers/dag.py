@@ -481,15 +481,25 @@ async def merge_branch(
                 # neither can race a concurrent writer (rounds 28,
                 # 29, 30). The advisory lock above also serializes
                 # against other DAG writers on the same branch.
+                # Pull versioned fields from the live row too so we
+                # can verify they match target_head before doing
+                # a destructive UPDATE (round-32 fix). The check
+                # only fires for main merges (target_branch ==
+                # "main"), since feature merges never touch the
+                # live row.
                 if user.role == "root":
                     live = await conn.fetchrow(
-                        "SELECT id, owner_id, namespace "
+                        "SELECT id, owner_id, namespace, "
+                        "content, category, subcategory, metadata, "
+                        "verbatim_content "
                         "FROM memories WHERE id = $1 FOR UPDATE",
                         memory_id,
                     )
                 else:
                     live = await conn.fetchrow(
-                        "SELECT id, owner_id, namespace "
+                        "SELECT id, owner_id, namespace, "
+                        "content, category, subcategory, metadata, "
+                        "verbatim_content "
                         "FROM memories WHERE id = $1 "
                         "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
                         memory_id, user.user_id, user.namespace,
@@ -700,6 +710,40 @@ async def merge_branch(
                 # trigger consults via its WHEN clause (per
                 # migrations_charon_trigger_guard).
                 if live_tracks_target:
+                    # Round-32 fix: verify the live row ACTUALLY
+                    # equals target_head's versioned fields before
+                    # the destructive UPDATE. The "memories tracks
+                    # main" rule is a contract, but bugs / partial
+                    # imports / migration repair could leave the
+                    # live row drifted from main HEAD. Overwriting
+                    # without checking would silently destroy that
+                    # drift, and because we suppress the version
+                    # trigger, no audit record of the destruction
+                    # would exist. On mismatch: 409 with repair
+                    # guidance; the human/operator decides whether
+                    # to repair main HEAD to match the live row,
+                    # or vice versa, before the merge can proceed.
+                    if (live["content"] != target_head["content"]
+                            or live["category"] != target_head["category"]
+                            or live["subcategory"] != target_head["subcategory"]
+                            or live["metadata"] != target_head["metadata"]
+                            or live["verbatim_content"] != target_head["verbatim_content"]):
+                        logger.error(
+                            f"[DAG] Merge aborted: live memory row for "
+                            f"{memory_id} has drifted from main HEAD "
+                            f"({target_head['commit_hash'][:12]}). Refusing "
+                            f"to overwrite live state silently. Operator "
+                            f"must reconcile via revert or update before "
+                            f"this merge can run."
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Live memory row has drifted from main "
+                                f"HEAD; manual reconciliation required "
+                                f"before merge into main"
+                            ),
+                        )
                     await conn.execute(
                         "SELECT set_config('mnemos.suppress_version_snapshot', '1', true)"
                     )
