@@ -35,6 +35,7 @@ services:
       - ./db/migrations_v3_3_recall_tracking.sql:/docker-entrypoint-initdb.d/21-recall-tracking.sql
       - ./db/migrations_charon_trigger_guard.sql:/docker-entrypoint-initdb.d/22-charon-trigger-guard.sql
       - ./db/migrations_v3_4_federation_compat.sql:/docker-entrypoint-initdb.d/23-federation-compat.sql
+      - ./db/migrations_v3_5_trigger_same_memory_parent.sql:/docker-entrypoint-initdb.d/24-trigger-same-memory-parent.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
