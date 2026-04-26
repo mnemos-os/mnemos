@@ -208,35 +208,39 @@ async def add_session_message(
     # Token-aware truncation and privilege-gating role='system' on
     # add_session_message remain the structurally correct redesign;
     # tracked separately, out of scope here.
+    # Ordering key is (timestamp, id) — pure timestamp is not unique
+    # in session_messages, so an exclusion that uses `timestamp >`
+    # alone could either double-count the initial row or skip it on
+    # a tie. Using the row id as a tie-breaker is deterministic.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
             WITH first_system AS (
-                SELECT role, content, timestamp
+                SELECT id, role, content, timestamp
                   FROM session_messages
                  WHERE session_id = $1 AND role = 'system'
-                 ORDER BY timestamp ASC
+                 ORDER BY timestamp ASC, id ASC
                  LIMIT 1
             ),
             later_system AS (
-                SELECT s.role, s.content, s.timestamp
+                SELECT s.id, s.role, s.content, s.timestamp
                   FROM session_messages s
                  WHERE s.session_id = $1
                    AND s.role = 'system'
-                   AND s.timestamp > (SELECT timestamp FROM first_system)
-                 ORDER BY s.timestamp DESC
+                   AND s.id <> (SELECT id FROM first_system)
+                 ORDER BY s.timestamp DESC, s.id DESC
                  LIMIT 4
             ),
             pinned AS (
-                SELECT role, content, timestamp, 0 AS k FROM first_system
+                SELECT id, role, content, timestamp, 0 AS k FROM first_system
                 UNION ALL
-                SELECT role, content, timestamp, 0 AS k FROM later_system
+                SELECT id, role, content, timestamp, 0 AS k FROM later_system
             ),
             recent AS (
-                SELECT role, content, timestamp, 1 AS k
+                SELECT id, role, content, timestamp, 1 AS k
                   FROM session_messages
                  WHERE session_id = $1 AND role <> 'system'
-                 ORDER BY timestamp DESC
+                 ORDER BY timestamp DESC, id DESC
                  LIMIT 10
             )
             SELECT role, content FROM (
@@ -244,7 +248,7 @@ async def add_session_message(
                 UNION ALL
                 SELECT * FROM recent
             ) all_msgs
-            ORDER BY k, timestamp ASC
+            ORDER BY k, timestamp ASC, id ASC
             """,
             session_id,
         )
