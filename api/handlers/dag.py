@@ -493,7 +493,9 @@ async def merge_branch(
                     )
                 target_head = await conn.fetchrow(
                     """
-                    SELECT mv.id, mv.version_num, mv.commit_hash
+                    SELECT mv.id, mv.version_num, mv.commit_hash,
+                           mv.content, mv.category, mv.subcategory,
+                           mv.metadata, mv.verbatim_content
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = $2
@@ -506,29 +508,21 @@ async def merge_branch(
                     raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
 
                 if request.strategy == "latest-wins":
-                    # Pre-flight: are the source and target's
-                    # VERSIONED fields actually different? The
-                    # mnemos_version_snapshot trigger only versions
-                    # changes to content / category / subcategory /
-                    # metadata / verbatim_content / permission_mode /
-                    # namespace / owner_id (round-19 finding). If the
-                    # versioned set is identical, doing the UPDATE
-                    # would still mutate non-versioned columns
-                    # (source_*, updated) and commit them — diverging
-                    # the live row from the DAG history. Detect
-                    # equality BEFORE the UPDATE and return a clean
-                    # no-op (round-20 fix).
-                    target_versioned = await conn.fetchrow(
-                        "SELECT content, category, subcategory, metadata, "
-                        "verbatim_content FROM memories WHERE id = $1",
-                        memory_id,
-                    )
-                    if (target_versioned is not None
-                            and source_head["content"] == target_versioned["content"]
-                            and source_head["category"] == target_versioned["category"]
-                            and source_head["subcategory"] == target_versioned["subcategory"]
-                            and source_head["metadata"] == target_versioned["metadata"]
-                            and source_head["verbatim_content"] == target_versioned["verbatim_content"]):
+                    # Pre-flight: are the source and TARGET BRANCH HEAD's
+                    # VERSIONED fields actually different? Compare
+                    # against target_head (the resolved memory_versions
+                    # row for the requested branch), NOT the global
+                    # `memories` live row. If target_branch is not
+                    # the currently-materialized branch in `memories`,
+                    # the live row reflects whichever branch wrote
+                    # most recently — comparing to it would falsely
+                    # detect a no-op when the merge actually needs to
+                    # advance the target branch (round-21 finding).
+                    if (source_head["content"] == target_head["content"]
+                            and source_head["category"] == target_head["category"]
+                            and source_head["subcategory"] == target_head["subcategory"]
+                            and source_head["metadata"] == target_head["metadata"]
+                            and source_head["verbatim_content"] == target_head["verbatim_content"]):
                         logger.info(
                             f"[DAG] Merge no-op (pre-update): "
                             f"{request.source_branch} -> {target_branch} for "
