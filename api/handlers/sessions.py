@@ -185,12 +185,70 @@ async def add_session_message(
             request.model or session["model"],
         )
 
-    # Get conversation history (last 10 messages for context)
+    # Get conversation history for the provider:
+    #   1. The earliest role='system' row (the initial_context written
+    #      at create_session time) — ALWAYS included, never evictable.
+    #   2. Up to 4 most recent later system rows (subsequent policy
+    #      updates posted via add_session_message). Bounded to prevent
+    #      adversarial role='system' spam from blowing the prompt
+    #      budget.
+    #   3. The 10 most recent non-system messages, chronological.
+    #
+    # Iteration history under Codex review:
+    #   - ASC LIMIT 10  → returned 10 OLDEST messages (wrong dir).
+    #   - DESC LIMIT 10 → recent works, but loses initial_context.
+    #   - LIMIT 1 pinned earliest → drops later system updates.
+    #   - No LIMIT pinned → unbounded pinned context.
+    #   - LIMIT 5 pinned (most recent) → 5 later system writes
+    #     evict the foundational initial_context (adversarial path).
+    #   - This shape: earliest pinned + 4 most recent later +
+    #     10 recent non-system. Initial context never evictable;
+    #     later updates capped; bounded total surface.
+    #
+    # Token-aware truncation and privilege-gating role='system' on
+    # add_session_message remain the structurally correct redesign;
+    # tracked separately, out of scope here.
+    # Ordering key is (timestamp, id) — pure timestamp is not unique
+    # in session_messages, so an exclusion that uses `timestamp >`
+    # alone could either double-count the initial row or skip it on
+    # a tie. Using the row id as a tie-breaker is deterministic.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
-            SELECT role, content FROM session_messages
-            WHERE session_id = $1 ORDER BY timestamp ASC LIMIT 10
+            WITH first_system AS (
+                SELECT id, role, content, timestamp
+                  FROM session_messages
+                 WHERE session_id = $1 AND role = 'system'
+                 ORDER BY timestamp ASC, id ASC
+                 LIMIT 1
+            ),
+            later_system AS (
+                SELECT s.id, s.role, s.content, s.timestamp
+                  FROM session_messages s
+                 WHERE s.session_id = $1
+                   AND s.role = 'system'
+                   AND s.id <> (SELECT id FROM first_system)
+                 ORDER BY s.timestamp DESC, s.id DESC
+                 LIMIT 4
+            ),
+            pinned AS (
+                SELECT id, role, content, timestamp, 0 AS k FROM first_system
+                UNION ALL
+                SELECT id, role, content, timestamp, 0 AS k FROM later_system
+            ),
+            recent AS (
+                SELECT id, role, content, timestamp, 1 AS k
+                  FROM session_messages
+                 WHERE session_id = $1 AND role <> 'system'
+                 ORDER BY timestamp DESC, id DESC
+                 LIMIT 10
+            )
+            SELECT role, content FROM (
+                SELECT * FROM pinned
+                UNION ALL
+                SELECT * FROM recent
+            ) all_msgs
+            ORDER BY k, timestamp ASC, id ASC
             """,
             session_id,
         )

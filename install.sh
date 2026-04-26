@@ -4,7 +4,7 @@
 # Handles system-level prerequisites, then hands off to python -m installer
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/mnemos-dev/mnemos/master/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/mnemos-os/mnemos/master/install.sh | bash
 #   bash install.sh [--agent|--wizard|--unattended|--upgrade|--check]
 #
 # Supported: Debian/Ubuntu, RHEL/Fedora, macOS (Homebrew)
@@ -16,7 +16,7 @@ set -euo pipefail
 # ── Constants ────────────────────────────────────────────────────────────────
 
 MNEMOS_VERSION="3.0.0"
-MNEMOS_REPO="https://github.com/perlowja/mnemos"
+MNEMOS_REPO="https://github.com/mnemos-os/mnemos"
 INSTALL_DIR="${MNEMOS_INSTALL_DIR:-/opt/mnemos}"
 INSTALLER_ARGS="${*:-}"
 MIN_PYTHON_MINOR=11
