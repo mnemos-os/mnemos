@@ -98,7 +98,7 @@ async def tool_log_memory(
                 """
                 WITH RECURSIVE commit_walk AS (
                     SELECT
-                        mv.id, mv.commit_hash, mv.parent_version_id,
+                        mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.change_type, mv.snapshot_at, mv.snapshot_by,
                         mv.owner_id, mv.namespace, mv.permission_mode,
@@ -111,14 +111,22 @@ async def tool_log_memory(
                     )
                     WHERE mv.memory_id = $1
                     UNION ALL
+                    -- Same-memory predicate (mv.memory_id =
+                    -- cw.memory_id) prevents corrupt
+                    -- parent_version_id from pulling another
+                    -- memory's version into this memory's log
+                    -- (round-38 finding). Mirrors the HTTP log
+                    -- handler in api/handlers/dag.py.
                     SELECT
-                        mv.id, mv.commit_hash, mv.parent_version_id,
+                        mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.change_type, mv.snapshot_at, mv.snapshot_by,
                         mv.owner_id, mv.namespace, mv.permission_mode,
                         cw.depth + 1
                     FROM memory_versions mv
-                    INNER JOIN commit_walk cw ON mv.id = cw.parent_version_id
+                    INNER JOIN commit_walk cw
+                        ON mv.id = cw.parent_version_id
+                       AND mv.memory_id = cw.memory_id
                     WHERE cw.depth < $4
                 )
                 SELECT

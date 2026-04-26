@@ -496,13 +496,49 @@ async def revert_memory(
                     "FROM memory_versions WHERE memory_id = $1 AND branch = $2",
                     memory_id, branch,
                 )
-                # Get current HEAD for parent linkage
+                # Get current HEAD for parent linkage. Resolve
+                # via a scoped JOIN so a corrupt branch row pointing
+                # at another memory's version_id can't launder a
+                # cross-memory parent edge into this memory's DAG
+                # (round-38 finding). We return mb's head_version_id
+                # ONLY if the version belongs to the same memory.
                 target_head_id = await conn.fetchval(
-                    "SELECT head_version_id FROM memory_branches "
-                    "WHERE memory_id = $1 AND name = $2",
+                    """
+                    SELECT mb.head_version_id FROM memory_branches mb
+                    INNER JOIN memory_versions mv
+                        ON mv.id = mb.head_version_id
+                       AND mv.memory_id = mb.memory_id
+                    WHERE mb.memory_id = $1 AND mb.name = $2
+                    """,
                     memory_id, branch,
                 )
                 if target_head_id is None:
+                    # Either the branch row is missing (legitimate
+                    # 404) or it exists but its head_version_id
+                    # points outside this memory (corrupt row).
+                    # Distinguish so the operator gets the right
+                    # signal.
+                    bare = await conn.fetchval(
+                        "SELECT head_version_id FROM memory_branches "
+                        "WHERE memory_id = $1 AND name = $2",
+                        memory_id, branch,
+                    )
+                    if bare is not None:
+                        logger.error(
+                            f"[VERSION] Corrupt feature branch '{branch}' "
+                            f"for memory {memory_id}: head_version_id "
+                            f"points outside this memory. Refusing to "
+                            f"insert a new version with a cross-memory "
+                            f"parent edge. Operator reconciliation required."
+                        )
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                f"Branch '{branch}' has a head pointing "
+                                f"outside this memory; manual reconciliation "
+                                f"required before revert can proceed"
+                            ),
+                        )
                     raise HTTPException(
                         status_code=404,
                         detail=f"Branch '{branch}' not found",

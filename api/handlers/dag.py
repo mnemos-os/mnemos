@@ -152,7 +152,13 @@ async def get_memory_log(
                     )
                     WHERE mv.memory_id = $1
                     UNION ALL
-                    -- Recursive: WALK backward via parent_version_id
+                    -- Recursive: WALK backward via parent_version_id.
+                    -- Same-memory predicate (mv.memory_id =
+                    -- cw.memory_id) prevents corrupt parent_version_id
+                    -- from pulling another memory's version into this
+                    -- memory's log (round-38 finding). Cross-memory
+                    -- parent edges silently drop out of the walk; the
+                    -- HTTP log surfaces only intra-memory ancestry.
                     SELECT
                         mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
@@ -160,7 +166,9 @@ async def get_memory_log(
                         mv.owner_id, mv.namespace, mv.permission_mode,
                         cw.depth + 1
                     FROM memory_versions mv
-                    INNER JOIN commit_walk cw ON mv.id = cw.parent_version_id
+                    INNER JOIN commit_walk cw
+                        ON mv.id = cw.parent_version_id
+                       AND mv.memory_id = cw.memory_id
                     WHERE cw.depth < $3
                 )
                 SELECT
