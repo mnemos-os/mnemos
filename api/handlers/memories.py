@@ -75,6 +75,45 @@ def _is_root(user: UserContext) -> bool:
     return user.role == "root"
 
 
+def _read_visibility_predicate(
+    user: UserContext, start_param_idx: int
+) -> tuple[str, list]:
+    """Read-visibility WHERE clause for non-root callers, mirroring
+    the v1_multiuser RLS policies (db/migrations_v1_multiuser.sql):
+
+      - mnemos_owner_select:  owner_id = caller
+      - mnemos_world_select:  (permission_mode % 10) >= 4
+      - mnemos_group_select:  permission_mode >= 640
+                              AND group_id IS NOT NULL
+                              AND caller is a member of group_id
+      - federation: federation_source IS NOT NULL — federated rows
+        are explicitly cross-tenant-readable per the v3.2 H1 design
+        (api/lifecycle.py:465 search/rehydrate use the same OR).
+
+    The predicate must live at the app layer because RLS combines
+    with WHERE via AND — RLS cannot re-add rows that the handler's
+    WHERE has rejected. A strict owner-only WHERE would silently
+    hide group/world-readable rows in team/enterprise mode.
+
+    Returns (clause, params). params extend the caller's params
+    list in order. start_param_idx is the next free $N placeholder.
+    """
+    n = start_param_idx
+    # owner / federation: 1 param (user_id)
+    # world-readable: 0 params (literal predicate)
+    # group-readable: 1 param (group_ids array)
+    clause = (
+        "("
+        f"owner_id=${n}"
+        " OR federation_source IS NOT NULL"
+        " OR (permission_mode % 10) >= 4"
+        f" OR (permission_mode >= 640 AND group_id IS NOT NULL "
+        f"AND group_id = ANY(${n + 1}::text[]))"
+        ")"
+    )
+    return clause, [user.user_id, list(user.group_ids)]
+
+
 async def _bump_recall_counters(memory_ids: list) -> None:
     """Increment recall_count + set last_recalled_at for a hit set.
 
@@ -114,23 +153,17 @@ async def list_memories(
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     # Tenancy scoping for non-root callers:
-    #   - Namespace pinned to caller's namespace. An explicit
-    #     `?namespace=other` from a non-root caller returns 403
-    #     (mirrors search_memories' parity contract — silent
-    #     re-scoping would hide bad caller behavior).
-    #   - Read-visibility predicate: own rows OR federated rows
-    #     (federation_source IS NOT NULL). Federation imports store
-    #     rows under owner_id='federation', and lifecycle.py:465
-    #     uses the same predicate for search/rehydrate/gateway —
-    #     keeps list/get visibility consistent with those paths.
-    #     Mutation paths (update/delete) keep strict owner_id; only
-    #     READ surfaces include the federation OR-branch.
-    #   - Group/world-readable rows (permission_mode >= 0o644) are
-    #     visible only via RLS in team/enterprise mode today; an
-    #     app-layer extension is tracked as a separate v3.5 audit
-    #     follow-up.
-    # Root callers see everything; an explicit ?namespace= filter is
-    # honored for cross-tenant audit lookups.
+    #   - Namespace pinned. Cross-namespace request returns 403
+    #     (mirrors search_memories' parity contract).
+    #   - Read-visibility predicate aligned with the v1_multiuser
+    #     RLS policies (see _read_visibility_predicate). Combines
+    #     owner / federation / group-readable / world-readable into
+    #     a single OR-clause at the app layer because RLS cannot
+    #     RE-ADD rows that the handler WHERE has already excluded —
+    #     a strict owner-only WHERE would silently hide
+    #     group/world-readable rows in team/enterprise mode.
+    # Root callers see everything; explicit ?namespace= honored for
+    # cross-tenant audit lookups.
     is_root = _is_root(user)
     if not is_root and namespace and namespace != user.namespace:
         raise HTTPException(
@@ -154,12 +187,11 @@ async def list_memories(
         where_parts.append(f"namespace=${len(params) + 1}")
         params.append(effective_namespace)
     if not is_root:
-        # Read-visibility: own rows OR federated rows. Same shape as
-        # api/lifecycle.py:465 (search/rehydrate/gateway).
-        where_parts.append(
-            f"(owner_id=${len(params) + 1} OR federation_source IS NOT NULL)"
+        vis_clause, vis_params = _read_visibility_predicate(
+            user, len(params) + 1,
         )
-        params.append(user.user_id)
+        where_parts.append(vis_clause)
+        params.extend(vis_params)
 
     where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
@@ -190,19 +222,20 @@ async def get_memory(
                     f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
                 )
             else:
-                # Read visibility for non-root: namespace pinned, plus
-                # own rows OR federated rows. Mirrors lifecycle.py:465
-                # and the new list_memories shape so a memory visible
-                # via search/list is also visible via GET-by-id.
+                # Read visibility for non-root: namespace pinned + the
+                # shared read-visibility predicate (own / federation /
+                # world-readable / group-readable), mirroring the
+                # v1_multiuser RLS policies. Same predicate as
+                # list_memories so a memory visible to a user via
+                # list/search is also visible via GET-by-id.
                 # Mutation paths (update/delete) keep strict
-                # owner_id-only scoping to prevent non-owners from
-                # editing federated content. 404 (not 403) keeps
-                # other-tenant memory existence invisible.
+                # owner_id scoping. 404 (not 403) keeps other-tenant
+                # memory existence invisible.
+                vis_clause, vis_params = _read_visibility_predicate(user, 3)
                 row = await conn.fetchrow(
                     f"SELECT {_MEMORY_COLS} FROM memories "
-                    "WHERE id=$1 AND namespace=$2 "
-                    "AND (owner_id=$3 OR federation_source IS NOT NULL)",
-                    memory_id, user.namespace, user.user_id,
+                    f"WHERE id=$1 AND namespace=$2 AND {vis_clause}",
+                    memory_id, user.namespace, *vis_params,
                 )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")

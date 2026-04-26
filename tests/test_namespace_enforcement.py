@@ -110,8 +110,15 @@ def test_list_memories_filters_by_namespace_for_non_root(monkeypatch):
     # for non-root callers, matching search/update/delete. Without
     # this, a non-root user could list other users' rows in the
     # same namespace.
+    # Full read-visibility predicate (mirrors v1_multiuser RLS policies):
+    # owner / federation / world-readable / group-readable. RLS cannot
+    # re-add rows that the WHERE rejected, so all four branches must
+    # appear at the app layer.
     assert "owner_id=$" in sql
-    assert "federation_source IS NOT NULL" in sql  # read-visibility OR-branch
+    assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql  # world-readable
+    assert "permission_mode >= 640" in sql  # group-readable threshold
+    assert "group_id = ANY(" in sql        # group-membership branch
     assert "alice" in args
 
 
@@ -230,8 +237,15 @@ def test_get_memory_filters_by_namespace_for_non_root(monkeypatch):
     # v3.5 audit slice 2: get_memory must also scope by owner_id —
     # otherwise any non-root caller in the same namespace could read
     # other users' rows by guessing memory_id.
+    # Full read-visibility predicate (mirrors v1_multiuser RLS policies):
+    # owner / federation / world-readable / group-readable. RLS cannot
+    # re-add rows that the WHERE rejected, so all four branches must
+    # appear at the app layer.
     assert "owner_id=$" in sql
-    assert "federation_source IS NOT NULL" in sql  # read-visibility OR-branch
+    assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql  # world-readable
+    assert "permission_mode >= 640" in sql  # group-readable threshold
+    assert "group_id = ANY(" in sql        # group-membership branch
     assert "alice" in args
 
 
