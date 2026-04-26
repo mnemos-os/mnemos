@@ -395,6 +395,54 @@ async def revert_memory(
                 )
 
             if branch == "main":
+                # Main-branch revert: same live-row drift guard
+                # merge_branch enforces (slice 2 round 32+33+34).
+                # If live has drifted from main HEAD on any of the
+                # trigger-versioned fields (content, category,
+                # subcategory, metadata, verbatim_content,
+                # owner_id, namespace, permission_mode), refusing
+                # to overwrite it silently — the trigger writes
+                # the new version row from NEW.* of the UPDATE,
+                # so a stale OLD live row would generate a
+                # version with wrong tenancy parented to the
+                # stale main HEAD.
+                main_head = await conn.fetchrow(
+                    """
+                    SELECT mv.content, mv.category, mv.subcategory,
+                           mv.metadata, mv.verbatim_content,
+                           mv.owner_id, mv.namespace, mv.permission_mode,
+                           mv.commit_hash
+                    FROM memory_versions mv
+                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                    WHERE mv.memory_id = $1 AND mb.name = 'main'
+                    """,
+                    memory_id,
+                )
+                if main_head is not None and (
+                    live["content"] != main_head["content"]
+                    or live["category"] != main_head["category"]
+                    or live["subcategory"] != main_head["subcategory"]
+                    or live["metadata"] != main_head["metadata"]
+                    or live["verbatim_content"] != main_head["verbatim_content"]
+                    or live["owner_id"] != main_head["owner_id"]
+                    or live["namespace"] != main_head["namespace"]
+                    or live["permission_mode"] != main_head["permission_mode"]
+                ):
+                    logger.error(
+                        f"[VERSION] Revert aborted: live memory row for "
+                        f"{memory_id} has drifted from main HEAD "
+                        f"({main_head['commit_hash'][:12]}). Refusing "
+                        f"to overwrite live state silently."
+                    )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"Live memory row has drifted from main "
+                            f"HEAD; manual reconciliation required "
+                            f"before revert into main"
+                        ),
+                    )
+
                 # Main-branch revert: UPDATE memories under the main
                 # GUC and let mnemos_version_snapshot create the
                 # revert version row + advance memory_branches HEAD
