@@ -111,6 +111,7 @@ def test_list_memories_filters_by_namespace_for_non_root(monkeypatch):
     # this, a non-root user could list other users' rows in the
     # same namespace.
     assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql  # read-visibility OR-branch
     assert "alice" in args
 
 
@@ -177,7 +178,41 @@ def test_list_memories_combines_namespace_with_category_and_subcategory(monkeypa
     assert "subcategory=$" in sql
     assert "namespace=$" in sql
     assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql
     assert all(v in args for v in ("solutions", "pipeline", "alice-ns", "alice"))
+
+
+def test_list_memories_rejects_cross_namespace_for_non_root(monkeypatch):
+    """Non-root caller asking ?namespace=other → 403, not silent re-scope.
+    Mirrors search_memories' parity contract; hides bad caller behavior
+    otherwise."""
+    conn = _Conn(rows=[])
+    _install(monkeypatch, conn)
+
+    from fastapi import HTTPException
+    import pytest as _p
+    with _p.raises(HTTPException) as exc:
+        asyncio.run(memories_handler.list_memories(
+            namespace="other-ns", user=_alice("alice-ns"),
+        ))
+    assert exc.value.status_code == 403
+
+
+def test_list_memories_root_honors_explicit_namespace(monkeypatch):
+    """Root callers can target a specific namespace for cross-tenant
+    audit lookups."""
+    conn = _Conn(rows=[])
+    _install(monkeypatch, conn)
+
+    asyncio.run(memories_handler.list_memories(
+        namespace="other-ns", user=_root(),
+    ))
+
+    sql = _fetched_sql(conn)
+    args = _fetched_args(conn)
+    assert "namespace=$" in sql
+    assert "other-ns" in args
+    assert "owner_id=$" not in sql  # root still bypasses owner scoping
 
 
 # ---- get_memory ------------------------------------------------------------
@@ -196,6 +231,7 @@ def test_get_memory_filters_by_namespace_for_non_root(monkeypatch):
     # otherwise any non-root caller in the same namespace could read
     # other users' rows by guessing memory_id.
     assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql  # read-visibility OR-branch
     assert "alice" in args
 
 

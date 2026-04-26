@@ -105,6 +105,7 @@ async def _bump_recall_counters(memory_ids: list) -> None:
 async def list_memories(
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
+    namespace: Optional[str] = None,
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
@@ -112,17 +113,31 @@ async def list_memories(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    # Tenancy scoping. Non-root callers see only their own memories
-    # in their namespace — matches the pattern in search_memories /
-    # update_memory / delete_memory (owner_id + namespace pinned to
-    # the caller's identity). Root passes through unfiltered.
-    #
-    # The earlier app-layer enforcement scoped by namespace ONLY,
-    # which let any non-root user list other users' rows in the same
-    # namespace. The audit (api/handlers/memories.py:115) flagged
-    # this as the read/mutate inconsistency; this fix aligns reads
-    # with the rest of the contract.
+    # Tenancy scoping for non-root callers:
+    #   - Namespace pinned to caller's namespace. An explicit
+    #     `?namespace=other` from a non-root caller returns 403
+    #     (mirrors search_memories' parity contract — silent
+    #     re-scoping would hide bad caller behavior).
+    #   - Read-visibility predicate: own rows OR federated rows
+    #     (federation_source IS NOT NULL). Federation imports store
+    #     rows under owner_id='federation', and lifecycle.py:465
+    #     uses the same predicate for search/rehydrate/gateway —
+    #     keeps list/get visibility consistent with those paths.
+    #     Mutation paths (update/delete) keep strict owner_id; only
+    #     READ surfaces include the federation OR-branch.
+    #   - Group/world-readable rows (permission_mode >= 0o644) are
+    #     visible only via RLS in team/enterprise mode today; an
+    #     app-layer extension is tracked as a separate v3.5 audit
+    #     follow-up.
+    # Root callers see everything; an explicit ?namespace= filter is
+    # honored for cross-tenant audit lookups.
     is_root = _is_root(user)
+    if not is_root and namespace and namespace != user.namespace:
+        raise HTTPException(
+            status_code=403,
+            detail="cross-namespace list requires root",
+        )
+    effective_namespace = namespace if is_root else user.namespace
 
     # Build dynamic WHERE clauses to avoid 4×2 hardcoded SQL branches.
     # Filter list is preserved across SELECT and COUNT — same params,
@@ -135,11 +150,16 @@ async def list_memories(
     if subcategory is not None:
         where_parts.append(f"subcategory=${len(params) + 1}")
         params.append(subcategory)
-    if not is_root:
-        where_parts.append(f"owner_id=${len(params) + 1}")
-        params.append(user.user_id)
+    if effective_namespace is not None:
         where_parts.append(f"namespace=${len(params) + 1}")
-        params.append(user.namespace)
+        params.append(effective_namespace)
+    if not is_root:
+        # Read-visibility: own rows OR federated rows. Same shape as
+        # api/lifecycle.py:465 (search/rehydrate/gateway).
+        where_parts.append(
+            f"(owner_id=${len(params) + 1} OR federation_source IS NOT NULL)"
+        )
+        params.append(user.user_id)
 
     where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
 
@@ -170,17 +190,19 @@ async def get_memory(
                     f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
                 )
             else:
-                # Two-dimensional tenancy: owner_id AND namespace.
-                # Same shape as update_memory / delete_memory. The
-                # earlier code scoped by namespace alone, so any non-
-                # root user could read every other user's rows in
-                # the same namespace — caught by the v3.4.1 audit
-                # (api/handlers/memories.py:219). 404 (not 403) keeps
+                # Read visibility for non-root: namespace pinned, plus
+                # own rows OR federated rows. Mirrors lifecycle.py:465
+                # and the new list_memories shape so a memory visible
+                # via search/list is also visible via GET-by-id.
+                # Mutation paths (update/delete) keep strict
+                # owner_id-only scoping to prevent non-owners from
+                # editing federated content. 404 (not 403) keeps
                 # other-tenant memory existence invisible.
                 row = await conn.fetchrow(
                     f"SELECT {_MEMORY_COLS} FROM memories "
-                    "WHERE id=$1 AND owner_id=$2 AND namespace=$3",
-                    memory_id, user.user_id, user.namespace,
+                    "WHERE id=$1 AND namespace=$2 "
+                    "AND (owner_id=$3 OR federation_source IS NOT NULL)",
+                    memory_id, user.namespace, user.user_id,
                 )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
