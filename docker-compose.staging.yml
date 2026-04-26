@@ -110,6 +110,12 @@ services:
       MNEMOS_PROFILE: staging
       MNEMOS_AUTH_ENABLED: '1'
 
+      # Federation: allow http:// peer URLs (PYTHIA + CERBERUS prods are
+      # both http on private 192.168.207.x; staging pulls from them).
+      # Production should use https:// peers; FEDERATION_ALLOW_INSECURE
+      # is staging-only.
+      FEDERATION_ALLOW_INSECURE: ${FEDERATION_ALLOW_INSECURE:-true}
+
       # Tesseract anomaly detection — CERBERUS AD-Diffusion NIM (CPU mode)
       # Optional; not load-bearing for staging
       TESSERACT_AD_URL: ${TESSERACT_AD_URL:-http://192.168.207.96:8002}
