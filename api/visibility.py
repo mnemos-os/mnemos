@@ -38,9 +38,13 @@ def read_visibility_predicate(
     - ``mnemos_owner_select``  → ``owner_id = $caller``
     - ``federation`` (v3.2 H1) → ``federation_source IS NOT NULL``
     - ``mnemos_world_select``  → ``(permission_mode % 10) >= 4``
-    - ``mnemos_group_select``  → ``permission_mode >= 640
+      (extract Unix-style world bits via ones-digit)
+    - ``mnemos_group_select``  → ``((permission_mode / 10) % 10) >= 4
                                    AND group_id IS NOT NULL
                                    AND group_id = ANY($groups)``
+      (extract Unix-style group bits via tens-digit; permission_mode
+      = 700 has group bits = 0, so the row is owner-only even though
+      the row's `permission_mode >= 640`).
 
     ``group_ids`` is sourced from ``UserContext.group_ids`` (resolved
     at auth time) rather than re-querying ``user_groups`` via EXISTS;
@@ -50,6 +54,14 @@ def read_visibility_predicate(
     ``"m"`` → ``m.owner_id``) for queries that join multiple tables
     and need disambiguation. Default empty produces unqualified
     column names suitable for single-table queries.
+
+    NOTE: the v1_multiuser ``mnemos_group_select`` RLS policy uses
+    ``permission_mode >= 640``, which has the same Unix-bit bug
+    (mode 700 satisfies the threshold but has group bits 0). This
+    predicate is intentionally stricter than the RLS to fail closed
+    on owner-only rows. The RLS policy itself needs the same
+    correction in a follow-up migration so behavior is identical
+    whether RLS is on or off.
     """
     n = start_param_idx
     p = f"{table_alias}." if table_alias else ""
@@ -58,7 +70,8 @@ def read_visibility_predicate(
         f"{p}owner_id=${n}"
         f" OR {p}federation_source IS NOT NULL"
         f" OR ({p}permission_mode % 10) >= 4"
-        f" OR ({p}permission_mode >= 640 AND {p}group_id IS NOT NULL "
+        f" OR ((({p}permission_mode / 10) % 10) >= 4 "
+        f"AND {p}group_id IS NOT NULL "
         f"AND {p}group_id = ANY(${n + 1}::text[]))"
         ")"
     )

@@ -117,7 +117,7 @@ def test_list_memories_filters_by_namespace_for_non_root(monkeypatch):
     assert "owner_id=$" in sql
     assert "federation_source IS NOT NULL" in sql
     assert "permission_mode % 10" in sql  # world-readable
-    assert "permission_mode >= 640" in sql  # group-readable threshold
+    assert "(permission_mode / 10) % 10" in sql  # group-readable threshold
     assert "group_id = ANY(" in sql        # group-membership branch
     assert "alice" in args
 
@@ -244,7 +244,7 @@ def test_get_memory_filters_by_namespace_for_non_root(monkeypatch):
     assert "owner_id=$" in sql
     assert "federation_source IS NOT NULL" in sql
     assert "permission_mode % 10" in sql  # world-readable
-    assert "permission_mode >= 640" in sql  # group-readable threshold
+    assert "(permission_mode / 10) % 10" in sql  # group-readable threshold
     assert "group_id = ANY(" in sql        # group-membership branch
     assert "alice" in args
 

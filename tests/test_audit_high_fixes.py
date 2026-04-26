@@ -113,7 +113,7 @@ def test_slice2_fts_fetch_with_group_ids_uses_full_visibility(monkeypatch):
     assert "owner_id=$" in sql
     assert "federation_source IS NOT NULL" in sql
     assert "permission_mode % 10" in sql           # world-readable
-    assert "permission_mode >= 640" in sql         # group-readable threshold
+    assert "(permission_mode / 10) % 10" in sql         # group-readable threshold
     assert "group_id = ANY(" in sql                # group-membership branch
     assert "alice" in args
     assert ["g1", "g2"] in args                    # group_ids array passed
@@ -130,7 +130,7 @@ def test_slice2_vector_search_with_group_ids_uses_full_visibility(monkeypatch):
 
     sql = conn.fetches[-1][0]
     assert "permission_mode % 10" in sql
-    assert "permission_mode >= 640" in sql
+    assert "(permission_mode / 10) % 10" in sql
     assert "group_id = ANY(" in sql
 
 

@@ -421,9 +421,14 @@ async def search_memories(
     # Cache key must include the caller's group_ids — search visibility
     # now depends on group membership (slice 2.1), so caching by
     # user_id alone would either leak rows after a group revoke or
-    # hide rows after a group grant for the cache TTL window. Hash a
-    # sorted snapshot so order doesn't fragment the cache.
-    group_ids_key = ",".join(sorted(user.group_ids))
+    # hide rows after a group grant for the cache TTL window.
+    #
+    # JSON-encode the sorted snapshot so commas inside group IDs
+    # don't collide on a flat join: ['a,b','c'] vs ['a','b,c']
+    # would otherwise both serialize to "a,b,c". JSON's quoted
+    # elements + escaped quotes make every membership signature
+    # uniquely decodable.
+    group_ids_key = json.dumps(sorted(user.group_ids), separators=(",", ":"))
     cache_key = _get_cache_key(
         "search",
         user.user_id, user.namespace,
