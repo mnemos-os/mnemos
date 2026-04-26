@@ -235,28 +235,38 @@ async def tool_branch_memory(
                 if not start:
                     return {"success": False, "error": "main branch not found"}
 
-            # Create branch — CREATE-ONLY semantics. The earlier
-            # `ON CONFLICT DO UPDATE SET head_version_id = ...` was
-            # described as "create a branch" but silently rewrote
-            # the existing branch's head pointer on a duplicate
-            # name (including 'main'). That's a write-path data-
-            # integrity hole: a retry, an accidental re-run, or a
-            # caller passing name='main' would move the branch
-            # head with no audit boundary, breaking subsequent
-            # logs/diffs/merges.
+            # Create branch — CREATE-ONLY semantics with race-safe
+            # idempotency. The earlier ON CONFLICT DO UPDATE silently
+            # rewrote existing branches' heads. The round-12 fix
+            # used check-then-insert, which under concurrent retries
+            # could let two callers both observe "no branch" and
+            # one would lose to the unique constraint with a generic
+            # DB error rather than the advertised idempotent-success
+            # or 409-conflict.
             #
-            # New semantics: idempotent success when the existing
-            # branch already points at the same head_version_id
-            # (safe re-run); 409-shaped failure when a branch with
-            # that name exists at a DIFFERENT head (caller must use
-            # an explicit branch-move op, which doesn't exist yet).
-            existing = await conn.fetchrow(
-                "SELECT head_version_id FROM memory_branches "
-                "WHERE memory_id = $1 AND name = $2",
-                memory_id, name,
+            # Race-safe shape: INSERT ... ON CONFLICT DO NOTHING
+            # RETURNING head_version_id. If RETURNING yields a row,
+            # we won the insert (created the branch). If it returns
+            # NULL, a concurrent caller already created it; we then
+            # SELECT the existing head and either return idempotent
+            # success (same head) or 409-shaped conflict (different
+            # head).
+            inserted = await conn.fetchrow(
+                """
+                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (memory_id, name) DO NOTHING
+                RETURNING head_version_id
+                """,
+                memory_id, name, start["id"], user.user_id,
             )
-            if existing is not None:
-                if existing["head_version_id"] == start["id"]:
+            if inserted is None:
+                existing = await conn.fetchrow(
+                    "SELECT head_version_id FROM memory_branches "
+                    "WHERE memory_id = $1 AND name = $2",
+                    memory_id, name,
+                )
+                if existing is not None and existing["head_version_id"] == start["id"]:
                     return {
                         "success": True,
                         "memory_id": memory_id,
@@ -272,14 +282,6 @@ async def tool_branch_memory(
                         f"head; refusing to silently move it"
                     ),
                 }
-
-            await conn.execute(
-                """
-                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
-                VALUES ($1, $2, $3, $4)
-                """,
-                memory_id, name, start["id"], user.user_id,
-            )
 
             return {
                 "success": True,
