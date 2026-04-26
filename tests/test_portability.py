@@ -45,13 +45,26 @@ def _root() -> UserContext:
 
 
 class _Conn:
-    def __init__(self, rows=None):
+    def __init__(self, rows=None, *, routed_rows=None):
+        """Mock asyncpg connection.
+
+        ``rows`` is the default row set for any fetch.
+        ``routed_rows`` is an optional dict mapping a substring (e.g.
+        the table name "kg_triples") to the rows that should be
+        returned when the SQL contains that substring. Used by the
+        sidecar tests to seed different row sets per query without
+        building a full SQL parser.
+        """
         self._rows = rows or []
+        self._routed = routed_rows or {}
         self.fetch_calls: list[tuple[str, tuple]] = []
         self.executes: list[tuple[str, tuple]] = []
 
     async def fetch(self, sql: str, *args):
         self.fetch_calls.append((sql, args))
+        for needle, payload in self._routed.items():
+            if needle in sql:
+                return payload
         return self._rows
 
     async def execute(self, sql: str, *args):
@@ -60,7 +73,19 @@ class _Conn:
         # simulate ON CONFLICT DO NOTHING (INSERT 0 0) or failures.
         return "INSERT 0 1"
 
-    def transaction(self):
+    async def fetchrow(self, sql: str, *args):
+        """Like fetch but returns a single row (or None). Mirrors
+        asyncpg.Connection.fetchrow."""
+        self.fetch_calls.append((sql, args))
+        for needle, payload in self._routed.items():
+            if needle in sql:
+                return payload[0] if payload else None
+        return self._rows[0] if self._rows else None
+
+    def transaction(self, *args, **kwargs):
+        # Accept asyncpg's transaction kwargs (isolation, readonly)
+        # so the export handler's REPEATABLE READ READ ONLY wrapper
+        # works against this mock — Codex round-41.
         class _NullCtx:
             async def __aenter__(self_): return self_
             async def __aexit__(self_, *a): return False
@@ -108,7 +133,7 @@ def test_export_filters_by_caller_owner_and_namespace_for_non_root(monkeypatch):
 
     asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
     ))
 
     sql, args = conn.fetch_calls[-1]
@@ -126,7 +151,7 @@ def test_export_non_root_cross_owner_param_rejected(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(portability.export_memories(
             category=None, limit=1000, offset=0,
-            owner_id="bob", namespace=None, user=_alice(),
+            owner_id="bob", namespace=None, include_sidecars=False, user=_alice(),
         ))
     assert exc.value.status_code == 403
     # No DB fetch should have happened
@@ -141,7 +166,7 @@ def test_export_non_root_cross_namespace_param_rejected(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         asyncio.run(portability.export_memories(
             category=None, limit=1000, offset=0,
-            owner_id=None, namespace="other-ns", user=_alice(),
+            owner_id=None, namespace="other-ns", include_sidecars=False, user=_alice(),
         ))
     assert exc.value.status_code == 403
 
@@ -152,7 +177,7 @@ def test_export_root_may_target_arbitrary_slice(monkeypatch):
 
     result = asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id="bob", namespace="bob-ns", user=_root(),
+        owner_id="bob", namespace="bob-ns", include_sidecars=False, user=_root(),
     ))
     sql, args = conn.fetch_calls[-1]
     assert "bob" in args
@@ -167,10 +192,10 @@ def test_export_envelope_shape(monkeypatch):
 
     env = asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
     ))
 
-    assert env.mpf_version == "0.1.0"
+    assert env.mpf_version == "0.1.1"
     assert env.source_system == "mnemos"
     assert len(env.records) == 1
     rec = env.records[0]
@@ -191,11 +216,297 @@ def test_export_strips_none_payload_fields(monkeypatch):
 
     env = asyncio.run(portability.export_memories(
         category=None, limit=1000, offset=0,
-        owner_id=None, namespace=None, user=_alice(),
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
     ))
     payload = env.records[0].payload
     assert "source_model" not in payload
     assert "source_provider" not in payload
+
+
+# ─── /v1/export — sidecar emission (CHARON v0.2) ────────────────────────────
+
+
+def _kg_row(id: str = "kg_1", memory_id: str = "mem_alice1"):
+    return {
+        "id": id,
+        "subject": "Paris",
+        "predicate": "capitalOf",
+        "object": "France",
+        "subject_type": "place",
+        "object_type": "place",
+        "valid_from": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "valid_until": None,
+        "memory_id": memory_id,
+        "confidence": 0.95,
+        "created": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+    }
+
+
+def _mv_row(id: str = "ver_1", memory_id: str = "mem_alice1"):
+    return {
+        "id": id,
+        "memory_id": memory_id,
+        "version_num": 1,
+        "content": "hello",
+        "category": "solutions",
+        "subcategory": None,
+        "metadata": {"src": "test"},
+        "verbatim_content": "hello verbatim",
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "permission_mode": 600,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+        "snapshot_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+        "snapshot_by": "alice",
+        "change_type": "create",
+        "commit_hash": "abc123",
+        "parent_version_id": None,
+        "branch": "main",
+        "merge_parents": None,
+    }
+
+
+def _cv_row(memory_id: str = "mem_alice1"):
+    return {
+        "memory_id": memory_id,
+        "owner_id": "alice",
+        "winner_candidate_id": None,
+        "engine_id": "apollo",
+        "engine_version": "1.0",
+        "compressed_content": "compressed:hello",
+        "compressed_tokens": 4,
+        "compression_ratio": 2.5,
+        "quality_score": 0.87,
+        "composite_score": 0.81,
+        "scoring_profile": "balanced",
+        "judge_model": "claude-opus-4-7",
+        "selected_at": datetime(2026, 1, 1, tzinfo=timezone.utc),
+    }
+
+
+def test_export_omits_sidecars_by_default(monkeypatch):
+    """include_sidecars=False (the default) must not even SELECT from
+    sidecar tables — old envelopes stay byte-identical."""
+    conn = _Conn(rows=[_memory_row()])
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=False, user=_alice(),
+    ))
+
+    sql_seen = " | ".join(s for s, _ in conn.fetch_calls)
+    assert "kg_triples" not in sql_seen
+    assert "memory_versions" not in sql_seen
+    assert "memory_compressed_variants" not in sql_seen
+    assert env.kg_triples is None
+    assert env.memory_versions is None
+    assert env.compression_manifest is None
+
+
+def test_export_with_sidecars_emits_three_arrays(monkeypatch):
+    """include_sidecars=True emits all three sidecar arrays, scoped
+    to the same owner+namespace as the memories query."""
+    conn = _Conn(
+        rows=[_memory_row()],
+        routed_rows={
+            "FROM kg_triples": [_kg_row()],
+            "FROM memory_versions": [_mv_row()],
+            "FROM memory_compressed_variants": [_cv_row()],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=True, user=_alice(),
+    ))
+
+    assert env.kg_triples is not None and len(env.kg_triples) == 1
+    assert env.memory_versions is not None and len(env.memory_versions) == 1
+    assert env.compression_manifest is not None and len(env.compression_manifest) == 1
+
+    # KG triple shape
+    kg = env.kg_triples[0]
+    assert kg["predicate"] == "capitalOf"
+    assert kg["subject_literal"] == "Paris"
+    assert kg["object_literal"] == "France"
+    assert kg["subject_type"] == "place"
+    assert kg["confidence"] == 0.95
+
+    # memory_version shape carries DAG + snapshot fields
+    mv = env.memory_versions[0]
+    assert mv["record_id"] == "mem_alice1"
+    assert mv["commit_hash"] == "abc123"
+    assert mv["branch"] == "main"
+    assert mv["change_type"] == "create"
+    assert mv["verbatim_content"] == "hello verbatim"
+
+    # compression_manifest shape carries judge + ratio fields
+    cm = env.compression_manifest[0]
+    assert cm["record_id"] == "mem_alice1"
+    assert cm["engine_id"] == "apollo"
+    assert cm["quality_score"] == 0.87
+    assert cm["compressed_tokens"] == 4
+
+
+def test_export_runs_in_repeatable_read_readonly_transaction(monkeypatch):
+    """Round-41 finding: under READ COMMITTED, a concurrent
+    update between the memories SELECT and a sidecar SELECT can
+    produce an envelope where records[] holds old content while
+    memory_versions[] holds the new HEAD — internally inconsistent
+    for migration backups. The handler now wraps all reads in a
+    REPEATABLE READ READ ONLY transaction so the snapshot is taken
+    at the first statement and held for every subsequent SELECT.
+
+    We can't simulate the concurrent write against the mock, but
+    we can assert that the transaction context manager is opened
+    with the right isolation/readonly flags, which is the
+    structural guarantee the fix provides.
+    """
+    captured: list[dict] = []
+
+    class _CapturingConn(_Conn):
+        def transaction(self, *args, **kwargs):
+            captured.append(dict(args=args, kwargs=kwargs))
+            return super().transaction(*args, **kwargs)
+
+    conn = _CapturingConn(
+        rows=[_memory_row()],
+        routed_rows={
+            "FROM kg_triples": [],
+            "FROM memory_versions": [],
+            "FROM memory_compressed_variants": [],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None,
+        include_sidecars=True, user=_alice(),
+    ))
+
+    assert captured, "export must open a transaction"
+    tx = captured[0]
+    assert tx["kwargs"].get("isolation") == "repeatable_read", (
+        f"export must use repeatable_read isolation, got {tx!r}"
+    )
+    assert tx["kwargs"].get("readonly") is True, (
+        f"export transaction must be readonly, got {tx!r}"
+    )
+
+
+def test_export_returns_413_when_sidecar_exceeds_hard_cap(monkeypatch):
+    """Round-40 finding: include_sidecars=true had no per-surface
+    cap, so a non-root caller could accumulate a long
+    memory_versions / kg_triples history on a single memory and
+    ask for limit=1+include_sidecars=true to materialize unbounded
+    rows into one JSON envelope, bypassing _EXPORT_HARD_LIMIT and
+    risking worker memory/latency DoS.
+
+    The fix appends ``LIMIT cap+1`` to each sidecar SELECT and
+    raises HTTPException 413 when cap+1 rows come back. This test
+    seeds a fake conn that returns cap+1 memory_versions rows and
+    asserts the API rejects with 413 + a guidance message rather
+    than building the giant envelope.
+    """
+    cap = portability._EXPORT_SIDECAR_HARD_LIMIT
+    over = [_mv_row(id=f"ver_{i}") for i in range(cap + 1)]
+
+    conn = _Conn(
+        rows=[_memory_row()],
+        routed_rows={
+            "FROM kg_triples": [],
+            "FROM memory_versions": over,
+            "FROM memory_compressed_variants": [],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(portability.export_memories(
+            category=None, limit=1, offset=0,
+            owner_id=None, namespace=None,
+            include_sidecars=True, user=_alice(),
+        ))
+    assert exc_info.value.status_code == 413
+    assert "memory_versions" in exc_info.value.detail
+    assert "Narrow the slice" in exc_info.value.detail
+
+
+def test_export_sidecars_constrained_to_exported_memory_ids(monkeypatch):
+    """memory_versions / memory_compressed_variants queries must
+    restrict to the exported memory id set so a category-filtered
+    export doesn't drag in all-time DAG history."""
+    rows: list[tuple[str, tuple]] = []
+
+    class _CapturingConn(_Conn):
+        async def fetch(self, sql, *args):
+            rows.append((sql, args))
+            return await super().fetch(sql, *args)
+
+    conn = _CapturingConn(
+        rows=[_memory_row(id="mem_42")],
+        routed_rows={
+            "FROM kg_triples": [],
+            "FROM memory_versions": [],
+            "FROM memory_compressed_variants": [],
+        },
+    )
+    _install(monkeypatch, conn)
+
+    asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=True,
+        include_unattached_kg=False, user=_alice(),
+    ))
+
+    mv_sql, mv_args = next((s, a) for s, a in rows if "FROM memory_versions" in s)
+    cv_sql, cv_args = next((s, a) for s, a in rows if "FROM memory_compressed_variants" in s)
+    kg_sql, _ = next((s, a) for s, a in rows if "FROM kg_triples" in s)
+
+    # memory_versions + compression_manifest must include the
+    # memory_id IN (...) clause and the exported id alice's
+    # mem_42 must appear in the params.
+    assert "memory_id = ANY" in mv_sql
+    assert ["mem_42"] in (list(mv_args) or [])
+    assert "memory_id = ANY" in cv_sql
+    # KG triples bound to the slice. First-class triples (memory_id
+    # NULL) are opt-in via include_unattached_kg; default (which
+    # this test does not pass) is False, so the query has the ANY
+    # clause but NOT the NULL branch (Codex round-7 fix).
+    assert "memory_id = ANY" in kg_sql
+    assert "memory_id IS NULL" not in kg_sql
+
+
+def test_export_empty_memory_set_yields_empty_sidecars(monkeypatch):
+    """Empty memory result skips bound-to-memories sidecar queries
+    entirely (no DB hit) and returns empty arrays."""
+    conn = _Conn(rows=[])  # no memories
+    _install(monkeypatch, conn)
+
+    env = asyncio.run(portability.export_memories(
+        category=None, limit=1000, offset=0,
+        owner_id=None, namespace=None, include_sidecars=True, user=_alice(),
+    ))
+
+    assert env.records == []
+    # kg_triples is still queried (not bound to memories), so empty list ≠ None
+    assert env.kg_triples == []
+    assert env.memory_versions == []
+    assert env.compression_manifest == []
+
+    # Verify no SELECT FROM memory_versions or memory_compressed_variants
+    sql_seen = " | ".join(s for s, _ in conn.fetch_calls)
+    assert "FROM memory_versions" not in sql_seen
+    assert "FROM memory_compressed_variants" not in sql_seen
 
 
 # ─── /v1/import ──────────────────────────────────────────────────────────────
@@ -342,7 +653,32 @@ def test_import_idempotent_on_id_collision(monkeypatch):
         async def execute(self, sql, *args):
             self.executes.append((sql, args))
             return "INSERT 0 0"  # always conflict
-    conn = _DupeConn()
+    # Round-34 + Round-36: ON CONFLICT path now verifies existing
+    # memory row matches across all envelope-bound columns. Seed a
+    # row that matches the handler's defaulted values
+    # (permission_mode=600, quality_rating=75, metadata={},
+    # subcategory/source_*=None) — the test uses _memory_record's
+    # defaults which omit those fields.
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = $1": [
+            {
+                "content": "body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
+        ],
+    })
     _install(monkeypatch, conn)
 
     env = _envelope([_memory_record(id="mem_dupe")])
@@ -351,3 +687,1676 @@ def test_import_idempotent_on_id_collision(monkeypatch):
     ))
     assert stats.imported == 0
     assert stats.skipped == 1
+
+
+def test_import_rejected_conflict_blocks_sidecar_attachment(monkeypatch):
+    """Round-35 finding: under root + preserve_owner=true, a memory
+    record whose ON CONFLICT row mismatches the envelope (different
+    content) is marked failed — but earlier code populated id_remap
+    BEFORE the verification, leaving sidecar references rewritable
+    to the stale DB row. Without the round-35 fix, a kg_triples
+    entry referencing that record_id would still attach to the
+    pre-existing memory because it legitimately exists in DB and
+    passes the unscoped allowlist SELECT.
+
+    Setup: envelope claims memory id ``mem_alice1`` with content
+    ``new body``; DB already has ``mem_alice1`` with ``stale body``.
+    Conflict-row check rejects the memory record. The kg_triples
+    sidecar entry referencing ``mem_alice1`` MUST be refused — not
+    attached to the stale row.
+    """
+    class _MismatchConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memories" in sql:
+                return "INSERT 0 0"  # always conflict
+            return "INSERT 0 1"
+
+    conn = _MismatchConn(routed_rows={
+        # The conflict-row verification SELECT — DB content does NOT
+        # match envelope's "new body" claim. Other envelope-bound
+        # columns match the defaults so only `content` triggers the
+        # rejection.
+        "FROM memories WHERE id = $1": [
+            {
+                "content": "stale body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
+        ],
+        # Allowlist SELECT (unscoped under root + preserve_owner)
+        # would normally find the existing row.
+        "SELECT id, owner_id, namespace FROM memories": [
+            _allowlist_row(memory_id="mem_alice1"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.0",
+        records=[_memory_record(id="mem_alice1", content="new body")],
+        kg_triples=[_kg_sidecar_entry()],
+    )
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.failed >= 1
+    # The kg_triples sidecar MUST NOT attach to the rejected record.
+    assert stats.sidecars_imported.get("kg_triples", 0) == 0
+    assert all(
+        "INSERT INTO kg_triples" not in sql
+        for sql, _ in conn.executes
+    ), (
+        "kg_triples must not be inserted when its referenced memory "
+        "record was rejected by the conflict-row verification"
+    )
+
+
+def test_import_rejects_conflict_on_stale_permission_mode(monkeypatch):
+    """Round-36 finding: round-34 conflict-row check only compared
+    content/owner/namespace, leaving stale permission_mode (used
+    for federation visibility per the schema), category, metadata,
+    quality_rating, source_*, and subcategory free to authorize
+    sidecar attachment after a mismatch.
+
+    Setup: envelope claims memory id ``mem_alice1`` with the
+    default permission_mode (600 / private). DB has the same id +
+    same content + same owner/ns BUT permission_mode=644 (a
+    federation-visible value). Without the round-36 fix the
+    conflict-row check passes (content/owner/ns all match) and
+    sidecars attach to the federation-visible row. With the fix
+    the permission_mode mismatch rejects the record AND refuses
+    the kg_triples sidecar.
+    """
+    class _MismatchConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memories" in sql:
+                return "INSERT 0 0"
+            return "INSERT 0 1"
+
+    conn = _MismatchConn(routed_rows={
+        "FROM memories WHERE id = $1": [
+            {
+                "content": "body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                # Mismatch — envelope defaults to 600, DB has 644.
+                "permission_mode": 644,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
+        ],
+        "SELECT id, owner_id, namespace FROM memories": [
+            _allowlist_row(memory_id="mem_alice1"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.0",
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry()],
+    )
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.failed >= 1
+    assert any(
+        "permission_mode" in err for err in stats.errors
+    ), f"expected permission_mode mismatch error in {stats.errors!r}"
+    assert stats.sidecars_imported.get("kg_triples", 0) == 0
+    assert all(
+        "INSERT INTO kg_triples" not in sql
+        for sql, _ in conn.executes
+    )
+
+
+def test_import_disables_timestamp_tolerance_for_freshly_inserted_records(monkeypatch):
+    """Round-39 finding: round-38's COALESCE-tolerance for omitted
+    sidecar timestamps was over-broad. For a memory just inserted
+    in this transaction, an INSERT 0 0 on memory_versions /
+    kg_triples / compression_manifest cannot be an idempotent
+    retry — those tables retain prior-lifetime rows that survive
+    memory deletion. The omitted-timestamp tolerance lets stale
+    history attach to fresh memories. Round-39 fix gates the
+    tolerance on whether the referenced record_id is in the
+    inserted_record_ids set populated by the records loop.
+
+    Setup: envelope inserts a brand-new memory (first INSERT 1)
+    AND its memory_versions sidecar entry has snapshot_at omitted
+    AND the DB simulates a retained prior-lifetime memory_versions
+    row that matches every other column. Without the round-39
+    gate, round-38 tolerance would skip the snapshot_at compare
+    and the stale row would land on authorized_version_ids,
+    handing branch-restore a stale HEAD. With the round-39 gate,
+    snapshot_at compare runs strictly, the row is rejected, AND
+    because the record was freshly inserted the all-or-nothing
+    rule rolls back the whole transaction with a 500.
+    """
+    class _StaleMVConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memory_versions" in sql:
+                return "INSERT 0 0"  # collision with retained row
+            if "INSERT INTO memories" in sql:
+                return "INSERT 0 1"  # the memory itself is fresh
+            return "INSERT 0 1"
+
+    mv_entry = _mv_sidecar_entry()
+    mv_entry.pop("snapshot_at", None)
+
+    stale_prior_lifetime = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+        "merge_parents": None,
+        "category": mv_entry.get("category"),
+        "subcategory": mv_entry.get("subcategory"),
+        "metadata": mv_entry.get("metadata") or {},
+        "verbatim_content": mv_entry.get("verbatim_content"),
+        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "source_model": mv_entry.get("source_model"),
+        "source_provider": mv_entry.get("source_provider"),
+        "source_session": mv_entry.get("source_session"),
+        "source_agent": mv_entry.get("source_agent"),
+        # The single divergence — DB has a NOW() value the envelope
+        # cannot have produced, because this is a retained
+        # prior-lifetime row, not an idempotent retry of the
+        # current import.
+        "snapshot_at": datetime(2025, 6, 1, 0, 0, 0, tzinfo=timezone.utc),
+        "snapshot_by": mv_entry.get("snapshot_by"),
+        "change_type": mv_entry.get("change_type") or "create",
+    }
+    conn = _StaleMVConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "FROM memory_versions WHERE id = $1::uuid": [stale_prior_lifetime],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[mv_entry],
+    )
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    # All-or-nothing rule fires because mem_alice1 was freshly
+    # inserted AND its memory_versions sidecar entry failed.
+    assert exc_info.value.status_code == 500
+    assert "memory_versions sidecar had failed entries" in exc_info.value.detail
+
+
+def test_import_idempotent_when_sidecar_envelopes_omit_optional_timestamps(monkeypatch):
+    """Round-38 finding: kg_triples (valid_from, created),
+    memory_versions (snapshot_at), and compression_manifest
+    (selected_at) all use COALESCE($N, NOW()) on INSERT. When an
+    envelope omits any of these, the first import succeeds (DB
+    stores NOW()). On idempotent retry, the envelope still has
+    None for that field, so strict-equality conflict verification
+    rejects the row as 'stale prior-lifetime' even though the
+    only difference is the DB-generated default the verifier
+    can't see in the envelope. Round-38 fix tolerates the mismatch
+    only when the envelope omitted the field — the DB-generated
+    default is the right answer for that case.
+
+    Setup: envelope sidecars omit valid_from/created (kg),
+    snapshot_at (mv), selected_at (cm). DB rows match across all
+    other columns and carry NOW() in those slots. The handler must
+    count all three as skipped, not failed.
+    """
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+
+    kg_entry = _kg_sidecar_entry()
+    kg_entry.pop("valid_from", None)
+    kg_entry.pop("created", None)
+
+    mv_entry = _mv_sidecar_entry()
+    mv_entry.pop("snapshot_at", None)
+
+    cm_entry = _cm_sidecar_entry()
+    cm_entry.pop("selected_at", None)
+
+    db_now = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    matching_kg = {
+        "subject": kg_entry["subject_literal"],
+        "predicate": kg_entry["predicate"],
+        "object": kg_entry["object_literal"],
+        "subject_type": kg_entry.get("subject_type"),
+        "object_type": kg_entry.get("object_type"),
+        "memory_id": kg_entry.get("memory_id"),
+        "confidence": kg_entry.get("confidence"),
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        # COALESCE-stored DB defaults — round-38 must tolerate
+        # these even though the envelope has None.
+        "valid_from": db_now,
+        "valid_until": None,
+        "created": db_now,
+    }
+    matching_mv = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+        "merge_parents": None,
+        "category": mv_entry.get("category"),
+        "subcategory": mv_entry.get("subcategory"),
+        "metadata": mv_entry.get("metadata") or {},
+        "verbatim_content": mv_entry.get("verbatim_content"),
+        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "source_model": mv_entry.get("source_model"),
+        "source_provider": mv_entry.get("source_provider"),
+        "source_session": mv_entry.get("source_session"),
+        "source_agent": mv_entry.get("source_agent"),
+        # Same: DB has the COALESCE'd NOW() value.
+        "snapshot_at": db_now,
+        "snapshot_by": mv_entry.get("snapshot_by"),
+        "change_type": mv_entry.get("change_type") or "create",
+    }
+    matching_cm = {
+        "owner_id": "alice",
+        "winner_candidate_id": cm_entry.get("winner_contest_id"),
+        "engine_id": cm_entry["engine_id"],
+        "engine_version": cm_entry.get("engine_version"),
+        "compressed_content": cm_entry.get("compressed_content"),
+        "compressed_tokens": cm_entry.get("compressed_tokens"),
+        "compression_ratio": cm_entry.get("compression_ratio"),
+        "quality_score": cm_entry.get("quality_score"),
+        "composite_score": cm_entry.get("composite_score"),
+        "scoring_profile": cm_entry.get("scoring_profile") or "balanced",
+        "judge_model": cm_entry.get("judge_model"),
+        # Same: DB has COALESCE'd NOW() value.
+        "selected_at": db_now,
+    }
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "FROM memory_versions WHERE id = $1::uuid": [matching_mv],
+        "FROM kg_triples WHERE id = $1": [matching_kg],
+        "FROM memory_compressed_variants": [matching_cm],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[],
+        kg_triples=[kg_entry],
+        memory_versions=[mv_entry],
+        compression_manifest=[cm_entry],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.sidecars_failed == {}, (
+        f"timestamp omission should not fail conflict verification "
+        f"on idempotent retry, but got {stats.sidecars_failed!r} "
+        f"with errors {stats.errors!r}"
+    )
+    assert stats.sidecars_skipped == {
+        "kg_triples": 1,
+        "memory_versions": 1,
+        "compression_manifest": 1,
+    }
+
+
+def test_import_early_validation_rejection_blocks_sidecar(monkeypatch):
+    """Round-37 finding: pre-insert validation rejections (empty
+    content, unsupported payload_version) hit ``continue`` BEFORE
+    persisted_id is computed and id_remap is populated. Without
+    adding the envelope record_id to rejected_persisted_ids at
+    those points, a root+preserve_owner=true import can reject
+    the memory record and STILL attach kg_triples /
+    compression_manifest / memory_versions to a pre-existing DB
+    row carrying the same id, because the allowlist build sees
+    nothing rejected.
+
+    Setup: envelope claims memory id ``mem_alice1`` with empty
+    content (early-fail validation). DB has the pre-existing row
+    matching that id under root+preserve_owner unscoped allowlist.
+    The kg_triples sidecar referencing ``mem_alice1`` MUST be
+    refused — not attached to the pre-existing row.
+    """
+    conn = _Conn(routed_rows={
+        "SELECT id, owner_id, namespace FROM memories": [
+            _allowlist_row(memory_id="mem_alice1"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.0",
+        records=[_memory_record(id="mem_alice1", content="")],
+        kg_triples=[_kg_sidecar_entry()],
+    )
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+
+    assert stats.failed >= 1
+    assert any(
+        "empty content" in err for err in stats.errors
+    ), f"expected empty-content rejection in {stats.errors!r}"
+    assert stats.sidecars_imported.get("kg_triples", 0) == 0
+    assert all(
+        "INSERT INTO kg_triples" not in sql
+        for sql, _ in conn.executes
+    ), (
+        "kg_triples must not attach to a pre-existing DB row when its "
+        "envelope memory record was rejected by early-validation"
+    )
+
+
+def test_import_accepts_011_envelope(monkeypatch):
+    """Forward-compat ratchet: 0.1.1 envelopes import cleanly against
+    the same handler. The required-fields contract didn't change in
+    the patch bump."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        mpf_version="0.1.1",
+        records=[_memory_record(id="mem_011")],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+
+
+# ─── /v1/import — sidecar consumption (CHARON v0.2) ─────────────────────────
+
+
+def _kg_sidecar_entry(
+    id: str = "kg_1",
+    predicate: str = "capitalOf",
+    subject: str = "Paris",
+    obj: str = "France",
+    owner_id: str = "alice",
+    namespace: str = "alice-ns",
+):
+    return {
+        "id": id,
+        "predicate": predicate,
+        "subject_literal": subject,
+        "object_literal": obj,
+        "subject_type": "place",
+        "object_type": "place",
+        "memory_id": "mem_alice1",
+        "confidence": 0.9,
+        "valid_from": "2026-01-01T00:00:00+00:00",
+        "created": "2026-01-01T00:00:00+00:00",
+        "owner_id": owner_id,
+        "namespace": namespace,
+    }
+
+
+def _mv_sidecar_entry(
+    id: str = "00000000-0000-0000-0000-000000000001",
+    record_id: str = "mem_alice1",
+    owner_id: str = "alice",
+    namespace: str = "alice-ns",
+):
+    return {
+        "id": id,
+        "record_id": record_id,
+        "version_num": 1,
+        "content": "version body",
+        "category": "solutions",
+        "verbatim_content": "verbatim",
+        "owner_id": owner_id,
+        "namespace": namespace,
+        "permission_mode": 600,
+        "snapshot_at": "2026-01-01T00:00:00+00:00",
+        "change_type": "create",
+        "commit_hash": "abc123",
+        "branch": "main",
+    }
+
+
+# Standard test fixture's derived id under non-root path:
+# _derive_caller_scoped_id('mem_alice1', 'alice', 'alice-ns', 'body').
+# Hardcoded so tests don't need to import the helper. Round-14 fix.
+_ALICE_MEM_ALICE1_DERIVED = "mnemos_70c2ee51e5c57c5fd6ba105e5ded1595"
+
+
+def _allowlist_row(memory_id="mem_alice1", owner_id="alice", namespace="alice-ns"):
+    """Routed-fetch row for the allowlist SELECT issued before sidecar
+    imports. Mirrors what `_build_referenced_memory_allowlist` expects:
+    a memories row with id + owner_id + namespace columns.
+
+    Default uses verbatim "mem_alice1" since CHARON v0.2 restricts
+    memory_versions sidecar imports to the root + preserve_owner=true
+    path, where envelope ids are kept as-is. Tests exercising
+    non-root records-only id rewrite pass
+    `memory_id=_ALICE_MEM_ALICE1_DERIVED` explicitly."""
+    return {"id": memory_id, "owner_id": owner_id, "namespace": namespace}
+
+
+def _cm_sidecar_entry(
+    record_id: str = "mem_alice1",
+    owner_id: str = "alice",
+):
+    return {
+        "record_id": record_id,
+        "engine_id": "apollo",
+        "engine_version": "1.0",
+        "compressed_content": "compressed:body",
+        "compressed_tokens": 4,
+        "compression_ratio": 2.5,
+        "quality_score": 0.87,
+        "composite_score": 0.81,
+        "scoring_profile": "balanced",
+        "judge_model": "claude-opus-4-7",
+        "selected_at": "2026-01-01T00:00:00+00:00",
+        "owner_id": owner_id,
+    }
+
+
+def test_import_kg_triples_sidecar_imports_with_caller_owner_for_non_root(monkeypatch):
+    """Same anti-smuggling rule as memories — non-root rewrites
+    owner_id + namespace on every kg_triple to the caller's identity."""
+    # Non-root records-loop derives a caller-scoped id; the allowlist
+    # row + sidecar memory_id remap target the derived id.
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id=_ALICE_MEM_ALICE1_DERIVED)],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry(owner_id="bob", namespace="bob-ns")],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+    assert stats.sidecars_imported == {"kg_triples": 1}
+
+    kg_insert = next(e for e in conn.executes if "INSERT INTO kg_triples" in e[0])
+    args = kg_insert[1]
+    # Caller identity wins; the bob/bob-ns labels in the envelope are dropped.
+    assert "alice" in args
+    assert "alice-ns" in args
+    assert "bob" not in args
+    assert "bob-ns" not in args
+
+
+def test_import_kg_triples_root_preserve_owner_honors_envelope(monkeypatch):
+    # preserve_owner=True: sidecar's stated owner+ns must match the
+    # referenced memory's actual owner+ns. Here the kg_triple claims
+    # bob/bob-ns; the allowlist says mem_alice1 IS owned by bob/bob-ns
+    # (root-driven cross-tenant migration scenario, not a smuggle).
+    # preserve_owner=true keeps envelope id verbatim — explicit
+    # memory_id="mem_alice1" in the allowlist row.
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_alice1",
+                           owner_id="bob", namespace="bob-ns")
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry(owner_id="bob", namespace="bob-ns")],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_imported == {"kg_triples": 1}
+    kg_insert = next(e for e in conn.executes if "INSERT INTO kg_triples" in e[0])
+    args = kg_insert[1]
+    assert "bob" in args
+    assert "bob-ns" in args
+
+
+def test_import_kg_triples_missing_predicate_failed(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    bad = _kg_sidecar_entry()
+    bad.pop("predicate")
+    env = portability.MPFEnvelope(records=[], kg_triples=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {}
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert any("missing required" in e and "kg_triples" in e for e in stats.errors)
+    # Critically: no INSERT executed for the malformed row.
+    assert not any("INSERT INTO kg_triples" in e[0] for e in conn.executes)
+
+
+def test_import_memory_versions_sidecar_imports(monkeypatch):
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # Post-import v1 verification SELECT — return mem_alice1 as
+        # covered so the rollback path doesn't fire.
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_imported == {"memory_versions": 1}
+    mv_insert = next(e for e in conn.executes if "INSERT INTO memory_versions" in e[0])
+    args = mv_insert[1]
+    assert "mem_alice1" in args
+    # CHARON v0.2 restricts memory_versions sidecar import to root +
+    # preserve_owner=true (Path B from round-24). On that path the
+    # envelope's commit_hash is preserved verbatim.
+    assert "abc123" in args  # commit_hash kept verbatim under root
+    assert "main" in args    # branch
+
+
+def test_import_memory_versions_missing_required_fails(monkeypatch):
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["content"] = ""  # required field empty
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    assert not any("INSERT INTO memory_versions" in e[0] for e in conn.executes)
+
+
+def test_import_compression_manifest_sidecar_imports(monkeypatch):
+    # Non-root records-loop derives a caller-scoped id.
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id=_ALICE_MEM_ALICE1_DERIVED)],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        compression_manifest=[_cm_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {"compression_manifest": 1}
+    cm_insert = next(e for e in conn.executes if "INSERT INTO memory_compressed_variants" in e[0])
+    args = cm_insert[1]
+    # Non-root: records-loop derived memory_id; sidecar remap
+    # translated record_id to the derived id before INSERT.
+    assert _ALICE_MEM_ALICE1_DERIVED in args
+    assert "apollo" in args
+    # No namespace column on this table — caller's namespace must NOT
+    # appear in the args list (only owner_id is bound).
+    assert "alice-ns" not in args
+
+
+def test_import_all_three_sidecars_under_one_envelope(monkeypatch):
+    """Most realistic scenario: a CHARON round-trip envelope with one
+    memory + a triple + a version + a compression entry. Per-surface
+    counters break out cleanly."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        kg_triples=[_kg_sidecar_entry()],
+        memory_versions=[_mv_sidecar_entry()],
+        compression_manifest=[_cm_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.imported == 1
+    assert stats.sidecars_imported == {
+        "kg_triples": 1,
+        "memory_versions": 1,
+        "compression_manifest": 1,
+    }
+
+
+def test_import_sidecar_idempotent_on_id_collision(monkeypatch):
+    """Re-importing the same kg_triples / memory_versions /
+    compression_manifest envelope is a no-op — counts as skipped,
+    not imported."""
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1.
+    # Round-23 fix: ON CONFLICT skip path now verifies the existing
+    # memory_versions row matches the envelope claim. Seed a matching
+    # row so the idempotent re-import test still passes.
+    mv_entry = _mv_sidecar_entry()
+    matching_existing = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+        "merge_parents": None,
+        "category": mv_entry.get("category"),
+        "subcategory": mv_entry.get("subcategory"),
+        "metadata": mv_entry.get("metadata") or {},
+        "verbatim_content": mv_entry.get("verbatim_content"),
+        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "source_model": mv_entry.get("source_model"),
+        "source_provider": mv_entry.get("source_provider"),
+        "source_session": mv_entry.get("source_session"),
+        "source_agent": mv_entry.get("source_agent"),
+        "snapshot_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+        "snapshot_by": mv_entry.get("snapshot_by"),
+        "change_type": mv_entry.get("change_type") or "create",
+    }
+    # Round-30: kg_triples ON CONFLICT now does exact-match too,
+    # so seed a matching kg row for the dupe-conn test.
+    kg_entry = _kg_sidecar_entry()
+    matching_kg = {
+        "subject": kg_entry["subject_literal"],
+        "predicate": kg_entry["predicate"],
+        "object": kg_entry["object_literal"],
+        "subject_type": kg_entry.get("subject_type"),
+        "object_type": kg_entry.get("object_type"),
+        "memory_id": kg_entry.get("memory_id"),
+        "confidence": kg_entry.get("confidence"),
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "valid_from": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+        "valid_until": None,
+        "created": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    }
+    # Round-32: compression_manifest now does exact-match too —
+    # seed a matching cm row.
+    cm_entry = _cm_sidecar_entry()
+    matching_cm = {
+        "owner_id": "alice",
+        "winner_candidate_id": cm_entry.get("winner_contest_id"),
+        "engine_id": cm_entry["engine_id"],
+        "engine_version": cm_entry.get("engine_version"),
+        "compressed_content": cm_entry.get("compressed_content"),
+        "compressed_tokens": cm_entry.get("compressed_tokens"),
+        "compression_ratio": cm_entry.get("compression_ratio"),
+        "quality_score": cm_entry.get("quality_score"),
+        "composite_score": cm_entry.get("composite_score"),
+        "scoring_profile": cm_entry.get("scoring_profile") or "balanced",
+        "judge_model": cm_entry.get("judge_model"),
+        "selected_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+    }
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
+        "FROM kg_triples WHERE id = $1": [matching_kg],
+        "FROM memory_compressed_variants": [matching_cm],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[],
+        kg_triples=[_kg_sidecar_entry()],
+        memory_versions=[mv_entry],
+        compression_manifest=[_cm_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_imported == {}
+    assert stats.sidecars_skipped == {
+        "kg_triples": 1,
+        "memory_versions": 1,
+        "compression_manifest": 1,
+    }
+
+
+def test_import_no_sidecars_means_no_sidecar_inserts(monkeypatch):
+    """A 0.1.0-shape envelope with sidecar fields absent must not
+    trigger any sidecar INSERTs."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = _envelope([_memory_record(id="mem_alice1")])
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.imported == 1
+    assert stats.sidecars_imported == {}
+    assert not any("kg_triples" in e[0] or
+                   "memory_versions" in e[0] or
+                   "memory_compressed_variants" in e[0]
+                   for e in conn.executes)
+
+
+# ─── /v1/import — cross-tenant attachment defense (Codex finding #3) ────────
+
+
+def test_import_kg_triple_referencing_foreign_memory_id_rejected(monkeypatch):
+    """Attack scenario: alice posts a kg_triple with memory_id =
+    'mem_bob_secret', a memory she does NOT own. The records loop
+    skips bob's row via ON CONFLICT (id) DO NOTHING, but without the
+    allowlist gate the kg_triple would attach to bob's memory under
+    alice's owner_id+namespace, poisoning bob's read paths.
+
+    Allowlist SELECT must return ZERO rows (alice does not own
+    mem_bob_secret), and the helper must reject the entry, count it
+    under sidecars_failed, and execute no INSERT against kg_triples."""
+    conn = _Conn(routed_rows={
+        # Allowlist returns nothing — alice owns no matching memory.
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[],
+        kg_triples=[_kg_sidecar_entry(id="kg_attack")],
+    )
+    # Override the entry's memory_id to point at bob.
+    env.kg_triples[0]["memory_id"] = "mem_bob_secret"
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {}
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert any(
+        "mem_bob_secret" in e and "not in caller-owned" in e
+        for e in stats.errors
+    ), f"expected rejection error, got {stats.errors}"
+    assert not any("INSERT INTO kg_triples" in e[0] for e in conn.executes)
+
+
+def test_import_memory_version_referencing_foreign_record_id_rejected(monkeypatch):
+    """Same attack via memory_versions — alice tries to attach
+    authoritative version history to bob's record_id."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["record_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    assert any(
+        "mem_bob_secret" in e and "not in caller-owned" in e
+        for e in stats.errors
+    ), f"expected rejection error, got {stats.errors}"
+    assert not any("INSERT INTO memory_versions" in e[0] for e in conn.executes)
+
+
+def test_import_compression_manifest_referencing_foreign_record_id_rejected(monkeypatch):
+    """Same attack via compression_manifest — would let alice plant
+    arbitrary compressed_content + judge scores on bob's memory."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _cm_sidecar_entry()
+    bad["record_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], compression_manifest=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_failed == {"compression_manifest": 1}
+    assert any(
+        "mem_bob_secret" in e and "not in caller-owned" in e
+        for e in stats.errors
+    ), f"expected rejection error, got {stats.errors}"
+    assert not any(
+        "INSERT INTO memory_compressed_variants" in e[0] for e in conn.executes
+    )
+
+
+def test_import_kg_triple_with_no_memory_id_is_first_class(monkeypatch):
+    """A kg_triple without memory_id is a stand-alone fact (e.g.
+    Graphiti-style first-class triple). It should NOT be rejected
+    by the allowlist gate — there's no memory FK to validate."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    free = _kg_sidecar_entry(id="kg_first_class")
+    free.pop("memory_id")  # first-class triple
+    env = portability.MPFEnvelope(records=[], kg_triples=[free])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    assert stats.sidecars_imported == {"kg_triples": 1}
+    assert stats.sidecars_failed == {}
+
+
+def test_import_preserve_owner_rejects_owner_namespace_mismatch(monkeypatch):
+    """Under preserve_owner=true: sidecar's stated owner+ns MUST
+    match the referenced memory's actual owner+ns. If a root caller
+    posts a kg_triple stamped owner=bob+ns=bob-ns referencing a
+    memory_id that DB says is owned by carol, reject."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_carol_real",
+                           owner_id="carol", namespace="carol-ns")
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _kg_sidecar_entry(owner_id="bob", namespace="bob-ns")
+    bad["memory_id"] = "mem_carol_real"
+    env = portability.MPFEnvelope(records=[], kg_triples=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    assert any(
+        "mem_carol_real" in e and "carol" in e.lower()
+        for e in stats.errors
+    ), f"expected owner-mismatch rejection, got {stats.errors}"
+
+
+def test_import_compression_manifest_cross_namespace_same_owner_rejected(monkeypatch):
+    """Codex review #2: alice in ns_A submits a compression_manifest
+    referencing alice's OWN memory in ns_B. The previous fix passed
+    require_namespace_match=False because the variants table has no
+    namespace column — but the threat model is that compressed
+    content in ns_B gets poisoned by alice acting from ns_A.
+
+    Validation must use the referenced memory's namespace, not the
+    variants table's lack of one. Allowlist returns mem_alice_in_B
+    as alice/ns_B; the caller is alice/ns_A — namespace mismatch
+    must reject."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_alice_in_B",
+                           owner_id="alice", namespace="ns_B"),
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _cm_sidecar_entry()
+    bad["record_id"] = "mem_alice_in_B"
+    env = portability.MPFEnvelope(records=[], compression_manifest=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False,
+        user=UserContext(
+            user_id="alice", group_ids=[], role="user",
+            namespace="ns_A", authenticated=True,
+        ),
+    ))
+    assert stats.sidecars_failed == {"compression_manifest": 1}
+    assert any(
+        "ns_B" in e or "ns_A" in e
+        for e in stats.errors
+    ), f"expected ns mismatch rejection, got {stats.errors}"
+    assert not any(
+        "INSERT INTO memory_compressed_variants" in e[0] for e in conn.executes
+    )
+
+
+def test_import_partial_memory_versions_coverage_rejected(monkeypatch):
+    """Codex review #2: if envelope ships memory_versions sidecar
+    that doesn't cover every kind:memory record, the import must
+    reject upfront (before any trigger suppression). Otherwise
+    records without coverage land in `memories` with no v1 — the
+    trigger is suppressed and the sidecar has no entry."""
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[
+            _memory_record(id="mem_covered"),
+            _memory_record(id="mem_uncovered"),
+        ],
+        memory_versions=[
+            # Only mem_covered has a v1; mem_uncovered does not.
+            {**_mv_sidecar_entry(), "record_id": "mem_covered"},
+        ],
+    )
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    assert exc.value.status_code == 400
+    assert "memory_versions sidecar must cover" in exc.value.detail
+    assert "mem_uncovered" in exc.value.detail
+    # Critically: NO INSERTs executed — we rejected before opening
+    # the transaction.
+    assert not any("INSERT INTO" in e[0] for e in conn.executes)
+
+
+def test_import_full_memory_versions_coverage_passes(monkeypatch):
+    """Companion to the partial-coverage rejection test: when every
+    record HAS a v1 in the sidecar, the import proceeds normally.
+    Runs under root + preserve_owner=true (the only path that
+    accepts memory_versions sidecars in CHARON v0.2)."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_a"),
+            _allowlist_row(memory_id="mem_b"),
+        ],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_a"}, {"memory_id": "mem_b"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[
+            _memory_record(id="mem_a"),
+            _memory_record(id="mem_b"),
+        ],
+        memory_versions=[
+            {**_mv_sidecar_entry(), "record_id": "mem_a",
+             "id": "00000000-0000-0000-0000-000000000aaa"},
+            {**_mv_sidecar_entry(), "record_id": "mem_b",
+             "id": "00000000-0000-0000-0000-000000000bbb"},
+        ],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.imported == 2
+    assert stats.sidecars_imported.get("memory_versions") == 2
+
+
+def test_import_memory_versions_restores_branch_head(monkeypatch):
+    """Codex review #2: after memory_versions sidecar import, the
+    handler must upsert memory_branches with the head version_id
+    per (memory_id, branch). The trigger normally does this on
+    memory INSERT but is suppressed during CHARON imports.
+
+    Verify by checking that an INSERT INTO memory_branches was
+    executed for each imported memory_id."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # _restore_memory_branches issues a DISTINCT ON SELECT
+        # against memory_versions — return the v1 row we'd expect
+        # post-import.
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": "mem_alice1", "branch": "main",
+             "head_version_id": "11111111-1111-1111-1111-111111111111"},
+        ],
+        # Post-import v1 verification needs to find the imported memory.
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_imported.get("memory_versions") == 1
+    # memory_branches UPSERT must have been executed
+    branch_inserts = [e for e in conn.executes if "INSERT INTO memory_branches" in e[0]]
+    assert len(branch_inserts) == 1, (
+        f"expected one memory_branches UPSERT, got {len(branch_inserts)}: "
+        f"{[e[0][:60] for e in conn.executes]}"
+    )
+    args = branch_inserts[0][1]
+    assert "mem_alice1" in args
+    assert "main" in args
+
+
+def test_import_post_verification_rolls_back_when_memory_unversioned(monkeypatch):
+    """Codex review #3: even with full pre-coverage, a per-row
+    failure in memory_versions sidecar (e.g. allowlist rejection or
+    UUID format error) can leave a memory committed without v1
+    under trigger suppression. Post-import verification must SELECT
+    memory_versions and rollback if any imported memory is uncovered."""
+    conn = _Conn(routed_rows={
+        # Allowlist returns the memory under a DIFFERENT owner so the
+        # sidecar entry's allowlist check fails — the memory record
+        # itself still inserts (the records loop runs first).
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_alice1",
+                           owner_id="charlie", namespace="charlie-ns"),
+        ],
+        # Post-verification SELECT: memory exists in DB...
+        # but coverage SELECT returns NOTHING — uncovered.
+        "SELECT DISTINCT memory_id FROM memory_versions": [],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    assert exc.value.status_code == 500
+    # Round-7 fix: failed memory_versions for an inserted record is
+    # caught by the all-or-nothing check, NOT only by the post-
+    # verification SELECT. Either path satisfies the integrity
+    # contract; check the unifying property: "rolled back".
+    # Round-14 fix: id is the derived caller-scoped hash for non-root.
+    assert "rolled back" in exc.value.detail
+    assert "mem_alice1" in exc.value.detail
+
+
+def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkeypatch):
+    """Codex review #4: post-verification must scope to records THIS
+    request actually INSERTed, not the full envelope.records list.
+    Otherwise a pre-existing legacy memory with no v1 history (which
+    this transaction did not create) could roll back an unrelated
+    import. _DupeConn returns INSERT 0 0 for everything → nothing
+    new was inserted → no post-verification rollback even though
+    the coverage SELECT comes back empty."""
+    class _DupeConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            return "INSERT 0 0"
+    # Round-23: ON CONFLICT skip path now verifies existing row
+    # matches the envelope. Seed the matching row so the test's
+    # idempotent re-import flow still works.
+    mv_entry = _mv_sidecar_entry()
+    matching_existing = {
+        "memory_id": mv_entry["record_id"],
+        "owner_id": "alice",
+        "namespace": "alice-ns",
+        "version_num": mv_entry["version_num"],
+        "content": mv_entry["content"],
+        "commit_hash": mv_entry["commit_hash"],
+        "parent_version_id": None,
+        "branch": mv_entry["branch"],
+        "merge_parents": None,
+        "category": mv_entry.get("category"),
+        "subcategory": mv_entry.get("subcategory"),
+        "metadata": mv_entry.get("metadata") or {},
+        "verbatim_content": mv_entry.get("verbatim_content"),
+        "permission_mode": mv_entry.get("permission_mode") or 600,
+        "source_model": mv_entry.get("source_model"),
+        "source_provider": mv_entry.get("source_provider"),
+        "source_session": mv_entry.get("source_session"),
+        "source_agent": mv_entry.get("source_agent"),
+        "snapshot_at": datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc),
+        "snapshot_by": mv_entry.get("snapshot_by"),
+        "change_type": mv_entry.get("change_type") or "create",
+    }
+    conn = _DupeConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        # Coverage SELECT: returns empty (the pre-existing memory has
+        # no v1 — legacy data). Without the inserted-set scope, this
+        # would trigger the 500 rollback.
+        "SELECT DISTINCT memory_id FROM memory_versions": [],
+        "FROM memory_versions WHERE id = $1::uuid": [matching_existing],
+        # Round-34 + Round-36: records-loop conflict-row
+        # verification now selects all envelope-bound columns. Seed
+        # a matching row across the full surface so the conflict-skip
+        # branch treats the test's existing memory as authorized.
+        "SELECT content, category, subcategory, metadata": [
+            {
+                "content": "body",
+                "category": "solutions",
+                "subcategory": None,
+                "metadata": {},
+                "quality_rating": 75,
+                "owner_id": "alice",
+                "namespace": "alice-ns",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "created": None,
+                "updated": None,
+            },
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[mv_entry],
+    )
+    # No HTTPException — conflict means we didn't insert, so verification skips.
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.imported == 0
+    assert stats.skipped == 1
+    # Sidecar imports still ran but landed under skipped-via-conflict
+    # (the dupe conn returns INSERT 0 0 for everything).
+    assert stats.sidecars_skipped.get("memory_versions") == 1
+
+
+def test_topo_sort_handles_forked_branch(monkeypatch):
+    """Codex round-9 finding: feature-branch v1 with parent on
+    main vN. Lexicographic-on-branch sort would emit feature/v1
+    before main/v(N-1)..vN, breaking the FK. Real topological
+    sort emits parents before children regardless of branch."""
+    main_v1 = {**_mv_sidecar_entry(),
+               "id": "00000000-0000-0000-0000-000000000001",
+               "version_num": 1, "branch": "main",
+               "parent_version_id": None}
+    main_v2 = {**_mv_sidecar_entry(),
+               "id": "00000000-0000-0000-0000-000000000002",
+               "version_num": 2, "branch": "main",
+               "parent_version_id": "00000000-0000-0000-0000-000000000001"}
+    feature_v1 = {**_mv_sidecar_entry(),
+                  "id": "00000000-0000-0000-0000-000000000003",
+                  "version_num": 1, "branch": "feature",
+                  "parent_version_id": "00000000-0000-0000-0000-000000000002"}
+
+    # Adversarial input order: feature_v1 first, then main_v2, then main_v1.
+    sorted_entries = portability._topo_sort_versions([feature_v1, main_v2, main_v1])
+    ids = [e["id"] for e in sorted_entries]
+    # main_v1 must be first (no parent), main_v2 next (parent=main_v1),
+    # feature_v1 last (parent=main_v2).
+    assert ids == [
+        "00000000-0000-0000-0000-000000000001",
+        "00000000-0000-0000-0000-000000000002",
+        "00000000-0000-0000-0000-000000000003",
+    ], f"topo sort failed: {ids}"
+
+
+def test_import_memory_versions_rejects_cross_tenant_parent(monkeypatch):
+    """Codex round-11 finding: parent_version_id and merge_parents
+    are FKs to memory_versions(id) but the DB FK only proves the
+    UUID exists — not that it belongs to the same memory or tenant.
+    An adversarial envelope can attach alice's child version to
+    bob's parent UUID, creating a cross-tenant DAG edge that
+    downstream /log traversal follows.
+
+    Verify the import rejects such an entry without inserting."""
+    foreign_parent_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        # Parent UUID exists in DB but under bob's memory_id.
+        "FROM memory_versions WHERE id = ANY": [
+            {"id": foreign_parent_uuid, "memory_id": "mem_bob_secret",
+             "owner_id": "bob", "namespace": "bob-ns"},
+        ],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["parent_version_id"] = foreign_parent_uuid
+    env = portability.MPFEnvelope(
+        records=[],
+        memory_versions=[bad],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    assert any(
+        "foreign-tenant" in e or "foreign-record" in e
+        for e in stats.errors
+    ), f"expected cross-tenant parent rejection, got {stats.errors}"
+    assert not any(
+        "INSERT INTO memory_versions" in e[0] for e in conn.executes
+    )
+
+
+def test_import_memory_versions_rejects_shadowed_parent(monkeypatch):
+    """Codex round-12 finding: ON CONFLICT (id) DO NOTHING means
+    an envelope-supplied 'parent' entry with a UUID that already
+    exists in DB gets SKIPPED. If the adversary crafts a fake
+    parent entry labeled with their own tenancy but using a
+    known-foreign UUID, the conflict-skip path bypasses the
+    in-envelope check and the child's FK resolves to the foreign
+    DB row. DB-truth lookup is now authoritative — verify the
+    shadow attack is rejected."""
+    foreign_uuid = "ffffffff-ffff-ffff-ffff-ffffffffffff"
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        # Parent UUID exists in DB under bob — even though the
+        # envelope's fake-parent entry claims it for alice.
+        "FROM memory_versions WHERE id = ANY": [
+            {"id": foreign_uuid, "memory_id": "mem_bob_secret",
+             "owner_id": "bob", "namespace": "bob-ns"},
+        ],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    # Adversary's envelope: a fake parent entry claiming alice's
+    # tenancy with bob's UUID, plus a child entry pointing at it.
+    fake_parent = {**_mv_sidecar_entry(),
+                   "id": foreign_uuid,
+                   "version_num": 1,
+                   "owner_id": "alice", "namespace": "alice-ns"}
+    child = {**_mv_sidecar_entry(),
+             "id": "00000000-0000-0000-0000-00000000000c",
+             "version_num": 2,
+             "parent_version_id": foreign_uuid}
+    env = portability.MPFEnvelope(
+        records=[],
+        memory_versions=[fake_parent, child],
+    )
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    # Both entries should fail: parent because DB-truth says
+    # mem_bob_secret/bob, child because its parent UUID resolves
+    # to bob's row.
+    assert stats.sidecars_failed.get("memory_versions", 0) >= 1
+    # No INSERT for the child (its parent validation rejected it).
+    insert_args = [
+        e[1] for e in conn.executes
+        if "INSERT INTO memory_versions" in e[0]
+        and child["id"] in e[1]
+    ]
+    assert insert_args == [], (
+        f"child must not insert when its parent shadows a foreign UUID; "
+        f"found {len(insert_args)} INSERTs"
+    )
+
+
+def test_import_rolls_back_when_inserted_memory_has_no_main_branch(monkeypatch):
+    """Codex round-20 finding: INNER JOIN on memory_branches name='main'
+    misses records that have NO main branch entirely. An envelope can
+    ship memory_versions only on branch='feature', land it, and the
+    INNER JOIN returns nothing — divergent stays empty, memory commits
+    without any main-branch history. Verify the LEFT JOIN catches
+    missing main."""
+    derived_id = "mem_alice1"
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": derived_id},
+        ],
+        # head_check with LEFT JOIN: no main branch for derived_id,
+        # so head_content is NULL. memory was just inserted, so
+        # missing-main is fatal.
+        "JOIN memory_branches b": [
+            {"id": derived_id,
+             "memory_content": "body",
+             "head_content": None},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    feature_only = _mv_sidecar_entry()
+    feature_only["branch"] = "feature"
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[feature_only],
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    assert exc.value.status_code == 500
+    assert "no main-branch HEAD" in exc.value.detail
+
+
+def test_import_rolls_back_existing_memory_dag_poisoning(monkeypatch):
+    """Codex round-19 finding: round-18's HEAD-content check only
+    ran on inserted_record_ids. A sidecar-only import against an
+    EXISTING caller-owned memory can move that memory's HEAD to
+    stale content while the live row stays unchanged. Verify the
+    extended check catches this."""
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": "mem_alice1", "branch": "main",
+             "head_version_id": "11111111-1111-1111-1111-111111111111"},
+        ],
+        # head_check after the DAG-only sidecar lands: HEAD points
+        # at stale "v0_OLD" but live memory.content is "current".
+        "JOIN memory_branches b": [
+            {"id": "mem_alice1",
+             "memory_content": "current",
+             "head_content": "v0_OLD_STALE"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    # Sidecar-only import (no records=). Targets pre-existing
+    # mem_alice1 owned by alice.
+    bad = _mv_sidecar_entry()
+    bad["record_id"] = "mem_alice1"
+    bad["content"] = "v0_OLD_STALE"
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    assert exc.value.status_code == 500
+    assert "diverges" in exc.value.detail
+
+
+def test_import_rolls_back_when_memory_content_diverges_from_head_version(monkeypatch):
+    """Codex round-18 finding: an envelope can pass coverage by
+    having SOME version for each record, but if the version's
+    content differs from the live memories.content, /log and
+    branch traversal report stale history. Verify the post-import
+    head_check rolls back on divergence."""
+    derived_id = "mem_alice1"
+    conn = _Conn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row()],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": derived_id},
+        ],
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": derived_id, "branch": "main",
+             "head_version_id": "11111111-1111-1111-1111-111111111111"},
+        ],
+        # head_check: memories.content="body", but version
+        # head_content is something else — mismatch.
+        "JOIN memory_branches b": [
+            {"id": derived_id,
+             "memory_content": "body",
+             "head_content": "STALE_OLDER_VERSION"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1", content="body")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=True, user=_root(),
+        ))
+    assert exc.value.status_code == 500
+    assert "diverges" in exc.value.detail
+    assert "rolled back" in exc.value.detail
+
+
+def test_import_non_root_memory_versions_sidecar_rejected_403(monkeypatch):
+    """CHARON v0.2 architectural restriction (Codex Path B): the
+    trigger-suppressed memory_versions sidecar import path is only
+    available under root + preserve_owner=true. Non-root callers
+    submitting a memory_versions sidecar get a 403 with a pointer
+    to the documented --preserve-metadata path. Closes the entire
+    round-16-through-24 class of stale-state findings structurally.
+    """
+    conn = _Conn()
+    _install(monkeypatch, conn)
+
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_alice1")],
+        memory_versions=[_mv_sidecar_entry()],
+    )
+    from fastapi import HTTPException
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(portability.import_memories(
+            envelope=env, preserve_owner=False, user=_alice(),
+        ))
+    assert exc.value.status_code == 403
+    assert "memory_versions sidecar" in exc.value.detail
+    assert "preserve_owner=true" in exc.value.detail
+    assert "--preserve-metadata" in exc.value.detail
+    # No INSERT executed — rejected before opening the transaction.
+    assert not any(
+        "INSERT INTO memory_versions" in e[0] for e in conn.executes
+    )
+
+
+def test_import_non_root_record_id_is_caller_scoped_not_envelope_verbatim(monkeypatch):
+    """Codex round-14 finding: a non-root caller could probe for
+    foreign memory_ids via the records-loop's imported-vs-skipped
+    response — POSTing a guessed id either inserts (id was new)
+    or hits ON CONFLICT DO NOTHING (id existed). Different counts
+    leak existence.
+
+    Fix: under non-root, the envelope's record.id is rewritten to
+    a deterministic caller-scoped hash. Foreign-id collisions
+    can't happen because every caller's id space is disjoint.
+    Verify the actually-inserted id is the derived hash, not
+    the envelope-supplied 'mem_bob_secret'."""
+    captured: list = []
+
+    class _CaptureConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            captured.append((sql, args))
+            return "INSERT 0 1"
+    conn = _CaptureConn()
+    _install(monkeypatch, conn)
+
+    # Adversary submits envelope with bob's id.
+    env = portability.MPFEnvelope(
+        records=[_memory_record(id="mem_bob_secret", content="payload")],
+    )
+    asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+    insert = next(
+        e for e in captured if "INSERT INTO memories" in e[0]
+    )
+    args = insert[1]
+    # The id stored MUST be the derived hash, NOT bob's id.
+    assert args[0].startswith("mnemos_"), (
+        f"non-root insert must use derived id; got {args[0]!r}"
+    )
+    assert "mem_bob_secret" not in args, (
+        f"non-root insert must NOT use envelope id verbatim; "
+        f"args contained 'mem_bob_secret'"
+    )
+
+
+def test_import_non_root_cannot_probe_foreign_memory_ids(monkeypatch):
+    """Codex round-13 finding: a non-root caller submits a sidecar
+    referencing a guessed `mem_bob_secret` and uses the rejection
+    message to learn whether the id exists and who owns it.
+
+    With the scoped allowlist SELECT + unified rejection message,
+    foreign ids are indistinguishable from nonexistent ids from
+    the caller's POV — both surface as 'not in caller-owned
+    memory id set'."""
+
+    captured_sql: list = []
+
+    class _CaptureConn(_Conn):
+        async def fetch(self, sql, *args):
+            captured_sql.append((sql, args))
+            return await super().fetch(sql, *args)
+
+    # Allowlist: scoped to alice. Even though mem_bob_secret
+    # exists in DB under bob, the scoped query returns nothing.
+    conn = _CaptureConn(routed_rows={
+        "FROM memories WHERE id = ANY": [],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _kg_sidecar_entry(id="kg_probe")
+    bad["memory_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], kg_triples=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=False, user=_alice(),
+    ))
+
+    # Allowlist SELECT must include alice's tenancy filter, NOT
+    # an unscoped lookup.
+    allowlist_sql = next(
+        s for s, _ in captured_sql
+        if "FROM memories WHERE id = ANY" in s
+    )
+    assert "owner_id" in allowlist_sql, (
+        f"allowlist SELECT must scope by owner_id; got: {allowlist_sql}"
+    )
+
+    # Error must be the generic "not in caller-owned" form.
+    # The caller-supplied memory_id echoes back (fine — it's their
+    # own input); what must NOT leak is the actual OWNER of the
+    # foreign memory or the language "belongs to owner X".
+    assert stats.sidecars_failed == {"kg_triples": 1}
+    err = stats.errors[0]
+    assert "not in caller-owned" in err
+    assert "belongs to owner" not in err
+    assert "bob-ns" not in err  # no namespace leak either
+
+
+def test_topo_sort_treats_external_parents_as_roots(monkeypatch):
+    """If parent_version_id points at a UUID that's NOT in the
+    envelope (parent already in DB), the entry is a root from
+    this envelope's POV."""
+    orphan = {**_mv_sidecar_entry(),
+              "id": "00000000-0000-0000-0000-000000000abc",
+              "version_num": 5,
+              "parent_version_id": "00000000-0000-0000-0000-000000099999"}  # not in envelope
+    sorted_entries = portability._topo_sort_versions([orphan])
+    assert len(sorted_entries) == 1
+    assert sorted_entries[0]["id"] == orphan["id"]
+
+
+def test_import_memory_versions_handles_v2_before_v1(monkeypatch):
+    """Codex round-8 finding: parent_version_id is a self-referential
+    FK. If a child version arrives in the envelope before its parent,
+    the FK check fails — but a friendly export ought to be order-
+    independent. Sort the sidecar by (memory_id, branch, version_num)
+    on import so v1 always lands before v2 regardless of envelope
+    order."""
+    seen_inserts: list = []
+
+    class _OrderTrackingConn(_Conn):
+        async def execute(self, sql, *args):
+            self.executes.append((sql, args))
+            if "INSERT INTO memory_versions" in sql:
+                # version_num is positional arg #3 in the INSERT
+                seen_inserts.append(args[2])
+            return "INSERT 0 1"
+
+    # records=[] → no id remap → sidecars reference verbatim mem_alice1
+    conn = _OrderTrackingConn(routed_rows={
+        "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
+        "SELECT DISTINCT memory_id FROM memory_versions": [
+            {"memory_id": "mem_alice1"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    # Envelope deliberately has v2 BEFORE v1 — adversarial order.
+    v2 = {**_mv_sidecar_entry(),
+          "id": "00000000-0000-0000-0000-00000000000b", "version_num": 2}
+    v1 = {**_mv_sidecar_entry(),
+          "id": "00000000-0000-0000-0000-00000000000a", "version_num": 1}
+    env = portability.MPFEnvelope(
+        records=[],
+        memory_versions=[v2, v1],
+    )
+    asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    # The import sort must have flipped them: v1 inserted first, then v2.
+    assert seen_inserts == [1, 2], (
+        f"expected version_num inserts in [1, 2] order; got {seen_inserts}"
+    )
+
+
+def test_import_branch_restore_skips_rejected_record_ids(monkeypatch):
+    """Codex review #3: if a memory_versions sidecar entry is
+    rejected by the allowlist gate, _restore_memory_branches must
+    NOT issue an UPSERT for that record_id — even if the underlying
+    DB has prior versions for it. Otherwise an adversarial envelope
+    could trigger writes against another tenant's memory_branches."""
+    conn = _Conn(routed_rows={
+        # Allowlist: the only memory we know about is owned by bob,
+        # so alice's sidecar entry referencing mem_bob_secret will
+        # fail the allowlist check.
+        "FROM memories WHERE id = ANY": [
+            _allowlist_row(memory_id="mem_bob_secret",
+                           owner_id="bob", namespace="bob-ns"),
+        ],
+        # Post-verification: alice's records loop didn't insert
+        # anything (no records in envelope), so this returns empty.
+        "SELECT DISTINCT memory_id FROM memory_versions": [],
+        # Branch restore would issue a SELECT DISTINCT ON if called.
+        "SELECT DISTINCT ON (memory_id, branch)": [
+            {"memory_id": "mem_bob_secret", "branch": "main",
+             "head_version_id": "ffffffff-ffff-ffff-ffff-ffffffffffff"},
+        ],
+    })
+    _install(monkeypatch, conn)
+
+    bad = _mv_sidecar_entry()
+    bad["record_id"] = "mem_bob_secret"
+    env = portability.MPFEnvelope(records=[], memory_versions=[bad])
+
+    stats = asyncio.run(portability.import_memories(
+        envelope=env, preserve_owner=True, user=_root(),
+    ))
+    assert stats.sidecars_failed == {"memory_versions": 1}
+    # The rejected entry must NOT have driven a memory_branches UPSERT.
+    branch_inserts = [
+        e for e in conn.executes if "INSERT INTO memory_branches" in e[0]
+    ]
+    assert branch_inserts == [], (
+        f"expected no memory_branches UPSERT for rejected entry; "
+        f"got {len(branch_inserts)}: {[e[0][:60] for e in branch_inserts]}"
+    )

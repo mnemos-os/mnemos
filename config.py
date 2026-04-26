@@ -49,10 +49,31 @@ PG_CONFIG = {
 
 # ============================================================================
 # Embeddings Configuration
-# Env vars: OLLAMA_EMBED_HOST, OLLAMA_EMBED_MODEL
+#
+# Canonical env vars: INFERENCE_EMBED_HOST, INFERENCE_EMBED_MODEL,
+#   INFERENCE_EMBED_TIMEOUT.
+#
+# Backward-compat fallbacks: OLLAMA_EMBED_HOST, OLLAMA_EMBED_MODEL,
+#   OLLAMA_EMBED_TIMEOUT (deprecated; removal scheduled for v4.0).
+#
+# The endpoint is backend-agnostic — `api/lifecycle.py::_get_embedding`
+# auto-detects the wire shape and works against llama-server, Ollama,
+# vLLM, NVIDIA NIM embedding containers, or any OpenAI-compat
+# /v1/embeddings endpoint. The fleet today runs llama-server, not
+# Ollama; the legacy prefix was a historical artifact.
+#
+# These exported names (`OLLAMA_EMBED_HOST`, `OLLAMA_EMBED_URL`) are
+# kept identifier-stable for any external script or test that imports
+# them. Internally api/lifecycle.py prefers the INFERENCE_EMBED_*
+# names. Module-level identifiers will be renamed in v4.0 alongside
+# the env-var deprecation.
 # ============================================================================
 
-OLLAMA_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://localhost:11434')
+OLLAMA_EMBED_HOST = (
+    os.getenv('INFERENCE_EMBED_HOST')
+    or os.getenv('OLLAMA_EMBED_HOST')
+    or 'http://localhost:11434'
+)
 OLLAMA_EMBED_URL = f'{OLLAMA_EMBED_HOST}/api/embeddings'
 
 # ============================================================================

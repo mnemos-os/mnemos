@@ -1,5 +1,22 @@
 """MORPHEUS — dream-state memory consolidation.
 
+NAMING CONVENTION (locked in v3.4):
+  - `morpheus` is the **internal** identifier used throughout the
+    codebase — this Python module, REST routes (`/v1/morpheus/*`),
+    database tables (`morpheus_runs`, `morpheus_clusters`,
+    `morpheus_run_id` column), and Python class names (`MorpheusRun`,
+    `MorpheusCluster`, etc.).
+  - **`APOLLO S-IVB`** is the **release / marketing identifier** used
+    in roadmaps, charters, announcements, and conceptual references
+    (Saturn V third-stage = trans-lunar burn = leaves convergent
+    compression for divergent dreams).
+  - Both names refer to the same subsystem. They coexist by design,
+    not as transitional naming. No rename is planned.
+  - When you see "APOLLO S-IVB phase N" in a charter or roadmap, it
+    maps to "MORPHEUS slice N" in code. Phases 1-2 ship in v3.4
+    (REPLAY → CLUSTER → SYNTHESISE → COMMIT pipeline). Phases 3-4
+    (CONSOLIDATE, EXTRACT) are queued for v3.5/v3.6 per the charters.
+
 The off-peak worker that processes accumulated memory into shaped form.
 Named after the Greek god of dreams (μορφεύς, "the one who shapes")
 and the Matrix character of the same name — both meanings land:

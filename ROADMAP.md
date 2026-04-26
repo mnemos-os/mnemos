@@ -73,16 +73,32 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 - ✅ **MORPHEUS dream-state subsystem (slice 1: foundation).** v3.3.0-alpha.1 ships `morpheus_runs` table + per-row `morpheus_run_id` tagging + admin/observability API + rollback contract. Synthesis logic stubbed; slice 2 fills it in. Architecture per GRAEAE consensus 2026-04-25: append-only synthesis first, mutation paths (CONSOLIDATE / EXTRACT / ARCHIVE) deferred to v3.6+.
 - 🔵 **MORPHEUS slice 2** in flight: real cluster + synthesise phases, cron timer at 03:17 UTC, recall-frequency tracking columns (absorbed from OpenClaw dreaming patterns), per-cluster introspection artifact, per-namespace dream scoping. Drops the `-alpha` when it lands.
 
-### v3.4 — S-IVB (third stage: trans-lunar injection) — **PLAN UPDATED 2026-04-25**
+### v3.4 — S-IVB (third stage: trans-lunar injection) — **READY TO TAG 2026-04-26**
 
-The original v3.4 plan was distill-on-ingest + ANAMNESIS deprecation. Both still in scope, but the headline shifts based on the v3.2.x audit pass and the post-MORPHEUS roadmap:
+**Headline: "CHARON v0.2 — agent memory now travels."** The portability surface that turns MNEMOS into something other systems can interop with.
 
-- 🔵 **CHARON v0.2 — full MPF v0.2 sidecars.** Server-side import/export for `kind in {document, fact, event, kg_triples, relations, compression_manifest, memory_versions}`. Adapter `payload_version` normalization (Graphiti / Cognee currently mislabel `kind=event/fact/document` as `mnemos-3.1` instead of `mpf-0.1` — schema becomes authoritative). Per-adapter validate-before-post + skipped-record reporting. Round-trip CI tests: `memory_export json/jsonl → memory_import --preserve-metadata` per adapter.
-- 🔵 **KNOSSOS solidify (phase 2).** Tunnels (`mempalace_create_tunnel` / `_list_tunnels` / `_delete_tunnel`), diary read/write, `_get_aaak_spec` for round-trip with MemPalace-compressed drawers. End-to-end test against a real OpenClaw + MemPalace stack. Migration guide for MemPalace operators.
-- 🔵 **First wave of goodwill PRs to MemPalace.** 2–3 small, high-value upstream contributions: bug fixes from their tracker, an `export --mpf-v0.1` mode, doc improvements spotted while building KNOSSOS adapters. Establishes contributor presence ahead of the Track 4 RFC.
-- 🔵 Distill-on-ingest as default write path (carried forward from original v3.4 plan).
-- 🔵 ANAMNESIS deprecation path; APOLLO LLM-fallback subsumes its role. Stays importable until v4.0.
-- 🔵 Full round-trip fidelity benchmark as GA gate.
+**Shipped:**
+- ✅ **CHARON v0.2 — full MPF v0.1.x sidecar surface.** Server-side import/export for `kind=memory` records plus `kg_triples`, `memory_versions`, `compression_manifest` sidecars. Root + `preserve_owner=true` admin path supports authoritative version-history restoration via the trigger-suppression GUC; non-root callers can ship `kg_triples` and `compression_manifest` without restriction. Peer adapter scaffolding for Mem0 / Letta / Graphiti / Cognee / MemPalace.
+- ✅ **42 rounds of CHARON adversarial review.** 59+ exploitable findings closed across cross-tenant attacks, ID-derivation drift, retry-idempotency, COALESCE-tolerance, snapshot consistency under concurrent writes, per-surface DoS bounds.
+- ✅ **APOLLO S-II schemas.** decision / person / event / commit / code schemas (originally scheduled for v3.4, landed in v3.3).
+- ✅ **APOLLO S-IVB phases 1–2** — the divergent dream-state subsystem. Phase 1 = `morpheus_runs` foundation + audit + rollback; phase 2 = REPLAY → CLUSTER → SYNTHESISE → COMMIT pipeline.
+
+  **Naming convention (locked in v3.4):** `morpheus` is the **internal** identifier — Python module (`morpheus/`), REST routes (`/v1/morpheus/*`), database tables (`morpheus_runs`, `morpheus_clusters`), and Python classes (`MorpheusRun`, etc.). `APOLLO S-IVB` is the **release / marketing / Greek-pantheon identifier** used in roadmaps, charters, announcements, and conceptual references. Both names refer to the same subsystem and will continue to coexist; no rename is planned. The dual-naming aligns with the broader pattern: release-shaped Greek-mythology framing externally, concrete code-friendly names internally.
+- ✅ **Recall-frequency tracking columns** (`recall_count`, `last_recalled_at`, `unique_queries`).
+- ✅ **Per-cluster introspection artifact** (`morpheus_clusters` table + `/v1/morpheus/runs/{id}/clusters`).
+- ✅ **Per-namespace dream scoping** (`morpheus_runs.namespace` filter).
+- ✅ **Pre-tag GUC audit (2026-04-26)** caught and fixed pool-leak + injection-shape bug at `api/handlers/versions.py:253` — plain `SET` on user-controllable input → `set_config(..., true)` (transaction-local + parameter binding). Commit `e4b41aa`.
+- ✅ **Pre-tag migration idempotency verification (2026-04-26)** — `migrations_charon_trigger_guard.sql` empirically applied twice on a populated DB; triggers fire correctly on INSERT/DELETE post-reapply.
+- ✅ Audit-remediation log responses to the 2026-04-25 GPT critical review (8 of 13 findings closed, 1 partial, 4 deferred-by-design or carried to v4.0 — see audit log section below).
+
+**Carried forward (originally bundled with v3.4):**
+- Distill-on-ingest as default write path → **v3.5** (see `docs/V3_5_CHARTER.md`).
+- ANAMNESIS deprecation path → stays importable until **v4.0**.
+- Full round-trip fidelity benchmark as GA gate → **v3.5** (paired with embedding migration plan).
+- KNOSSOS solidify (phase 2) → **v3.5**.
+- First wave of goodwill PRs to MemPalace → **v3.5** (subject to the 3-4 PRs/24h-per-upstream rate-limit constraint per `~/.claude/rules/github-behavior.md`).
+
+**See:** `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md`, `docs/OPERATIONS.md` for locked scopes downstream of this tag.
 
 ### v3.5 — MemPalace RFC re-engagement + compression hot-paths
 

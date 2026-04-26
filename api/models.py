@@ -21,7 +21,10 @@ class ConsultationRequest(BaseModel):
 
 
 class StatsResponse(BaseModel):
-    total_memories: int
+    total_memories: int                              # native + federated
+    native_memories: int = 0                         # locally-created (federation_source IS NULL)
+    federated_memories: int = 0                      # pulled from peers (federation_source IS NOT NULL)
+    memories_by_peer: Dict[str, int] = {}            # per-peer count of pulled memories
     total_compressions: int
     average_compression_ratio: float
     average_quality_rating: int
@@ -570,6 +573,15 @@ class FederationPeerCreateRequest(BaseModel):
     category_filter: Optional[List[str]] = None
     enabled: bool = True
     sync_interval_secs: int = 300
+    compat_mode: str = Field(
+        "strict",
+        description=(
+            "Schema-compat policy. 'strict' (default) refuses sync when peer's "
+            "major.minor MNEMOS version differs from ours; 'permissive' logs the "
+            "mismatch and proceeds. Use permissive only for known-compatible "
+            "version skew across a federation."
+        ),
+    )
 
 
 class FederationPeerUpdateRequest(BaseModel):
@@ -579,6 +591,7 @@ class FederationPeerUpdateRequest(BaseModel):
     category_filter: Optional[List[str]] = None
     enabled: Optional[bool] = None
     sync_interval_secs: Optional[int] = None
+    compat_mode: Optional[str] = None
 
 
 class FederationPeer(BaseModel):
@@ -594,6 +607,9 @@ class FederationPeer(BaseModel):
     last_error: Optional[str] = None
     last_error_at: Optional[str] = None
     total_pulled: int = 0
+    compat_mode: str = "strict"
+    peer_mnemos_version: Optional[str] = None
+    last_schema_check_at: Optional[str] = None
     created: str
     updated: str
 

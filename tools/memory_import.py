@@ -39,6 +39,7 @@ Preserve-metadata mode (the cross-version-migration path):
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import sys
@@ -46,6 +47,30 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any, Dict, Optional
+
+
+def _stable_id_from_mem(mem: dict) -> str:
+    """Derive a deterministic, content-addressed id for a memory dict
+    that came in without one. Hashing the canonical payload keeps
+    re-imports of the same source idempotent — same input yields
+    same id, so ON CONFLICT DO NOTHING does the right thing.
+
+    Older versions used `f"imported_{id(mem):x}"` which is a Python
+    process-local pointer address. Two runs against the same JSONL
+    produced different ids and bypassed ON CONFLICT — Codex round-5
+    finding. The hash is content-only (no timestamp, no source path),
+    so it's stable across machines and Python versions, and identical
+    content from any source dedupes naturally.
+    """
+    canonical = json.dumps(
+        {k: mem.get(k) for k in sorted(mem.keys()) if mem.get(k) is not None},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return f"imported_{digest}"
 
 
 # ---------------------------------------------------------------------------
@@ -56,7 +81,7 @@ class BaseImporter:
     """Shared HTTP posting logic for all importers."""
 
     # MPF envelope constants (must match api/handlers/portability.py).
-    MPF_VERSION = "0.1.0"
+    MPF_VERSION = "0.1.1"
     MEMORY_PAYLOAD_VERSION = "mnemos-3.1"
     # Keep envelope bodies small enough to avoid request-size limits.
     MPF_BATCH_SIZE = 200
@@ -77,6 +102,18 @@ class BaseImporter:
         # with preserve_owner=true, which requires a root bearer token
         # and keeps id/owner_id/namespace/timestamps verbatim.
         self.preserve_metadata = preserve_metadata
+        # CHARON sidecar passthrough: when the input file is an MPF
+        # envelope with kg_triples / memory_versions /
+        # compression_manifest populated, _parse_source stashes the
+        # ORIGINAL envelope here so the import path can POST it
+        # verbatim as a single request. The earlier design (post
+        # records first, then a sidecar trailer) created an ordering
+        # bug — the version-snapshot trigger fired during the records
+        # batch and the sidecar's authoritative v1 then collided on
+        # the partial unique index. Single-envelope POST lets the
+        # server's per-transaction trigger guard (mnemos_charon_trigger_guard
+        # migration) cover the whole import in one shot.
+        self.source_envelope: Optional[Dict[str, Any]] = None
 
     def _post(self, memories: list) -> tuple:
         """POST a list of memories to MNEMOS.
@@ -91,6 +128,15 @@ class BaseImporter:
             (ok_count, fail_count)
         """
         if self.preserve_metadata:
+            # CHARON sidecar passthrough: if the source was an MPF
+            # envelope WITH sidecars, post it verbatim as a single
+            # request. The reconstruct-and-batch path (_post_mpf)
+            # would split records and sidecars across multiple POSTs,
+            # which leaves a window where the version-snapshot
+            # trigger fires on the records batch before the sidecar
+            # trailer arrives — collisions on (memory_id, version_num).
+            if self.source_envelope is not None:
+                return self._post_mpf_passthrough(memories)
             return self._post_mpf(memories)
 
         ok = 0
@@ -164,7 +210,7 @@ class BaseImporter:
                 "source_agent": mem.get("source_agent"),
             }.items() if v is not None}
             return {
-                "id": mem.get("id") or f"imported_{id(mem):x}",
+                "id": mem.get("id") or _stable_id_from_mem(mem),
                 "kind": "memory",
                 "payload_version": self.MEMORY_PAYLOAD_VERSION,
                 "payload": payload,
@@ -217,6 +263,69 @@ class BaseImporter:
 
         return ok, fail
 
+    def _post_mpf_passthrough(self, memories: list) -> tuple:
+        """POST the source MPF envelope verbatim as a single request.
+
+        Used when the parsed source was an MPF envelope WITH sidecars.
+        The records-and-sidecars-together posture is required for the
+        server's per-transaction version-snapshot trigger guard to
+        scope correctly — a separate sidecar trailer would arrive
+        AFTER the trigger has already fired on the records batch.
+
+        We don't batch here. Envelopes large enough to need batching
+        also need a chunking design that splits sidecars by referenced
+        memory_id; that's out of scope for this CLI.
+        """
+        url = f"{self.endpoint}/v1/import?preserve_owner=true"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        if self.dry_run:
+            for mem in memories:
+                preview = str(mem.get("content", ""))[:80].replace("\n", " ")
+                print(f"  DRY RUN  id={mem.get('id')!r}  content={preview!r}")
+            sidecar_summary = ", ".join(
+                f"{k}={len(self.source_envelope.get(k) or [])}"
+                for k in ("kg_triples", "memory_versions", "compression_manifest")
+                if self.source_envelope.get(k)
+            )
+            if sidecar_summary:
+                print(f"  DRY RUN  sidecars: {sidecar_summary}")
+            return len(memories), 0
+
+        data = json.dumps(self.source_envelope).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read())
+                imported = int(body.get("imported", 0))
+                skipped = int(body.get("skipped", 0))
+                failed = int(body.get("failed", 0))
+                s_imp = body.get("sidecars_imported") or {}
+                s_skip = body.get("sidecars_skipped") or {}
+                s_fail = body.get("sidecars_failed") or {}
+                print(
+                    f"  envelope: imported={imported} skipped={skipped} failed={failed}"
+                )
+                for k in ("kg_triples", "memory_versions", "compression_manifest"):
+                    if (s_imp.get(k) or s_skip.get(k) or s_fail.get(k)):
+                        print(
+                            f"  sidecar  {k}: imported={s_imp.get(k, 0)} "
+                            f"skipped={s_skip.get(k, 0)} failed={s_fail.get(k, 0)}"
+                        )
+                return imported, failed
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            print(f"  WARNING  /v1/import HTTP {exc.code}: {detail}")
+            return 0, len(memories)
+        except urllib.error.URLError as exc:
+            print(f"  WARNING  /v1/import error: {exc.reason}")
+            return 0, len(memories)
+        except Exception as exc:
+            print(f"  WARNING  /v1/import exception: {exc}")
+            return 0, len(memories)
+
     def run(self) -> dict:
         """Execute the import. Override in subclasses.
 
@@ -258,6 +367,17 @@ class JsonImporter(BaseImporter):
         """Return a list of raw memory dicts regardless of input shape."""
         if self.jsonl:
             items = []
+            # mpf_records — lines that were already MPF-shaped
+            # ({id, kind, payload_version, payload}). Pass through
+            # verbatim when building the passthrough envelope.
+            mpf_records: list = []
+            # flat_memory_lines — flat memory-dict lines with no
+            # MPF wrapping. If a sidecar trailer arrives later,
+            # these get converted to MPF records on the fly so
+            # they reach the passthrough envelope (Codex round-4
+            # finding: silently dropping these is wrong).
+            flat_memory_lines: list = []
+            jsonl_sidecars: Dict[str, list] = {}
             with self.file_path.open(encoding="utf-8") as f:
                 for line_num, line in enumerate(f, 1):
                     line = line.strip()
@@ -268,6 +388,20 @@ class JsonImporter(BaseImporter):
                     except json.JSONDecodeError as exc:
                         print(f"WARNING: line {line_num}: bad JSON ({exc})",
                               file=sys.stderr)
+                        continue
+                    # CHARON sidecar trailer:
+                    # memory_export.py jsonl mode emits a final line
+                    # {"mpf_sidecars": true, "kg_triples": [...], ...}
+                    # carrying any populated sidecar arrays. Detect
+                    # and capture into source_envelope so the
+                    # passthrough path picks them up.
+                    if (isinstance(parsed, dict)
+                            and parsed.get("mpf_sidecars") is True):
+                        for k in ("kg_triples", "memory_versions",
+                                  "compression_manifest"):
+                            arr = parsed.get(k)
+                            if isinstance(arr, list) and arr:
+                                jsonl_sidecars[k] = arr
                         continue
                     # Per-line MPF record unwrap:
                     # memory_export.py emits one full MPF record per
@@ -287,8 +421,94 @@ class JsonImporter(BaseImporter):
                         if "id" in parsed:
                             payload.setdefault("id", parsed["id"])
                         items.append(payload)
+                        # Keep the original record shape so we can
+                        # rebuild a verbatim envelope below if a
+                        # trailer was seen.
+                        mpf_records.append(parsed)
                     else:
                         items.append(parsed)
+                        # Track flat memory dicts in case a trailer
+                        # arrives later and we need to lift them
+                        # into MPF shape.
+                        if isinstance(parsed, dict) and parsed.get("content"):
+                            flat_memory_lines.append(parsed)
+            # Trailer-aware source_envelope construction (Codex
+            # round-3 finding): always materialize the passthrough
+            # envelope when sidecars are present in preserve_metadata
+            # mode, even if the records list is empty (sidecar-only
+            # input) or the JSONL has flat memory dicts rather than
+            # MPF record lines. Otherwise sidecars get silently
+            # dropped on these shapes.
+            if jsonl_sidecars and self.preserve_metadata:
+                # When a sidecar trailer is present, both MPF-shaped
+                # lines AND flat memory dicts must reach the
+                # passthrough envelope. Lift the flat dicts into MPF
+                # records here using the same wrapping logic the
+                # JSON envelope path uses, so a flat-records-plus-
+                # trailer JSONL imports identically to one-shot JSON.
+                lifted: list = []
+                for mem in flat_memory_lines:
+                    payload = {
+                        k: v for k, v in {
+                            "content": mem.get("content"),
+                            "category": mem.get("category") or self.category,
+                            "subcategory": mem.get("subcategory"),
+                            "created": mem.get("created"),
+                            "updated": mem.get("updated"),
+                            "owner_id": mem.get("owner_id") or "default",
+                            "namespace": mem.get("namespace") or "default",
+                            "permission_mode": mem.get("permission_mode"),
+                            "quality_rating": mem.get("quality_rating"),
+                            "metadata": mem.get("metadata") or {},
+                            "source_model": mem.get("source_model"),
+                            "source_provider": mem.get("source_provider"),
+                            "source_session": mem.get("source_session"),
+                            "source_agent": mem.get("source_agent"),
+                        }.items() if v is not None
+                    }
+                    lifted.append({
+                        "id": mem.get("id") or _stable_id_from_mem(mem),
+                        "kind": "memory",
+                        "payload_version": self.MEMORY_PAYLOAD_VERSION,
+                        "payload": payload,
+                    })
+
+                all_records = mpf_records + lifted
+                self.source_envelope = {
+                    "mpf_version": self.MPF_VERSION,
+                    "source_system": "memory_import",
+                    "source_version": self.MEMORY_PAYLOAD_VERSION,
+                    "exported_at": datetime.now(timezone.utc).isoformat(),
+                    # Carry MPF-shaped + lifted-flat records. May be
+                    # empty for trailer-only inputs. The server
+                    # accepts records=[] as valid (sidecar-only
+                    # imports are a documented use-case).
+                    "records": all_records,
+                    **jsonl_sidecars,
+                }
+                if not all_records:
+                    print(
+                        f"  passthrough: trailer-only ({', '.join(jsonl_sidecars)})",
+                        file=sys.stderr,
+                    )
+                elif lifted:
+                    print(
+                        f"  passthrough: {len(mpf_records)} MPF records + "
+                        f"{len(lifted)} flat-memory-records lifted into MPF",
+                        file=sys.stderr,
+                    )
+            elif jsonl_sidecars and not self.preserve_metadata:
+                # Without preserve_metadata the per-record path is
+                # used, which can't carry sidecars. Warn loudly so
+                # operators don't get a silent partial import.
+                kinds = ", ".join(jsonl_sidecars.keys())
+                print(
+                    f"WARNING: input JSONL contains sidecars ({kinds}) "
+                    "but --preserve-metadata is not set; sidecars will "
+                    "NOT be imported. Re-run with --preserve-metadata "
+                    "to use the CHARON envelope passthrough path.",
+                    file=sys.stderr,
+                )
             return items
 
         raw = self.file_path.read_text(encoding="utf-8")
@@ -311,6 +531,39 @@ class JsonImporter(BaseImporter):
                 if "id" in rec:
                     payload.setdefault("id", rec["id"])
                 flat.append(payload)
+            # CHARON sidecar passthrough: if any sidecar array is
+            # present in the source envelope, stash the WHOLE envelope
+            # so the import POSTs it verbatim as a single request.
+            # This is what guarantees the records and the sidecars hit
+            # the server inside one transaction — required for the
+            # version-snapshot-trigger guard to scope correctly.
+            has_sidecars = any(
+                isinstance(data.get(k), list) and data.get(k)
+                for k in ("kg_triples", "memory_versions", "compression_manifest")
+            )
+            if has_sidecars and self.preserve_metadata:
+                self.source_envelope = data
+            elif has_sidecars and not self.preserve_metadata:
+                # Symmetric with the JSONL trailer warning — the
+                # records-only path can't carry sidecars, so we'd
+                # silently drop kg_triples / memory_versions /
+                # compression_manifest. Emit a loud warning so the
+                # operator knows their export+import round-trip
+                # lost data (Codex round-27 finding). Mirror's the
+                # JSONL trailer-without-preserve-metadata warning.
+                kinds = ", ".join(
+                    k for k in
+                    ("kg_triples", "memory_versions", "compression_manifest")
+                    if data.get(k)
+                )
+                print(
+                    f"WARNING: input MPF envelope contains sidecars "
+                    f"({kinds}) but --preserve-metadata is not set; "
+                    "sidecars will NOT be imported. Re-run with "
+                    "--preserve-metadata to use the CHARON envelope "
+                    "passthrough path.",
+                    file=sys.stderr,
+                )
             return flat
 
         # Wrapped export format: {"memories": [...]}

@@ -25,6 +25,16 @@ services:
       - ./db/migrations_v3_ownership.sql:/docker-entrypoint-initdb.d/11-ownership.sql
       - ./db/migrations_v3_1_compression.sql:/docker-entrypoint-initdb.d/12-compression.sql
       - ./db/migrations_v3_1_versioning_fix.sql:/docker-entrypoint-initdb.d/13-versioning-fix.sql
+      - ./db/migrations_v3_1_2_kg_tenancy.sql:/docker-entrypoint-initdb.d/14-kg-tenancy.sql
+      - ./db/migrations_v3_1_2_audit_log_columns.sql:/docker-entrypoint-initdb.d/15-audit-log-columns.sql
+      - ./db/migrations_v3_2_user_namespace.sql:/docker-entrypoint-initdb.d/16-user-namespace.sql
+      - ./db/migrations_v3_2_entities_namespace.sql:/docker-entrypoint-initdb.d/17-entities-namespace.sql
+      - ./db/migrations_v3_2_2_version_snapshot_new_values.sql:/docker-entrypoint-initdb.d/18-version-snapshot-new-values.sql
+      - ./db/migrations_v3_3_morpheus.sql:/docker-entrypoint-initdb.d/19-morpheus.sql
+      - ./db/migrations_v3_3_morpheus_namespace.sql:/docker-entrypoint-initdb.d/20-morpheus-namespace.sql
+      - ./db/migrations_v3_3_recall_tracking.sql:/docker-entrypoint-initdb.d/21-recall-tracking.sql
+      - ./db/migrations_charon_trigger_guard.sql:/docker-entrypoint-initdb.d/22-charon-trigger-guard.sql
+      - ./db/migrations_v3_4_federation_compat.sql:/docker-entrypoint-initdb.d/23-federation-compat.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:

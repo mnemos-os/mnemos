@@ -41,7 +41,10 @@ async def health_check() -> HealthResponse:
 @router.get("/stats", response_model=StatsResponse)
 async def get_stats() -> StatsResponse:
     """Get system statistics from database (cached 60 s)."""
-    cache_key = "stats:global"
+    # Cache key versioned to invalidate after the federation-aware
+    # native/federated split shipped in v3.4.x. Bumping the suffix
+    # forces clients to recompute against the new schema.
+    cache_key = "stats:global:v2"
 
     if _lc._cache:
         try:
@@ -58,6 +61,22 @@ async def get_stats() -> StatsResponse:
     try:
         async with _lc._pool.acquire() as conn:
             total = await conn.fetchval('SELECT COUNT(*) FROM memories')
+            # Federation-aware split: native rows have federation_source
+            # NULL; pulled rows carry the peer name there. memories_by_peer
+            # is the per-peer count for operator visibility into what a
+            # given staging/prod node is hosting from each upstream.
+            native = await conn.fetchval(
+                'SELECT COUNT(*) FROM memories WHERE federation_source IS NULL'
+            )
+            federated = await conn.fetchval(
+                'SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL'
+            )
+            peer_rows = await conn.fetch(
+                'SELECT federation_source, COUNT(*) AS cnt FROM memories '
+                'WHERE federation_source IS NOT NULL '
+                'GROUP BY federation_source ORDER BY cnt DESC'
+            )
+            memories_by_peer = {r['federation_source']: r['cnt'] for r in peer_rows}
             cat_rows = await conn.fetch('SELECT category, COUNT(*) as cnt FROM memories GROUP BY category')
             memories_by_category = {row['category']: row['cnt'] for row in cat_rows}
             sub_rows = await conn.fetch(
@@ -86,6 +105,9 @@ async def get_stats() -> StatsResponse:
 
         result = StatsResponse(
             total_memories=total or 0,
+            native_memories=native or 0,
+            federated_memories=federated or 0,
+            memories_by_peer=memories_by_peer,
             total_compressions=total_compressions,
             average_compression_ratio=round(avg_ratio_row, 2) if avg_ratio_row else 0.57,
             average_quality_rating=int(avg_quality) if avg_quality else 75,
