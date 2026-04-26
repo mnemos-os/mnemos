@@ -261,15 +261,33 @@ async def tool_branch_memory(
                 )
 
             if inserted is None:
+                # Scope the JOIN by mb.memory_id = mv.memory_id
+                # too. A stale branch row for THIS memory pointing
+                # at ANOTHER memory's version_id would otherwise
+                # let an idempotent retry return that foreign
+                # commit_hash and silently legitimize the corrupt
+                # branch (round-37 finding).
                 existing = await conn.fetchrow(
-                    "SELECT head_version_id, mv.commit_hash "
+                    "SELECT mb.head_version_id, mv.commit_hash "
                     "FROM memory_branches mb "
-                    "INNER JOIN memory_versions mv ON mv.id = mb.head_version_id "
+                    "INNER JOIN memory_versions mv "
+                    "    ON mv.id = mb.head_version_id "
+                    "   AND mv.memory_id = mb.memory_id "
                     "WHERE mb.memory_id = $1 AND mb.name = $2",
                     memory_id, name,
                 )
                 if existing is None:
-                    return {"success": False, "error": "branch lookup failed"}
+                    # Either the branch row was missing (race) or
+                    # it was a corrupt cross-memory pointer that
+                    # the scoped JOIN excluded. Either way: don't
+                    # claim idempotent success.
+                    return {
+                        "success": False,
+                        "error": (
+                            "branch exists but points at a foreign "
+                            "memory version; reconciliation required"
+                        ),
+                    }
                 # Implicit-HEAD retries (from_commit=None) are
                 # idempotent regardless of whether main has advanced
                 # since the original create — the caller didn't ask

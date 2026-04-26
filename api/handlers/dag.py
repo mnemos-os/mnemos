@@ -236,27 +236,50 @@ async def get_memory_branches(
     try:
         async with pool.acquire() as conn:
             await _assert_memory_access(conn, memory_id, user)
+            # Scope the JOIN by memory_id too — a stale/corrupt
+            # branch row pointing at another memory's version_id
+            # would otherwise leak that other memory's commit_hash
+            # through `head_commit_hash` (round-37 finding). With
+            # the scoped JOIN, mismatched rows return NULL for
+            # commit_hash; the `head_commit_hash` field then
+            # surfaces the corruption rather than papering over it.
             branches = await conn.fetch(
                 """
                 SELECT
                     mb.name, mv.commit_hash, mb.created_at, mb.created_by
                 FROM memory_branches mb
-                LEFT JOIN memory_versions mv ON mv.id = mb.head_version_id
+                LEFT JOIN memory_versions mv
+                    ON mv.id = mb.head_version_id
+                   AND mv.memory_id = mb.memory_id
                 WHERE mb.memory_id = $1
                 ORDER BY mb.created_at DESC
                 """,
                 memory_id,
             )
 
-            return [
-                BranchInfo(
+            # Filter out rows where the scoped JOIN returned NULL
+            # commit_hash — those are branches pointing at a
+            # foreign memory's version_id (or no row at all),
+            # i.e. stale/corrupt pointers that this endpoint
+            # MUST NOT silently surface. Log so the operator can
+            # repair.
+            result = []
+            for b in branches:
+                if b["commit_hash"] is None:
+                    logger.error(
+                        f"[DAG] Corrupt branch '{b['name']}' for memory "
+                        f"{memory_id}: head_version_id points outside "
+                        f"this memory; omitting from response. Operator "
+                        f"reconciliation required."
+                    )
+                    continue
+                result.append(BranchInfo(
                     name=b["name"],
                     head_commit_hash=b["commit_hash"],
                     created_at=b["created_at"].isoformat(),
                     created_by=b["created_by"],
-                )
-                for b in branches
-            ]
+                ))
+            return result
 
     except Exception as e:
         logger.error(f"[DAG] Branches failed: {e}")
