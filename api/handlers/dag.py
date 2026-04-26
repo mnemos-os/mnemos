@@ -587,6 +587,32 @@ async def merge_branch(
                             "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
                             memory_id, user.user_id, user.namespace,
                         )
+                    # Re-read target_head AFTER acquiring the row
+                    # lock (round-28 fix). The earlier fetch happened
+                    # before FOR UPDATE, so concurrent update_memory
+                    # or main-branch revert could have advanced
+                    # main's HEAD between the read and our INSERT,
+                    # leaving us with stale version_num/parent. Now
+                    # the row lock serializes against those writers
+                    # (their UPDATE on memories acquires the same
+                    # row lock implicitly), so target_head is fresh
+                    # under the lock.
+                    target_head = await conn.fetchrow(
+                        """
+                        SELECT mv.id, mv.version_num, mv.commit_hash,
+                               mv.content, mv.category, mv.subcategory,
+                               mv.metadata, mv.verbatim_content
+                        FROM memory_versions mv
+                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                        WHERE mv.memory_id = $1 AND mb.name = $2
+                        """,
+                        memory_id, target_branch,
+                    )
+                    if not target_head:
+                        raise HTTPException(
+                            status_code=404,
+                            detail=f"Target branch '{target_branch}' not found",
+                        )
                     if live is None:
                         raise HTTPException(
                             status_code=404,
