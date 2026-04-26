@@ -53,10 +53,49 @@ def _schedule_background(coro) -> None:
 
 # DB config sourced from config.PG_CONFIG (env > config.toml > defaults)
 
-# Embedding config (for vector search, MOD-02)
-_EMBED_HOST = os.getenv('OLLAMA_EMBED_HOST', 'http://localhost:11434')
-_EMBED_MODEL = os.getenv('OLLAMA_EMBED_MODEL', 'nomic-embed-text')
-_EMBED_TIMEOUT = float(os.getenv('OLLAMA_EMBED_TIMEOUT', '10'))
+# Embedding config (for vector search, MOD-02).
+#
+# The embedding endpoint is BACKEND-AGNOSTIC. The function _get_embedding
+# below auto-detects the wire shape (OpenAI-compat /v1/embeddings vs
+# Ollama-compat /api/embeddings), so the same env var works against:
+#   - llama.cpp llama-server in embeddings mode (CERBERUS/TYPHON/PYTHIA)
+#   - Ollama (legacy / dev workstations)
+#   - vLLM with --task embed
+#   - NVIDIA NIM embedding containers (e.g. llama-3.2-nv-embedqa-1b-v2)
+#   - any OpenAI-compatible /v1/embeddings endpoint
+#
+# Canonical env vars are INFERENCE_EMBED_* (matches the broader
+# _inference_backend namespacing in this module). The OLLAMA_EMBED_*
+# names are kept as deprecated fallbacks for backward compat with
+# existing .env.prod files; new deployments should use INFERENCE_EMBED_*.
+# Deprecation removal scheduled for v4.0 per docs/V4_PLAN.md. The
+# OLLAMA_ prefix was a historical artifact — the actual fleet runs
+# llama-server, not Ollama, on every host.
+_EMBED_HOST = (
+    os.getenv('INFERENCE_EMBED_HOST')
+    or os.getenv('OLLAMA_EMBED_HOST')
+    or 'http://localhost:11434'
+)
+_EMBED_MODEL = (
+    os.getenv('INFERENCE_EMBED_MODEL')
+    or os.getenv('OLLAMA_EMBED_MODEL')
+    or 'nomic-embed-text'
+)
+_EMBED_TIMEOUT = float(
+    os.getenv('INFERENCE_EMBED_TIMEOUT')
+    or os.getenv('OLLAMA_EMBED_TIMEOUT')
+    or '10'
+)
+if os.getenv('OLLAMA_EMBED_HOST') and not os.getenv('INFERENCE_EMBED_HOST'):
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "[EMBED] OLLAMA_EMBED_HOST is deprecated and will be removed in v4.0. "
+        "Rename to INFERENCE_EMBED_HOST in your .env. The endpoint is "
+        "backend-agnostic — works with llama-server, Ollama, vLLM, NVIDIA "
+        "NIM, or any OpenAI-compat embeddings server. The OLLAMA_ prefix "
+        "was a historical artifact; the actual fleet runs llama-server, "
+        "not Ollama."
+    )
 
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
