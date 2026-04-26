@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/perlowja/mnemos/blob/master/docs/mpf_v0.1.json",
+  "$id": "https://github.com/mnemos-os/mnemos/blob/master/docs/mpf_v0.1.json",
   "title": "Memory Portability Format (MPF) v0.1",
   "description": "Cross-system agent-memory interchange format. Envelope-level schema version with per-record payload versions; discriminated union of record kinds (document, memory, fact, event). Designed to be emitted by Mem0, Letta, Graphiti, Cognee, MNEMOS, and consumed by any of the same. See docs/MEMORY_EXPORT_FORMAT.md for the prose spec. Schema patch level 0.1.1 added optional pass-through fields on kg_triple, memory_version_entry, and compression_manifest_entry to support lossless round-trip of MNEMOS DB columns that 0.1.0 left under additionalProperties.",
   "type": "object",

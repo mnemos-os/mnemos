@@ -135,7 +135,7 @@ def install_systemd(config: Config, repo_path: str) -> bool:
 
     unit_content = f"""[Unit]
 Description=MNEMOS Memory System API
-Documentation=https://github.com/perlowja/mnemos
+Documentation=https://github.com/mnemos-os/mnemos
 After=network.target postgresql.service
 Wants=postgresql.service
 

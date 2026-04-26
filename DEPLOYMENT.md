@@ -16,7 +16,7 @@
 
 ```bash
 # Clone repository
-git clone https://github.com/perlowja/mnemos.git
+git clone https://github.com/mnemos-os/mnemos.git
 cd mnemos
 
 # Copy environment template
@@ -419,5 +419,5 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 
 ## Support
 
-- GitHub: https://github.com/perlowja/mnemos
-- Issues: https://github.com/perlowja/mnemos/issues
+- GitHub: https://github.com/mnemos-os/mnemos
+- Issues: https://github.com/mnemos-os/mnemos/issues

@@ -20,7 +20,7 @@ sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client
 sudo apt install -y git curl build-essential libpq-dev
 
 # 4. MNEMOS code (2 minutes)
-git clone https://github.com/perlowja/mnemos
+git clone https://github.com/mnemos-os/mnemos
 cd mnemos
 python3.11 -m venv venv
 source venv/bin/activate
@@ -54,7 +54,7 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 
 # 2. Clone and configure (5 minutes)
-git clone https://github.com/perlowja/mnemos
+git clone https://github.com/mnemos-os/mnemos
 cd mnemos
 cp .env.example .env
 # Edit .env if needed
@@ -300,8 +300,8 @@ kill -9 <PID>
 
 ## Support
 
-- **GitHub Issues**: https://github.com/perlowja/mnemos/issues
-- **Documentation**: https://github.com/perlowja/mnemos#readme
+- **GitHub Issues**: https://github.com/mnemos-os/mnemos/issues
+- **Documentation**: https://github.com/mnemos-os/mnemos#readme
 - **Community**: Discord/Slack (if applicable)
 
 ---
