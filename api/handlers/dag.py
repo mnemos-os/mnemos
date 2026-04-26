@@ -110,7 +110,9 @@ async def get_memory_log(
     try:
         async with pool.acquire() as conn:
             await _assert_memory_access(conn, memory_id, user)
-            # Recursive CTE: walk from HEAD backward through parent_version_id
+            # Recursive CTE: walk from HEAD backward through parent_version_id.
+            # Carries owner_id/namespace/permission_mode through both arms so
+            # the post-walk filter can drop snapshots the caller can't read.
             rows = await conn.fetch(
                 """
                 WITH RECURSIVE commit_walk AS (
@@ -118,7 +120,9 @@ async def get_memory_log(
                     SELECT
                         mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
-                        mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type, 1 AS depth
+                        mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
+                        mv.owner_id, mv.namespace, mv.permission_mode,
+                        1 AS depth
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON (
                         mb.memory_id = mv.memory_id AND
@@ -132,6 +136,7 @@ async def get_memory_log(
                         mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
+                        mv.owner_id, mv.namespace, mv.permission_mode,
                         cw.depth + 1
                     FROM memory_versions mv
                     INNER JOIN commit_walk cw ON mv.id = cw.parent_version_id
@@ -139,7 +144,8 @@ async def get_memory_log(
                 )
                 SELECT
                     commit_hash, version_num, branch, content, category, subcategory,
-                    snapshot_at, snapshot_by, change_type
+                    snapshot_at, snapshot_by, change_type,
+                    owner_id, namespace, permission_mode
                 FROM commit_walk
                 ORDER BY depth ASC
                 LIMIT $3
@@ -151,6 +157,23 @@ async def get_memory_log(
 
             if not rows:
                 raise HTTPException(status_code=404, detail=f"Branch '{branch}' not found")
+
+            # Per-snapshot tenancy filter (slice 2 round 15). Applied
+            # client-side because the recursive CTE doesn't compose
+            # cleanly with a snapshot-level WHERE. A memory created
+            # private (mode 600) → snapshotted into v1 → relaxed to
+            # public (mode 644) MUST NOT expose v1 to readers who
+            # only became authorized after the permission flip.
+            # Mirrors api/handlers/versions.py + api/mcp_tools.py.
+            if user.role != "root":
+                def _snap_visible(r) -> bool:
+                    if r["namespace"] != user.namespace:
+                        return False
+                    return (
+                        r["owner_id"] == user.user_id
+                        or (r["permission_mode"] % 10) >= 4
+                    )
+                rows = [r for r in rows if _snap_visible(r)]
 
             # Assemble with parent hashes
             commits = []
@@ -307,19 +330,43 @@ async def get_commit(
     try:
         async with pool.acquire() as conn:
             await _assert_memory_access(conn, memory_id, user)
-            row = await conn.fetchrow(
-                """
-                SELECT
-                    mv.commit_hash, mv.version_num, mv.branch, mv.content, mv.category,
-                    mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
-                    (SELECT commit_hash FROM memory_versions mv2
-                     WHERE mv2.id = mv.parent_version_id) AS parent_hash
-                FROM memory_versions mv
-                WHERE mv.memory_id = $1 AND mv.commit_hash = $2
-                """,
-                memory_id,
-                commit_hash,
-            )
+            # Per-snapshot tenancy gate (slice 2 round 15). The
+            # live-memory check above is necessary but not sufficient
+            # — a snapshot taken when the row was private must remain
+            # private to readers who can only access the now-public
+            # live row.
+            if user.role == "root":
+                row = await conn.fetchrow(
+                    """
+                    SELECT
+                        mv.commit_hash, mv.version_num, mv.branch, mv.content, mv.category,
+                        mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
+                        (SELECT commit_hash FROM memory_versions mv2
+                         WHERE mv2.id = mv.parent_version_id) AS parent_hash
+                    FROM memory_versions mv
+                    WHERE mv.memory_id = $1 AND mv.commit_hash = $2
+                    """,
+                    memory_id, commit_hash,
+                )
+            else:
+                from api.visibility import version_visibility_predicate
+                vis_clause, vis_params = version_visibility_predicate(
+                    user.user_id, start_param_idx=3, table_alias="mv",
+                )
+                ns_ph = f"${len(vis_params) + 3}"
+                row = await conn.fetchrow(
+                    f"""
+                    SELECT
+                        mv.commit_hash, mv.version_num, mv.branch, mv.content, mv.category,
+                        mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
+                        (SELECT commit_hash FROM memory_versions mv2
+                         WHERE mv2.id = mv.parent_version_id) AS parent_hash
+                    FROM memory_versions mv
+                    WHERE mv.memory_id = $1 AND mv.commit_hash = $2
+                      AND {vis_clause} AND mv.namespace = {ns_ph}
+                    """,
+                    memory_id, commit_hash, *vis_params, user.namespace,
+                )
 
             if not row:
                 raise HTTPException(status_code=404, detail="Commit not found")
@@ -378,15 +425,41 @@ async def merge_branch(
                 # Serialize concurrent merges on this (memory, branch).
                 await conn.execute("SELECT pg_advisory_xact_lock($1)", _lock_key)
 
-                source_head = await conn.fetchrow(
-                    """
-                    SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
-                    FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
-                    WHERE mv.memory_id = $1 AND mb.name = $2
-                    """,
-                    memory_id, request.source_branch,
-                )
+                # Per-snapshot tenancy gate on the SOURCE head (slice
+                # 2 round 15). Merge copies the source snapshot's
+                # content into a new target-branch version — if the
+                # caller can't read the source snapshot directly via
+                # get_commit, they can't be allowed to copy its
+                # content via merge. Target head needs no per-snapshot
+                # gate because we're WRITING new content, not exposing
+                # the existing target HEAD.
+                if user.role == "root":
+                    source_head = await conn.fetchrow(
+                        """
+                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
+                        FROM memory_versions mv
+                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                        WHERE mv.memory_id = $1 AND mb.name = $2
+                        """,
+                        memory_id, request.source_branch,
+                    )
+                else:
+                    from api.visibility import version_visibility_predicate
+                    vis_clause, vis_params = version_visibility_predicate(
+                        user.user_id, start_param_idx=3, table_alias="mv",
+                    )
+                    ns_ph = f"${len(vis_params) + 3}"
+                    source_head = await conn.fetchrow(
+                        f"""
+                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num
+                        FROM memory_versions mv
+                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                        WHERE mv.memory_id = $1 AND mb.name = $2
+                          AND {vis_clause} AND mv.namespace = {ns_ph}
+                        """,
+                        memory_id, request.source_branch,
+                        *vis_params, user.namespace,
+                    )
                 target_head = await conn.fetchrow(
                     """
                     SELECT mv.id, mv.version_num
