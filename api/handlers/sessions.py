@@ -186,42 +186,51 @@ async def add_session_message(
         )
 
     # Get conversation history for the provider:
-    #   1. Up to 5 most recent role='system' rows (initial_context
-    #      plus any later system directives), chronological.
-    #   2. The 10 most recent non-system messages, chronological.
+    #   1. The earliest role='system' row (the initial_context written
+    #      at create_session time) — ALWAYS included, never evictable.
+    #   2. Up to 4 most recent later system rows (subsequent policy
+    #      updates posted via add_session_message). Bounded to prevent
+    #      adversarial role='system' spam from blowing the prompt
+    #      budget.
+    #   3. The 10 most recent non-system messages, chronological.
     #
-    # The audit-quick-wins iteration uncovered three layers:
-    #   - Original query: ORDER BY timestamp ASC LIMIT 10 (returned
-    #     the 10 OLDEST messages — wrong direction).
-    #   - First fix: DESC LIMIT 10 + outer ASC reorder. Correct
-    #     recency, but in long sessions the initial_context system
-    #     row falls outside the 10-row window — provider loses
-    #     session-level instructions.
-    #   - Second fix: pin earliest system row + 10 recent non-system.
-    #     But add_session_message accepts role='system'; later system
-    #     updates were dropped.
-    #   - Third fix (this code): pin ALL system rows. Codex caught
-    #     this as an unbounded prompt-surface — adversarial or buggy
-    #     callers writing many/large system rows could blow up the
-    #     provider context budget on every turn.
-    #   - Current shape: cap pinned to the 5 most recent system rows.
-    #     Covers typical multi-system policy updates; bounds the
-    #     pathological case at a small constant. Token-aware
-    #     truncation + privilege-gating role='system' on
-    #     add_session_message is a separate redesign tracked
-    #     elsewhere.
+    # Iteration history under Codex review:
+    #   - ASC LIMIT 10  → returned 10 OLDEST messages (wrong dir).
+    #   - DESC LIMIT 10 → recent works, but loses initial_context.
+    #   - LIMIT 1 pinned earliest → drops later system updates.
+    #   - No LIMIT pinned → unbounded pinned context.
+    #   - LIMIT 5 pinned (most recent) → 5 later system writes
+    #     evict the foundational initial_context (adversarial path).
+    #   - This shape: earliest pinned + 4 most recent later +
+    #     10 recent non-system. Initial context never evictable;
+    #     later updates capped; bounded total surface.
+    #
+    # Token-aware truncation and privilege-gating role='system' on
+    # add_session_message remain the structurally correct redesign;
+    # tracked separately, out of scope here.
     async with pool.acquire() as conn:
         history = await conn.fetch(
             """
-            WITH pinned AS (
-                SELECT role, content, timestamp, 0 AS k
-                  FROM (
-                      SELECT role, content, timestamp
-                        FROM session_messages
-                       WHERE session_id = $1 AND role = 'system'
-                       ORDER BY timestamp DESC
-                       LIMIT 5
-                  ) recent_system
+            WITH first_system AS (
+                SELECT role, content, timestamp
+                  FROM session_messages
+                 WHERE session_id = $1 AND role = 'system'
+                 ORDER BY timestamp ASC
+                 LIMIT 1
+            ),
+            later_system AS (
+                SELECT s.role, s.content, s.timestamp
+                  FROM session_messages s
+                 WHERE s.session_id = $1
+                   AND s.role = 'system'
+                   AND s.timestamp > (SELECT timestamp FROM first_system)
+                 ORDER BY s.timestamp DESC
+                 LIMIT 4
+            ),
+            pinned AS (
+                SELECT role, content, timestamp, 0 AS k FROM first_system
+                UNION ALL
+                SELECT role, content, timestamp, 0 AS k FROM later_system
             ),
             recent AS (
                 SELECT role, content, timestamp, 1 AS k
