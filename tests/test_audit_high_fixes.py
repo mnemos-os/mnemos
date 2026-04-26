@@ -153,6 +153,28 @@ def test_slice2_cache_key_no_delimiter_collision():
     assert k3 != k4, "group_ids with comma must produce distinct keys"
 
 
+def test_slice2_cache_key_distinguishes_none_from_empty_string():
+    """Codex round 8: search_memories' query helpers treat None as
+    'no SQL predicate' but '' as 'predicate with empty value'. The
+    cache key MUST preserve that distinction or a cached unfiltered
+    search can be replayed for an explicit-empty-string search.
+    Pass-through (no truthy-coalescing) + JSON encoding inside
+    _get_cache_key gives None→null vs ''→\"\" — distinct."""
+    from api.lifecycle import _get_cache_key
+
+    k_none = _get_cache_key("search", "alice", "default", None, None)
+    k_empty = _get_cache_key("search", "alice", "default", "", "")
+    assert k_none != k_empty, (
+        "None and '' must produce distinct cache keys "
+        "(query helpers distinguish them in SQL, cache must too)"
+    )
+
+    # And a list arg vs a list-shaped string arg also stay distinct.
+    k_list = _get_cache_key("search", ["g1", "g2"])
+    k_str = _get_cache_key("search", "['g1', 'g2']")
+    assert k_list != k_str
+
+
 def test_h1_gateway_context_search_includes_federation(monkeypatch):
     """/v1/chat/completions _search_mnemos_context uses an inline
     SELECT (not the shared helpers because it has a category-OR).

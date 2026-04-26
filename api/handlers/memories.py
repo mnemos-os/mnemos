@@ -423,22 +423,22 @@ async def search_memories(
     # user_id alone would either leak rows after a group revoke or
     # hide rows after a group grant for the cache TTL window.
     #
-    # JSON-encode the sorted snapshot so commas inside group IDs
-    # don't collide on a flat join: ['a,b','c'] vs ['a','b,c']
-    # would otherwise both serialize to "a,b,c". JSON's quoted
-    # elements + escaped quotes make every membership signature
-    # uniquely decodable.
-    group_ids_key = json.dumps(sorted(user.group_ids), separators=(",", ":"))
+    # Round-8 fix: pass RAW values (no `or ""` truthy-coalescing).
+    # The query helpers distinguish None (no SQL predicate) from ""
+    # (predicate with empty value); collapsing both to "" before
+    # serialization aliases distinct semantics. JSON encoding inside
+    # _get_cache_key now preserves None as null vs "" as "" so the
+    # digest reflects the request's actual filter shape.
     cache_key = _get_cache_key(
         "search",
         user.user_id, user.namespace,
         request.query, request_limit,
-        request.category or "", request.subcategory or "",
+        request.category, request.subcategory,
         "semantic" if request.semantic else "fts",
-        request.source_provider or "", request.source_model or "",
-        request.source_agent or "",
-        search_namespace or "", search_owner_id or "",
-        group_ids_key,
+        request.source_provider, request.source_model,
+        request.source_agent,
+        search_namespace, search_owner_id,
+        sorted(user.group_ids),  # list, not pre-serialized string
     )
 
     if _lc._cache and not request.include_compressed:
