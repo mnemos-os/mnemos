@@ -481,15 +481,19 @@ async def merge_branch(
                 # neither can race a concurrent writer (rounds 28,
                 # 29, 30). The advisory lock above also serializes
                 # against other DAG writers on the same branch.
-                # Pull versioned fields from the live row too so we
-                # can verify they match target_head before doing
-                # a destructive UPDATE (round-32 fix). The check
-                # only fires for main merges (target_branch ==
-                # "main"), since feature merges never touch the
-                # live row.
+                # Pull versioned fields from the live row including
+                # tenancy fields (round 33). The drift guard before
+                # the destructive UPDATE compares ALL of the
+                # trigger's versioned fields — content / category /
+                # subcategory / metadata / verbatim_content PLUS
+                # owner_id / namespace / permission_mode. Otherwise
+                # a permission-mode drift between live (private) and
+                # target_head (public) would let us publish a public
+                # version-log entry whose content is currently held
+                # private in `memories`.
                 if user.role == "root":
                     live = await conn.fetchrow(
-                        "SELECT id, owner_id, namespace, "
+                        "SELECT id, owner_id, namespace, permission_mode, "
                         "content, category, subcategory, metadata, "
                         "verbatim_content "
                         "FROM memories WHERE id = $1 FOR UPDATE",
@@ -497,7 +501,7 @@ async def merge_branch(
                     )
                 else:
                     live = await conn.fetchrow(
-                        "SELECT id, owner_id, namespace, "
+                        "SELECT id, owner_id, namespace, permission_mode, "
                         "content, category, subcategory, metadata, "
                         "verbatim_content "
                         "FROM memories WHERE id = $1 "
@@ -566,7 +570,8 @@ async def merge_branch(
                     """
                     SELECT mv.id, mv.version_num, mv.commit_hash,
                            mv.content, mv.category, mv.subcategory,
-                           mv.metadata, mv.verbatim_content
+                           mv.metadata, mv.verbatim_content,
+                           mv.owner_id, mv.namespace, mv.permission_mode
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = $2
@@ -657,10 +662,18 @@ async def merge_branch(
                 # merge commit. Pulls owner_id/namespace/
                 # permission_mode from the source snapshot
                 # (per slice-2 round-15 source-head visibility
-                # gate), copies content + provenance fields,
-                # parents off target_head.id, change_type=update
-                # (the v2 CHECK constraint doesn't allow 'merge';
-                # see migration_v2_versioning).
+                # gate), copies content + provenance from SOURCE,
+                # but tenancy fields (owner_id / namespace /
+                # permission_mode) from TARGET. Round-33 fix: the
+                # earlier code copied tenancy from the source
+                # snapshot, which let merging from a public branch
+                # (forked while public) into a now-private main
+                # publish content under the source's stale public
+                # permission_mode. Tenancy must follow the target
+                # branch so the new commit's visibility matches
+                # what the destination actually owns.
+                # change_type='update' (the v2 CHECK constraint
+                # doesn't allow 'merge'; see migration_v2_versioning).
                 new_version_id = await conn.fetchval(
                     """
                     INSERT INTO memory_versions (
@@ -670,26 +683,27 @@ async def merge_branch(
                         source_model, source_provider, source_session, source_agent,
                         branch, commit_hash, parent_version_id,
                         snapshot_by, change_type
-                    )
-                    SELECT
+                    ) VALUES (
                         $1, $2, $3, $4, $5,
                         $6::jsonb, $7,
-                        owner_id, namespace, permission_mode,
-                        $8, $9, $10, $11,
-                        $12, $13, $14, $15, 'update'
-                    FROM memory_versions WHERE id = $16
+                        $8, $9, $10,
+                        $11, $12, $13, $14,
+                        $15, $16, $17, $18, 'update'
+                    )
                     RETURNING id
                     """,
                     memory_id, next_version,
                     source_head["content"], source_head["category"],
                     source_head["subcategory"],
                     meta_str, source_head["verbatim_content"],
+                    target_head["owner_id"], target_head["namespace"],
+                    target_head["permission_mode"],
                     source_head["source_model"],
                     source_head["source_provider"],
                     source_head["source_session"],
                     source_head["source_agent"],
                     target_branch, merge_hash, target_head["id"],
-                    user.user_id, source_head["id"],
+                    user.user_id,
                 )
 
                 # Advance the target branch HEAD pointer.
@@ -710,24 +724,24 @@ async def merge_branch(
                 # trigger consults via its WHEN clause (per
                 # migrations_charon_trigger_guard).
                 if live_tracks_target:
-                    # Round-32 fix: verify the live row ACTUALLY
-                    # equals target_head's versioned fields before
-                    # the destructive UPDATE. The "memories tracks
-                    # main" rule is a contract, but bugs / partial
-                    # imports / migration repair could leave the
-                    # live row drifted from main HEAD. Overwriting
-                    # without checking would silently destroy that
-                    # drift, and because we suppress the version
-                    # trigger, no audit record of the destruction
-                    # would exist. On mismatch: 409 with repair
-                    # guidance; the human/operator decides whether
-                    # to repair main HEAD to match the live row,
-                    # or vice versa, before the merge can proceed.
+                    # Drift guard (rounds 32 + 33). Compare ALL of
+                    # the trigger's versioned fields between live
+                    # and target_head — content + category +
+                    # subcategory + metadata + verbatim_content
+                    # PLUS owner_id, namespace, permission_mode.
+                    # Tenancy drift would be especially dangerous:
+                    # if main was made private (mode 600) but the
+                    # version log still shows public (mode 644),
+                    # merging would publish a public commit whose
+                    # content the live row holds privately.
                     if (live["content"] != target_head["content"]
                             or live["category"] != target_head["category"]
                             or live["subcategory"] != target_head["subcategory"]
                             or live["metadata"] != target_head["metadata"]
-                            or live["verbatim_content"] != target_head["verbatim_content"]):
+                            or live["verbatim_content"] != target_head["verbatim_content"]
+                            or live["owner_id"] != target_head["owner_id"]
+                            or live["namespace"] != target_head["namespace"]
+                            or live["permission_mode"] != target_head["permission_mode"]):
                         logger.error(
                             f"[DAG] Merge aborted: live memory row for "
                             f"{memory_id} has drifted from main HEAD "
