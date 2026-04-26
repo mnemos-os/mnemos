@@ -290,7 +290,7 @@ async def create_branch(
                     """
                     SELECT mv.id, mv.commit_hash, mv.created_at
                     FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = 'main'
                     """,
                     memory_id,
@@ -529,7 +529,7 @@ async def merge_branch(
                                mv.source_model, mv.source_provider,
                                mv.source_session, mv.source_agent
                         FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                         WHERE mv.memory_id = $1 AND mb.name = $2
                         """,
                         memory_id, request.source_branch,
@@ -548,7 +548,7 @@ async def merge_branch(
                                mv.source_model, mv.source_provider,
                                mv.source_session, mv.source_agent
                         FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                         WHERE mv.memory_id = $1 AND mb.name = $2
                           AND {vis_clause} AND mv.namespace = {ns_ph}
                         """,
@@ -573,7 +573,7 @@ async def merge_branch(
                            mv.metadata, mv.verbatim_content,
                            mv.owner_id, mv.namespace, mv.permission_mode
                     FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = $2
                     """,
                     memory_id, target_branch,

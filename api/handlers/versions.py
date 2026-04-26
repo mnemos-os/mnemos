@@ -413,7 +413,7 @@ async def revert_memory(
                            mv.owner_id, mv.namespace, mv.permission_mode,
                            mv.commit_hash
                     FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.head_version_id = mv.id
+                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = 'main'
                     """,
                     memory_id,
