@@ -251,6 +251,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_3_recall_tracking.sql",
         repo_path / "db" / "migrations_charon_trigger_guard.sql",
         repo_path / "db" / "migrations_v3_4_federation_compat.sql",
+        repo_path / "db" / "migrations_v3_5_trigger_same_memory_parent.sql",
     ]
 
     print("[db] Running migrations...")

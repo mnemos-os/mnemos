@@ -106,6 +106,20 @@ def test_list_memories_filters_by_namespace_for_non_root(monkeypatch):
     args = _fetched_args(conn)
     assert "namespace=$" in sql
     assert "alice-ns" in args
+    # v3.5 audit slice 2: list_memories must also scope by owner_id
+    # for non-root callers, matching search/update/delete. Without
+    # this, a non-root user could list other users' rows in the
+    # same namespace.
+    # Full read-visibility predicate (mirrors v1_multiuser RLS policies):
+    # owner / federation / world-readable / group-readable. RLS cannot
+    # re-add rows that the WHERE rejected, so all four branches must
+    # appear at the app layer.
+    assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql  # world-readable
+    assert "(permission_mode / 10) % 10" in sql  # group-readable threshold
+    assert "group_id = ANY(" in sql        # group-membership branch
+    assert "alice" in args
 
 
 def test_list_memories_no_namespace_filter_for_root(monkeypatch):
@@ -116,6 +130,8 @@ def test_list_memories_no_namespace_filter_for_root(monkeypatch):
 
     sql = _fetched_sql(conn)
     assert "namespace=$" not in sql
+    # Root bypasses both namespace and owner_id scoping.
+    assert "owner_id=$" not in sql
 
 
 def test_list_memories_combines_namespace_with_category(monkeypatch):
@@ -130,8 +146,10 @@ def test_list_memories_combines_namespace_with_category(monkeypatch):
     args = _fetched_args(conn)
     assert "category=$" in sql
     assert "namespace=$" in sql
+    assert "owner_id=$" in sql
     assert "solutions" in args
     assert "alice-ns" in args
+    assert "alice" in args
 
 
 def test_list_memories_combines_namespace_with_subcategory(monkeypatch):
@@ -146,8 +164,10 @@ def test_list_memories_combines_namespace_with_subcategory(monkeypatch):
     args = _fetched_args(conn)
     assert "subcategory=$" in sql
     assert "namespace=$" in sql
+    assert "owner_id=$" in sql
     assert "pipeline" in args
     assert "alice-ns" in args
+    assert "alice" in args
 
 
 def test_list_memories_combines_namespace_with_category_and_subcategory(monkeypatch):
@@ -164,7 +184,42 @@ def test_list_memories_combines_namespace_with_category_and_subcategory(monkeypa
     assert "category=$" in sql
     assert "subcategory=$" in sql
     assert "namespace=$" in sql
-    assert all(v in args for v in ("solutions", "pipeline", "alice-ns"))
+    assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql
+    assert all(v in args for v in ("solutions", "pipeline", "alice-ns", "alice"))
+
+
+def test_list_memories_rejects_cross_namespace_for_non_root(monkeypatch):
+    """Non-root caller asking ?namespace=other → 403, not silent re-scope.
+    Mirrors search_memories' parity contract; hides bad caller behavior
+    otherwise."""
+    conn = _Conn(rows=[])
+    _install(monkeypatch, conn)
+
+    from fastapi import HTTPException
+    import pytest as _p
+    with _p.raises(HTTPException) as exc:
+        asyncio.run(memories_handler.list_memories(
+            namespace="other-ns", user=_alice("alice-ns"),
+        ))
+    assert exc.value.status_code == 403
+
+
+def test_list_memories_root_honors_explicit_namespace(monkeypatch):
+    """Root callers can target a specific namespace for cross-tenant
+    audit lookups."""
+    conn = _Conn(rows=[])
+    _install(monkeypatch, conn)
+
+    asyncio.run(memories_handler.list_memories(
+        namespace="other-ns", user=_root(),
+    ))
+
+    sql = _fetched_sql(conn)
+    args = _fetched_args(conn)
+    assert "namespace=$" in sql
+    assert "other-ns" in args
+    assert "owner_id=$" not in sql  # root still bypasses owner scoping
 
 
 # ---- get_memory ------------------------------------------------------------
@@ -179,6 +234,19 @@ def test_get_memory_filters_by_namespace_for_non_root(monkeypatch):
     sql, args = conn.fetchrow_calls[-1]
     assert "namespace=$" in sql
     assert "alice-ns" in args
+    # v3.5 audit slice 2: get_memory must also scope by owner_id —
+    # otherwise any non-root caller in the same namespace could read
+    # other users' rows by guessing memory_id.
+    # Full read-visibility predicate (mirrors v1_multiuser RLS policies):
+    # owner / federation / world-readable / group-readable. RLS cannot
+    # re-add rows that the WHERE rejected, so all four branches must
+    # appear at the app layer.
+    assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql  # world-readable
+    assert "(permission_mode / 10) % 10" in sql  # group-readable threshold
+    assert "group_id = ANY(" in sql        # group-membership branch
+    assert "alice" in args
 
 
 def test_get_memory_no_namespace_filter_for_root(monkeypatch):
@@ -189,6 +257,7 @@ def test_get_memory_no_namespace_filter_for_root(monkeypatch):
 
     sql, _ = conn.fetchrow_calls[-1]
     assert "namespace=$" not in sql
+    assert "owner_id=$" not in sql
 
 
 def test_get_memory_returns_404_when_namespace_mismatch(monkeypatch):

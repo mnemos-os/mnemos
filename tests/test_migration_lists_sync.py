@@ -87,7 +87,7 @@ def test_every_migration_list_entry_exists_on_disk():
 
 
 def _extract_docker_compose_migrations(compose_path: Path) -> list[str]:
-    """Pull migration filenames from docker-compose.yml's volume
+    """Pull migration filenames from docker-compose volume
     mounts. Each mount looks like:
       - ./db/migrations_*.sql:/docker-entrypoint-initdb.d/NN-name.sql
     """
@@ -102,13 +102,16 @@ def _extract_docker_compose_migrations(compose_path: Path) -> list[str]:
         # `- ./db/<file>.sql:/docker-entrypoint-initdb.d/...`
         host_path = line.split(":", 1)[0]  # `- ./db/<file>.sql`
         host_path = host_path.removeprefix("- ").strip()
-        out.append(Path(host_path).name)
+        name = Path(host_path).name
+        if not name.startswith("migrations"):
+            continue
+        out.append(name)
     return out
 
 
-def test_docker_compose_migration_list_matches_installer():
-    """Codex round-26 finding: docker-compose.yml maintained its
-    own migration init list and drifted behind installer/db.py
+def test_docker_compose_migration_lists_match_installer():
+    """Codex round-26 finding: docker-compose*.yml maintained their
+    own migration init lists and drifted behind installer/db.py
     (stopped at v3_1_versioning_fix while CHARON v0.2 added 9
     more migrations through migrations_charon_trigger_guard.sql).
     Fresh `docker compose up` databases would have kg_triples
@@ -123,16 +126,71 @@ def test_docker_compose_migration_list_matches_installer():
     installer_list = _extract_migration_list(
         repo_root / "installer" / "db.py", "run_migrations",
     )
-    compose_list = _extract_docker_compose_migrations(
-        repo_root / "docker-compose.yml",
-    )
-    assert installer_list == compose_list, (
-        "docker-compose.yml migration list has drifted from "
-        "installer/db.py.\n"
-        f"  installer/db.py ({len(installer_list)} entries):    "
-        f"{installer_list}\n"
-        f"  docker-compose.yml ({len(compose_list)} entries): "
-        f"{compose_list}\n"
-        "When adding a new migration, append to ALL THREE: "
-        "install.py, installer/db.py, AND docker-compose.yml."
-    )
+    for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
+        compose_list = _extract_docker_compose_migrations(repo_root / compose_name)
+        assert installer_list == compose_list, (
+            f"{compose_name} migration list has drifted from installer/db.py.\n"
+            f"  installer/db.py ({len(installer_list)} entries): "
+            f"{installer_list}\n"
+            f"  {compose_name} ({len(compose_list)} entries): "
+            f"{compose_list}\n"
+            "When adding a new migration, append to ALL FOUR: "
+            "install.py, installer/db.py, docker-compose.yml, "
+            "AND docker-compose.staging.yml."
+        )
+
+
+def test_compose_files_run_trigger_upgrade_for_existing_volumes():
+    """The initdb mount only affects fresh Postgres volumes.
+
+    Dev and PROTEUS staging keep named postgres_data volumes, so the
+    v3.5 trigger patch also needs an explicit compose-time upgrade
+    service that runs against already-initialized databases.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
+        text = (repo_root / compose_name).read_text()
+
+        assert "postgres-upgrade:" in text, compose_name
+        assert (
+            "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
+            "/migrations/24-trigger-same-memory-parent.sql:ro"
+        ) in text, compose_name
+        assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
+        assert "-v ON_ERROR_STOP=1" in text, compose_name
+        assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
+        assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
+
+
+def _extract_trigger_delete_branch(sql: str) -> str:
+    try:
+        return sql.split("ELSIF TG_OP = 'DELETE' THEN", 1)[1].split(
+            "\n    IF TG_OP = 'DELETE' THEN",
+            1,
+        )[0]
+    except IndexError as exc:
+        raise AssertionError("could not isolate mnemos_version_snapshot DELETE branch") from exc
+
+
+def test_v3_5_trigger_delete_branch_advances_head_to_delete_snapshot():
+    """trg_memory_version_delete is live on this branch.
+
+    The DELETE branch must capture the inserted tombstone id and move
+    memory_branches.head_version_id to it, or /log and reconciliation
+    callers stay pinned to the pre-delete version.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (repo_root / "db" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
+    delete_branch = _extract_trigger_delete_branch(sql)
+    compact = " ".join(delete_branch.split())
+
+    assert "dead code" not in sql.lower()
+    assert "AND mv.memory_id = mb.memory_id" in compact
+    assert (
+        "_by, 'delete', _commit_hash, _branch, _parent_version ) "
+        "RETURNING id INTO _new_version_id"
+    ) in compact
+    assert (
+        "UPDATE memory_branches SET head_version_id = _new_version_id "
+        "WHERE memory_id = OLD.id AND name = _branch"
+    ) in compact

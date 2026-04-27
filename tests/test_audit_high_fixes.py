@@ -96,11 +96,93 @@ def test_h1_fts_fetch_no_owner_filter_leaves_query_clean(monkeypatch):
     assert "federation_source IS NOT NULL" not in sql
 
 
+def test_slice2_fts_fetch_with_group_ids_uses_full_visibility(monkeypatch):
+    """When group_ids is also passed, _fts_fetch emits the full
+    v1_multiuser-mirror predicate: owner / federation / world /
+    group-readable. Slice 2.1 closure — search now matches list/get
+    visibility."""
+    from api.lifecycle import _fts_fetch
+
+    conn = _Conn()
+    asyncio.run(_fts_fetch(
+        conn, "query", 10, owner_id="alice", group_ids=["g1", "g2"],
+    ))
+
+    sql = conn.fetches[-1][0]
+    args = conn.fetches[-1][1]
+    assert "owner_id=$" in sql
+    assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql           # world-readable
+    assert "(permission_mode / 10) % 10" in sql         # group-readable threshold
+    assert "group_id = ANY(" in sql                # group-membership branch
+    assert "alice" in args
+    assert ["g1", "g2"] in args                    # group_ids array passed
+
+
+def test_slice2_vector_search_with_group_ids_uses_full_visibility(monkeypatch):
+    """Same closure for the pgvector path."""
+    from api.lifecycle import _vector_search
+
+    conn = _Conn()
+    asyncio.run(_vector_search(
+        conn, [0.1, 0.2], 10, owner_id="alice", group_ids=[],
+    ))
+
+    sql = conn.fetches[-1][0]
+    assert "permission_mode % 10" in sql
+    assert "(permission_mode / 10) % 10" in sql
+    assert "group_id = ANY(" in sql
+
+
+def test_slice2_cache_key_no_delimiter_collision():
+    """Codex round 7: distinct argument tuples must not collide on
+    the cache key digest. The old ':'.join() encoding made
+    (category='a:b', subcategory='c') and (category='a',
+    subcategory='b:c') hash to the same key, so a request with
+    one filter combo could replay the other's cached result. JSON
+    encoding fixes this — quoted/escaped values are unambiguous."""
+    from api.lifecycle import _get_cache_key
+
+    k1 = _get_cache_key("search", "a:b", "c")
+    k2 = _get_cache_key("search", "a", "b:c")
+    assert k1 != k2, "delimiter collision regressed: distinct args produced same key"
+
+    # Also verify group_ids list with embedded commas is safe.
+    k3 = _get_cache_key("search", '["a,b","c"]')
+    k4 = _get_cache_key("search", '["a","b,c"]')
+    assert k3 != k4, "group_ids with comma must produce distinct keys"
+
+
+def test_slice2_cache_key_distinguishes_none_from_empty_string():
+    """Codex round 8: search_memories' query helpers treat None as
+    'no SQL predicate' but '' as 'predicate with empty value'. The
+    cache key MUST preserve that distinction or a cached unfiltered
+    search can be replayed for an explicit-empty-string search.
+    Pass-through (no truthy-coalescing) + JSON encoding inside
+    _get_cache_key gives None→null vs ''→\"\" — distinct."""
+    from api.lifecycle import _get_cache_key
+
+    k_none = _get_cache_key("search", "alice", "default", None, None)
+    k_empty = _get_cache_key("search", "alice", "default", "", "")
+    assert k_none != k_empty, (
+        "None and '' must produce distinct cache keys "
+        "(query helpers distinguish them in SQL, cache must too)"
+    )
+
+    # And a list arg vs a list-shaped string arg also stay distinct.
+    k_list = _get_cache_key("search", ["g1", "g2"])
+    k_str = _get_cache_key("search", "['g1', 'g2']")
+    assert k_list != k_str
+
+
 def test_h1_gateway_context_search_includes_federation(monkeypatch):
     """/v1/chat/completions _search_mnemos_context uses an inline
     SELECT (not the shared helpers because it has a category-OR).
-    That SQL must also match federated rows within the caller's
-    namespace."""
+    Slice 2 round 9: must use the full v1_multiuser-mirror
+    visibility predicate via the shared module — owner / federation
+    / world-readable / group-readable — same as list/get/search/
+    rehydrate. Otherwise group/world-readable rows visible elsewhere
+    silently disappear from gateway context injection."""
     from api.handlers import openai_compat
 
     conn = _Conn()
@@ -109,11 +191,12 @@ def test_h1_gateway_context_search_includes_federation(monkeypatch):
     asyncio.run(openai_compat._search_mnemos_context("hello", _alice(), limit=5))
 
     sql = conn.fetches[-1][0]
-    # v3.2 compression-in-hot-paths added table aliases (`m.`, `v.`)
-    # and a LEFT JOIN to memory_compressed_variants. The federation
-    # clause now reads `m.owner_id = $1 OR m.federation_source IS NOT NULL`.
-    assert "owner_id = $1 OR" in sql
-    assert "federation_source IS NOT NULL" in sql
+    # All four predicate branches present, aliased to m.
+    assert "m.owner_id=$" in sql
+    assert "m.federation_source IS NOT NULL" in sql
+    assert "(m.permission_mode % 10)" in sql           # world-readable
+    assert "((m.permission_mode / 10) % 10)" in sql    # group-readable
+    assert "m.group_id = ANY(" in sql                  # group-membership
 
 
 # ─── H2: consensus fields populated ──────────────────────────────────────────

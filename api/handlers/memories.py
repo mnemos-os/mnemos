@@ -6,6 +6,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import api.lifecycle as _lc
@@ -30,6 +31,7 @@ from api.models import (
     RehydrationRequest,
     RehydrationResponse,
 )
+from api.visibility import handle_trigger_pgerror
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
@@ -75,6 +77,21 @@ def _is_root(user: UserContext) -> bool:
     return user.role == "root"
 
 
+def _read_visibility_predicate(
+    user: UserContext, start_param_idx: int
+) -> tuple[str, list]:
+    """Thin adapter over api.visibility.read_visibility_predicate
+    that takes a UserContext directly. The shared module powers
+    list/get here AND the search/rehydrate helpers in
+    api/lifecycle.py — single source of truth for the predicate
+    that mirrors the v1_multiuser RLS policies.
+    """
+    from api.visibility import read_visibility_predicate
+    return read_visibility_predicate(
+        user.user_id, list(user.group_ids), start_param_idx,
+    )
+
+
 async def _bump_recall_counters(memory_ids: list) -> None:
     """Increment recall_count + set last_recalled_at for a hit set.
 
@@ -105,6 +122,7 @@ async def _bump_recall_counters(memory_ids: list) -> None:
 async def list_memories(
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
+    namespace: Optional[str] = None,
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
@@ -112,93 +130,59 @@ async def list_memories(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    # v3.1.2: app-layer namespace enforcement. When RLS is disabled
-    # (personal mode), the memory handlers previously saw every row
-    # regardless of the caller's namespace. The filter below scopes
-    # non-root callers to their namespace without needing RLS.
-    scope_to_ns = not _is_root(user)
+    # Tenancy scoping for non-root callers:
+    #   - Namespace pinned. Cross-namespace request returns 403
+    #     (mirrors search_memories' parity contract).
+    #   - Read-visibility predicate aligned with the v1_multiuser
+    #     RLS policies (see _read_visibility_predicate). Combines
+    #     owner / federation / group-readable / world-readable into
+    #     a single OR-clause at the app layer because RLS cannot
+    #     RE-ADD rows that the handler WHERE has already excluded —
+    #     a strict owner-only WHERE would silently hide
+    #     group/world-readable rows in team/enterprise mode.
+    # Root callers see everything; explicit ?namespace= honored for
+    # cross-tenant audit lookups.
+    is_root = _is_root(user)
+    if not is_root and namespace and namespace != user.namespace:
+        raise HTTPException(
+            status_code=403,
+            detail="cross-namespace list requires root",
+        )
+    effective_namespace = namespace if is_root else user.namespace
+
+    # Build dynamic WHERE clauses to avoid 4×2 hardcoded SQL branches.
+    # Filter list is preserved across SELECT and COUNT — same params,
+    # same predicate.
+    where_parts: list[str] = []
+    params: list = []
+    if category is not None:
+        where_parts.append(f"category=${len(params) + 1}")
+        params.append(category)
+    if subcategory is not None:
+        where_parts.append(f"subcategory=${len(params) + 1}")
+        params.append(subcategory)
+    if effective_namespace is not None:
+        where_parts.append(f"namespace=${len(params) + 1}")
+        params.append(effective_namespace)
+    if not is_root:
+        vis_clause, vis_params = _read_visibility_predicate(
+            user, len(params) + 1,
+        )
+        where_parts.append(vis_clause)
+        params.extend(vis_params)
+
+    where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+
+    select_sql = (
+        f"SELECT {_MEMORY_COLS} FROM memories{where_sql} "
+        f"ORDER BY created DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+    )
+    count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            if category and subcategory:
-                if scope_to_ns:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE category=$1 AND subcategory=$2 AND namespace=$3 "
-                        "ORDER BY created DESC LIMIT $4 OFFSET $5",
-                        category, subcategory, user.namespace, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE category=$1 AND subcategory=$2 AND namespace=$3",
-                        category, subcategory, user.namespace,
-                    )
-                else:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE category=$1 AND subcategory=$2 ORDER BY created DESC LIMIT $3 OFFSET $4",
-                        category, subcategory, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE category=$1 AND subcategory=$2",
-                        category, subcategory,
-                    )
-            elif category:
-                if scope_to_ns:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE category=$1 AND namespace=$2 "
-                        "ORDER BY created DESC LIMIT $3 OFFSET $4",
-                        category, user.namespace, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE category=$1 AND namespace=$2",
-                        category, user.namespace,
-                    )
-                else:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE category=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
-                        category, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE category=$1", category)
-            elif subcategory:
-                if scope_to_ns:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE subcategory=$1 AND namespace=$2 "
-                        "ORDER BY created DESC LIMIT $3 OFFSET $4",
-                        subcategory, user.namespace, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE subcategory=$1 AND namespace=$2",
-                        subcategory, user.namespace,
-                    )
-                else:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE subcategory=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
-                        subcategory, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE subcategory=$1", subcategory)
-            else:
-                if scope_to_ns:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories "
-                        "WHERE namespace=$1 ORDER BY created DESC LIMIT $2 OFFSET $3",
-                        user.namespace, limit, offset,
-                    )
-                    total = await conn.fetchval(
-                        "SELECT COUNT(*) FROM memories WHERE namespace=$1",
-                        user.namespace,
-                    )
-                else:
-                    rows = await conn.fetch(
-                        f"SELECT {_MEMORY_COLS} FROM memories ORDER BY created DESC LIMIT $1 OFFSET $2",
-                        limit, offset,
-                    )
-                    total = await conn.fetchval("SELECT COUNT(*) FROM memories")
+            rows = await conn.fetch(select_sql, *params, limit, offset)
+            total = await conn.fetchval(count_sql, *params)
     return MemoryListResponse(count=total, memories=[_row_to_memory(r) for r in rows])
 
 
@@ -216,13 +200,20 @@ async def get_memory(
                     f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
                 )
             else:
-                # Non-root: 404 on namespace mismatch. Returning 403
-                # would leak existence of memories in other namespaces;
-                # 404 is uniform with the "not found" response.
+                # Read visibility for non-root: namespace pinned + the
+                # shared read-visibility predicate (own / federation /
+                # world-readable / group-readable), mirroring the
+                # v1_multiuser RLS policies. Same predicate as
+                # list_memories so a memory visible to a user via
+                # list/search is also visible via GET-by-id.
+                # Mutation paths (update/delete) keep strict
+                # owner_id scoping. 404 (not 403) keeps other-tenant
+                # memory existence invisible.
+                vis_clause, vis_params = _read_visibility_predicate(user, 3)
                 row = await conn.fetchrow(
                     f"SELECT {_MEMORY_COLS} FROM memories "
-                    "WHERE id=$1 AND namespace=$2",
-                    memory_id, user.namespace,
+                    f"WHERE id=$1 AND namespace=$2 AND {vis_clause}",
+                    memory_id, user.namespace, *vis_params,
                 )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -429,15 +420,27 @@ async def search_memories(
     # owner_id — the server-resolved filter values, not the caller's
     # raw request. Using request.namespace (possibly None) would create
     # duplicate cache entries for identical result sets.
+    # Cache key must include the caller's group_ids — search visibility
+    # now depends on group membership (slice 2.1), so caching by
+    # user_id alone would either leak rows after a group revoke or
+    # hide rows after a group grant for the cache TTL window.
+    #
+    # Round-8 fix: pass RAW values (no `or ""` truthy-coalescing).
+    # The query helpers distinguish None (no SQL predicate) from ""
+    # (predicate with empty value); collapsing both to "" before
+    # serialization aliases distinct semantics. JSON encoding inside
+    # _get_cache_key now preserves None as null vs "" as "" so the
+    # digest reflects the request's actual filter shape.
     cache_key = _get_cache_key(
         "search",
         user.user_id, user.namespace,
         request.query, request_limit,
-        request.category or "", request.subcategory or "",
+        request.category, request.subcategory,
         "semantic" if request.semantic else "fts",
-        request.source_provider or "", request.source_model or "",
-        request.source_agent or "",
-        search_namespace or "", search_owner_id or "",
+        request.source_provider, request.source_model,
+        request.source_agent,
+        search_namespace, search_owner_id,
+        sorted(user.group_ids),  # list, not pre-serialized string
     )
 
     if _lc._cache and not request.include_compressed:
@@ -454,12 +457,19 @@ async def search_memories(
 
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
+            # group_ids is set only for non-root callers (search_owner_id
+            # set means the predicate should mirror the v1_multiuser
+            # full read-visibility, including group-readable rows).
+            search_group_ids = (
+                list(user.group_ids) if search_owner_id is not None else None
+            )
             _prov = dict(
                 source_provider=request.source_provider,
                 source_model=request.source_model,
                 source_agent=request.source_agent,
                 namespace=search_namespace,
                 owner_id=search_owner_id,
+                group_ids=search_group_ids,
             )
             if request.semantic:
                 embedding = await _get_embedding(request.query)
@@ -689,34 +699,45 @@ async def update_memory(
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             async with conn.transaction():
-                # Defense-in-depth: don't rely exclusively on RLS. Explicitly
-                # check ownership so that an install with rls_enabled=false
-                # still prevents cross-user edits.
-                if user.role == "root":
-                    row = await conn.fetchrow(
-                        "SELECT id FROM memories WHERE id=$1", memory_id,
-                    )
-                else:
-                    # Two-dimensional check: owner_id AND namespace.
-                    # RLS enforces the former when enabled; we add the
-                    # latter as app-layer defense.
-                    row = await conn.fetchrow(
-                        "SELECT id FROM memories "
-                        "WHERE id=$1 AND owner_id=$2 AND namespace=$3",
-                        memory_id, user.user_id, user.namespace,
-                    )
+                # Authorization + mutation in a single statement to
+                # close the TOCTOU window. The earlier shape was a
+                # SELECT-then-UPDATE pair where the SELECT proved
+                # owner+namespace but the UPDATE filtered by id alone
+                # — between the two, a concurrent admin/repair path
+                # could have changed ownership and the caller would
+                # still complete the update. Folding the predicate
+                # into the UPDATE … RETURNING makes the authorization
+                # atomic with the mutation: if the row no longer
+                # satisfies the predicate at write time, the update
+                # affects zero rows and we 404.
+                set_sql = ", ".join(set_clauses)
+                try:
+                    if user.role == "root":
+                        row = await conn.fetchrow(
+                            f"UPDATE memories SET {set_sql} "
+                            f"WHERE id=$1 RETURNING {_lc._MEMORY_COLS}",
+                            memory_id, *values,
+                        )
+                    else:
+                        # Append owner_id + namespace placeholders after
+                        # the existing $1 (id) + values placeholders.
+                        owner_ph = f"${len(values) + 2}"
+                        ns_ph = f"${len(values) + 3}"
+                        row = await conn.fetchrow(
+                            f"UPDATE memories SET {set_sql} "
+                            f"WHERE id=$1 AND owner_id={owner_ph} "
+                            f"AND namespace={ns_ph} "
+                            f"RETURNING {_lc._MEMORY_COLS}",
+                            memory_id, *values, user.user_id, user.namespace,
+                        )
+                except asyncpg.PostgresError as exc:
+                    handle_trigger_pgerror(exc)
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-                # The mnemos_version_snapshot AFTER UPDATE trigger writes the
-                # new memory_versions row (commit_hash + bumped version_num);
-                # the handler must not duplicate that INSERT.
-                await conn.execute(
-                    f"UPDATE memories SET {', '.join(set_clauses)} WHERE id=$1",
-                    memory_id, *values,
-                )
-                row = await conn.fetchrow(
-                    f"SELECT {_lc._MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
-                )
+                # mnemos_version_snapshot AFTER UPDATE trigger writes
+                # the new memory_versions row (commit_hash + bumped
+                # version_num); the handler must not duplicate that
+                # INSERT.
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
@@ -756,20 +777,23 @@ async def delete_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            if user.role == "root":
-                result = await conn.execute(
-                    "DELETE FROM memories WHERE id = $1", memory_id,
-                )
-            else:
-                # Two-dimensional check: non-root can only delete
-                # rows in their own namespace, preventing a namespace
-                # A user from deleting a namespace B row even under
-                # the same owner_id.
-                result = await conn.execute(
-                    "DELETE FROM memories "
-                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
-                    memory_id, user.user_id, user.namespace,
-                )
+            try:
+                if user.role == "root":
+                    result = await conn.execute(
+                        "DELETE FROM memories WHERE id = $1", memory_id,
+                    )
+                else:
+                    # Two-dimensional check: non-root can only delete
+                    # rows in their own namespace, preventing a namespace
+                    # A user from deleting a namespace B row even under
+                    # the same owner_id.
+                    result = await conn.execute(
+                        "DELETE FROM memories "
+                        "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                        memory_id, user.user_id, user.namespace,
+                    )
+            except asyncpg.PostgresError as exc:
+                handle_trigger_pgerror(exc)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     if _lc._cache:
@@ -830,13 +854,18 @@ async def rehydrate_memories(
     sql_params: list = [clean_query, request.limit]
     idx = 3
     if rehydrate_owner_id is not None:
-        # Apply the v3.1.2 Tier 3 federation-aware filter: the caller's
-        # own rows OR any row marked federation_source.
-        sql_conditions.append(
-            f"(m.owner_id=${idx} OR m.federation_source IS NOT NULL)"
+        # Slice 2.1: full v1_multiuser-mirror visibility predicate
+        # (owner / federation / world-readable / group-readable),
+        # aliased to the JOIN's `m.` table reference. Same predicate
+        # as list/get/search so a memory visible there is visible
+        # via /memories/rehydrate.
+        from api.visibility import read_visibility_predicate
+        clause, vis_params = read_visibility_predicate(
+            rehydrate_owner_id, list(user.group_ids), idx, table_alias="m",
         )
-        sql_params.append(rehydrate_owner_id)
-        idx += 1
+        sql_conditions.append(clause)
+        sql_params.extend(vis_params)
+        idx += len(vis_params)
     if rehydrate_namespace is not None:
         sql_conditions.append(f"m.namespace=${idx}")
         sql_params.append(rehydrate_namespace)

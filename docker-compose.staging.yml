@@ -70,6 +70,7 @@ services:
       - ./db/migrations_v3_3_recall_tracking.sql:/docker-entrypoint-initdb.d/21-recall-tracking.sql
       - ./db/migrations_charon_trigger_guard.sql:/docker-entrypoint-initdb.d/22-charon-trigger-guard.sql
       - ./db/migrations_v3_4_federation_compat.sql:/docker-entrypoint-initdb.d/23-federation-compat.sql
+      - ./db/migrations_v3_5_trigger_same_memory_parent.sql:/docker-entrypoint-initdb.d/24-trigger-same-memory-parent.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -79,12 +80,29 @@ services:
       retries: 10
     restart: unless-stopped
 
+  postgres-upgrade:
+    image: pgvector/pgvector:pg17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.staging}
+    volumes:
+      - ./db/migrations_v3_5_trigger_same_memory_parent.sql:/migrations/24-trigger-same-memory-parent.sql:ro
+    command: >
+      sh -c "psql -h postgres -U mnemos_user -d mnemos
+      -v ON_ERROR_STOP=1
+      -f /migrations/24-trigger-same-memory-parent.sql"
+    restart: "no"
+
   mnemos:
     build:
       context: .
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-upgrade:
+        condition: service_completed_successfully
     environment:
       # Postgres
       PG_USER: mnemos_user
