@@ -260,6 +260,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_5_webhook_superseded_marker.sql",
         repo_path / "db" / "migrations_v3_5_webhook_attempt_unique.sql",
         repo_path / "db" / "migrations_v3_5_webhook_succeeded_unique.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_succeeded_terminal_trigger.sql",
     ]
 
     print("[db] Running migrations...")

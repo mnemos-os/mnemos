@@ -47,7 +47,7 @@ row locks to persisted attempt leases. Apply this gate when upgrading an
 existing deployment:
 
 1. Stop or drain all MNEMOS processes that can write webhook delivery attempts.
-2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, `db/migrations_v3_5_webhook_attempt_unique.sql`, and `db/migrations_v3_5_webhook_succeeded_unique.sql`.
+2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, `db/migrations_v3_5_webhook_attempt_unique.sql`, `db/migrations_v3_5_webhook_succeeded_unique.sql`, and `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`.
 3. Restart MNEMOS workers on the new build.
 
 Draining those writers remains the operationally clean upgrade path, but the
@@ -74,6 +74,12 @@ advance the grace clock even though that code knows nothing about the column.
 The migration backfill gives live lease-less legacy rows a fresh
 `clock_timestamp()` value, so the grace window starts from the migration run
 instead of from an old `scheduled_at`.
+`db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` adds a database
+trigger that fires before any `webhook_deliveries` UPDATE attempting to move a
+row away from `status='succeeded'`. During mixed-version overlap, old id-only
+writers that try to revert an ACK to `pending` or `retrying` fail with
+SQLSTATE `23514` (`check_violation`) at the trigger boundary; audit-only
+updates such as response-body capture or lease cleanup still succeed.
 The startup/periodic repair worker is idempotent and terminalizes any
 lease-free `pending` or `retrying` row with a newer successor, including
 old-worker status overwrites of rows already marked `superseded=TRUE`. It skips
@@ -233,12 +239,12 @@ existing `postgres_data` volume starts with newer migration files mounted.
 For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
 then applies the v3.5 upgrade migrations through
-`db/migrations_v3_5_webhook_succeeded_unique.sql` before the MNEMOS service
+`db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` before the MNEMOS service
 starts.
 
 Fresh volumes still receive these migrations from the initdb mounts, ending at
-`/docker-entrypoint-initdb.d/32-webhook-succeeded-unique.sql`. Existing volumes
-receive the same SQL through `/migrations/32-webhook-succeeded-unique.sql` in
+`/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql`. Existing volumes
+receive the same SQL through `/migrations/33-webhook-succeeded-terminal-trigger.sql` in
 the one-shot service. Keep the compose mounts and `installer/db.py` /
 `install.py` migration order in sync.
 

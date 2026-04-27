@@ -31,6 +31,8 @@ class _FakeWebhookStore:
         self.claim_update_stall = None
         self.enforce_succeeded_unique = False
         self.unique_violation_cls: type[Exception] = RuntimeError
+        self.enforce_succeeded_terminal = False
+        self.check_violation_cls: type[Exception] = RuntimeError
         self.succeeded_update_attempts = 0
         self.savepoint_commands: list[str] = []
         self.bulk_successor_fetches = 0
@@ -697,6 +699,15 @@ class _FakeWebhookConn:
         *,
         changed_at: datetime | None = None,
     ) -> None:
+        if (
+            self.store.enforce_succeeded_terminal
+            and row.get("status") == "succeeded"
+            and status != "succeeded"
+        ):
+            raise self.store.check_violation_cls(
+                "webhook_deliveries: cannot transition status away from "
+                f"succeeded (id={row['id']}, attempted new status={status})"
+            )
         self._record_row_change(row)
         if row.get("status") != status:
             row["status_updated_at"] = changed_at or datetime.now(timezone.utc)
@@ -3556,3 +3567,124 @@ def test_webhook_succeeded_unique_migration_deduplicates_existing_succeeded_rows
         pass
     else:
         raise AssertionError("succeeded-chain unique index did not reject duplicate success")
+
+
+def test_succeeded_terminal_trigger_migration_blocks_status_revert():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "CREATE OR REPLACE FUNCTION webhook_deliveries_enforce_succeeded_terminal()" in compact
+    assert "OLD.status = 'succeeded'" in compact
+    assert "NEW.status IS DISTINCT FROM 'succeeded'" in compact
+    assert "cannot transition status away from succeeded" in sql
+    assert "USING ERRCODE = 'check_violation'" in compact
+    assert "RETURN NEW" in compact
+    assert "CREATE TRIGGER webhook_deliveries_succeeded_terminal" in compact
+    assert "BEFORE UPDATE ON webhook_deliveries" in compact
+    assert "EXECUTE FUNCTION webhook_deliveries_enforce_succeeded_terminal()" in compact
+
+
+def test_stale_writer_cannot_revert_succeeded():
+    class _FakeCheckViolationError(Exception):
+        pass
+
+    async def run():
+        row = _attempt()
+        row["status"] = "succeeded"
+        store = _FakeWebhookStore([row])
+        store.enforce_succeeded_terminal = True
+        store.check_violation_cls = _FakeCheckViolationError
+        conn = _FakeWebhookConn(store)
+
+        try:
+            await conn.execute(
+                "UPDATE webhook_deliveries SET status='retrying' WHERE id=$1::uuid",
+                row["id"],
+            )
+        except _FakeCheckViolationError as exc:
+            assert "cannot transition status away from succeeded" in str(exc)
+        else:
+            raise AssertionError("succeeded terminal trigger did not reject stale writer")
+
+        assert row["status"] == "succeeded"
+
+    asyncio.run(run())
+
+
+def test_succeeded_terminal_trigger_allows_response_body_audit_update():
+    async def run():
+        row = _attempt()
+        row["status"] = "succeeded"
+        store = _FakeWebhookStore([row])
+        store.enforce_succeeded_terminal = True
+        conn = _FakeWebhookConn(store)
+
+        result = await conn.execute(
+            "UPDATE webhook_deliveries SET response_body=$2 WHERE id=$1::uuid",
+            row["id"],
+            "late audit body",
+        )
+
+        assert result == "UPDATE 1"
+        assert row["status"] == "succeeded"
+        assert row["response_body"] == "late audit body"
+
+    asyncio.run(run())
+
+
+def test_succeeded_terminal_trigger_allows_lease_clear_update():
+    async def run():
+        row = _attempt()
+        row["status"] = "succeeded"
+        row["lease_token"] = "00000000-0000-0000-0000-000000000099"
+        row["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=30)
+        store = _FakeWebhookStore([row])
+        store.enforce_succeeded_terminal = True
+        conn = _FakeWebhookConn(store)
+
+        result = await conn.fetchrow(
+            "UPDATE webhook_deliveries SET lease_token=NULL, lease_expires_at=NULL "
+            "WHERE id=$1::uuid AND lease_token=$2::uuid RETURNING id",
+            row["id"],
+            "00000000-0000-0000-0000-000000000099",
+        )
+
+        assert result == {
+            "id": row["id"],
+            "status": "succeeded",
+            "superseded": False,
+        }
+        assert row["status"] == "succeeded"
+        assert row["lease_token"] is None
+        assert row["lease_expires_at"] is None
+
+    asyncio.run(run())
+
+
+def test_webhook_succeeded_terminal_trigger_migration_list_sync():
+    repo_root = Path(__file__).resolve().parents[1]
+    migration_name = "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"
+
+    for relative in (
+        "install.py",
+        "installer/db.py",
+        "docker-compose.yml",
+        "docker-compose.staging.yml",
+    ):
+        text = (repo_root / relative).read_text()
+        assert migration_name in text, relative
+
+    for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
+        text = (repo_root / compose_name).read_text()
+        assert (
+            "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
+            "/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql"
+        ) in text, compose_name
+        assert (
+            "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
+            "/migrations/33-webhook-succeeded-terminal-trigger.sql:ro"
+        ) in text, compose_name
+        assert "-f /migrations/33-webhook-succeeded-terminal-trigger.sql" in text, compose_name

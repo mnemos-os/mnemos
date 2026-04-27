@@ -48,6 +48,7 @@ EXPECTED_MIGRATIONS = [
     "migrations_v3_5_webhook_superseded_marker.sql",
     "migrations_v3_5_webhook_attempt_unique.sql",
     "migrations_v3_5_webhook_succeeded_unique.sql",
+    "migrations_v3_5_webhook_succeeded_terminal_trigger.sql",
 ]
 
 
@@ -222,6 +223,10 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/32-webhook-succeeded-unique.sql"
         ) in text, compose_name
         assert (
+            "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
+            "/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql"
+        ) in text, compose_name
+        assert (
             "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
             "/migrations/24-trigger-same-memory-parent.sql:ro"
         ) in text, compose_name
@@ -257,6 +262,10 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "./db/migrations_v3_5_webhook_succeeded_unique.sql:"
             "/migrations/32-webhook-succeeded-unique.sql:ro"
         ) in text, compose_name
+        assert (
+            "./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:"
+            "/migrations/33-webhook-succeeded-terminal-trigger.sql:ro"
+        ) in text, compose_name
         assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
         assert "-v ON_ERROR_STOP=1" in text, compose_name
         assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
@@ -268,6 +277,7 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
         assert "-f /migrations/30-webhook-superseded-marker.sql" in text, compose_name
         assert "-f /migrations/31-webhook-attempt-unique.sql" in text, compose_name
         assert "-f /migrations/32-webhook-succeeded-unique.sql" in text, compose_name
+        assert "-f /migrations/33-webhook-succeeded-terminal-trigger.sql" in text, compose_name
         assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
 
 

@@ -190,6 +190,12 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   attempt retryable. The rare tradeoff is a bounded duplicate POST after
   lease expiry, logged for observability, instead of a committed succeeded
   predecessor with live successors that old v3.5-dev workers could replay.
+  Round 24 adds
+  `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`, making
+  `status='succeeded'` terminal at the database layer. Old id-only writers
+  that attempt to move an ACKed row back to `pending` or `retrying` now fail
+  with a trigger-raised `check_violation`, while response-body audit updates
+  and lease clearing remain permitted.
 
 ### Conflicts and operator handling
 
