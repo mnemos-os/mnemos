@@ -136,16 +136,12 @@ def test_search_large_results_do_not_probe_legacy_backend(monkeypatch):
     monkeypatch.setattr(lc, "_rls_enabled", False)
     monkeypatch.setattr(memories, "_bump_recall_counters", _noop_recall_bump)
 
-    legacy_probe = MagicMock(side_effect=AssertionError("legacy backend probe called"))
-    monkeypatch.setattr(lc, "get_inference_backend", legacy_probe, raising=False)
-
     req = MemorySearchRequest(query="needle", limit=1)
     resp = asyncio.run(memories.search_memories(req, user=_alice()))
 
     assert resp.count == 1
     assert resp.compression_applied is False
     assert resp.compression_metadata is None
-    legacy_probe.assert_not_called()
 
 
 # ─── rehydrate ──────────────────────────────────────────────────────────────

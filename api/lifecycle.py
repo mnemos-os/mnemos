@@ -246,7 +246,7 @@ async def _run_distillation_worker():
 
 @asynccontextmanager
 async def lifespan(app):
-    """FastAPI lifespan: initialize and teardown DB pool, Redis, inference provider, and workers."""
+    """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
     global _pool, _cache, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
@@ -385,7 +385,6 @@ async def lifespan(app):
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
-    await backend.close()
     logger.info("Shutting down MNEMOS API Server")
 
 

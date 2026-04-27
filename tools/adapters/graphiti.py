@@ -914,11 +914,11 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("ERROR: --post requires --api-key", file=sys.stderr)
         return 2
 
-    backend = _open_backend(args)
+    source = _open_backend(args)
     try:
         t0 = time.time()
         envelope = build_envelope(
-            backend,
+            source,
             source_instance=args.source_instance,
             group_id=args.group_id,
             tenancy_axis=args.tenancy_axis,
@@ -926,7 +926,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
         elapsed = time.time() - t0
     finally:
-        backend.close()
+        source.close()
 
     print(
         f"read {envelope['record_count']} records + "
