@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import uuid as _uuid
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
@@ -364,7 +364,7 @@ async def federation_status(_: UserContext = Depends(require_root)):
 async def federation_feed(
     request: Request,
     _: UserContext = Depends(_require_federation_role),
-    since: Optional[str] = Query(None, description="ISO 8601 timestamp"),
+    since: Optional[str] = Query(None, description="Opaque federation cursor"),
     namespace: Optional[str] = Query(None, description="Comma-separated namespace filter"),
     category: Optional[str] = Query(None, description="Comma-separated category filter"),
     limit: int = Query(100, ge=1, le=500),
@@ -374,19 +374,18 @@ async def federation_feed(
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     since_ts: Optional[datetime] = None
+    since_cursor_updated: Optional[datetime] = None
+    since_id: Optional[str] = None
+    since_is_legacy = False
     if since:
         try:
-            _parsed = datetime.fromisoformat(since.replace("Z", "+00:00"))
+            cursor = _fed._decode_feed_cursor(since)
         except ValueError:
-            raise HTTPException(status_code=422, detail="since must be ISO 8601")
-        # Memories are stored as `timestamp without time zone` in UTC by
-        # convention. If the input carried an offset, convert to UTC first
-        # so the wall-clock matches what's stored; if it was naive, assume
-        # the caller already meant UTC. Either way, strip tzinfo so asyncpg
-        # can bind it against the naive column.
-        if _parsed.tzinfo is not None:
-            _parsed = _parsed.astimezone(timezone.utc)
-        since_ts = _parsed.replace(tzinfo=None)
+            raise HTTPException(status_code=422, detail="since must be a federation cursor")
+        since_cursor_updated = cursor.updated
+        since_ts = _fed._cursor_timestamp_for_db(cursor.updated)
+        since_id = cursor.memory_id
+        since_is_legacy = cursor.is_legacy
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
@@ -403,19 +402,28 @@ async def federation_feed(
     # `federation_source IS NULL` prevents loops (don't re-export memories
     # we ourselves pulled from another peer).
     query_parts = [
-        "federation_source IS NULL",
-        "(permission_mode % 10) >= 4",
+        "m.federation_source IS NULL",
+        "(m.permission_mode % 10) >= 4",
     ]
     args: list = []
     if since_ts is not None:
         args.append(since_ts)
-        query_parts.append(f"updated > ${len(args)}")
+        since_updated_arg = len(args)
+        if since_is_legacy:
+            query_parts.append(f"m.updated >= ${since_updated_arg}")
+        else:
+            args.append(since_id)
+            since_id_arg = len(args)
+            query_parts.append(
+                f"(m.updated > ${since_updated_arg} "
+                f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+            )
     if namespaces:
         args.append(namespaces)
-        query_parts.append(f"namespace = ANY(${len(args)})")
+        query_parts.append(f"m.namespace = ANY(${len(args)})")
     if categories:
         args.append(categories)
-        query_parts.append(f"category = ANY(${len(args)})")
+        query_parts.append(f"m.category = ANY(${len(args)})")
 
     args.append(limit + 1)   # request one extra to detect has_more
     where_clause = " AND ".join(query_parts)
@@ -427,9 +435,9 @@ async def federation_feed(
                    verbatim_content, owner_id, namespace, permission_mode,
                    source_model, source_provider, source_session, source_agent,
                    created, updated
-            FROM memories
+            FROM memories m
             WHERE {where_clause}
-            ORDER BY updated
+            ORDER BY m.updated ASC, m.id ASC
             LIMIT ${len(args)}
             """,
             *args,
@@ -459,7 +467,12 @@ async def federation_feed(
         )
         for r in rows
     ]
-    next_cursor = (rows[-1]["updated"].isoformat() + "Z") if rows and rows[-1]["updated"] else None
+    if rows and rows[-1]["updated"]:
+        next_cursor = _fed._encode_feed_cursor(rows[-1]["updated"], rows[-1]["id"])
+    elif since_is_legacy and since_cursor_updated is not None:
+        next_cursor = _fed._encode_feed_cursor(since_cursor_updated, "")
+    else:
+        next_cursor = since
 
     return FederationFeedResponse(
         memories=memories,
