@@ -253,6 +253,14 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_4_federation_compat.sql",
         repo_path / "db" / "migrations_v3_5_trigger_same_memory_parent.sql",
         repo_path / "db" / "migrations_v3_5_rls_group_select_unix_bits.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_retry_terminal_state.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_attempt_lease.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_writer_revision.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_status_updated_at.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_superseded_marker.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_attempt_unique.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_succeeded_unique.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_succeeded_terminal_trigger.sql",
     ]
 
     print("[db] Running migrations...")

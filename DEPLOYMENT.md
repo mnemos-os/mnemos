@@ -40,6 +40,85 @@ The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
 
 ---
 
+## v3.5 Webhook Retry Migration Gate
+
+The v3.5 webhook retry migrations change delivery ownership from in-transaction
+row locks to persisted attempt leases. Apply this gate when upgrading an
+existing deployment:
+
+1. Stop or drain all MNEMOS processes that can write webhook delivery attempts.
+2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, `db/migrations_v3_5_webhook_attempt_unique.sql`, `db/migrations_v3_5_webhook_succeeded_unique.sql`, and `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`.
+3. Restart MNEMOS workers on the new build.
+
+Draining those writers remains the operationally clean upgrade path, but the
+round-8 compatibility path also protects deployments that cannot fully drain.
+Superseded attempts use `status='abandoned'` plus `superseded=TRUE`, so old
+v3.5-dev workers that only skip `succeeded` and `abandoned` still skip the row.
+The live unique index on `(subscription_id, event_type, payload_hash,
+attempt_num)` structurally prevents duplicate successor rows if an old writer
+races after a new worker's no-successor check. The succeeded unique index on
+`(subscription_id, event_type, payload_hash) WHERE status='succeeded'`
+structurally enforces one terminal success per retry chain if workers race
+past the app-level chain-peer guard. New workers use per-attempt leases plus
+per-chain advisory locks, lifecycle starts a dedicated repair
+worker that runs repeated sweeps for the first minute independent of delivery
+send latency, and the `writer_revision` marker is the technically correct
+compatibility path: current code explicitly writes `NEW_CODE_WRITER_REVISION=1`,
+while legacy or unknown rows are `NULL` or `0`.
+`WEBHOOK_LEGACY_GRACE_SECONDS` remains the safety net for rollouts that skip
+the drain: lease-less legacy `pending` and `retrying` rows are not recoverable
+until `status_updated_at + WEBHOOK_LEGACY_GRACE_SECONDS` has elapsed. The
+`status_updated_at` column is maintained by a database trigger on every status
+change, so old-writer `UPDATE status='retrying'` statements automatically
+advance the grace clock even though that code knows nothing about the column.
+The migration backfill gives live lease-less legacy rows a fresh
+`clock_timestamp()` value, so the grace window starts from the migration run
+instead of from an old `scheduled_at`.
+`db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` adds a database
+trigger that fires before any `webhook_deliveries` UPDATE attempting to move a
+row away from `status='succeeded'`. During mixed-version overlap, old id-only
+writers that try to revert an ACK to `pending` or `retrying` fail with
+SQLSTATE `23514` (`check_violation`) at the trigger boundary; audit-only
+updates such as response-body capture or lease cleanup still succeed.
+The startup/periodic repair worker is idempotent and terminalizes any
+lease-free `pending` or `retrying` row with a newer successor, including
+old-worker status overwrites of rows already marked `superseded=TRUE`. It skips
+rows with an unexpired `lease_token` / `lease_expires_at` pair so an in-flight
+new worker can finalize without losing ownership.
+New-code rows with `writer_revision=1` are recoverable immediately. The default
+grace is 300 seconds. Tune it to cover the maximum expected old-writer rollout
+overlap; after the grace expires, the new recovery worker treats any
+still-running old writer in that gap as crashed.
+
+`WEBHOOK_LEASE_SECONDS` is the authoritative webhook delivery ownership knob.
+Claims write and return `lease_expires_at` / `claim_db_now` from PostgreSQL
+`clock_timestamp()`, not transaction-snapshot `NOW()`, so time spent waiting
+on the per-chain advisory lock cannot backdate the lease. The sender captures
+an app-side monotonic anchor immediately before issuing the claim UPDATE, then
+subtracts elapsed time since that pre-claim anchor plus
+`WEBHOOK_FINALIZE_BUFFER_SECONDS` before starting DNS validation or HTTP POST.
+If less than the minimum send window remains, the worker records a retryable
+failure instead of posting with a stale lease. Startup still validates that the
+configured lease is larger than the finalize buffer. Keep `WEBHOOK_HTTP_TIMEOUT`
+at or below the lease-derived send budget if you tune it; `httpx` phase timeouts
+are not a replacement for the lease-anchored wall-clock deadline. Outbound
+webhook requests send `Accept-Encoding: identity`, response bodies are read
+with raw-byte streaming, and any non-identity `Content-Encoding` is not
+decompressed; only a small bounded raw preview is retained for audit. Delivery
+acknowledgement is based on the HTTP status code once response headers arrive:
+2xx is finalized as success even if the body is slow, truncated, or unavailable.
+Body capture failures are recorded as audit markers and do not create retries.
+
+`WEBHOOK_SHUTDOWN_DRAIN_SECONDS` controls graceful webhook shutdown. Lifespan
+teardown cancels perpetual worker loops first, which stops new recovery
+scheduling, then waits for in-flight webhook delivery attempts to finish
+finalization without cancellation. The default matches the effective
+`WEBHOOK_LEASE_SECONDS` value so a normal lease window can drain. If the drain
+timeout expires, shutdown logs the replay risk and cancels remaining delivery
+attempts as a last resort.
+
+---
+
 ## Configuration
 
 ### Minimal Configuration (.env)
@@ -159,14 +238,15 @@ when the data directory is first initialized. They do not re-run when an
 existing `postgres_data` volume starts with newer migration files mounted.
 For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
-then applies `db/migrations_v3_5_trigger_same_memory_parent.sql` before
-the MNEMOS service starts.
+then applies the v3.5 upgrade migrations through
+`db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` before the MNEMOS service
+starts.
 
-Fresh volumes still receive the migration from the initdb mount:
-`/docker-entrypoint-initdb.d/24-trigger-same-memory-parent.sql`.
-Existing volumes receive the same SQL through
-`/migrations/24-trigger-same-memory-parent.sql` in the one-shot service. Keep the compose mount
-and `installer/db.py` / `install.py` migration order in sync.
+Fresh volumes still receive these migrations from the initdb mounts, ending at
+`/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql`. Existing volumes
+receive the same SQL through `/migrations/33-webhook-succeeded-terminal-trigger.sql` in
+the one-shot service. Keep the compose mounts and `installer/db.py` /
+`install.py` migration order in sync.
 
 ---
 

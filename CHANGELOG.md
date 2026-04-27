@@ -76,6 +76,127 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 - **Project URLs moved.** `pyproject.toml` metadata points at
   `mnemos-os/mnemos`.
 
+### Fixed
+
+- **Webhook retry replay state machine** — `api/webhook_dispatcher.py:121-146`
+  now recovers due `pending` rows plus `retrying` rows only when no
+  successor attempt exists. Superseded attempts use old-worker-compatible
+  `status='abandoned'` plus `superseded=TRUE`, while final failures keep
+  `superseded=FALSE`; `db/migrations_v3_5_webhook_superseded_marker.sql`
+  adds the audit marker and converts rows from the pre-round-8 branch-only
+  terminal state. `db/migrations_v3_5_webhook_attempt_unique.sql` adds a
+  live partial unique index on `(subscription_id, event_type, payload_hash,
+  attempt_num)`, and successor inserts now use `ON CONFLICT DO NOTHING
+  RETURNING` after an in-transaction successor recheck.
+  `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs existing
+  superseded `retrying` rows with `abandoned` so old workers skip them.
+  Round 3 replaces the long-held `FOR UPDATE SKIP LOCKED` send lock with
+  `lease_token` / `lease_expires_at` persisted claims in
+  `db/migrations_v3_5_webhook_attempt_lease.sql`, so DNS validation and
+  outbound HTTP no longer hold shared DB connections. It also caps active
+  sends per process, gates new-code recovery claims and successor inserts
+  with a per-chain advisory lock, and runs a startup repair burst before
+  backing off to periodic repair sweeps. Operators must drain webhook
+  writers before applying the v3.5 webhook retry migrations during rolling
+  upgrades. Round 4 derives one wall-clock send deadline from
+  `WEBHOOK_LEASE_SECONDS`, reserves a finalize buffer, wraps DNS validation,
+  the HTTP POST, and the response-body read in that deadline, and streams
+  response bodies into a fixed audit cap so a slow receiver cannot outlive
+  the lease or hold a semaphore slot indefinitely. Round 5 adds
+  `WEBHOOK_LEGACY_GRACE_SECONDS` so lease-less legacy `retrying` rows are
+  not recoverable during old-writer successor-insert gaps, anchors each send
+  timeout to the DB-returned claim timestamps instead of a fresh static
+  budget, and sends `Accept-Encoding: identity` on webhook POSTs as the first
+  response-compression defense. Round 6 switches
+  webhook lease/expiry SQL from transaction-snapshot `NOW()` to
+  `clock_timestamp()`, reads audited response bodies through `aiter_raw()` and
+  rejects non-identity response encodings before decompression, and adds
+  `db/migrations_v3_5_webhook_writer_revision.sql` so lease-less legacy or
+  unknown `pending` and `retrying` rows wait for legacy grace while current
+  writer rows remain immediately recoverable. Round 7 adds
+  `db/migrations_v3_5_webhook_status_updated_at.sql`, a trigger-maintained
+  status-transition timestamp, and anchors legacy grace to it so old-writer
+  `retrying` transitions cannot bypass grace with an old `scheduled_at`.
+  Round 8 makes the status backfill conservative for live lease-less legacy
+  rows by starting their grace clock at migration time. Round 9 relaxes the
+  idempotent repair sweep so old-worker `pending`/`retrying` overwrites of an
+  already superseded attempt are terminalized again whenever a newer successor
+  exists. Round 10 splits retry repair and delivery recovery into independent
+  lifespan tasks so slow webhook POSTs cannot starve the repair cadence, and
+  makes the repair predicate skip rows with an unexpired lease so active
+  new-worker sends do not lose ownership. Round 11 moves the app-side send
+  deadline anchor inside `_claim_delivery` immediately before the lease UPDATE,
+  makes lease-valid success finalization cancel free live successors under the
+  chain advisory lock, and drains in-flight webhook delivery attempts during
+  graceful shutdown before any last-resort cancellation. Round 12 schedules
+  recovered rows into the lifecycle-tracked delivery-attempt registry instead
+  of awaiting sends inside the recovery worker, adds succeeded-predecessor
+  guards to claim, failure-finalize, and repair paths so active successors
+  converge after canonical success, and treats response headers as the delivery
+  acknowledgement while response-body capture becomes best-effort audit data.
+  Round 13 extends the succeeded-predecessor guard into success finalization,
+  so an active successor that also receives 2xx is abandoned/superseded with
+  its response audit metadata instead of creating a second succeeded row.
+  Round 14 broadens the convergence guard from earlier predecessors to any
+  succeeded chain peer across claim, success-finalize, and failure-finalize
+  paths, and adds `db/migrations_v3_5_webhook_succeeded_unique.sql` with a
+  partial unique index that structurally enforces one terminal succeeded row
+  per retry chain after deduplicating legacy duplicate successes. Round 15
+  excludes the current delivery id from succeeded-chain peer checks, requires
+  active peer-abandon updates to still target live non-superseded attempts, and
+  isolates ordinary stream/client cleanup exceptions after response headers so
+  captured acknowledgements still finalize while `CancelledError` propagates.
+  Round 16 makes revocation, final-failure, and retry-failure terminal UPDATEs
+  require the leased row to still be live (`pending`/`retrying` and not
+  superseded), so failure finalization cannot overwrite same-row legacy
+  succeeded or abandoned terminal writes during rolling upgrades. Round 17
+  applies the same live-row guard to the success finalize UPDATE, clearing only
+  stale lease columns when a same-row legacy terminal write has already won, and
+  moves recovery to claim due rows with a lease in the dequeue CTE before
+  scheduling send tasks so repeated recovery polls do not enqueue duplicates
+  behind the send semaphore. Round 18 sizes each recovery claim batch to the
+  send semaphore's current free slots, treats `lease-expired-before-send` as a
+  non-consumptive lease release instead of a failed attempt, and makes
+  recovery-preclaimed sends take the retry-chain advisory lock for a final
+  live-lease and succeeded-peer recheck before any outbound POST. Round 19
+  makes external 2xx ACKs trump later lease expiry during success finalization:
+  matching token ownership plus a still-live row is enough to persist
+  `status='succeeded'`, while failure paths still require lease validity.
+  Post-header stream/client cleanup is also bounded so a stuck `__aexit__`
+  cannot delay finalization indefinitely. Round 20 moves status-code
+  finalization ahead of response-body capture and stream/client cleanup:
+  headers first persist `response_status` with `response_body=NULL`, then a
+  post-finalize audit update fills the body only if capture finishes within its
+  own timeout. Cleanup is also post-finalize best-effort. Round 21 splits the
+  successful 2xx terminal UPDATE into its own short committed transaction, then
+  reacquires the chain advisory lock for best-effort free-successor cleanup so
+  cleanup lock contention, exceptions, or shutdown cancellation cannot roll back
+  an already ACKed `status='succeeded'`. It also makes recovery-preclaimed sends
+  re-check for live successors, including active-leased successors, under the
+  pre-POST chain lock and abandon/supersede the older attempt before any
+  duplicate outbound delivery.
+  Round 22 keeps the ACK-protecting behavior for ordinary per-successor
+  cleanup failures while closing the mixed-version replay window in the common
+  case: the success UPDATE now finds and abandons free live successors in the
+  same chain-locked transaction, with each abandon isolated by an explicit
+  savepoint. A post-commit cleanup pass remains only as a fallback for
+  successors inserted after the in-transaction successor query but before the
+  success commit.
+  Round 23 makes that convergence fully atomic for rolling-upgrade safety:
+  per-successor savepoints and the post-commit fallback are removed, so a
+  2xx success row and all free successor `status='abandoned'` updates commit
+  or roll back together. Cleanup exceptions and `CancelledError` before commit
+  now roll back the ACK record and partial cleanup, leaving the lease-owned
+  attempt retryable. The rare tradeoff is a bounded duplicate POST after
+  lease expiry, logged for observability, instead of a committed succeeded
+  predecessor with live successors that old v3.5-dev workers could replay.
+  Round 24 adds
+  `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`, making
+  `status='succeeded'` terminal at the database layer. Old id-only writers
+  that attempt to move an ACKed row back to `pending` or `retrying` now fail
+  with a trigger-raised `check_violation`, while response-body audit updates
+  and lease clearing remain permitted.
+
 ### Conflicts and operator handling
 
 - Trigger-raised `MN001` maps to HTTP 409 with reconciliation guidance:
@@ -86,7 +207,6 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 
 ### Still open on the v3.5 backlog
 
-- #20 webhook retry state machine.
 - #21 federation per-peer ACL + stable cursor.
 - #22 audit endpoint scoping + lifespan teardown.
 - #23 entity namespace conflict-key migration.

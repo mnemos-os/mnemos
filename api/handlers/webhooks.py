@@ -393,6 +393,7 @@ async def list_deliveries(
         rows = await conn.fetch(
             """
             SELECT id, subscription_id, event_type, attempt_num, status,
+                   superseded,
                    response_status, response_body, error,
                    scheduled_at, delivered_at, created
             FROM webhook_deliveries
@@ -410,6 +411,7 @@ async def list_deliveries(
             event_type=r["event_type"],
             attempt_num=r["attempt_num"],
             status=r["status"],
+            superseded=r["superseded"],
             response_status=r["response_status"],
             response_body=r["response_body"],
             error=r["error"],

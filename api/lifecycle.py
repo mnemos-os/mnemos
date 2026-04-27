@@ -29,8 +29,25 @@ logger = logging.getLogger(__name__)
 COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
 COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
-# Background task registry — prevents dangling tasks at shutdown
+# Background task registries — keep finite webhook sends out of the cancel-first
+# worker pool so graceful shutdown can let them finalize their leases.
 _background_tasks: set = set()
+_worker_tasks: set = set()
+_delivery_attempt_tasks: set = set()
+_WORKER_SHUTDOWN_CANCEL_SECONDS = float(os.getenv("WORKER_SHUTDOWN_CANCEL_SECONDS", "10.0"))
+_FINAL_CANCEL_WAIT_SECONDS = 5.0
+
+
+def _default_webhook_shutdown_drain_seconds() -> float:
+    dns_timeout = float(os.getenv("WEBHOOK_DNS_TIMEOUT", "10.0"))
+    http_timeout = float(os.getenv("WEBHOOK_HTTP_TIMEOUT", "10.0"))
+    default_lease = max(90, int(dns_timeout + http_timeout + 30))
+    return float(os.getenv("WEBHOOK_LEASE_SECONDS", str(default_lease)))
+
+
+WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(
+    os.getenv("WEBHOOK_SHUTDOWN_DRAIN_SECONDS", str(_default_webhook_shutdown_drain_seconds()))
+)
 
 # Worker health tracking
 _worker_status: dict = {
@@ -39,17 +56,99 @@ _worker_status: dict = {
 }
 
 
-def _schedule_background(coro) -> None:
-    """Schedule a fire-and-forget coroutine with lifecycle tracking.
-
-    Unlike asyncio.create_task(), tasks created here are tracked in
-    _background_tasks so the lifespan teardown can await them before
-    closing the DB pool.
-    """
+def _schedule_tracked(coro, registry: set):
     import asyncio as _asyncio
     task = _asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
+    registry.add(task)
+    task.add_done_callback(registry.discard)
+    return task
+
+
+def _schedule_background(coro):
+    """Schedule a generic finite background task with lifecycle tracking."""
+    return _schedule_tracked(coro, _background_tasks)
+
+
+def _schedule_worker(coro):
+    """Schedule a perpetual worker loop that shutdown cancels in phase 1."""
+    return _schedule_tracked(coro, _worker_tasks)
+
+
+def _schedule_delivery_attempt(coro):
+    """Schedule a finite webhook send that graceful shutdown drains before cancel."""
+    return _schedule_tracked(coro, _delivery_attempt_tasks)
+
+
+async def _cancel_tracked_tasks(tasks: set, *, label: str, timeout: float) -> None:
+    if not tasks:
+        return
+
+    import asyncio as _asyncio
+
+    snapshot = list(tasks)
+    logger.info(f"Cancelling {len(snapshot)} {label} task(s)…")
+    for task in snapshot:
+        task.cancel()
+
+    done, pending = await _asyncio.wait(snapshot, timeout=timeout)
+    if done:
+        await _asyncio.gather(*done, return_exceptions=True)
+
+    if pending:
+        logger.warning(
+            "%d %s task(s) did not stop within %.1fs; continuing shutdown",
+            len(pending),
+            label,
+            timeout,
+        )
+        for task in pending:
+            task.cancel()
+        stopped, still_pending = await _asyncio.wait(pending, timeout=_FINAL_CANCEL_WAIT_SECONDS)
+        if stopped:
+            await _asyncio.gather(*stopped, return_exceptions=True)
+        if still_pending:
+            logger.error(
+                "%d %s task(s) ignored cancellation for another %.1fs",
+                len(still_pending),
+                label,
+                _FINAL_CANCEL_WAIT_SECONDS,
+            )
+
+
+async def _drain_delivery_attempt_tasks() -> None:
+    if not _delivery_attempt_tasks:
+        return
+
+    import asyncio as _asyncio
+
+    tasks = list(_delivery_attempt_tasks)
+    logger.info(
+        "Waiting up to %.1fs for %d webhook delivery attempt task(s) to finalize",
+        WEBHOOK_SHUTDOWN_DRAIN_SECONDS,
+        len(tasks),
+    )
+    done, pending = await _asyncio.wait(tasks, timeout=WEBHOOK_SHUTDOWN_DRAIN_SECONDS)
+    if done:
+        await _asyncio.gather(*done, return_exceptions=True)
+
+    if pending:
+        logger.error(
+            "Cancelling %d webhook delivery attempt task(s) after %.1fs drain; "
+            "these deliveries may replay on restart if the HTTP side effect already happened",
+            len(pending),
+            WEBHOOK_SHUTDOWN_DRAIN_SECONDS,
+        )
+        for task in pending:
+            task.cancel()
+        stopped, still_pending = await _asyncio.wait(pending, timeout=_FINAL_CANCEL_WAIT_SECONDS)
+        if stopped:
+            await _asyncio.gather(*stopped, return_exceptions=True)
+        if still_pending:
+            logger.error(
+                "%d webhook delivery attempt task(s) ignored last-resort cancellation for %.1fs",
+                len(still_pending),
+                _FINAL_CANCEL_WAIT_SECONDS,
+            )
 
 # DB config sourced from config.PG_CONFIG (env > config.toml > defaults)
 
@@ -272,24 +371,30 @@ async def lifespan(app):
     worker_enabled = config.get("worker", {}).get("enabled", True)
     if worker_enabled and _pool:
         logger.info("Launching background distillation worker")
-        _schedule_background(_run_distillation_worker())
+        _schedule_worker(_run_distillation_worker())
         import asyncio as _asyncio
         await _asyncio.sleep(0.5)  # Give worker time to initialize
     else:
         logger.info("Background distillation worker disabled")
         _worker_status["distillation_worker"] = "disabled"
 
-    # Webhook delivery recovery worker (v3.0.0 — picks up pending/retrying deliveries)
+    # Webhook retry repair + delivery recovery workers. Repair owns its own
+    # startup burst and periodic cadence, independent of slow webhook sends.
     if _pool:
+        from api.webhook_dispatcher import (  # noqa: WPS433
+            delivery_worker_loop as _webhook_delivery,
+            repair_worker_loop as _webhook_repair,
+        )
+        logger.info('Launching webhook retry repair worker')
+        _schedule_worker(_webhook_repair(_pool))
         logger.info('Launching webhook delivery recovery worker')
-        from api.webhook_dispatcher import recovery_worker_loop as _webhook_recovery
-        _schedule_background(_webhook_recovery(_pool))
+        _schedule_worker(_webhook_delivery(_pool))
 
     # Federation sync worker (v3.0.0 — pulls from remote peers on their intervals)
     if _pool:
         logger.info('Launching federation sync worker')
         from api.federation import federation_worker_loop as _federation_worker
-        _schedule_background(_federation_worker(_pool))
+        _schedule_worker(_federation_worker(_pool))
 
     # OAuth expired-session GC worker (v3.0.0)
     if _pool:
@@ -306,14 +411,21 @@ async def lifespan(app):
                     raise
                 except Exception:
                     logger.exception('oauth gc iteration failed')
-        _schedule_background(_oauth_gc_loop())
+        _schedule_worker(_oauth_gc_loop())
 
     yield
 
-    if _background_tasks:
-        logger.info(f"Draining {len(_background_tasks)} background task(s)…")
-        import asyncio as _asyncio
-        await _asyncio.gather(*list(_background_tasks), return_exceptions=True)
+    await _cancel_tracked_tasks(
+        _worker_tasks,
+        label="worker",
+        timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
+    )
+    await _drain_delivery_attempt_tasks()
+    await _cancel_tracked_tasks(
+        _background_tasks,
+        label="background",
+        timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
+    )
 
     if _pool:
         await _pool.close()

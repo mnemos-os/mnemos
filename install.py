@@ -168,6 +168,14 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_4_federation_compat.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_trigger_same_memory_parent.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_rls_group_select_unix_bits.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_retry_terminal_state.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_attempt_lease.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_writer_revision.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_status_updated_at.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_superseded_marker.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_attempt_unique.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_succeeded_unique.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"),
     ]
 
     print("=" * 60)
