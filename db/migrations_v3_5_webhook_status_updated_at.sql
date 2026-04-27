@@ -7,14 +7,32 @@
 -- time for the attempt, not the transition time into retrying. status_updated_at
 -- records the last status transition so the grace window starts at the event
 -- that can race with old-writer successor inserts.
+--
+-- Live legacy in-flight rows are backfilled to clock_timestamp() to give them
+-- the full legacy_grace from migration time. This conservatively waits for any
+-- old writer to finish or be drained.
 -- ---------------------------------------------------------------------------
 
 ALTER TABLE webhook_deliveries
     ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ;
 
-UPDATE webhook_deliveries
-SET status_updated_at = COALESCE(scheduled_at, NOW())
-WHERE status_updated_at IS NULL;
+WITH migration_clock AS (
+    SELECT clock_timestamp() AS migrated_at
+)
+UPDATE webhook_deliveries d
+SET status_updated_at = CASE
+    WHEN d.status IN ('pending', 'retrying')
+     AND d.writer_revision IS DISTINCT FROM 1
+     AND (
+        d.lease_token IS NULL
+        OR d.lease_expires_at IS NULL
+        OR d.lease_expires_at <= migration_clock.migrated_at
+     )
+        THEN migration_clock.migrated_at
+    ELSE COALESCE(d.scheduled_at, migration_clock.migrated_at)
+END
+FROM migration_clock
+WHERE d.status_updated_at IS NULL;
 
 ALTER TABLE webhook_deliveries
     ALTER COLUMN status_updated_at SET DEFAULT clock_timestamp(),

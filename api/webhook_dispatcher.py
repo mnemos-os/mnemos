@@ -10,8 +10,9 @@ Design notes
   before the HTTP call so crashes between queue and send can be replayed.
 - Initial attempt runs inline as a background task (asyncio.create_task via
   _schedule_background). On failure, a new delivery row is scheduled at the
-  next backoff interval; the failed attempt is marked `retry_scheduled` so it
-  remains available for audit without being replayed. Workers claim due rows
+  next backoff interval; the failed attempt is marked `abandoned` with
+  `superseded=TRUE` so old workers skip it while audit queries can distinguish
+  retry-chain advancement from final-attempt failure. Workers claim due rows
   by writing a short-lived lease, release the database connection, and only
   then perform DNS validation and the outbound POST. The lease is the
   authoritative delivery budget: DNS validation, HTTP send, and capped response
@@ -62,11 +63,9 @@ RECOVERY_POLL_INTERVAL = 30.0          # seconds between recovery-worker passes
 REPAIR_BURST_SECONDS = float(os.getenv("WEBHOOK_REPAIR_BURST_SECONDS", "60.0"))
 REPAIR_BURST_INTERVAL = float(os.getenv("WEBHOOK_REPAIR_BURST_INTERVAL", "5.0"))
 REPAIR_PERIODIC_INTERVAL = float(os.getenv("WEBHOOK_REPAIR_PERIODIC_INTERVAL", "300.0"))
-SUPERSEDED_RETRY_STATUS = "retry_scheduled"
 TERMINAL_DELIVERY_STATUSES = frozenset((
     "succeeded",
     "abandoned",
-    SUPERSEDED_RETRY_STATUS,
 ))
 LIVE_DELIVERY_STATUSES = frozenset(("pending", "retrying"))
 _send_semaphore: asyncio.Semaphore | None = None
@@ -103,10 +102,12 @@ TOTAL_SEND_DEADLINE_SECONDS = _derive_total_send_deadline_seconds(
 
 WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
     UPDATE webhook_deliveries d
-    SET status = 'retry_scheduled',
+    SET status = 'abandoned',
+        superseded = TRUE,
         lease_token = NULL,
         lease_expires_at = NULL
     WHERE d.status = 'retrying'
+      AND NOT d.superseded
       AND EXISTS (
         SELECT 1
         FROM webhook_deliveries newer
@@ -250,6 +251,8 @@ async def _recoverable_delivery_ids(
         SELECT d.id FROM webhook_deliveries d
         WHERE d.scheduled_at <= clock_timestamp()
           AND d.attempt_num <= $1
+          AND d.status NOT IN ('succeeded', 'abandoned')
+          AND NOT d.superseded
           AND d.status IN ('pending', 'retrying')
           AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
           AND (
@@ -356,12 +359,13 @@ async def _claim_delivery(
                 await conn.execute(
                     """
                     UPDATE webhook_deliveries
-                    SET status=$2,
+                    SET status='abandoned',
+                        superseded=TRUE,
                         lease_token=NULL,
                         lease_expires_at=NULL
-                    WHERE id=$1::uuid AND status='retrying'
+                    WHERE id=$1::uuid AND status='retrying' AND NOT superseded
                     """,
-                    delivery_id, SUPERSEDED_RETRY_STATUS,
+                    delivery_id,
                 )
                 return None
 
@@ -377,6 +381,7 @@ async def _claim_delivery(
                   AND d.id=$1::uuid
                   AND d.scheduled_at <= claim_clock.claim_now
                   AND d.attempt_num <= $4
+                  AND NOT d.superseded
                   AND d.status IN ('pending', 'retrying')
                   AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
                   AND (
@@ -588,6 +593,7 @@ async def _finalize_delivery(
                     """
                     UPDATE webhook_deliveries
                     SET status='abandoned',
+                        superseded=FALSE,
                         error='subscription revoked',
                         delivered_at=clock_timestamp(),
                         lease_token=NULL,
@@ -606,6 +612,7 @@ async def _finalize_delivery(
                     """
                     UPDATE webhook_deliveries
                     SET status='succeeded',
+                        superseded=FALSE,
                         response_status=$3,
                         response_body=$4,
                         error=NULL,
@@ -627,6 +634,7 @@ async def _finalize_delivery(
                     """
                     UPDATE webhook_deliveries
                     SET status='abandoned',
+                        superseded=FALSE,
                         response_status=$3,
                         response_body=$4,
                         error=$5,
@@ -644,13 +652,15 @@ async def _finalize_delivery(
 
             backoff = BACKOFF_SCHEDULE[delivery["attempt_num"] - 1]
             scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+            successor_exists = await _has_successor_attempt(conn, delivery)
             finalized = await conn.fetchrow(
                 """
                 UPDATE webhook_deliveries
-                SET status=$3,
-                    response_status=$4,
-                    response_body=$5,
-                    error=$6,
+                SET status='abandoned',
+                    superseded=TRUE,
+                    response_status=$3,
+                    response_body=$4,
+                    error=$5,
                     lease_token=NULL,
                     lease_expires_at=NULL
                 WHERE id=$1::uuid
@@ -660,7 +670,6 @@ async def _finalize_delivery(
                 """,
                 delivery_id,
                 lease_token,
-                SUPERSEDED_RETRY_STATUS,
                 result.response_status,
                 result.response_body,
                 result.error,
@@ -672,21 +681,8 @@ async def _finalize_delivery(
                 )
                 return False
 
-            await conn.execute(
-                """
-                INSERT INTO webhook_deliveries
-                  (subscription_id, event_type, payload, payload_hash,
-                   attempt_num, status, scheduled_at, writer_revision)
-                VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
-                """,
-                delivery["subscription_id"],
-                delivery["event_type"],
-                delivery["payload"],
-                delivery["payload_hash"],
-                next_attempt,
-                scheduled_at,
-                NEW_CODE_WRITER_REVISION,
-            )
+            if not successor_exists:
+                await _insert_successor_delivery(conn, delivery, next_attempt, scheduled_at)
             logger.info(
                 "webhook delivery %s attempt %d failed (status=%s error=%s), retry in %ds",
                 delivery_id, delivery["attempt_num"], result.response_status, result.error, backoff,
@@ -706,10 +702,39 @@ async def _load_delivery_for_claim(conn: asyncpg.Connection, delivery_id: str) -
         WHERE d.id = $1::uuid
           AND d.scheduled_at <= clock_timestamp()
           AND d.attempt_num <= $2
+          AND NOT d.superseded
           AND d.status IN ('pending', 'retrying')
           AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
         """,
         delivery_id, MAX_ATTEMPTS,
+    )
+
+
+async def _insert_successor_delivery(
+    conn: asyncpg.Connection,
+    delivery: asyncpg.Record,
+    next_attempt: int,
+    scheduled_at: datetime,
+) -> Optional[asyncpg.Record]:
+    """Insert the next live retry attempt if another writer has not already won."""
+    return await conn.fetchrow(
+        """
+        INSERT INTO webhook_deliveries
+          (subscription_id, event_type, payload, payload_hash,
+           attempt_num, status, scheduled_at, writer_revision)
+        VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+        ON CONFLICT (subscription_id, event_type, payload_hash, attempt_num)
+          WHERE status IN ('pending', 'retrying') AND NOT superseded
+        DO NOTHING
+        RETURNING id
+        """,
+        delivery["subscription_id"],
+        delivery["event_type"],
+        delivery["payload"],
+        delivery["payload_hash"],
+        next_attempt,
+        scheduled_at,
+        NEW_CODE_WRITER_REVISION,
     )
 
 

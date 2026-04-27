@@ -80,12 +80,16 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 
 - **Webhook retry replay state machine** — `api/webhook_dispatcher.py:121-146`
   now recovers due `pending` rows plus `retrying` rows only when no
-  successor attempt exists; `_attempt_delivery` treats
-  `retry_scheduled` as terminal (`api/webhook_dispatcher.py:198-231`)
-  and atomically inserts the successor before terminalizing the failed
-  attempt (`api/webhook_dispatcher.py:353-392`). The new migration
-  `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs
-  existing superseded `retrying` rows and keeps them out of replay.
+  successor attempt exists. Superseded attempts use old-worker-compatible
+  `status='abandoned'` plus `superseded=TRUE`, while final failures keep
+  `superseded=FALSE`; `db/migrations_v3_5_webhook_superseded_marker.sql`
+  adds the audit marker and converts rows from the pre-round-8 branch-only
+  terminal state. `db/migrations_v3_5_webhook_attempt_unique.sql` adds a
+  live partial unique index on `(subscription_id, event_type, payload_hash,
+  attempt_num)`, and successor inserts now use `ON CONFLICT DO NOTHING
+  RETURNING` after an in-transaction successor recheck.
+  `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs existing
+  superseded `retrying` rows with `abandoned` so old workers skip them.
   Round 3 replaces the long-held `FOR UPDATE SKIP LOCKED` send lock with
   `lease_token` / `lease_expires_at` persisted claims in
   `db/migrations_v3_5_webhook_attempt_lease.sql`, so DNS validation and
@@ -113,6 +117,8 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   `db/migrations_v3_5_webhook_status_updated_at.sql`, a trigger-maintained
   status-transition timestamp, and anchors legacy grace to it so old-writer
   `retrying` transitions cannot bypass grace with an old `scheduled_at`.
+  Round 8 makes the status backfill conservative for live lease-less legacy
+  rows by starting their grace clock at migration time.
 
 ### Conflicts and operator handling
 

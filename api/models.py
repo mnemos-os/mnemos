@@ -452,6 +452,7 @@ class WebhookDelivery(BaseModel):
     event_type: str
     attempt_num: int
     status: str
+    superseded: bool = False
     response_status: Optional[int] = None
     response_body: Optional[str] = None
     error: Optional[str] = None

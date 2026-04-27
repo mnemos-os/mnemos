@@ -7,12 +7,13 @@
 -- status='retrying', and the recovery worker selected due retrying rows, so a
 -- superseded attempt could replay forever alongside its successor.
 --
--- New runtime status:
---   retry_scheduled = terminal failed attempt; a later pending attempt exists.
+-- Superseded attempts use status='abandoned', which old v3.5-dev workers
+-- already treat as terminal. A later migration adds webhook_deliveries.superseded
+-- so audit queries can distinguish retry-chain advancement from final failure.
 -- ---------------------------------------------------------------------------
 
 COMMENT ON COLUMN webhook_deliveries.status IS
-    'pending | retrying | succeeded | retry_scheduled | abandoned';
+    'pending | retrying | succeeded | abandoned';
 
 -- One-time best-effort data repair: terminalize retrying rows that already
 -- have a newer attempt for the same subscription/event/payload chain. This
@@ -21,7 +22,7 @@ COMMENT ON COLUMN webhook_deliveries.status IS
 -- where an older process commits status='retrying' before inserting its
 -- successor row.
 UPDATE webhook_deliveries d
-SET status = 'retry_scheduled'
+SET status = 'abandoned'
 WHERE d.status = 'retrying'
   AND EXISTS (
     SELECT 1
@@ -32,9 +33,9 @@ WHERE d.status = 'retrying'
       AND newer.attempt_num > d.attempt_num
   );
 
--- Keep the recovery-worker index aligned with live statuses. retry_scheduled
--- is intentionally excluded; retrying stays indexed so crash recovery can
--- reclaim in-flight rows that do not yet have a successor.
+-- Keep the recovery-worker index aligned with live statuses. abandoned is
+-- intentionally excluded; retrying stays indexed so crash recovery can reclaim
+-- in-flight rows that do not yet have a successor.
 DROP INDEX IF EXISTS idx_webhook_deliveries_pending;
 CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_pending
     ON webhook_deliveries(scheduled_at)

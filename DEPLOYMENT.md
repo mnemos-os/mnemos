@@ -47,23 +47,29 @@ row locks to persisted attempt leases. Apply this gate when upgrading an
 existing deployment:
 
 1. Stop or drain all MNEMOS processes that can write webhook delivery attempts.
-2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, and `db/migrations_v3_5_webhook_status_updated_at.sql`.
+2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, and `db/migrations_v3_5_webhook_attempt_unique.sql`.
 3. Restart MNEMOS workers on the new build.
 
-Do not run this migration while old v3.5-dev webhook writers are still active.
-Older writers update a parent attempt and insert its successor in separate
-statements, which can interleave with new recovery workers. Draining those
-writers remains the operationally correct upgrade path. New workers use
-per-attempt leases plus per-chain advisory locks, startup runs repeated repair
-sweeps for the first minute, and the `writer_revision` marker is the
-technically correct compatibility path: current code explicitly writes
-`NEW_CODE_WRITER_REVISION=1`, while legacy or unknown rows are `NULL` or `0`.
+Draining those writers remains the operationally clean upgrade path, but the
+round-8 compatibility path also protects deployments that cannot fully drain.
+Superseded attempts use `status='abandoned'` plus `superseded=TRUE`, so old
+v3.5-dev workers that only skip `succeeded` and `abandoned` still skip the row.
+The live unique index on `(subscription_id, event_type, payload_hash,
+attempt_num)` structurally prevents duplicate successor rows if an old writer
+races after a new worker's no-successor check. New workers use per-attempt
+leases plus per-chain advisory locks, startup runs repeated repair sweeps for
+the first minute, and the `writer_revision` marker is the technically correct
+compatibility path: current code explicitly writes `NEW_CODE_WRITER_REVISION=1`,
+while legacy or unknown rows are `NULL` or `0`.
 `WEBHOOK_LEGACY_GRACE_SECONDS` remains the safety net for rollouts that skip
 the drain: lease-less legacy `pending` and `retrying` rows are not recoverable
 until `status_updated_at + WEBHOOK_LEGACY_GRACE_SECONDS` has elapsed. The
 `status_updated_at` column is maintained by a database trigger on every status
 change, so old-writer `UPDATE status='retrying'` statements automatically
 advance the grace clock even though that code knows nothing about the column.
+The migration backfill gives live lease-less legacy rows a fresh
+`clock_timestamp()` value, so the grace window starts from the migration run
+instead of from an old `scheduled_at`.
 New-code rows with `writer_revision=1` are recoverable immediately. The default
 grace is 300 seconds. Tune it to cover the maximum expected old-writer rollout
 overlap; after the grace expires, the new recovery worker treats any
@@ -206,12 +212,12 @@ existing `postgres_data` volume starts with newer migration files mounted.
 For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
 then applies the v3.5 upgrade migrations through
-`db/migrations_v3_5_webhook_status_updated_at.sql` before the MNEMOS service
+`db/migrations_v3_5_webhook_attempt_unique.sql` before the MNEMOS service
 starts.
 
 Fresh volumes still receive these migrations from the initdb mounts, ending at
-`/docker-entrypoint-initdb.d/29-webhook-status-updated-at.sql`. Existing volumes
-receive the same SQL through `/migrations/29-webhook-status-updated-at.sql` in
+`/docker-entrypoint-initdb.d/31-webhook-attempt-unique.sql`. Existing volumes
+receive the same SQL through `/migrations/31-webhook-attempt-unique.sql` in
 the one-shot service. Keep the compose mounts and `installer/db.py` /
 `install.py` migration order in sync.
 

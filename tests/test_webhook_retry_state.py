@@ -43,6 +43,23 @@ class _FakeWebhookStore:
             for other in self.rows
         )
 
+    def has_live_attempt_conflict(
+        self,
+        subscription_id: str,
+        event_type: str,
+        payload_hash: str,
+        attempt_num: int,
+    ) -> bool:
+        return any(
+            other["subscription_id"] == subscription_id
+            and other["event_type"] == event_type
+            and other["payload_hash"] == payload_hash
+            and other["attempt_num"] == attempt_num
+            and other["status"] in {"pending", "retrying"}
+            and not other.get("superseded", False)
+            for other in self.rows
+        )
+
     def release_locks(self, conn_id: int) -> None:
         self.locked_by = {
             row_id: owner
@@ -140,6 +157,8 @@ class _FakeWebhookConn:
         for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
             if row["scheduled_at"] > now or row["attempt_num"] > max_attempts:
                 continue
+            if row.get("superseded", False):
+                continue
             if not self._lease_available(row):
                 continue
             if row["status"] == "pending":
@@ -209,6 +228,7 @@ class _FakeWebhookConn:
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
             self._set_status(row, "abandoned")
+            row["superseded"] = "superseded=TRUE" in compact
             if "subscription revoked" in compact:
                 row["error"] = "subscription revoked"
             else:
@@ -218,6 +238,9 @@ class _FakeWebhookConn:
             row["delivered_at"] = datetime.now(timezone.utc)
             self._clear_lease(row)
             return {"id": row["id"]}
+
+        if compact.startswith("INSERT INTO webhook_deliveries"):
+            return self._insert_delivery(*args)
 
         if "SET status=$3" in compact:
             row = self._row(args[0])
@@ -262,14 +285,27 @@ class _FakeWebhookConn:
             self.advisory_keys.append(key)
             self.store.advisory_acquisitions += 1
             return "SELECT 1"
-        if compact.startswith("UPDATE webhook_deliveries d SET status = 'retry_scheduled'"):
+        if compact.startswith("UPDATE webhook_deliveries d SET status = 'abandoned'"):
             updated = 0
             for row in self.rows:
-                if row["status"] == "retrying" and self._has_successor(row):
-                    self._set_status(row, "retry_scheduled")
+                if (
+                    row["status"] == "retrying"
+                    and not row.get("superseded", False)
+                    and self._has_successor(row)
+                ):
+                    self._set_status(row, "abandoned")
+                    row["superseded"] = True
                     self._clear_lease(row)
                     updated += 1
             return f"UPDATE {updated}"
+        if compact.startswith("UPDATE webhook_deliveries SET status='abandoned', superseded=TRUE"):
+            row = self._row(args[0])
+            if row is None or row["status"] != "retrying" or row.get("superseded", False):
+                return "UPDATE 0"
+            self._set_status(row, "abandoned")
+            row["superseded"] = True
+            self._clear_lease(row)
+            return "UPDATE 1"
         if compact.startswith("UPDATE webhook_deliveries SET status=$2"):
             row = self._row(args[0])
             if row is None or row["status"] != "retrying":
@@ -284,25 +320,8 @@ class _FakeWebhookConn:
             self._set_status(row, "retrying")
             return "UPDATE 1"
         if compact.startswith("INSERT INTO webhook_deliveries"):
-            self.rows.append({
-                "id": str(uuid.uuid4()),
-                "subscription_id": args[0],
-                "event_type": args[1],
-                "payload": args[2],
-                "payload_hash": args[3],
-                "attempt_num": args[4],
-                "status": "pending",
-                "scheduled_at": args[5],
-                "status_updated_at": datetime.now(timezone.utc),
-                "response_status": None,
-                "response_body": None,
-                "error": None,
-                "delivered_at": None,
-                "lease_token": None,
-                "lease_expires_at": None,
-                "writer_revision": args[6] if len(args) > 6 else 1,
-            })
-            return "INSERT 0 1"
+            inserted = self._insert_delivery(*args)
+            return "INSERT 0 1" if inserted else "INSERT 0 0"
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
     def _row(self, row_id: str):
@@ -310,6 +329,31 @@ class _FakeWebhookConn:
 
     def _has_successor(self, row: dict[str, Any]) -> bool:
         return self.store.has_successor(row)
+
+    def _insert_delivery(self, *args):
+        if self.store.has_live_attempt_conflict(args[0], args[1], args[3], args[4]):
+            return None
+        row = {
+            "id": str(uuid.uuid4()),
+            "subscription_id": args[0],
+            "event_type": args[1],
+            "payload": args[2],
+            "payload_hash": args[3],
+            "attempt_num": args[4],
+            "status": "pending",
+            "superseded": False,
+            "scheduled_at": args[5],
+            "status_updated_at": datetime.now(timezone.utc),
+            "response_status": None,
+            "response_body": None,
+            "error": None,
+            "delivered_at": None,
+            "lease_token": None,
+            "lease_expires_at": None,
+            "writer_revision": args[6] if len(args) > 6 else 1,
+        }
+        self.rows.append(row)
+        return {"id": row["id"]}
 
     def _lease_available(self, row: dict[str, Any]) -> bool:
         expires_at = row.get("lease_expires_at")
@@ -344,6 +388,7 @@ class _FakeWebhookConn:
         return (
             row["scheduled_at"] <= datetime.now(timezone.utc)
             and row["attempt_num"] <= max_attempts
+            and not row.get("superseded", False)
             and row["status"] in {"pending", "retrying"}
             and self._lease_available(row)
         )
@@ -521,6 +566,7 @@ def _attempt(attempt_num: int = 1) -> dict[str, Any]:
         "payload_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "attempt_num": attempt_num,
         "status": "pending",
+        "superseded": False,
         "scheduled_at": scheduled_at,
         "status_updated_at": scheduled_at,
         "response_status": None,
@@ -572,8 +618,10 @@ def test_failed_attempt_terminalizes_and_only_successor_is_recoverable(monkeypat
         await dispatcher._attempt_delivery(first["id"])
         await dispatcher._attempt_delivery(second["id"])
 
-        assert first["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert first["status"] == "abandoned"
+        assert first["superseded"] is True
         assert second["status"] == "succeeded"
+        assert second["superseded"] is False
         assert http.delivery_ids == [first["id"], second["id"]]
 
     asyncio.run(run())
@@ -597,10 +645,11 @@ def test_retry_chain_terminalizes_all_prior_attempts(monkeypatch):
         recoverable = await dispatcher._recoverable_delivery_ids(conn)
         assert [row["id"] for row in recoverable] == [third["id"]]
         assert [row["status"] for row in conn.rows] == [
-            dispatcher.SUPERSEDED_RETRY_STATUS,
-            dispatcher.SUPERSEDED_RETRY_STATUS,
+            "abandoned",
+            "abandoned",
             "pending",
         ]
+        assert [row["superseded"] for row in conn.rows] == [True, True, False]
         assert http.delivery_ids == [first["id"], second["id"]]
 
     asyncio.run(run())
@@ -619,8 +668,10 @@ def test_successful_successor_does_not_replay_prior_failed_attempt(monkeypatch):
 
         recoverable = await dispatcher._recoverable_delivery_ids(conn)
         assert recoverable == []
-        assert first["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert first["status"] == "abandoned"
+        assert first["superseded"] is True
         assert second["status"] == "succeeded"
+        assert second["superseded"] is False
         assert http.delivery_ids == [first["id"], second["id"]]
 
     asyncio.run(run())
@@ -639,7 +690,81 @@ def test_final_attempt_failure_is_abandoned_without_successor(monkeypatch):
         assert recoverable == []
         assert len(conn.rows) == 1
         assert final["status"] == "abandoned"
+        assert final["superseded"] is False
         assert http.delivery_ids == [final["id"]]
+
+    asyncio.run(run())
+
+
+def test_old_worker_compat_skips_superseded_abandoned_attempt():
+    row = _attempt()
+    row["status"] = "abandoned"
+    row["superseded"] = True
+
+    def old_worker_would_post(delivery: dict[str, Any]) -> bool:
+        return delivery["status"] not in {"succeeded", "abandoned"}
+
+    assert not old_worker_would_post(row)
+
+
+def test_delivery_audit_exposes_superseded_marker_for_abandoned_rows():
+    repo_root = Path(__file__).resolve().parents[1]
+    handler_source = (repo_root / "api" / "handlers" / "webhooks.py").read_text()
+    model_source = (repo_root / "api" / "models.py").read_text()
+    compact_handler = " ".join(handler_source.split())
+
+    assert "superseded: bool = False" in model_source
+    assert "SELECT id, subscription_id, event_type, attempt_num, status, superseded," in compact_handler
+    assert "superseded=r[\"superseded\"]" in compact_handler
+
+
+def test_successor_insert_uses_live_chain_attempt_uniqueness(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+        delivery = conn._with_subscription(parent)
+        scheduled_at = datetime.now(timezone.utc)
+        next_attempt = parent["attempt_num"] + 1
+
+        first = await dispatcher._insert_successor_delivery(
+            conn, delivery, next_attempt, scheduled_at,
+        )
+        second = await dispatcher._insert_successor_delivery(
+            conn, delivery, next_attempt, scheduled_at,
+        )
+
+        live_successors = [
+            row for row in conn.rows
+            if row["subscription_id"] == parent["subscription_id"]
+            and row["event_type"] == parent["event_type"]
+            and row["payload_hash"] == parent["payload_hash"]
+            and row["attempt_num"] == next_attempt
+            and row["status"] in {"pending", "retrying"}
+            and not row["superseded"]
+        ]
+        assert first is not None
+        assert second is None
+        assert len(live_successors) == 1
+
+    asyncio.run(run())
+
+
+def test_migration_backfill_gives_live_legacy_rows_fresh_grace_clock(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["writer_revision"] = None
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(minutes=10)
+        migration_moment = datetime.now(timezone.utc)
+        parent["status_updated_at"] = migration_moment
+        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+
+        before_grace = await dispatcher._recoverable_delivery_ids(conn)
+        assert before_grace == []
+
+        parent["status_updated_at"] = migration_moment - timedelta(seconds=61)
+        after_grace = await dispatcher._recoverable_delivery_ids(conn)
+        assert [row["id"] for row in after_grace] == [parent["id"]]
 
     asyncio.run(run())
 
@@ -665,6 +790,8 @@ def test_recoverable_predicate_requires_legacy_grace_for_lease_less_old_writer_r
     assert "WEBHOOK_LEGACY_GRACE_SECONDS" in source
     assert "NEW_CODE_WRITER_REVISION = 1" in source
     assert "status_updated_at" in source
+    assert "AND d.status NOT IN ('succeeded', 'abandoned') AND NOT d.superseded" in compact
+    assert "AND NOT d.superseded AND d.status IN ('pending', 'retrying')" in compact
     assert (
         "d.lease_token IS NOT NULL "
         "OR d.writer_revision = $4 "
@@ -890,7 +1017,8 @@ def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore
         assert http.cancelled
         assert http.exited == 1
         assert not semaphore.locked()
-        assert row["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert row["status"] == "abandoned"
+        assert row["superseded"] is True
         assert row["error"].startswith("send-timeout:")
         assert len(conn.rows) == 2
         assert conn.rows[1]["status"] == "pending"
@@ -920,7 +1048,8 @@ def test_webhook_send_refuses_post_when_claim_window_elapsed_before_send(monkeyp
         assert finalized
         assert http.delivery_ids == []
         assert not semaphore.locked()
-        assert row["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert row["status"] == "abandoned"
+        assert row["superseded"] is True
         assert row["error"].startswith("lease-expired-before-send:")
         assert len(conn.rows) == 2
         assert conn.rows[1]["status"] == "pending"
@@ -1023,7 +1152,8 @@ def test_rolling_upgrade_interleaving_waits_for_chain_advisory_lock_before_no_su
 
         assert not sent
         assert http.delivery_ids == []
-        assert parent["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
         assert conn.store.advisory_acquisitions >= 2
 
     asyncio.run(run())
@@ -1051,7 +1181,8 @@ def test_startup_repair_sweep_closes_upgrade_race(monkeypatch):
         result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
 
         assert result == "UPDATE 1"
-        assert parent["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
 
     asyncio.run(run())
 
@@ -1067,7 +1198,7 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
     assert "REPAIR_BURST_SECONDS" in dispatcher_source
     assert "REPAIR_PERIODIC_INTERVAL" in dispatcher_source
     assert "_repair_superseded_retrying_deliveries_safely" in dispatcher_source
-    assert "UPDATE webhook_deliveries d SET status = 'retry_scheduled'" in compact_dispatcher
+    assert "UPDATE webhook_deliveries d SET status = 'abandoned', superseded = TRUE" in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
 
 
@@ -1122,8 +1253,8 @@ def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
     ).read_text()
     compact = " ".join(sql.split())
 
-    assert "retry_scheduled" in sql
-    assert "SET status = 'retry_scheduled'" in compact
+    assert "retry_scheduled" not in sql
+    assert "SET status = 'abandoned'" in compact
     assert "newer.subscription_id = d.subscription_id" in compact
     assert "newer.event_type = d.event_type" in compact
     assert "newer.payload_hash = d.payload_hash" in compact
@@ -1165,7 +1296,11 @@ def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
     compact = " ".join(sql.split())
 
     assert "ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ" in compact
-    assert "COALESCE(scheduled_at, NOW())" in compact
+    assert "Live legacy in-flight rows are backfilled to clock_timestamp()" in sql
+    assert "d.writer_revision IS DISTINCT FROM 1" in compact
+    assert "d.lease_token IS NULL OR d.lease_expires_at IS NULL" in compact
+    assert "THEN migration_clock.migrated_at" in compact
+    assert "ELSE COALESCE(d.scheduled_at, migration_clock.migrated_at)" in compact
     assert "ALTER COLUMN status_updated_at SET DEFAULT clock_timestamp()" in compact
     assert "ALTER COLUMN status_updated_at SET NOT NULL" in compact
     assert "CREATE OR REPLACE FUNCTION webhook_deliveries_set_status_updated_at()" in compact
@@ -1173,3 +1308,35 @@ def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
     assert "NEW.status_updated_at = clock_timestamp()" in compact
     assert "BEFORE UPDATE ON webhook_deliveries" in compact
     assert "EXECUTE FUNCTION webhook_deliveries_set_status_updated_at()" in compact
+
+
+def test_webhook_superseded_marker_migration_adds_old_compatible_audit_marker():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_superseded_marker.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "ADD COLUMN IF NOT EXISTS superseded BOOLEAN NOT NULL DEFAULT FALSE" in compact
+    assert "status='abandoned'" in sql
+    assert "superseded=TRUE" in sql
+    assert "SET status = 'abandoned', superseded = TRUE" in compact
+    assert "WHERE status = 'retry_scheduled'" in compact
+    assert "newer.attempt_num > d.attempt_num" in compact
+
+
+def test_webhook_attempt_unique_migration_adds_live_chain_attempt_invariant():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_attempt_unique.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "PARTITION BY subscription_id, event_type, payload_hash, attempt_num" in compact
+    assert "ORDER BY created DESC, id DESC" in compact
+    assert "SET status = 'abandoned', superseded = TRUE" in compact
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_live_chain_attempt" in compact
+    assert (
+        "ON webhook_deliveries(subscription_id, event_type, payload_hash, attempt_num) "
+        "WHERE status IN ('pending', 'retrying') AND NOT superseded"
+    ) in compact
