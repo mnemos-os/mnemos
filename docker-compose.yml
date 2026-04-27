@@ -44,6 +44,21 @@ services:
       timeout: 5s
       retries: 10
 
+  postgres-upgrade:
+    image: pgvector/pgvector:pg16
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:-mnemos_local}
+    volumes:
+      - ./db/migrations_v3_5_trigger_same_memory_parent.sql:/migrations/24-trigger-same-memory-parent.sql:ro
+    command: >
+      sh -c "psql -h postgres -U mnemos_user -d mnemos
+      -v ON_ERROR_STOP=1
+      -f /migrations/24-trigger-same-memory-parent.sql"
+    restart: "no"
+
   ollama:
     image: ollama/ollama:latest
     volumes:
@@ -59,6 +74,8 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-upgrade:
+        condition: service_completed_successfully
     environment:
       PG_USER: mnemos_user
       PG_PASSWORD: ${POSTGRES_PASSWORD:-mnemos_local}

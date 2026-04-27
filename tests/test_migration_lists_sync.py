@@ -140,22 +140,57 @@ def test_docker_compose_migration_lists_match_installer():
         )
 
 
-def test_staging_compose_runs_trigger_upgrade_for_existing_volumes():
+def test_compose_files_run_trigger_upgrade_for_existing_volumes():
     """The initdb mount only affects fresh Postgres volumes.
 
-    PROTEUS staging keeps a named postgres_data volume, so the v3.5
-    trigger patch also needs an explicit compose-time upgrade service
-    that runs against already-initialized databases.
+    Dev and PROTEUS staging keep named postgres_data volumes, so the
+    v3.5 trigger patch also needs an explicit compose-time upgrade
+    service that runs against already-initialized databases.
     """
     repo_root = Path(__file__).resolve().parents[1]
-    text = (repo_root / "docker-compose.staging.yml").read_text()
+    for compose_name in ("docker-compose.yml", "docker-compose.staging.yml"):
+        text = (repo_root / compose_name).read_text()
 
-    assert "postgres-upgrade:" in text
+        assert "postgres-upgrade:" in text, compose_name
+        assert (
+            "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
+            "/migrations/24-trigger-same-memory-parent.sql:ro"
+        ) in text, compose_name
+        assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
+        assert "-v ON_ERROR_STOP=1" in text, compose_name
+        assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
+        assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
+
+
+def _extract_trigger_delete_branch(sql: str) -> str:
+    try:
+        return sql.split("ELSIF TG_OP = 'DELETE' THEN", 1)[1].split(
+            "\n    IF TG_OP = 'DELETE' THEN",
+            1,
+        )[0]
+    except IndexError as exc:
+        raise AssertionError("could not isolate mnemos_version_snapshot DELETE branch") from exc
+
+
+def test_v3_5_trigger_delete_branch_advances_head_to_delete_snapshot():
+    """trg_memory_version_delete is live on this branch.
+
+    The DELETE branch must capture the inserted tombstone id and move
+    memory_branches.head_version_id to it, or /log and reconciliation
+    callers stay pinned to the pre-delete version.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (repo_root / "db" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
+    delete_branch = _extract_trigger_delete_branch(sql)
+    compact = " ".join(delete_branch.split())
+
+    assert "dead code" not in sql.lower()
+    assert "AND mv.memory_id = mb.memory_id" in compact
     assert (
-        "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
-        "/migrations/24-trigger-same-memory-parent.sql:ro"
-    ) in text
-    assert "psql -h postgres -U mnemos_user -d mnemos" in text
-    assert "-v ON_ERROR_STOP=1" in text
-    assert "-f /migrations/24-trigger-same-memory-parent.sql" in text
-    assert "postgres-upgrade:\n        condition: service_completed_successfully" in text
+        "_by, 'delete', _commit_hash, _branch, _parent_version ) "
+        "RETURNING id INTO _new_version_id"
+    ) in compact
+    assert (
+        "UPDATE memory_branches SET head_version_id = _new_version_id "
+        "WHERE memory_id = OLD.id AND name = _branch"
+    ) in compact

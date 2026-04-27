@@ -34,11 +34,10 @@
 -- + reconciliation message rather than silently writing a bad
 -- parent edge.
 --
--- The DELETE branch of the trigger is dead code as of v3.5
--- (slice 2 round 12 introduced a BEFORE DELETE trigger that
--- writes to memory_deletion_log instead), but we patch its
--- parent lookup too for defense-in-depth in case anyone
--- re-enables an AFTER DELETE trigger calling this function.
+-- The DELETE branch remains live for deployments that still have
+-- trg_memory_version_delete attached. Keep it consistent with UPDATE:
+-- scoped parent lookup, write a delete snapshot, and advance branch
+-- HEAD to that tombstone version.
 --
 -- Idempotent: CREATE OR REPLACE FUNCTION rebinds the existing
 -- trigger automatically since trigger definitions reference the
@@ -160,14 +159,9 @@ BEGIN
         END IF;
 
     ELSIF TG_OP = 'DELETE' THEN
-        -- DEAD CODE as of v3.5 slice 2 round 12: the BEFORE DELETE
-        -- trigger trg_memory_deletion_log calls mnemos_deletion_log()
-        -- to write a tombstone to memory_deletion_log instead. The
-        -- AFTER DELETE trigger that called this branch was dropped
-        -- in migrations_v3_5_deletion_log.sql. The branch is left
-        -- here for backward compat in case anyone re-attaches an
-        -- AFTER DELETE trigger to memories. Same scoped parent
-        -- resolution as UPDATE for defense-in-depth.
+        -- DELETE is live when trg_memory_version_delete is attached.
+        -- Write the tombstone snapshot and move branch HEAD to it,
+        -- using the same scoped parent resolution as UPDATE.
         SELECT COALESCE(MAX(version_num), 0) + 1
         INTO   _next_v
         FROM   memory_versions
@@ -208,7 +202,11 @@ BEGIN
             OLD.verbatim_content, OLD.owner_id, OLD.namespace, OLD.permission_mode,
             OLD.source_model, OLD.source_provider, OLD.source_session, OLD.source_agent,
             _by, 'delete', _commit_hash, _branch, _parent_version
-        );
+        ) RETURNING id INTO _new_version_id;
+
+        UPDATE memory_branches
+        SET head_version_id = _new_version_id
+        WHERE memory_id = OLD.id AND name = _branch;
     END IF;
 
     IF TG_OP = 'DELETE' THEN
