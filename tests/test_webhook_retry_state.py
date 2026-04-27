@@ -377,6 +377,14 @@ class _FakeWebhookConn:
     async def fetchval(self, sql: str, *args):
         compact = " ".join(sql.split())
         if compact.startswith("SELECT EXISTS"):
+            if "FROM webhook_deliveries WHERE id=$1::uuid" in compact:
+                row = self._row(args[0])
+                return (
+                    row is not None
+                    and self._owns_live_lease(row, args[1])
+                    and row["status"] in {"pending", "retrying"}
+                    and not row.get("superseded", False)
+                )
             probe = {
                 "subscription_id": args[0],
                 "event_type": args[1],
@@ -960,11 +968,13 @@ def test_recovery_dequeue_uses_skip_locked_claim():
     compact = " ".join(source.split())
 
     assert "async def _claim_recoverable_deliveries" in source
+    assert "def _semaphore_available" in source
     assert "WITH claim_clock AS" in compact
     assert "FOR UPDATE SKIP LOCKED" in compact
     assert "UPDATE webhook_deliveries d SET lease_token=$2::uuid" in compact
     assert "_attempt_delivery(str(claimed.delivery[\"id\"]), pool=pool, claimed=claimed)" in compact
-    assert "min(50, limit, _recovery_available_send_capacity(limit))" in compact
+    assert "min(50, limit, _semaphore_available())" in compact
+    assert "max(0, _get_send_semaphore()._value)" in compact
     assert "pre_claim_monotonic = time.monotonic()" in compact
     assert "pre_claim_monotonic=claimed.pre_claim_monotonic" in compact
     assert "claim_observed_monotonic = time.monotonic()" not in compact
@@ -1129,15 +1139,88 @@ def test_recovery_preclaims_rows_before_send_semaphore_backpressure(monkeypatch)
         ]
         await asyncio.wait_for(asyncio.gather(*scheduled_tasks), timeout=2.0)
 
-        assert recovered == [5, 0, 0]
-        assert len(scheduled_tasks) == 5
+        assert recovered == [1, 0, 0]
+        assert len(scheduled_tasks) == 1
         assert http.max_active == 1
-        assert sorted(http.delivery_ids) == sorted(row["id"] for row in rows)
-        assert len(http.delivery_ids) == len(set(http.delivery_ids)) == 5
-        assert [row["status"] for row in rows] == ["succeeded"] * 5
-        assert all(row["lease_token"] is None for row in rows)
+        assert http.delivery_ids == [rows[0]["id"]]
+        assert len(http.delivery_ids) == len(set(http.delivery_ids)) == 1
+        assert rows[0]["status"] == "succeeded"
+        assert rows[0]["lease_token"] is None
+        assert [row["lease_token"] for row in rows[1:]] == [None] * 4
 
     asyncio.run(run())
+
+
+def test_recovery_claim_batch_uses_available_send_slots(monkeypatch):
+    async def run():
+        from api import lifecycle
+
+        rows = [_attempt() for _ in range(5)]
+        dispatcher, conn, _http = await _install(monkeypatch, rows, [])
+        monkeypatch.setattr(dispatcher, "_send_semaphore", asyncio.Semaphore(2))
+        scheduled = []
+
+        def _record_schedule(coro):
+            scheduled.append(coro)
+            return None
+
+        monkeypatch.setattr(lifecycle, "_schedule_delivery_attempt", _record_schedule)
+
+        recovered = await dispatcher._recover_due_deliveries(conn.pool, limit=5)
+        for coro in scheduled:
+            coro.close()
+
+        leased = [row for row in rows if row["lease_token"] is not None]
+        assert recovered == 2
+        assert len(scheduled) == 2
+        assert len(leased) == 2
+        assert [row["status"] for row in leased] == ["retrying", "retrying"]
+
+    asyncio.run(run())
+
+
+def test_recovery_backpressure_does_not_burn_retries(monkeypatch):
+    async def run():
+        from api import lifecycle
+
+        from api.webhook_dispatcher import MAX_ATTEMPTS
+
+        rows = [_attempt() for _ in range(10)]
+        original_rows = list(rows)
+        expected_delivery_count = len(original_rows) * MAX_ATTEMPTS
+        dispatcher, conn, http = await _install(monkeypatch, rows, [500] * (len(rows) * MAX_ATTEMPTS))
+        http.delay = 0.01
+        monkeypatch.setattr(dispatcher, "_send_semaphore", asyncio.Semaphore(2))
+        monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
+
+        while len(http.delivery_ids) < expected_delivery_count:
+            for row in conn.rows:
+                if row["status"] == "pending":
+                    _make_due(row)
+
+            recovered = await dispatcher._recover_due_deliveries(conn.pool, limit=len(rows))
+            tasks = list(lifecycle._delivery_attempt_tasks)
+            if tasks:
+                await asyncio.wait_for(asyncio.gather(*tasks), timeout=2.0)
+            elif recovered == 0:
+                await asyncio.sleep(0.01)
+
+        assert http.max_active <= 2
+        assert len(http.delivery_ids) == expected_delivery_count
+        for original in original_rows:
+            chain = [
+                row for row in conn.rows
+                if row["subscription_id"] == original["subscription_id"]
+                and row["event_type"] == original["event_type"]
+                and row["payload_hash"] == original["payload_hash"]
+            ]
+            assert sorted(row["attempt_num"] for row in chain) == list(range(1, MAX_ATTEMPTS + 1))
+            assert sum(row["id"] in http.delivery_ids for row in chain) == MAX_ATTEMPTS
+            assert all(row["status"] == "abandoned" for row in chain)
+            assert sum(not row["superseded"] for row in chain) == 1
+            assert max(row["attempt_num"] for row in chain if not row["superseded"]) == MAX_ATTEMPTS
+
+    asyncio.run(asyncio.wait_for(run(), timeout=10.0))
 
 
 def test_expired_delivery_lease_can_be_reclaimed(monkeypatch):
@@ -1698,6 +1781,91 @@ def test_claim_after_predecessor_success_terminalizes_without_send(monkeypatch):
     asyncio.run(run())
 
 
+def test_preclaimed_successor_waits_for_predecessor_success_before_post(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "retrying"
+        successor = _successor_for(parent)
+        dispatcher, conn, http = await _install(monkeypatch, [parent, successor], [204])
+        blocker = _FakeWebhookConn(conn.store, conn_id=999)
+
+        async with blocker.transaction():
+            await dispatcher._lock_delivery_chain(blocker, parent)
+            claimed = await dispatcher._claim_recoverable_deliveries(conn, limit=1)
+            assert [item.delivery["id"] for item in claimed] == [successor["id"]]
+
+            task = asyncio.create_task(
+                dispatcher._attempt_delivery(
+                    successor["id"],
+                    pool=conn.pool,
+                    claimed=claimed[0],
+                )
+            )
+            await asyncio.sleep(0.01)
+            assert http.delivery_ids == []
+
+            parent["status"] = "succeeded"
+            parent["response_status"] = 204
+            parent["delivered_at"] = datetime.now(timezone.utc)
+
+        sent = await task
+
+        assert not sent
+        assert http.delivery_ids == []
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+        assert successor["lease_token"] is None
+        assert conn.store.advisory_acquisitions >= 2
+
+    asyncio.run(run())
+
+
+def test_preclaimed_clean_chain_posts_normally(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [204])
+        claimed = await dispatcher._claim_recoverable_deliveries(conn, limit=1)
+
+        sent = await dispatcher._attempt_delivery(
+            row["id"],
+            pool=conn.pool,
+            claimed=claimed[0],
+        )
+
+        assert sent
+        assert http.delivery_ids == [row["id"]]
+        assert row["status"] == "succeeded"
+        assert row["lease_token"] is None
+        assert conn.store.advisory_acquisitions >= 2
+
+    asyncio.run(run())
+
+
+def test_preclaimed_stale_lease_releases_without_post(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [204])
+        claimed = await dispatcher._claim_recoverable_deliveries(conn, limit=1)
+        assert claimed
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        sent = await dispatcher._attempt_delivery(
+            row["id"],
+            pool=conn.pool,
+            claimed=claimed[0],
+        )
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert not sent
+        assert http.delivery_ids == []
+        assert row["status"] == "retrying"
+        assert row["superseded"] is False
+        assert row["lease_token"] is None
+        assert [item["id"] for item in recoverable] == [row["id"]]
+
+    asyncio.run(run())
+
+
 def test_webhook_send_concurrency_cap(monkeypatch):
     async def run():
         rows = [_attempt(), _attempt(), _attempt()]
@@ -1827,11 +1995,11 @@ def test_webhook_send_refuses_post_when_claim_window_elapsed_before_send(monkeyp
         assert finalized
         assert http.delivery_ids == []
         assert not semaphore.locked()
-        assert row["status"] == "abandoned"
-        assert row["superseded"] is True
-        assert row["error"].startswith("lease-expired-before-send:")
-        assert len(conn.rows) == 2
-        assert conn.rows[1]["status"] == "pending"
+        assert row["status"] == "retrying"
+        assert row["superseded"] is False
+        assert row["error"] is None
+        assert row["lease_token"] is None
+        assert len(conn.rows) == 1
 
     asyncio.run(run())
 
@@ -1864,9 +2032,11 @@ def test_webhook_send_refuses_post_after_app_stall_following_claim(monkeypatch):
 
         assert finalized
         assert http.delivery_ids == []
-        assert row["status"] == "abandoned"
-        assert row["superseded"] is True
-        assert row["error"].startswith("lease-expired-before-send:")
+        assert row["status"] == "retrying"
+        assert row["superseded"] is False
+        assert row["error"] is None
+        assert row["lease_token"] is None
+        assert len(conn.rows) == 1
 
     asyncio.run(run())
 
@@ -1894,9 +2064,11 @@ def test_pre_claim_monotonic_debits_stalled_claim_update(monkeypatch):
 
         assert finalized
         assert http.delivery_ids == []
-        assert row["status"] == "abandoned"
-        assert row["superseded"] is True
-        assert row["error"].startswith("lease-expired-before-send:")
+        assert row["status"] == "retrying"
+        assert row["superseded"] is False
+        assert row["error"] is None
+        assert row["lease_token"] is None
+        assert len(conn.rows) == 1
 
     asyncio.run(run())
 

@@ -154,7 +154,11 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   stale lease columns when a same-row legacy terminal write has already won, and
   moves recovery to claim due rows with a lease in the dequeue CTE before
   scheduling send tasks so repeated recovery polls do not enqueue duplicates
-  behind the send semaphore.
+  behind the send semaphore. Round 18 sizes each recovery claim batch to the
+  send semaphore's current free slots, treats `lease-expired-before-send` as a
+  non-consumptive lease release instead of a failed attempt, and makes
+  recovery-preclaimed sends take the retry-chain advisory lock for a final
+  live-lease and succeeded-peer recheck before any outbound POST.
 
 ### Conflicts and operator handling
 

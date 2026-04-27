@@ -142,6 +142,11 @@ class _DeliveryResult:
 
 
 @dataclass(frozen=True)
+class _LeaseExpiredBeforeSend(_DeliveryResult):
+    """Marker result for a lease window that elapsed before any POST began."""
+
+
+@dataclass(frozen=True)
 class _ClaimedDelivery:
     delivery: asyncpg.Record
     lease_token: str
@@ -271,7 +276,7 @@ async def repair_superseded_retrying_deliveries(pool: asyncpg.Pool) -> str:
 
 async def _recover_due_deliveries(pool: asyncpg.Pool, *, limit: int = 50) -> int:
     """Recover due deliveries by scheduling lifecycle-tracked send attempts."""
-    claim_limit = min(50, limit, _recovery_available_send_capacity(limit))
+    claim_limit = min(50, limit, _semaphore_available())
     if claim_limit <= 0:
         return 0
 
@@ -289,10 +294,9 @@ async def _recover_due_deliveries(pool: asyncpg.Pool, *, limit: int = 50) -> int
     return recovered
 
 
-def _recovery_available_send_capacity(limit: int) -> int:
-    """Return whether recovery should claim a batch for the send semaphore."""
-    semaphore = _get_send_semaphore()
-    return 0 if semaphore.locked() else limit
+def _semaphore_available() -> int:
+    """Return the current best-effort free slot count for recovery batch sizing."""
+    return max(0, _get_send_semaphore()._value)
 
 
 async def _claim_recoverable_deliveries(
@@ -486,6 +490,12 @@ async def _attempt_delivery(
             claimed = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
         else:
             lease_token = claimed.lease_token
+            if not await _guard_preclaimed_delivery_before_send(
+                pool,
+                claimed.delivery,
+                lease_token,
+            ):
+                return False
         if not claimed:
             return False
         result = await _send_claimed_delivery(
@@ -586,6 +596,58 @@ async def _claim_delivery(
             )
 
 
+async def _guard_preclaimed_delivery_before_send(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    lease_token: str,
+) -> bool:
+    """Re-check a recovery-preclaimed row under the chain lock before POSTing."""
+    delivery_id = str(delivery["id"])
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _lock_delivery_chain(conn, delivery)
+            if not await _preclaimed_delivery_is_live_and_owned(conn, delivery_id, lease_token):
+                await _release_owned_lease_for_reclaim(conn, delivery_id, lease_token)
+                return False
+
+            if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
+                await _abandon_owned_attempt_after_succeeded_chain_peer(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    _DeliveryResult(
+                        succeeded=False,
+                        error="succeeded-chain-peer-before-send",
+                    ),
+                )
+                return False
+
+            return True
+
+
+async def _preclaimed_delivery_is_live_and_owned(
+    conn: asyncpg.Connection,
+    delivery_id: str,
+    lease_token: str,
+) -> bool:
+    """Return whether a preclaimed row is still live under this worker's lease."""
+    return await conn.fetchval(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM webhook_deliveries
+          WHERE id=$1::uuid
+            AND lease_token=$2::uuid
+            AND lease_expires_at > clock_timestamp()
+            AND status IN ('pending', 'retrying')
+            AND NOT superseded
+        )
+        """,
+        delivery_id,
+        lease_token,
+    )
+
+
 async def _send_claimed_delivery(
     delivery: asyncpg.Record,
     *,
@@ -597,7 +659,7 @@ async def _send_claimed_delivery(
         pre_claim_monotonic=pre_claim_monotonic,
     )
     if remaining_seconds <= MIN_SEND_WINDOW_SECONDS:
-        return _DeliveryResult(
+        return _LeaseExpiredBeforeSend(
             succeeded=False,
             error=(
                 "lease-expired-before-send: remaining lease send window "
@@ -840,6 +902,9 @@ async def _finalize_delivery(
     delivery_id = str(delivery["id"])
     async with pool.acquire() as conn:
         async with conn.transaction():
+            if isinstance(result, _LeaseExpiredBeforeSend):
+                return await _release_owned_lease_for_reclaim(conn, delivery_id, lease_token)
+
             await _lock_delivery_chain(conn, delivery)
 
             if delivery["revoked"]:
@@ -995,6 +1060,31 @@ async def _finalize_delivery(
                 delivery_id, delivery["attempt_num"], result.response_status, result.error, backoff,
             )
             return True
+
+
+async def _release_owned_lease_for_reclaim(
+    conn: asyncpg.Connection,
+    delivery_id: str,
+    lease_token: str,
+) -> bool:
+    """Clear this worker's lease after no POST occurred, without consuming a retry."""
+    released = await conn.fetchrow(
+        """
+        UPDATE webhook_deliveries
+        SET lease_token=NULL,
+            lease_expires_at=NULL
+        WHERE id=$1::uuid
+          AND lease_token=$2::uuid
+        RETURNING id, status, superseded
+        """,
+        delivery_id,
+        lease_token,
+    )
+    return (
+        released is not None
+        and released["status"] in LIVE_DELIVERY_STATUSES
+        and not released["superseded"]
+    )
 
 
 async def _clear_stale_owned_lease_after_terminal_finalize(
