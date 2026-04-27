@@ -30,7 +30,8 @@ class TestWebhookModuleWiring:
     def test_dispatcher_imports(self):
         from api import webhook_dispatcher
         assert hasattr(webhook_dispatcher, "dispatch")
-        assert hasattr(webhook_dispatcher, "recovery_worker_loop")
+        assert hasattr(webhook_dispatcher, "repair_worker_loop")
+        assert hasattr(webhook_dispatcher, "delivery_worker_loop")
         assert hasattr(webhook_dispatcher, "_sign")
 
     def test_models_imported(self):

@@ -290,6 +290,7 @@ class _FakeWebhookConn:
             for row in self.rows:
                 if (
                     row["status"] in {"pending", "retrying"}
+                    and self._lease_available(row)
                     and self._has_successor(row)
                 ):
                     self._set_status(row, "abandoned")
@@ -1257,20 +1258,57 @@ def test_repair_sweep_normalizes_old_worker_pending_resurrect(monkeypatch):
     asyncio.run(run())
 
 
+def test_repair_sweep_does_not_strip_active_lease_with_successor(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "retrying"
+        parent["lease_token"] = "00000000-0000-0000-0000-000000000001"
+        parent["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        successor = _successor_for(parent)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        while_leased = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+
+        assert while_leased == "UPDATE 0"
+        assert parent["status"] == "retrying"
+        assert parent["superseded"] is False
+        assert parent["lease_token"] == "00000000-0000-0000-0000-000000000001"
+
+        parent["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        after_expiry = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+
+        assert after_expiry == "UPDATE 1"
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
+        assert parent["lease_token"] is None
+        assert parent["lease_expires_at"] is None
+
+    asyncio.run(run())
+
+
 def test_lifecycle_runs_webhook_retry_repair_on_startup():
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_source = (repo_root / "api" / "lifecycle.py").read_text()
     dispatcher_source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact_dispatcher = " ".join(dispatcher_source.split())
 
-    assert "recovery_worker_loop" in lifecycle_source
-    assert "_schedule_background(_webhook_recovery(_pool))" in lifecycle_source
+    assert "repair_worker_loop as _webhook_repair" in lifecycle_source
+    assert "delivery_worker_loop as _webhook_delivery" in lifecycle_source
+    assert "_schedule_background(_webhook_repair(_pool))" in lifecycle_source
+    assert "_schedule_background(_webhook_delivery(_pool))" in lifecycle_source
     assert "REPAIR_BURST_SECONDS" in dispatcher_source
     assert "REPAIR_PERIODIC_INTERVAL" in dispatcher_source
+    assert "async def repair_worker_loop" in dispatcher_source
+    assert "async def delivery_worker_loop" in dispatcher_source
     assert "_repair_superseded_retrying_deliveries_safely" in dispatcher_source
     assert "UPDATE webhook_deliveries d SET status = 'abandoned', superseded = TRUE" in compact_dispatcher
     assert "status_updated_at = clock_timestamp()" in compact_dispatcher
     assert "WHERE d.status IN ('pending', 'retrying')" in compact_dispatcher
+    assert (
+        "AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())"
+        in compact_dispatcher
+    )
     assert "WHERE d.status = 'retrying' AND NOT d.superseded" not in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
 
@@ -1290,9 +1328,6 @@ def test_startup_repair_burst_then_periodic(monkeypatch):
         async def _repair(pool, *, phase):
             phases.append(phase)
 
-        async def _recover(pool):
-            return 0
-
         async def _sleep(delay):
             nonlocal now
             intervals.append(delay)
@@ -1304,17 +1339,82 @@ def test_startup_repair_burst_then_periodic(monkeypatch):
         monkeypatch.setattr(dispatcher, "REPAIR_BURST_INTERVAL", 5)
         monkeypatch.setattr(dispatcher, "REPAIR_PERIODIC_INTERVAL", 300)
         monkeypatch.setattr(dispatcher, "_repair_superseded_retrying_deliveries_safely", _repair)
-        monkeypatch.setattr(dispatcher, "_recover_due_deliveries", _recover)
         monkeypatch.setattr(dispatcher.asyncio, "get_running_loop", lambda: _FakeLoop())
         monkeypatch.setattr(dispatcher.asyncio, "sleep", _sleep)
 
         try:
-            await dispatcher.recovery_worker_loop(object())
+            await dispatcher.repair_worker_loop(object())
         except asyncio.CancelledError:
             pass
 
         assert phases == ["burst", "burst", "periodic"]
-        assert intervals == [5, 5, 30.0]
+        # The split repair worker no longer wakes for delivery polling, so its
+        # post-burst sleep follows the coarser repair-only periodic cadence.
+        assert intervals == [5, 5, 300.0]
+
+    asyncio.run(run())
+
+
+def test_slow_delivery_loop_does_not_starve_repair_worker(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "abandoned"
+        parent["superseded"] = True
+        successor = _successor_for(parent)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        loop = asyncio.get_running_loop()
+        repair_ticks: list[float] = []
+        delivery_started = asyncio.Event()
+        slow_delivery_can_finish = asyncio.Event()
+        actual_repair = dispatcher.repair_superseded_retrying_deliveries
+
+        async def _repair(pool, *, phase):
+            repair_ticks.append(loop.time())
+            await actual_repair(pool)
+
+        async def _recover(pool):
+            delivery_started.set()
+            await slow_delivery_can_finish.wait()
+            return 0
+
+        monkeypatch.setattr(dispatcher, "REPAIR_BURST_SECONDS", 1.0)
+        monkeypatch.setattr(dispatcher, "REPAIR_BURST_INTERVAL", 0.02)
+        monkeypatch.setattr(dispatcher, "REPAIR_PERIODIC_INTERVAL", 1.0)
+        monkeypatch.setattr(dispatcher, "RECOVERY_POLL_INTERVAL", 1.0)
+        monkeypatch.setattr(dispatcher, "_repair_superseded_retrying_deliveries_safely", _repair)
+        monkeypatch.setattr(dispatcher, "_recover_due_deliveries", _recover)
+
+        repair_task = asyncio.create_task(dispatcher.repair_worker_loop(conn.pool))
+        delivery_task = asyncio.create_task(dispatcher.delivery_worker_loop(conn.pool))
+        try:
+            await asyncio.wait_for(delivery_started.wait(), timeout=1.0)
+
+            first_repair_deadline = loop.time() + 1.0
+            while len(repair_ticks) < 1 and loop.time() < first_repair_deadline:
+                await asyncio.sleep(0.005)
+            assert repair_ticks
+
+            resurrected_at = loop.time()
+            parent["status"] = "retrying"
+            parent["status_updated_at"] = datetime.now(timezone.utc)
+            parent["lease_token"] = None
+            parent["lease_expires_at"] = None
+
+            repair_deadline = loop.time() + 1.0
+            while parent["status"] != "abandoned" and loop.time() < repair_deadline:
+                await asyncio.sleep(0.005)
+
+            assert parent["status"] == "abandoned"
+            assert parent["superseded"] is True
+            assert loop.time() - resurrected_at < 1.0
+            assert not delivery_task.done()
+            assert len(repair_ticks) >= 2
+        finally:
+            slow_delivery_can_finish.set()
+            repair_task.cancel()
+            delivery_task.cancel()
+            await asyncio.gather(repair_task, delivery_task, return_exceptions=True)
 
     asyncio.run(run())
 

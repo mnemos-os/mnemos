@@ -108,6 +108,7 @@ WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
         lease_token = NULL,
         lease_expires_at = NULL
     WHERE d.status IN ('pending', 'retrying')
+      AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
       AND EXISTS (
         SELECT 1
         FROM webhook_deliveries newer
@@ -166,18 +167,18 @@ async def dispatch(
             sub["id"], event_type, body, body_hash, NEW_CODE_WRITER_REVISION,
         )
         # Schedule the send via the lifecycle-tracked background registry
-        # so pending tasks are awaited at shutdown. Import lazily to avoid
+        # so pending tasks are cancelled/awaited at shutdown. Import lazily to avoid
         # circular imports at module load time.
         from api.lifecycle import _schedule_background  # noqa: WPS433
         _schedule_background(_attempt_delivery(str(delivery_id)))
 
 
-async def recovery_worker_loop(pool: asyncpg.Pool) -> None:
-    """Background loop: picks up pending deliveries whose scheduled_at has arrived.
+async def repair_worker_loop(pool: asyncpg.Pool) -> None:
+    """Background loop: repair superseded retry rows on its own cadence.
 
     Started from the FastAPI lifespan. Cancels cleanly on shutdown.
     """
-    logger.info("webhook recovery worker started")
+    logger.info("webhook retry repair worker started")
     loop = asyncio.get_running_loop()
     repair_burst_deadline = loop.time() + REPAIR_BURST_SECONDS
     next_repair_at = loop.time()
@@ -194,16 +195,36 @@ async def recovery_worker_loop(pool: asyncpg.Pool) -> None:
                     REPAIR_BURST_INTERVAL if in_burst else REPAIR_PERIODIC_INTERVAL
                 )
 
-            await _recover_due_deliveries(pool)
-            await asyncio.sleep(
-                min(RECOVERY_POLL_INTERVAL, max(0.0, next_repair_at - loop.time()))
-            )
+            await asyncio.sleep(max(0.0, next_repair_at - loop.time()))
         except asyncio.CancelledError:
-            logger.info("webhook recovery worker cancelled")
+            logger.info("webhook retry repair worker cancelled")
             raise
         except Exception:  # pragma: no cover — log and keep running
-            logger.exception("webhook recovery worker iteration failed")
+            logger.exception("webhook retry repair worker iteration failed")
+            await asyncio.sleep(REPAIR_BURST_INTERVAL)
+
+
+async def delivery_worker_loop(pool: asyncpg.Pool) -> None:
+    """Background loop: picks up pending deliveries whose scheduled_at has arrived.
+
+    Started from the FastAPI lifespan. Cancels cleanly on shutdown.
+    """
+    logger.info("webhook delivery recovery worker started")
+    while True:
+        try:
+            await _recover_due_deliveries(pool)
             await asyncio.sleep(RECOVERY_POLL_INTERVAL)
+        except asyncio.CancelledError:
+            logger.info("webhook delivery recovery worker cancelled")
+            raise
+        except Exception:  # pragma: no cover — log and keep running
+            logger.exception("webhook delivery recovery worker iteration failed")
+            await asyncio.sleep(RECOVERY_POLL_INTERVAL)
+
+
+async def recovery_worker_loop(pool: asyncpg.Pool) -> None:
+    """Compatibility wrapper for the delivery recovery loop."""
+    await delivery_worker_loop(pool)
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────

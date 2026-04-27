@@ -57,8 +57,9 @@ v3.5-dev workers that only skip `succeeded` and `abandoned` still skip the row.
 The live unique index on `(subscription_id, event_type, payload_hash,
 attempt_num)` structurally prevents duplicate successor rows if an old writer
 races after a new worker's no-successor check. New workers use per-attempt
-leases plus per-chain advisory locks, startup runs repeated repair sweeps for
-the first minute, and the `writer_revision` marker is the technically correct
+leases plus per-chain advisory locks, lifecycle starts a dedicated repair
+worker that runs repeated sweeps for the first minute independent of delivery
+send latency, and the `writer_revision` marker is the technically correct
 compatibility path: current code explicitly writes `NEW_CODE_WRITER_REVISION=1`,
 while legacy or unknown rows are `NULL` or `0`.
 `WEBHOOK_LEGACY_GRACE_SECONDS` remains the safety net for rollouts that skip
@@ -70,9 +71,11 @@ advance the grace clock even though that code knows nothing about the column.
 The migration backfill gives live lease-less legacy rows a fresh
 `clock_timestamp()` value, so the grace window starts from the migration run
 instead of from an old `scheduled_at`.
-The startup/periodic repair sweep is idempotent and terminalizes any
-`pending` or `retrying` row with a newer successor, including old-worker status
-overwrites of rows already marked `superseded=TRUE`.
+The startup/periodic repair worker is idempotent and terminalizes any
+lease-free `pending` or `retrying` row with a newer successor, including
+old-worker status overwrites of rows already marked `superseded=TRUE`. It skips
+rows with an unexpired `lease_token` / `lease_expires_at` pair so an in-flight
+new worker can finalize without losing ownership.
 New-code rows with `writer_revision=1` are recoverable immediately. The default
 grace is 300 seconds. Tune it to cover the maximum expected old-writer rollout
 overlap; after the grace expires, the new recovery worker treats any

@@ -43,7 +43,7 @@ def _schedule_background(coro) -> None:
     """Schedule a fire-and-forget coroutine with lifecycle tracking.
 
     Unlike asyncio.create_task(), tasks created here are tracked in
-    _background_tasks so the lifespan teardown can await them before
+    _background_tasks so the lifespan teardown can cancel/await them before
     closing the DB pool.
     """
     import asyncio as _asyncio
@@ -279,15 +279,17 @@ async def lifespan(app):
         logger.info("Background distillation worker disabled")
         _worker_status["distillation_worker"] = "disabled"
 
-    # Webhook retry repair + recovery worker. The recovery loop owns a startup
-    # repair burst, then keeps sweeping periodically for retry rows that gain a
-    # successor during deploy or recovery drift.
+    # Webhook retry repair + delivery recovery workers. Repair owns its own
+    # startup burst and periodic cadence, independent of slow webhook sends.
     if _pool:
         from api.webhook_dispatcher import (  # noqa: WPS433
-            recovery_worker_loop as _webhook_recovery,
+            delivery_worker_loop as _webhook_delivery,
+            repair_worker_loop as _webhook_repair,
         )
+        logger.info('Launching webhook retry repair worker')
+        _schedule_background(_webhook_repair(_pool))
         logger.info('Launching webhook delivery recovery worker')
-        _schedule_background(_webhook_recovery(_pool))
+        _schedule_background(_webhook_delivery(_pool))
 
     # Federation sync worker (v3.0.0 — pulls from remote peers on their intervals)
     if _pool:
@@ -315,9 +317,12 @@ async def lifespan(app):
     yield
 
     if _background_tasks:
-        logger.info(f"Draining {len(_background_tasks)} background task(s)…")
+        tasks = list(_background_tasks)
+        logger.info(f"Cancelling {len(tasks)} background task(s)…")
         import asyncio as _asyncio
-        await _asyncio.gather(*list(_background_tasks), return_exceptions=True)
+        for task in tasks:
+            task.cancel()
+        await _asyncio.gather(*tasks, return_exceptions=True)
 
     if _pool:
         await _pool.close()

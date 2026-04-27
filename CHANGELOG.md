@@ -121,7 +121,10 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   rows by starting their grace clock at migration time. Round 9 relaxes the
   idempotent repair sweep so old-worker `pending`/`retrying` overwrites of an
   already superseded attempt are terminalized again whenever a newer successor
-  exists.
+  exists. Round 10 splits retry repair and delivery recovery into independent
+  lifespan tasks so slow webhook POSTs cannot starve the repair cadence, and
+  makes the repair predicate skip rows with an unexpired lease so active
+  new-worker sends do not lose ownership.
 
 ### Conflicts and operator handling
 
