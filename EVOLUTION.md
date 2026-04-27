@@ -491,11 +491,11 @@ NULL branch heads, raises SQLSTATE `MN001` for foreign heads, and lets
 `handle_trigger_pgerror` translate the condition to HTTP 409 with an
 operator reconciliation message.
 
-There is still one intentionally documented mismatch: the original
-`mnemos_group_select` RLS policy uses `permission_mode >= 640`, which
-is not a Unix group-bit test. The application predicate is stricter
-and fails closed (`api/visibility.py:76-82`); task #25 is the follow-up
-migration to make RLS match.
+The final documented mismatch is closed by
+`db/migrations_v3_5_rls_group_select_unix_bits.sql`: the
+`mnemos_group_select` RLS policy and application predicate now both
+test the Unix group-read bit directly with
+`((permission_mode / 10) % 10) >= 4`.
 
 ---
 

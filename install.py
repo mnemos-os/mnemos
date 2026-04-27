@@ -167,6 +167,7 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_charon_trigger_guard.sql"),
         os.path.join(script_dir, "db", "migrations_v3_4_federation_compat.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_trigger_same_memory_parent.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_rls_group_select_unix_bits.sql"),
     ]
 
     print("=" * 60)

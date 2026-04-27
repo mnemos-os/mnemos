@@ -107,11 +107,11 @@ v3.5 is in flight on `v3.5-dev`. Closed items below are merged into the branch; 
 - ✅ **Slice 1: audit quick wins** (`a62a099`). Session history now returns the most recent rows first, pins/caps system rows deterministically, and project metadata points at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`). Shared `read_visibility_predicate` gates memory list/get/search/rehydrate/gateway context; `version_visibility_predicate` gates version/log/commit/diff paths per snapshot; DAG writers use same-memory parent checks, target-head visibility gates, advisory-lock-before-row-lock ordering, race-safe branch creation, and `MN001` to HTTP 409 reconciliation.
 - ✅ **Docker existing-volume migration path** (`86f1532`, `19229d7`). `docker-compose.yml` and `docker-compose.staging.yml` run `postgres-upgrade` after Postgres is healthy so `db/migrations_v3_5_trigger_same_memory_parent.sql` applies to existing volumes, not only fresh initdb volumes.
+- ✅ **#25 RLS Unix-bit fix** (`pending commit`). `db/migrations_v3_5_rls_group_select_unix_bits.sql` replaces `mnemos_group_select` so RLS and `read_visibility_predicate` both use `((permission_mode / 10) % 10) >= 4` for group-readable rows.
 - 🔵 **#20 webhook retry state machine.** Durable state transitions for pending/retrying/terminal rows; still open.
 - 🔵 **#21 federation per-peer ACL + stable cursor.** Peer-specific scope plus cursor stability; still open.
 - 🔵 **#22 audit endpoint scoping + lifespan teardown.** Audit route scoping and cleanup behavior; still open.
 - 🔵 **#23 entity namespace conflict-key migration.** Namespace-aware conflict key for entity rows; still open.
-- 🔵 **#25 RLS Unix-bit fix.** `api/visibility.py:76-82` is stricter than `mnemos_group_select`; follow-up migration must replace `permission_mode >= 640` with the Unix group-bit expression.
 - 🔵 **#19 bulk webhook parity.** Bulk-create webhook behavior still differs from single-create.
 - 🔵 **#15 deletion-log refactor.** Parked; restore-drill cleanup still uses explicit `memory_branches` / `memory_versions` deletes.
 
@@ -209,7 +209,7 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 - ✅ Merge/revert writers could race branch HEAD movement or copy stale tenancy — closed with shared branch advisory locks, row-lock ordering, target-head visibility gates, drift guards covering tenancy, and target-derived tenancy on new commits.
 - ✅ HTTP/MCP branch creation had TOCTOU and duplicate-race windows — closed with `FOR SHARE` parent locks plus `INSERT ... ON CONFLICT DO NOTHING RETURNING` (`api/handlers/dag.py:341-450`, `api/mcp_tools.py:183-383`).
 - ✅ `mnemos_version_snapshot()` could write a parent edge to another memory if `memory_branches.head_version_id` was corrupt — closed by `db/migrations_v3_5_trigger_same_memory_parent.sql`, which raises `MN001` and lets `handle_trigger_pgerror` map it to HTTP 409.
-- 🔵 `mnemos_group_select` still uses `permission_mode >= 640` in `db/migrations_v1_multiuser.sql`; task #25 remains the RLS-side migration.
+- ✅ `mnemos_group_select` used threshold math that admitted owner-only mode 700 for group members — closed by `db/migrations_v3_5_rls_group_select_unix_bits.sql`, which replaces the policy with the same Unix group-bit expression as `read_visibility_predicate`.
 
 ### Codex round 1 — 9-commit deep probe (early v3.2.x cycle)
 

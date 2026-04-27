@@ -222,7 +222,7 @@ Each memory carries full ownership and LLM provenance:
 - `source_session` — session ID at time of creation
 - `source_agent` — agent name or identifier
 
-**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer. The application layer mirrors the RLS read contract so personal-mode and RLS-backed installs behave consistently. One loose end remains: `db/migrations_v1_multiuser.sql` still defines `mnemos_group_select` with the old `permission_mode >= 640` threshold; `api/visibility.py:76-82` is intentionally stricter and task #25 tracks the RLS migration.
+**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer. The application layer mirrors the RLS read contract so personal-mode and RLS-backed installs behave consistently. v3.5-dev closes task #25 with `db/migrations_v3_5_rls_group_select_unix_bits.sql`: `read_visibility_predicate` and the `mnemos_group_select` RLS policy now use identical Unix group-bit math, `((permission_mode / 10) % 10) >= 4`.
 
 **Deployment profiles** — selected at install time via `python install.py`:
 

@@ -15,6 +15,35 @@ import ast
 from pathlib import Path
 
 
+EXPECTED_MIGRATIONS = [
+    "migrations.sql",
+    "migrations_v1_multiuser.sql",
+    "migrations_v2_versioning.sql",
+    "migrations_v2_sessions.sql",
+    "migrations_model_registry.sql",
+    "migrations_v3_dag.sql",
+    "migrations_v3_graeae_unified.sql",
+    "migrations_v3_webhooks.sql",
+    "migrations_v3_oauth.sql",
+    "migrations_v3_federation.sql",
+    "migrations_v3_ownership.sql",
+    "migrations_v3_1_compression.sql",
+    "migrations_v3_1_versioning_fix.sql",
+    "migrations_v3_1_2_kg_tenancy.sql",
+    "migrations_v3_1_2_audit_log_columns.sql",
+    "migrations_v3_2_user_namespace.sql",
+    "migrations_v3_2_entities_namespace.sql",
+    "migrations_v3_2_2_version_snapshot_new_values.sql",
+    "migrations_v3_3_morpheus.sql",
+    "migrations_v3_3_morpheus_namespace.sql",
+    "migrations_v3_3_recall_tracking.sql",
+    "migrations_charon_trigger_guard.sql",
+    "migrations_v3_4_federation_compat.sql",
+    "migrations_v3_5_trigger_same_memory_parent.sql",
+    "migrations_v3_5_rls_group_select_unix_bits.sql",
+]
+
+
 def _extract_migration_list(source_path: Path, func_name: str) -> list[str]:
     """Parse the .py file, find `def <func_name>`, return the list of
     basenames assigned to `migration_files` inside that function.
@@ -66,6 +95,7 @@ def test_install_py_and_installer_db_lists_are_identical():
         "Both lists must be identical and in the same order. When adding "
         "a new migration, append to the END of BOTH lists."
     )
+    assert install_py_list == EXPECTED_MIGRATIONS
 
 
 def test_every_migration_list_entry_exists_on_disk():
@@ -140,11 +170,11 @@ def test_docker_compose_migration_lists_match_installer():
         )
 
 
-def test_compose_files_run_trigger_upgrade_for_existing_volumes():
+def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
     """The initdb mount only affects fresh Postgres volumes.
 
     Dev and PROTEUS staging keep named postgres_data volumes, so the
-    v3.5 trigger patch also needs an explicit compose-time upgrade
+    v3.5 database patches also need an explicit compose-time upgrade
     service that runs against already-initialized databases.
     """
     repo_root = Path(__file__).resolve().parents[1]
@@ -153,12 +183,21 @@ def test_compose_files_run_trigger_upgrade_for_existing_volumes():
 
         assert "postgres-upgrade:" in text, compose_name
         assert (
+            "./db/migrations_v3_5_rls_group_select_unix_bits.sql:"
+            "/docker-entrypoint-initdb.d/25-rls-group-select-unix-bits.sql"
+        ) in text, compose_name
+        assert (
             "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
             "/migrations/24-trigger-same-memory-parent.sql:ro"
+        ) in text, compose_name
+        assert (
+            "./db/migrations_v3_5_rls_group_select_unix_bits.sql:"
+            "/migrations/25-rls-group-select-unix-bits.sql:ro"
         ) in text, compose_name
         assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
         assert "-v ON_ERROR_STOP=1" in text, compose_name
         assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
+        assert "-f /migrations/25-rls-group-select-unix-bits.sql" in text, compose_name
         assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
 
 

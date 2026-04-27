@@ -1,13 +1,13 @@
 """Shared read-visibility predicate for non-root callers.
 
-Mirrors the v1_multiuser RLS policies (see
-db/migrations_v1_multiuser.sql) at the app layer. The same predicate
-must be applied across every read surface — list, get, search,
-rehydrate, gateway context — because PostgreSQL combines RLS with
-the handler's WHERE via AND. RLS cannot re-add rows the handler has
-already excluded; if one read path uses a narrower predicate than
-another, that path silently hides rows the rest of the contract
-admits.
+Mirrors the active PostgreSQL RLS read policies (see
+db/migrations_v1_multiuser.sql and follow-up policy migrations) at
+the app layer. The same predicate must be applied across every read
+surface — list, get, search, rehydrate, gateway context — because
+PostgreSQL combines RLS with the handler's WHERE via AND. RLS cannot
+re-add rows the handler has already excluded; if one read path uses a
+narrower predicate than another, that path silently hides rows the
+rest of the contract admits.
 
 Mutation paths (update, delete) deliberately do NOT use this
 predicate — writes stay strictly owner-scoped so a non-owner can't
@@ -51,7 +51,7 @@ def read_visibility_predicate(
     extend the caller's params list with (in the order the
     placeholders appear).
 
-    Branches mirror the v1_multiuser RLS policies:
+    Branches mirror the active RLS read policies:
 
     - ``mnemos_owner_select``  → ``owner_id = $caller``
     - ``federation`` (v3.2 H1) → ``federation_source IS NOT NULL``
@@ -62,7 +62,7 @@ def read_visibility_predicate(
                                    AND group_id = ANY($groups)``
       (extract Unix-style group bits via tens-digit; permission_mode
       = 700 has group bits = 0, so the row is owner-only even though
-      the row's `permission_mode >= 640`).
+      the owner bit is readable).
 
     ``group_ids`` is sourced from ``UserContext.group_ids`` (resolved
     at auth time) rather than re-querying ``user_groups`` via EXISTS;
@@ -73,13 +73,6 @@ def read_visibility_predicate(
     and need disambiguation. Default empty produces unqualified
     column names suitable for single-table queries.
 
-    NOTE: the v1_multiuser ``mnemos_group_select`` RLS policy uses
-    ``permission_mode >= 640``, which has the same Unix-bit bug
-    (mode 700 satisfies the threshold but has group bits 0). This
-    predicate is intentionally stricter than the RLS to fail closed
-    on owner-only rows. The RLS policy itself needs the same
-    correction in a follow-up migration so behavior is identical
-    whether RLS is on or off.
     """
     n = start_param_idx
     p = f"{table_alias}." if table_alias else ""

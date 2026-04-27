@@ -19,7 +19,6 @@ Open backlog still in scope or awaiting explicit deferral:
 - **#21** federation per-peer ACL + stable cursor.
 - **#22** audit endpoint scoping + lifespan teardown.
 - **#23** entity namespace conflict-key migration.
-- **#25** RLS Unix-bit fix for `mnemos_group_select`.
 - **#19** bulk webhook parity.
 - **#15** deletion-log refactor (parked).
 
@@ -160,7 +159,7 @@ All items required for v3.5 to be production-ready at scale:
    - Trigger replacement: `db/migrations_v3_5_trigger_same_memory_parent.sql`.
    - Branch-writer lock helper: `api/handlers/dag.py:21-40`.
    - Existing-volume upgrade path: `postgres-upgrade` in both compose files.
-   - Remaining follow-up: RLS Unix-bit migration (#25).
+   - RLS Unix-bit migration: `db/migrations_v3_5_rls_group_select_unix_bits.sql` (#25).
 
 1. **HTTP body-size cap** (FastAPI Body limit).
    - `POST /v1/import` and streaming request bodies must have hard cap.

@@ -78,7 +78,7 @@ been externalized.
 - Webhook retry state machine (#20), bulk webhook parity (#19), audit
   endpoint scoping/lifespan teardown (#22), federation per-peer ACL +
   stable cursor (#21), entity namespace conflict-key migration (#23),
-  RLS Unix-bit migration (#25), and deletion-log refactor (#15).
+  and deletion-log refactor (#15).
 - SQLite backend. Current backend is Postgres-only; SQLite +
   sqlite-vec for embedded tier is v4/lite-profile work.
 
@@ -642,12 +642,12 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
 - Hash-chained audit log on every GRAEAE consultation.
 - DAG trigger conflict mapping: SQLSTATE `MN001` becomes HTTP 409 with
   reconciliation guidance instead of a silent cross-memory parent write.
+- RLS group-select policy uses the same Unix group-read bit math as
+  application visibility after
+  `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
 ### 10.4 Known gaps (as of v3.5-dev)
 
-- `mnemos_group_select` in `db/migrations_v1_multiuser.sql` still uses
-  `permission_mode >= 640`; application visibility is stricter and task
-  #25 tracks the RLS migration.
 - Webhook retry state machine (#20), federation per-peer ACL/stable
   cursor (#21), audit endpoint scoping/lifespan teardown (#22), entity
   namespace conflict-key migration (#23), bulk webhook parity (#19), and

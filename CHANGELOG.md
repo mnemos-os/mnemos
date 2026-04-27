@@ -6,7 +6,8 @@ All notable changes to MNEMOS are documented here.
 
 v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
 as a release tag. The first two slices are merged: `a62a099` for
-audit-quick-wins and `d42c475` for memory-read tenancy + DAG integrity.
+audit-quick-wins and `d42c475` for memory-read tenancy + DAG integrity;
+task #25 is closed in v3.5-dev by the RLS group-select migration.
 
 ### Added
 
@@ -20,10 +21,15 @@ audit-quick-wins and `d42c475` for memory-read tenancy + DAG integrity.
   `mnemos_version_snapshot()` so UPDATE/DELETE resolve branch HEADs
   under lock, fail closed on missing/NULL/foreign heads with SQLSTATE
   `MN001`, and keep the DELETE tombstone path live.
+- **RLS group-select policy migration** —
+  `db/migrations_v3_5_rls_group_select_unix_bits.sql` replaces
+  `mnemos_group_select` so RLS uses Unix group-read bit math
+  (`((permission_mode / 10) % 10) >= 4`), matching
+  `read_visibility_predicate` and closing #25.
 - **Docker existing-volume upgrade path** — `docker-compose.yml` and
   `docker-compose.staging.yml` now include a one-shot
-  `postgres-upgrade` service that applies the v3.5 trigger migration
-  after Postgres is healthy. This is required because
+  `postgres-upgrade` service that applies v3.5 database patch
+  migrations after Postgres is healthy. This is required because
   `/docker-entrypoint-initdb.d` only runs when a volume is first
   initialized.
 - **Regression coverage** — new slice-2 tests cover branch visibility,
@@ -84,7 +90,6 @@ audit-quick-wins and `d42c475` for memory-read tenancy + DAG integrity.
 - #21 federation per-peer ACL + stable cursor.
 - #22 audit endpoint scoping + lifespan teardown.
 - #23 entity namespace conflict-key migration.
-- #25 RLS Unix-bit fix for `mnemos_group_select`.
 - #19 bulk webhook parity.
 - #15 deletion-log refactor.
 

@@ -7,7 +7,7 @@ development branch is `v3.5-dev`; it is not a release tag.
 
 ## Current security invariants
 
-As of v3.5-dev slice 2 (`d42c475`):
+As of v3.5-dev slice 2.5:
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP
@@ -25,10 +25,10 @@ As of v3.5-dev slice 2 (`d42c475`):
 - `db/migrations_v3_5_trigger_same_memory_parent.sql` rejects missing,
   NULL, or cross-memory branch heads with SQLSTATE `MN001`; the API maps
   that condition to HTTP 409 with branch reconciliation guidance.
-
-Known open item: the original `mnemos_group_select` RLS policy still uses
-`permission_mode >= 640`. The application predicate is stricter and uses
-the Unix group bit; task #25 tracks the matching RLS migration.
+- `db/migrations_v3_5_rls_group_select_unix_bits.sql` closes task #25:
+  the `mnemos_group_select` RLS policy and application
+  `read_visibility_predicate` both use the Unix group-read bit expression
+  `((permission_mode / 10) % 10) >= 4`.
 
 ## Reporting a vulnerability
 
