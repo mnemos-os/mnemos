@@ -40,6 +40,25 @@ The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
 
 ---
 
+## v3.5 Webhook Retry Migration Gate
+
+The v3.5 webhook retry migrations change delivery ownership from in-transaction
+row locks to persisted attempt leases. Apply this gate when upgrading an
+existing deployment:
+
+1. Stop or drain all MNEMOS processes that can write webhook delivery attempts.
+2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql` and `db/migrations_v3_5_webhook_attempt_lease.sql`.
+3. Restart MNEMOS workers on the new build.
+
+Do not run this migration while old v3.5-dev webhook writers are still active.
+Older writers update a parent attempt and insert its successor in separate
+statements, which can interleave with new recovery workers. New workers use
+per-attempt leases plus per-chain advisory locks, and startup runs repeated
+repair sweeps for the first minute, but the one-time migration window still
+requires draining old writers first.
+
+---
+
 ## Configuration
 
 ### Minimal Configuration (.env)

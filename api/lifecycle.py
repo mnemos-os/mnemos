@@ -279,20 +279,13 @@ async def lifespan(app):
         logger.info("Background distillation worker disabled")
         _worker_status["distillation_worker"] = "disabled"
 
-    # Webhook retry repair + recovery worker. The repair sweep closes the
-    # online-upgrade race where an older process committed status=retrying
-    # before committing the successor row during the SQL migration window.
+    # Webhook retry repair + recovery worker. The recovery loop owns a startup
+    # repair burst, then keeps sweeping periodically for retry rows that gain a
+    # successor during deploy or recovery drift.
     if _pool:
-        logger.info('Repairing superseded webhook retry attempts')
         from api.webhook_dispatcher import (  # noqa: WPS433
             recovery_worker_loop as _webhook_recovery,
-            repair_superseded_retrying_deliveries as _webhook_retry_repair,
         )
-        try:
-            repair_result = await _webhook_retry_repair(_pool)
-            logger.info('webhook retry repair sweep result: %s', repair_result)
-        except Exception:
-            logger.exception('webhook retry repair sweep failed')
         logger.info('Launching webhook delivery recovery worker')
         _schedule_background(_webhook_recovery(_pool))
 

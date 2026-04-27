@@ -86,10 +86,15 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   attempt (`api/webhook_dispatcher.py:353-392`). The new migration
   `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs
   existing superseded `retrying` rows and keeps them out of replay.
-  Round 2 holds a `FOR UPDATE SKIP LOCKED` claim through recovery send
-  and finalize, and adds an idempotent startup repair sweep for
-  upgrade-window retry rows that gained a successor after the migration
-  snapshot.
+  Round 3 replaces the long-held `FOR UPDATE SKIP LOCKED` send lock with
+  `lease_token` / `lease_expires_at` persisted claims in
+  `db/migrations_v3_5_webhook_attempt_lease.sql`, so DNS validation and
+  outbound HTTP no longer hold shared DB connections. It also caps active
+  sends per process, gates new-code recovery claims and successor inserts
+  with a per-chain advisory lock, and runs a startup repair burst before
+  backing off to periodic repair sweeps. Operators must drain webhook
+  writers before applying the v3.5 webhook retry migrations during rolling
+  upgrades.
 
 ### Conflicts and operator handling
 

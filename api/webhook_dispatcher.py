@@ -11,10 +11,9 @@ Design notes
 - Initial attempt runs inline as a background task (asyncio.create_task via
   _schedule_background). On failure, a new delivery row is scheduled at the
   next backoff interval; the failed attempt is marked `retry_scheduled` so it
-  remains available for audit without being replayed. A recovery worker
-  started at app lifespan wakes periodically and locks due `pending` rows,
-  plus due `retrying` rows that do not already have a successor attempt,
-  with `FOR UPDATE SKIP LOCKED` before any outbound POST is attempted.
+  remains available for audit without being replayed. Workers claim due rows
+  by writing a short-lived lease, release the database connection, and only
+  then perform DNS validation and the outbound POST.
 - HMAC-SHA256 signature over the raw JSON body bytes. Receivers verify with
   the per-subscription secret returned once at create time.
 
@@ -28,6 +27,9 @@ import hashlib
 import hmac
 import json
 import logging
+import os
+import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, Optional
 
@@ -39,8 +41,17 @@ logger = logging.getLogger(__name__)
 # Retry schedule in seconds: 1m, 5m, 30m, 2h
 BACKOFF_SCHEDULE = [60, 300, 1800, 7200]
 MAX_ATTEMPTS = len(BACKOFF_SCHEDULE)  # = 4
-DELIVERY_TIMEOUT = 10.0                # seconds per HTTP POST
+DNS_TIMEOUT = float(os.getenv("WEBHOOK_DNS_TIMEOUT", "10.0"))
+DELIVERY_TIMEOUT = float(os.getenv("WEBHOOK_HTTP_TIMEOUT", "10.0"))
+WEBHOOK_LEASE_SECONDS = int(os.getenv(
+    "WEBHOOK_LEASE_SECONDS",
+    str(max(90, int(DNS_TIMEOUT + DELIVERY_TIMEOUT + 30))),
+))
+WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
 RECOVERY_POLL_INTERVAL = 30.0          # seconds between recovery-worker passes
+REPAIR_BURST_SECONDS = float(os.getenv("WEBHOOK_REPAIR_BURST_SECONDS", "60.0"))
+REPAIR_BURST_INTERVAL = float(os.getenv("WEBHOOK_REPAIR_BURST_INTERVAL", "5.0"))
+REPAIR_PERIODIC_INTERVAL = float(os.getenv("WEBHOOK_REPAIR_PERIODIC_INTERVAL", "300.0"))
 SUPERSEDED_RETRY_STATUS = "retry_scheduled"
 TERMINAL_DELIVERY_STATUSES = frozenset((
     "succeeded",
@@ -48,10 +59,13 @@ TERMINAL_DELIVERY_STATUSES = frozenset((
     SUPERSEDED_RETRY_STATUS,
 ))
 LIVE_DELIVERY_STATUSES = frozenset(("pending", "retrying"))
+_send_semaphore: asyncio.Semaphore | None = None
 
 WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
     UPDATE webhook_deliveries d
-    SET status = 'retry_scheduled'
+    SET status = 'retry_scheduled',
+        lease_token = NULL,
+        lease_expires_at = NULL
     WHERE d.status = 'retrying'
       AND EXISTS (
         SELECT 1
@@ -62,6 +76,14 @@ WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
           AND newer.attempt_num > d.attempt_num
       )
 """
+
+
+@dataclass(frozen=True)
+class _DeliveryResult:
+    succeeded: bool
+    response_status: Optional[int] = None
+    response_body: Optional[str] = None
+    error: Optional[str] = None
 
 
 # ── Public surface ────────────────────────────────────────────────────────────
@@ -115,18 +137,48 @@ async def recovery_worker_loop(pool: asyncpg.Pool) -> None:
     Started from the FastAPI lifespan. Cancels cleanly on shutdown.
     """
     logger.info("webhook recovery worker started")
+    loop = asyncio.get_running_loop()
+    repair_burst_deadline = loop.time() + REPAIR_BURST_SECONDS
+    next_repair_at = loop.time()
     while True:
         try:
-            await asyncio.sleep(RECOVERY_POLL_INTERVAL)
+            now = loop.time()
+            if now >= next_repair_at:
+                in_burst = now < repair_burst_deadline
+                await _repair_superseded_retrying_deliveries_safely(
+                    pool,
+                    phase="burst" if in_burst else "periodic",
+                )
+                next_repair_at = now + (
+                    REPAIR_BURST_INTERVAL if in_burst else REPAIR_PERIODIC_INTERVAL
+                )
+
             await _recover_due_deliveries(pool)
+            await asyncio.sleep(
+                min(RECOVERY_POLL_INTERVAL, max(0.0, next_repair_at - loop.time()))
+            )
         except asyncio.CancelledError:
             logger.info("webhook recovery worker cancelled")
             raise
         except Exception:  # pragma: no cover — log and keep running
             logger.exception("webhook recovery worker iteration failed")
+            await asyncio.sleep(RECOVERY_POLL_INTERVAL)
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
+
+
+async def _repair_superseded_retrying_deliveries_safely(
+    pool: asyncpg.Pool,
+    *,
+    phase: str,
+) -> None:
+    """Run one repair sweep without killing the recovery worker on failure."""
+    try:
+        result = await repair_superseded_retrying_deliveries(pool)
+        logger.info("webhook retry repair %s sweep result: %s", phase, result)
+    except Exception:  # pragma: no cover — log and keep running
+        logger.exception("webhook retry repair %s sweep failed", phase)
 
 
 async def repair_superseded_retrying_deliveries(pool: asyncpg.Pool) -> str:
@@ -136,16 +188,14 @@ async def repair_superseded_retrying_deliveries(pool: asyncpg.Pool) -> str:
 
 
 async def _recover_due_deliveries(pool: asyncpg.Pool, *, limit: int = 50) -> int:
-    """Recover due deliveries under row locks, one send transaction at a time."""
+    """Recover due deliveries by taking short leases before each send."""
     recovered = 0
-    for _ in range(limit):
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                rows = await _recoverable_delivery_ids(conn, limit=1)
-                if not rows:
-                    return recovered
-                await _attempt_delivery_locked(conn, str(rows[0]["id"]))
-                recovered += 1
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            rows = await _recoverable_delivery_ids(conn, limit=limit)
+    for row in rows:
+        if await _attempt_delivery(str(row["id"]), pool=pool):
+            recovered += 1
     return recovered
 
 
@@ -161,6 +211,7 @@ async def _recoverable_delivery_ids(
         WHERE d.scheduled_at <= NOW()
           AND d.attempt_num <= $1
           AND d.status IN ('pending', 'retrying')
+          AND (d.lease_token IS NULL OR d.lease_expires_at < NOW())
           AND (
             d.status = 'pending'
             OR (
@@ -210,54 +261,100 @@ async def _matching_subscriptions(
     return await conn.fetch(query, *args)
 
 
-async def _attempt_delivery(delivery_id: str) -> None:
-    """Fire one HTTP POST for a single delivery row. Update status."""
-    from api.lifecycle import _pool  # noqa: WPS433
-    if not _pool:
+def _get_send_semaphore() -> asyncio.Semaphore:
+    global _send_semaphore
+    if _send_semaphore is None:
+        _send_semaphore = asyncio.Semaphore(max(1, WEBHOOK_MAX_CONCURRENT_SENDS))
+    return _send_semaphore
+
+
+async def _attempt_delivery(delivery_id: str, *, pool: Optional[asyncpg.Pool] = None) -> bool:
+    """Claim, send, and finalize one delivery without holding DB during I/O."""
+    if pool is None:
+        from api.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
+        pool = lifecycle_pool
+    if not pool:
         logger.warning("webhook dispatcher: no DB pool — skipping delivery %s", delivery_id)
-        return
+        return False
 
-    async with _pool.acquire() as conn:
+    async with _get_send_semaphore():
+        lease_token = str(uuid.uuid4())
+        delivery = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
+        if not delivery:
+            return False
+        result = await _send_claimed_delivery(delivery)
+        return await _finalize_delivery(pool, delivery, lease_token, result)
+
+
+async def _claim_delivery(
+    pool: asyncpg.Pool,
+    delivery_id: str,
+    *,
+    lease_token: str,
+    lease_seconds: int = WEBHOOK_LEASE_SECONDS,
+) -> Optional[asyncpg.Record]:
+    """Persist a short lease for one due live delivery row."""
+    async with pool.acquire() as conn:
         async with conn.transaction():
-            await _attempt_delivery_locked(conn, delivery_id)
+            delivery = await _load_delivery_for_claim(conn, delivery_id)
+            if not delivery:
+                return None
+
+            await _lock_delivery_chain(conn, delivery)
+            if delivery["status"] == "retrying" and await _has_successor_attempt(conn, delivery):
+                await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status=$2,
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid AND status='retrying'
+                    """,
+                    delivery_id, SUPERSEDED_RETRY_STATUS,
+                )
+                return None
+
+            return await conn.fetchrow(
+                """
+                UPDATE webhook_deliveries d
+                SET lease_token=$2::uuid,
+                    lease_expires_at=NOW() + ($3::int * INTERVAL '1 second'),
+                    status=CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
+                FROM webhook_subscriptions s
+                WHERE s.id = d.subscription_id
+                  AND d.id=$1::uuid
+                  AND d.scheduled_at <= NOW()
+                  AND d.attempt_num <= $4
+                  AND d.status IN ('pending', 'retrying')
+                  AND (d.lease_token IS NULL OR d.lease_expires_at < NOW())
+                  AND (
+                    d.status = 'pending'
+                    OR (
+                      d.status = 'retrying'
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM webhook_deliveries newer
+                        WHERE newer.subscription_id = d.subscription_id
+                          AND newer.event_type = d.event_type
+                          AND newer.payload_hash = d.payload_hash
+                          AND newer.attempt_num > d.attempt_num
+                      )
+                    )
+                  )
+                RETURNING d.id, d.subscription_id, d.event_type, d.payload,
+                          d.payload_hash, d.attempt_num, d.status,
+                          s.url, s.secret, s.revoked
+                """,
+                delivery_id, lease_token, lease_seconds, MAX_ATTEMPTS,
+            )
 
 
-async def _attempt_delivery_locked(conn: asyncpg.Connection, delivery_id: str) -> None:
-    """Attempt one delivery while holding its row lock for send + finalize."""
-    delivery = await _load_delivery_for_attempt(conn, delivery_id)
+async def _send_claimed_delivery(delivery: asyncpg.Record) -> _DeliveryResult:
+    """Perform DNS validation and HTTP POST for an already leased row."""
     if not delivery:
-        return
-    if delivery["status"] == "retrying" and await _has_successor_attempt(conn, delivery):
-        await conn.execute(
-            """
-            UPDATE webhook_deliveries
-            SET status=$2
-            WHERE id=$1::uuid AND status='retrying'
-            """,
-            delivery_id, SUPERSEDED_RETRY_STATUS,
-        )
-        return
-    if delivery["status"] == "pending":
-        await conn.execute(
-            """
-            UPDATE webhook_deliveries
-            SET status='retrying'
-            WHERE id=$1::uuid AND status='pending'
-            """,
-            delivery_id,
-        )
+        return _DeliveryResult(succeeded=False, error="delivery not found")
     if delivery["revoked"]:
-        await conn.execute(
-            """
-            UPDATE webhook_deliveries
-            SET status='abandoned',
-                error='subscription revoked',
-                delivered_at=NOW()
-            WHERE id=$1::uuid
-            """,
-            delivery_id,
-        )
-        return
+        return _DeliveryResult(succeeded=False, error="subscription revoked")
 
     signature = _sign(delivery["secret"], delivery["payload"])
     headers = {
@@ -280,7 +377,9 @@ async def _attempt_delivery_locked(conn: asyncpg.Connection, delivery_id: str) -
     # validate_webhook_url's docstring.
     try:
         from api.handlers.webhooks import validate_webhook_url
-        await validate_webhook_url(delivery["url"])
+        await asyncio.wait_for(validate_webhook_url(delivery["url"]), timeout=DNS_TIMEOUT)
+    except asyncio.TimeoutError:
+        error = f"url-rejected: TimeoutError: DNS validation exceeded {DNS_TIMEOUT:.1f}s"
     except Exception as e:
         error = f"url-rejected: {type(e).__name__}: {e}"
     else:
@@ -299,73 +398,138 @@ async def _attempt_delivery_locked(conn: asyncpg.Connection, delivery_id: str) -
             error = f"{type(e).__name__}: {e}"
 
     succeeded = response_status is not None and 200 <= response_status < 300
-
-    if succeeded:
-        await conn.execute(
-            """
-            UPDATE webhook_deliveries
-            SET status='succeeded',
-                response_status=$2,
-                response_body=$3,
-                delivered_at=NOW()
-            WHERE id=$1::uuid
-            """,
-            delivery_id, response_status, response_body,
-        )
-        return
-
-    next_attempt = delivery["attempt_num"] + 1
-    if next_attempt > MAX_ATTEMPTS:
-        await conn.execute(
-            """
-            UPDATE webhook_deliveries
-            SET status='abandoned',
-                response_status=$2,
-                response_body=$3,
-                error=$4,
-                delivered_at=NOW()
-            WHERE id=$1::uuid
-            """,
-            delivery_id, response_status, response_body, error,
-        )
-        return
-
-    # Enqueue the next attempt row, then terminalize this failed attempt.
-    backoff = BACKOFF_SCHEDULE[delivery["attempt_num"] - 1]
-    scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
-    await conn.execute(
-        """
-        INSERT INTO webhook_deliveries
-          (subscription_id, event_type, payload, payload_hash,
-           attempt_num, status, scheduled_at)
-        VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-        """,
-        delivery["subscription_id"],
-        delivery["event_type"],
-        delivery["payload"],
-        delivery["payload_hash"],
-        next_attempt,
-        scheduled_at,
-    )
-    await conn.execute(
-        """
-        UPDATE webhook_deliveries
-        SET status=$2,
-            response_status=$3,
-            response_body=$4,
-            error=$5
-        WHERE id=$1::uuid
-        """,
-        delivery_id, SUPERSEDED_RETRY_STATUS, response_status, response_body, error,
-    )
-    logger.info(
-        "webhook delivery %s attempt %d failed (status=%s error=%s), retry in %ds",
-        delivery_id, delivery["attempt_num"], response_status, error, backoff,
+    return _DeliveryResult(
+        succeeded=succeeded,
+        response_status=response_status,
+        response_body=response_body,
+        error=error,
     )
 
 
-async def _load_delivery_for_attempt(conn: asyncpg.Connection, delivery_id: str) -> Optional[asyncpg.Record]:
-    """Load and lock a due live delivery row, skipping rows another worker owns."""
+async def _finalize_delivery(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    lease_token: str,
+    result: _DeliveryResult,
+) -> bool:
+    """Persist the send result only if this worker still owns the lease."""
+    delivery_id = str(delivery["id"])
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _lock_delivery_chain(conn, delivery)
+
+            if delivery["revoked"]:
+                finalized = await conn.fetchrow(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='abandoned',
+                        error='subscription revoked',
+                        delivered_at=NOW(),
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND lease_token=$2::uuid
+                      AND lease_expires_at >= NOW()
+                    RETURNING id
+                    """,
+                    delivery_id, lease_token,
+                )
+                return finalized is not None
+
+            if result.succeeded:
+                finalized = await conn.fetchrow(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='succeeded',
+                        response_status=$3,
+                        response_body=$4,
+                        error=NULL,
+                        delivered_at=NOW(),
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND lease_token=$2::uuid
+                      AND lease_expires_at >= NOW()
+                    RETURNING id
+                    """,
+                    delivery_id, lease_token, result.response_status, result.response_body,
+                )
+                return finalized is not None
+
+            next_attempt = delivery["attempt_num"] + 1
+            if next_attempt > MAX_ATTEMPTS:
+                finalized = await conn.fetchrow(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='abandoned',
+                        response_status=$3,
+                        response_body=$4,
+                        error=$5,
+                        delivered_at=NOW(),
+                        lease_token=NULL,
+                        lease_expires_at=NULL
+                    WHERE id=$1::uuid
+                      AND lease_token=$2::uuid
+                      AND lease_expires_at >= NOW()
+                    RETURNING id
+                    """,
+                    delivery_id, lease_token, result.response_status, result.response_body, result.error,
+                )
+                return finalized is not None
+
+            backoff = BACKOFF_SCHEDULE[delivery["attempt_num"] - 1]
+            scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+            finalized = await conn.fetchrow(
+                """
+                UPDATE webhook_deliveries
+                SET status=$3,
+                    response_status=$4,
+                    response_body=$5,
+                    error=$6,
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND lease_expires_at >= NOW()
+                RETURNING id
+                """,
+                delivery_id,
+                lease_token,
+                SUPERSEDED_RETRY_STATUS,
+                result.response_status,
+                result.response_body,
+                result.error,
+            )
+            if finalized is None:
+                logger.info(
+                    "webhook delivery %s finalize skipped because lease expired or moved",
+                    delivery_id,
+                )
+                return False
+
+            await conn.execute(
+                """
+                INSERT INTO webhook_deliveries
+                  (subscription_id, event_type, payload, payload_hash,
+                   attempt_num, status, scheduled_at)
+                VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+                """,
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload"],
+                delivery["payload_hash"],
+                next_attempt,
+                scheduled_at,
+            )
+            logger.info(
+                "webhook delivery %s attempt %d failed (status=%s error=%s), retry in %ds",
+                delivery_id, delivery["attempt_num"], result.response_status, result.error, backoff,
+            )
+            return True
+
+
+async def _load_delivery_for_claim(conn: asyncpg.Connection, delivery_id: str) -> Optional[asyncpg.Record]:
+    """Load a due live delivery candidate for a short lease attempt."""
     return await conn.fetchrow(
         """
         SELECT d.id, d.subscription_id, d.event_type, d.payload,
@@ -377,10 +541,31 @@ async def _load_delivery_for_attempt(conn: asyncpg.Connection, delivery_id: str)
           AND d.scheduled_at <= NOW()
           AND d.attempt_num <= $2
           AND d.status IN ('pending', 'retrying')
-        FOR UPDATE OF d SKIP LOCKED
+          AND (d.lease_token IS NULL OR d.lease_expires_at < NOW())
         """,
         delivery_id, MAX_ATTEMPTS,
     )
+
+
+async def _lock_delivery_chain(conn: asyncpg.Connection, delivery: asyncpg.Record) -> None:
+    """Serialize new-code recovery claims and successor inserts per chain."""
+    await conn.execute("SELECT pg_advisory_xact_lock($1)", _delivery_chain_lock_key(delivery))
+
+
+def _delivery_chain_lock_key(delivery: asyncpg.Record, _hashlib_mod=None) -> int:
+    """Stable signed-int64 lock key for one webhook retry chain."""
+    if _hashlib_mod is None:
+        _hashlib_mod = hashlib
+    digest = _hashlib_mod.sha256(
+        (
+            "webhook-chain:"
+            f"{delivery['subscription_id']}:{delivery['event_type']}:{delivery['payload_hash']}"
+        ).encode("utf-8")
+    ).digest()[:8]
+    key = int.from_bytes(digest, "big", signed=False)
+    if key >= 2**63:
+        key -= 2**64
+    return key
 
 
 async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Record) -> bool:

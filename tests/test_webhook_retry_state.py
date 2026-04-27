@@ -23,6 +23,8 @@ class _FakeWebhookStore:
         }
         self.locked_by: dict[str, int] = {}
         self.lock_acquisitions = 0
+        self.advisory_locks: dict[int, asyncio.Lock] = {}
+        self.advisory_acquisitions = 0
         self.pool: "_FakePool | None" = None
 
     def row(self, row_id: str):
@@ -47,6 +49,13 @@ class _FakeWebhookStore:
             if owner != conn_id
         }
 
+    def advisory_lock(self, key: int) -> asyncio.Lock:
+        lock = self.advisory_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.advisory_locks[key] = lock
+        return lock
+
 
 class _FakeTransaction:
     def __init__(self, conn: "_FakeWebhookConn"):
@@ -58,6 +67,7 @@ class _FakeTransaction:
 
     async def __aexit__(self, exc_type, exc, tb):
         self.conn.store.release_locks(self.conn.conn_id)
+        self.conn.release_advisory_locks()
         self.conn.in_transaction -= 1
         return False
 
@@ -89,6 +99,7 @@ class _FakeWebhookConn:
         self.store = store
         self.conn_id = conn_id
         self.in_transaction = 0
+        self.advisory_keys: list[int] = []
 
     @property
     def rows(self):
@@ -109,6 +120,13 @@ class _FakeWebhookConn:
     def transaction(self):
         return _FakeTransaction(self)
 
+    def release_advisory_locks(self) -> None:
+        while self.advisory_keys:
+            key = self.advisory_keys.pop()
+            lock = self.store.advisory_lock(key)
+            if lock.locked():
+                lock.release()
+
     async def fetch(self, sql: str, *args):
         if "SELECT d.id FROM webhook_deliveries d" not in sql:
             raise AssertionError(f"unexpected fetch SQL: {sql}")
@@ -119,6 +137,8 @@ class _FakeWebhookConn:
         for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
             if row["scheduled_at"] > now or row["attempt_num"] > max_attempts:
                 continue
+            if not self._lease_available(row):
+                continue
             if row["status"] == "pending":
                 if self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
@@ -128,26 +148,68 @@ class _FakeWebhookConn:
         return recoverable[:limit]
 
     async def fetchrow(self, sql: str, *args):
-        if "FROM webhook_deliveries d" not in sql or "JOIN webhook_subscriptions" not in sql:
-            raise AssertionError(f"unexpected fetchrow SQL: {sql}")
-        row = self._row(args[0])
-        if row is None:
-            return None
-        max_attempts = args[1] if len(args) > 1 else 4
-        if (
-            row["scheduled_at"] > datetime.now(timezone.utc)
-            or row["attempt_num"] > max_attempts
-            or row["status"] not in {"pending", "retrying"}
-        ):
-            return None
-        if not self._try_lock(row["id"]):
-            return None
-        return {
-            **row,
-            "url": self.subscription["url"],
-            "secret": self.subscription["secret"],
-            "revoked": self.subscription["revoked"],
-        }
+        compact = " ".join(sql.split())
+        if compact.startswith("SELECT d.id, d.subscription_id"):
+            row = self._row(args[0])
+            if row is None:
+                return None
+            max_attempts = args[1] if len(args) > 1 else 4
+            if not self._due_live_and_leaseable(row, max_attempts):
+                return None
+            return self._with_subscription(row)
+
+        if compact.startswith("UPDATE webhook_deliveries d SET lease_token"):
+            row = self._row(args[0])
+            max_attempts = args[3]
+            if row is None or not self._due_live_and_leaseable(row, max_attempts):
+                return None
+            if row["status"] == "retrying" and self._has_successor(row):
+                return None
+            row["lease_token"] = str(args[1])
+            row["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=int(args[2]))
+            if row["status"] == "pending":
+                row["status"] = "retrying"
+            return self._with_subscription(row)
+
+        if "SET status='succeeded'" in compact:
+            row = self._row(args[0])
+            if row is None or not self._owns_live_lease(row, args[1]):
+                return None
+            row["status"] = "succeeded"
+            row["response_status"] = args[2]
+            row["response_body"] = args[3]
+            row["error"] = None
+            row["delivered_at"] = datetime.now(timezone.utc)
+            self._clear_lease(row)
+            return {"id": row["id"]}
+
+        if "SET status='abandoned'" in compact:
+            row = self._row(args[0])
+            if row is None or not self._owns_live_lease(row, args[1]):
+                return None
+            row["status"] = "abandoned"
+            if "subscription revoked" in compact:
+                row["error"] = "subscription revoked"
+            else:
+                row["response_status"] = args[2]
+                row["response_body"] = args[3]
+                row["error"] = args[4]
+            row["delivered_at"] = datetime.now(timezone.utc)
+            self._clear_lease(row)
+            return {"id": row["id"]}
+
+        if "SET status=$3" in compact:
+            row = self._row(args[0])
+            if row is None or not self._owns_live_lease(row, args[1]):
+                return None
+            row["status"] = args[2]
+            row["response_status"] = args[3]
+            row["response_body"] = args[4]
+            row["error"] = args[5]
+            self._clear_lease(row)
+            return {"id": row["id"]}
+
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
 
     async def fetchval(self, sql: str, *args):
         compact = " ".join(sql.split())
@@ -172,13 +234,28 @@ class _FakeWebhookConn:
 
     async def execute(self, sql: str, *args):
         compact = " ".join(sql.split())
+        if compact.startswith("SELECT pg_advisory_xact_lock"):
+            key = int(args[0])
+            lock = self.store.advisory_lock(key)
+            await lock.acquire()
+            self.advisory_keys.append(key)
+            self.store.advisory_acquisitions += 1
+            return "SELECT 1"
         if compact.startswith("UPDATE webhook_deliveries d SET status = 'retry_scheduled'"):
             updated = 0
             for row in self.rows:
                 if row["status"] == "retrying" and self._has_successor(row):
                     row["status"] = "retry_scheduled"
+                    self._clear_lease(row)
                     updated += 1
             return f"UPDATE {updated}"
+        if compact.startswith("UPDATE webhook_deliveries SET status=$2"):
+            row = self._row(args[0])
+            if row is None or row["status"] != "retrying":
+                return "UPDATE 0"
+            row["status"] = args[1]
+            self._clear_lease(row)
+            return "UPDATE 1"
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
             if row is None or row["status"] != "pending":
@@ -199,34 +276,10 @@ class _FakeWebhookConn:
                 "response_body": None,
                 "error": None,
                 "delivered_at": None,
+                "lease_token": None,
+                "lease_expires_at": None,
             })
             return "INSERT 0 1"
-        if "SET status='succeeded'" in compact:
-            row = self._row(args[0])
-            row["status"] = "succeeded"
-            row["response_status"] = args[1]
-            row["response_body"] = args[2]
-            row["delivered_at"] = datetime.now(timezone.utc)
-            return "UPDATE 1"
-        if "SET status='abandoned'" in compact:
-            row = self._row(args[0])
-            row["status"] = "abandoned"
-            if len(args) > 1:
-                row["response_status"] = args[1]
-                row["response_body"] = args[2]
-                row["error"] = args[3]
-            else:
-                row["error"] = "subscription revoked"
-            row["delivered_at"] = datetime.now(timezone.utc)
-            return "UPDATE 1"
-        if "SET status=$2" in compact:
-            row = self._row(args[0])
-            row["status"] = args[1]
-            if len(args) > 2:
-                row["response_status"] = args[2]
-                row["response_body"] = args[3]
-                row["error"] = args[4]
-            return "UPDATE 1"
         raise AssertionError(f"unexpected execute SQL: {sql}")
 
     def _row(self, row_id: str):
@@ -234,6 +287,40 @@ class _FakeWebhookConn:
 
     def _has_successor(self, row: dict[str, Any]) -> bool:
         return self.store.has_successor(row)
+
+    def _lease_available(self, row: dict[str, Any]) -> bool:
+        expires_at = row.get("lease_expires_at")
+        return row.get("lease_token") is None or (
+            expires_at is not None and expires_at < datetime.now(timezone.utc)
+        )
+
+    def _owns_live_lease(self, row: dict[str, Any], lease_token: str) -> bool:
+        expires_at = row.get("lease_expires_at")
+        return (
+            row.get("lease_token") == str(lease_token)
+            and expires_at is not None
+            and expires_at >= datetime.now(timezone.utc)
+        )
+
+    def _clear_lease(self, row: dict[str, Any]) -> None:
+        row["lease_token"] = None
+        row["lease_expires_at"] = None
+
+    def _due_live_and_leaseable(self, row: dict[str, Any], max_attempts: int) -> bool:
+        return (
+            row["scheduled_at"] <= datetime.now(timezone.utc)
+            and row["attempt_num"] <= max_attempts
+            and row["status"] in {"pending", "retrying"}
+            and self._lease_available(row)
+        )
+
+    def _with_subscription(self, row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **row,
+            "url": self.subscription["url"],
+            "secret": self.subscription["secret"],
+            "revoked": self.subscription["revoked"],
+        }
 
     def _try_lock(self, row_id: str) -> bool:
         if self.in_transaction == 0:
@@ -258,6 +345,8 @@ class _HTTPClientFactory:
         self.statuses = statuses
         self.delivery_ids: list[str] = []
         self.delay = 0.0
+        self.active = 0
+        self.max_active = 0
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
@@ -274,10 +363,15 @@ class _FakeHTTPClient:
         return False
 
     async def post(self, url, *, content, headers):
-        if self.factory.delay:
-            await asyncio.sleep(self.factory.delay)
-        self.factory.delivery_ids.append(headers["X-MNEMOS-Delivery-ID"])
-        return _FakeResponse(self.factory.statuses.pop(0))
+        self.factory.active += 1
+        self.factory.max_active = max(self.factory.max_active, self.factory.active)
+        try:
+            if self.factory.delay:
+                await asyncio.sleep(self.factory.delay)
+            self.factory.delivery_ids.append(headers["X-MNEMOS-Delivery-ID"])
+            return _FakeResponse(self.factory.statuses.pop(0))
+        finally:
+            self.factory.active -= 1
 
 
 def _attempt(attempt_num: int = 1) -> dict[str, Any]:
@@ -295,6 +389,8 @@ def _attempt(attempt_num: int = 1) -> dict[str, Any]:
         "response_body": None,
         "error": None,
         "delivered_at": None,
+        "lease_token": None,
+        "lease_expires_at": None,
     }
 
 
@@ -314,6 +410,7 @@ async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int])
     http_factory = _HTTPClientFactory(statuses)
     monkeypatch.setattr(webhooks, "validate_webhook_url", _accept_url)
     monkeypatch.setattr(webhook_dispatcher.httpx, "AsyncClient", http_factory)
+    monkeypatch.setattr(webhook_dispatcher, "_send_semaphore", None)
     return webhook_dispatcher, conn, http_factory
 
 
@@ -414,7 +511,10 @@ def test_recovery_dequeue_uses_skip_locked_claim():
     compact = " ".join(source.split())
 
     assert "FOR UPDATE SKIP LOCKED" in compact
-    assert "await _attempt_delivery_locked(conn, str(rows[0][\"id\"]))" in compact
+    assert "SET lease_token=$2::uuid" in compact
+    assert "await _send_claimed_delivery(delivery)" in compact
+    assert "FOR UPDATE OF d SKIP LOCKED" not in compact
+    assert "_attempt_delivery_locked" not in compact
 
 
 def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
@@ -430,9 +530,115 @@ def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
         )
 
         assert sum(recovered) == 1
-        assert conn.lock_acquisitions == 1
+        assert conn.store.advisory_acquisitions >= 1
         assert retrying["status"] == "succeeded"
         assert http.delivery_ids == [retrying["id"]]
+
+    asyncio.run(run())
+
+
+def test_expired_delivery_lease_can_be_reclaimed(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, _http = await _install(monkeypatch, [row], [])
+
+        first = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token="00000000-0000-0000-0000-000000000001",
+            lease_seconds=1,
+        )
+        assert first is not None
+        assert row["status"] == "retrying"
+        assert row["lease_token"] == "00000000-0000-0000-0000-000000000001"
+
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        second = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token="00000000-0000-0000-0000-000000000002",
+            lease_seconds=1,
+        )
+
+        assert second is not None
+        assert row["lease_token"] == "00000000-0000-0000-0000-000000000002"
+
+    asyncio.run(run())
+
+
+def test_finalize_with_stale_lease_token_is_noop(monkeypatch):
+    async def run():
+        row = _attempt()
+        row["status"] = "retrying"
+        row["lease_token"] = "00000000-0000-0000-0000-000000000001"
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        dispatcher, conn, _http = await _install(monkeypatch, [row], [])
+        delivery = conn._with_subscription(row)
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            delivery,
+            "00000000-0000-0000-0000-000000000001",
+            dispatcher._DeliveryResult(succeeded=True, response_status=204, response_body="ok"),
+        )
+
+        assert not finalized
+        assert row["status"] == "retrying"
+        assert row["response_status"] is None
+        assert row["lease_token"] == "00000000-0000-0000-0000-000000000001"
+
+    asyncio.run(run())
+
+
+def test_webhook_send_concurrency_cap(monkeypatch):
+    async def run():
+        rows = [_attempt(), _attempt(), _attempt()]
+        dispatcher, conn, http = await _install(monkeypatch, rows, [204, 204, 204])
+        http.delay = 0.05
+        monkeypatch.setattr(dispatcher, "_send_semaphore", asyncio.Semaphore(2))
+
+        sent = await asyncio.gather(*(dispatcher._attempt_delivery(row["id"]) for row in rows))
+
+        assert sent == [True, True, True]
+        assert http.max_active == 2
+        assert sorted(http.delivery_ids) == sorted(row["id"] for row in rows)
+        assert [row["status"] for row in rows] == ["succeeded", "succeeded", "succeeded"]
+        assert conn.store.advisory_acquisitions >= 6
+
+    asyncio.run(run())
+
+
+def test_rolling_upgrade_interleaving_waits_for_chain_advisory_lock_before_no_successor_check(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "retrying"
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+        blocker = _FakeWebhookConn(conn.store, conn_id=999)
+
+        async with blocker.transaction():
+            # This models a successor insert that is already in progress when
+            # recovery tries to claim the parent. Without the chain advisory
+            # lock, recovery would pass the no-successor check and POST parent.
+            await dispatcher._lock_delivery_chain(blocker, parent)
+            task = asyncio.create_task(dispatcher._attempt_delivery(parent["id"]))
+            await asyncio.sleep(0.01)
+            assert http.delivery_ids == []
+
+            successor = _attempt(attempt_num=parent["attempt_num"] + 1)
+            successor.update({
+                "subscription_id": parent["subscription_id"],
+                "event_type": parent["event_type"],
+                "payload": parent["payload"],
+                "payload_hash": parent["payload_hash"],
+            })
+            conn.rows.append(successor)
+
+        sent = await task
+
+        assert not sent
+        assert http.delivery_ids == []
+        assert parent["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert conn.store.advisory_acquisitions >= 2
 
     asyncio.run(run())
 
@@ -470,10 +676,57 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
     dispatcher_source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact_dispatcher = " ".join(dispatcher_source.split())
 
-    assert "repair_superseded_retrying_deliveries" in lifecycle_source
-    assert "await _webhook_retry_repair(_pool)" in lifecycle_source
+    assert "recovery_worker_loop" in lifecycle_source
+    assert "_schedule_background(_webhook_recovery(_pool))" in lifecycle_source
+    assert "REPAIR_BURST_SECONDS" in dispatcher_source
+    assert "REPAIR_PERIODIC_INTERVAL" in dispatcher_source
+    assert "_repair_superseded_retrying_deliveries_safely" in dispatcher_source
     assert "UPDATE webhook_deliveries d SET status = 'retry_scheduled'" in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
+
+
+def test_startup_repair_burst_then_periodic(monkeypatch):
+    async def run():
+        from api import webhook_dispatcher as dispatcher
+
+        phases: list[str] = []
+        intervals: list[float] = []
+        now = 0.0
+
+        class _FakeLoop:
+            def time(self):
+                return now
+
+        async def _repair(pool, *, phase):
+            phases.append(phase)
+
+        async def _recover(pool):
+            return 0
+
+        async def _sleep(delay):
+            nonlocal now
+            intervals.append(delay)
+            now += delay
+            if len(intervals) >= 3:
+                raise asyncio.CancelledError
+
+        monkeypatch.setattr(dispatcher, "REPAIR_BURST_SECONDS", 10)
+        monkeypatch.setattr(dispatcher, "REPAIR_BURST_INTERVAL", 5)
+        monkeypatch.setattr(dispatcher, "REPAIR_PERIODIC_INTERVAL", 300)
+        monkeypatch.setattr(dispatcher, "_repair_superseded_retrying_deliveries_safely", _repair)
+        monkeypatch.setattr(dispatcher, "_recover_due_deliveries", _recover)
+        monkeypatch.setattr(dispatcher.asyncio, "get_running_loop", lambda: _FakeLoop())
+        monkeypatch.setattr(dispatcher.asyncio, "sleep", _sleep)
+
+        try:
+            await dispatcher.recovery_worker_loop(object())
+        except asyncio.CancelledError:
+            pass
+
+        assert phases == ["burst", "burst", "periodic"]
+        assert intervals == [5, 5, 30.0]
+
+    asyncio.run(run())
 
 
 def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
@@ -491,3 +744,16 @@ def test_retry_terminal_state_migration_repairs_existing_superseded_rows():
     assert "newer.attempt_num > d.attempt_num" in compact
     assert "WHERE status IN ('pending', 'retrying')" in compact
     assert "same idempotent sweep on every startup" in sql
+
+
+def test_webhook_attempt_lease_migration_adds_claim_columns():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_attempt_lease.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "ADD COLUMN IF NOT EXISTS lease_token UUID NULL" in compact
+    assert "ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ NULL" in compact
+    assert "idx_webhook_deliveries_lease_expires_at" in sql
+    assert "ON webhook_deliveries(lease_expires_at)" in compact

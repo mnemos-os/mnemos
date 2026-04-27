@@ -42,6 +42,7 @@ EXPECTED_MIGRATIONS = [
     "migrations_v3_5_trigger_same_memory_parent.sql",
     "migrations_v3_5_rls_group_select_unix_bits.sql",
     "migrations_v3_5_webhook_retry_terminal_state.sql",
+    "migrations_v3_5_webhook_attempt_lease.sql",
 ]
 
 
@@ -192,6 +193,10 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/26-webhook-retry-terminal-state.sql"
         ) in text, compose_name
         assert (
+            "./db/migrations_v3_5_webhook_attempt_lease.sql:"
+            "/docker-entrypoint-initdb.d/27-webhook-attempt-lease.sql"
+        ) in text, compose_name
+        assert (
             "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
             "/migrations/24-trigger-same-memory-parent.sql:ro"
         ) in text, compose_name
@@ -203,11 +208,16 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "./db/migrations_v3_5_webhook_retry_terminal_state.sql:"
             "/migrations/26-webhook-retry-terminal-state.sql:ro"
         ) in text, compose_name
+        assert (
+            "./db/migrations_v3_5_webhook_attempt_lease.sql:"
+            "/migrations/27-webhook-attempt-lease.sql:ro"
+        ) in text, compose_name
         assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
         assert "-v ON_ERROR_STOP=1" in text, compose_name
         assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
         assert "-f /migrations/25-rls-group-select-unix-bits.sql" in text, compose_name
         assert "-f /migrations/26-webhook-retry-terminal-state.sql" in text, compose_name
+        assert "-f /migrations/27-webhook-attempt-lease.sql" in text, compose_name
         assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
 
 
