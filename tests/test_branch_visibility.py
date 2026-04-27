@@ -119,6 +119,124 @@ class _HiddenStartConn:
         raise AssertionError(f"unexpected fetch SQL: {sql}")
 
 
+class _MergeHiddenTargetConn:
+    """Alice owns the live memory, but target branch HEAD is Bob-private."""
+
+    def __init__(self):
+        self.now = datetime(2026, 1, 1, 12, 0, 0)
+        self.fetchrow_calls: list[tuple[str, tuple]] = []
+        self.fetchval_calls: list[tuple[str, tuple]] = []
+        self.execute_calls: list[tuple[str, tuple]] = []
+        self.target_gate_sql: str | None = None
+        self.insert_attempts = 0
+        self.memory = {
+            "id": "mem-1",
+            "owner_id": "alice",
+            "namespace": "alice-ns",
+            "permission_mode": 600,
+            "content": "live main content",
+            "category": "solutions",
+            "subcategory": None,
+            "metadata": {"live": True},
+            "verbatim_content": "live main content",
+        }
+        self.source_head = {
+            "id": "source-head-id",
+            "commit_hash": "source-hash",
+            "content": "source content",
+            "version_num": 2,
+            "category": "solutions",
+            "subcategory": None,
+            "metadata": {"from": "source"},
+            "verbatim_content": "source content",
+            "source_model": None,
+            "source_provider": None,
+            "source_session": None,
+            "source_agent": None,
+        }
+        self.hidden_target = {
+            "id": "hidden-target-id",
+            "version_num": 2,
+            "commit_hash": "hidden-target-hash",
+            "content": "hidden target content",
+            "category": "solutions",
+            "subcategory": None,
+            "metadata": {"hidden": True},
+            "verbatim_content": "hidden target content",
+            "owner_id": "bob",
+            "namespace": "alice-ns",
+            "permission_mode": 600,
+        }
+
+    def transaction(self):
+        return _Txn()
+
+    async def fetchrow(self, sql: str, *args):
+        self.fetchrow_calls.append((sql, args))
+        compact = " ".join(sql.split())
+
+        if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
+            return {"owner_id": "alice", "namespace": "alice-ns"}
+
+        if "FROM memories WHERE id = $1 AND owner_id = $2 AND namespace = $3 FOR UPDATE" in compact:
+            if args[1] == "alice" and args[2] == "alice-ns":
+                return self.memory
+            return None
+
+        if "FROM memory_versions mv" in compact and "mb.name = $2" in compact:
+            if args[1] == "source":
+                return self.source_head
+            if args[1] == "hidden_branch":
+                return self.hidden_target
+
+        if compact.startswith("SELECT head_version_id FROM memory_branches WHERE memory_id = $1 AND name = $2 FOR UPDATE"):
+            if args[1] == "hidden_branch":
+                return {"head_version_id": self.hidden_target["id"]}
+            return None
+
+        if compact.startswith("SELECT 1 FROM memory_versions WHERE id = $1"):
+            self.target_gate_sql = sql
+            if args[0] != self.hidden_target["id"]:
+                return None
+            if "permission_mode % 10" in compact:
+                caller = args[1]
+                namespace = args[-1]
+                world_readable = self.hidden_target["permission_mode"] % 10 >= 4
+                if (
+                    self.hidden_target["namespace"] != namespace
+                    or (
+                        self.hidden_target["owner_id"] != caller
+                        and not world_readable
+                    )
+                ):
+                    return None
+            return {"ok": 1}
+
+        if compact.startswith("SELECT id, version_num, commit_hash, content"):
+            if args[0] == self.hidden_target["id"] and args[1] == "mem-1":
+                return self.hidden_target
+            return None
+
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+    async def fetchval(self, sql: str, *args):
+        self.fetchval_calls.append((sql, args))
+        compact = " ".join(sql.split())
+        if compact.startswith("INSERT INTO memory_versions"):
+            self.insert_attempts += 1
+            return "merge-version-id"
+        raise AssertionError(f"unexpected fetchval SQL: {sql}")
+
+    async def execute(self, sql: str, *args):
+        self.execute_calls.append((sql, args))
+        compact = " ".join(sql.split())
+        if compact.startswith("SELECT pg_advisory_xact_lock"):
+            return "SELECT 1"
+        if compact.startswith("UPDATE memory_branches SET head_version_id = $1"):
+            return "UPDATE 1"
+        raise AssertionError(f"unexpected execute SQL: {sql}")
+
+
 @pytest.mark.parametrize(
     ("from_commit", "detail"),
     [
@@ -185,3 +303,25 @@ def test_list_branches_suppresses_invisible_heads(monkeypatch):
     assert conn.start_sql is not None
     assert "permission_mode % 10" in conn.start_sql
     assert "mv.namespace = $" in conn.start_sql
+
+
+def test_merge_rejects_invisible_target_head(monkeypatch):
+    conn = _MergeHiddenTargetConn()
+    _install(monkeypatch, conn)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            dag_handler.merge_branch(
+                "mem-1",
+                dag_handler.MergeRequest(source_branch="source"),
+                target_branch="hidden_branch",
+                user=_alice(),
+            )
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Target branch 'hidden_branch' not found"
+    assert conn.insert_attempts == 0
+    assert conn.target_gate_sql is not None
+    assert "permission_mode % 10" in conn.target_gate_sql
+    assert "namespace = $" in conn.target_gate_sql

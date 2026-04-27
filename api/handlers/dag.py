@@ -671,22 +671,44 @@ async def merge_branch(
                         detail=f"Source branch '{request.source_branch}' not found",
                     )
 
-                # target_head also under the lock. Reading it AFTER
-                # FOR UPDATE on memories serializes against
-                # update_memory and main-revert's row-level locks
-                # (round 28). source vs target both freshly read
-                # at the same serialization point.
+                # target_head also under the lock. Lock the branch
+                # row first, then gate the resolved HEAD snapshot
+                # before copying its tenancy into the merge commit.
+                # Reading it AFTER FOR UPDATE on memories serializes
+                # against update_memory and main-revert's row-level
+                # locks (round 28). source vs target both freshly
+                # read at the same serialization point.
+                target_branch_row = await conn.fetchrow(
+                    "SELECT head_version_id FROM memory_branches "
+                    "WHERE memory_id = $1 AND name = $2 FOR UPDATE",
+                    memory_id, target_branch,
+                )
+                if (
+                    target_branch_row is None
+                    or target_branch_row["head_version_id"] is None
+                ):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Target branch '{target_branch}' not found",
+                    )
+                target_head_id = target_branch_row["head_version_id"]
+                from api.visibility import _assert_target_head_visible
+                await _assert_target_head_visible(
+                    conn,
+                    target_head_id,
+                    user,
+                    f"Target branch '{target_branch}' not found",
+                )
                 target_head = await conn.fetchrow(
                     """
-                    SELECT mv.id, mv.version_num, mv.commit_hash,
-                           mv.content, mv.category, mv.subcategory,
-                           mv.metadata, mv.verbatim_content,
-                           mv.owner_id, mv.namespace, mv.permission_mode
-                    FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                    WHERE mv.memory_id = $1 AND mb.name = $2
+                    SELECT id, version_num, commit_hash,
+                           content, category, subcategory,
+                           metadata, verbatim_content,
+                           owner_id, namespace, permission_mode
+                    FROM memory_versions
+                    WHERE id = $1 AND memory_id = $2
                     """,
-                    memory_id, target_branch,
+                    target_head_id, memory_id,
                 )
                 if not target_head:
                     raise HTTPException(

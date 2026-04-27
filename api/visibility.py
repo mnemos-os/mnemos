@@ -135,3 +135,34 @@ def version_visibility_predicate(
         ")"
     )
     return clause, [user_id]
+
+
+async def _assert_target_head_visible(
+    conn,
+    head_version_id: str,
+    user,
+    not_found_detail: str,
+) -> None:
+    """Fail closed when a write target HEAD is invisible to the caller.
+
+    DAG write paths copy tenancy from the target branch HEAD into the new
+    commit. Non-root callers must therefore be able to read that target
+    snapshot directly before it can define the tenancy of a new version.
+    Callers are expected to run this after locking the branch row that yielded
+    ``head_version_id``.
+    """
+    if getattr(user, "role", None) == "root":
+        return
+
+    vis_clause, vis_params = version_visibility_predicate(
+        user.user_id, start_param_idx=2,
+    )
+    ns_ph = f"${len(vis_params) + 2}"
+    row = await conn.fetchrow(
+        f"SELECT 1 FROM memory_versions "
+        f"WHERE id = $1 "
+        f"AND {vis_clause} AND namespace = {ns_ph}",
+        head_version_id, *vis_params, user.namespace,
+    )
+    if not row:
+        raise HTTPException(status_code=404, detail=not_found_detail)

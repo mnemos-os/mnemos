@@ -178,7 +178,7 @@ class _FeatureRevertConn:
             }
         }
         self.target_head = {
-            "head_version_id": "target-head-id",
+            "id": "target-head-id",
             "owner_id": "alice",
             "namespace": "alice-ns",
             "permission_mode": 600,
@@ -212,7 +212,27 @@ class _FeatureRevertConn:
                 return self.memory
             return None
 
-        if "SELECT mb.head_version_id, mv.owner_id, mv.namespace, mv.permission_mode" in compact:
+        if compact.startswith("SELECT head_version_id FROM memory_branches WHERE memory_id = $1 AND name = $2 FOR UPDATE"):
+            return {"head_version_id": self.target_head["id"]}
+
+        if compact.startswith("SELECT 1 FROM memory_versions WHERE id = $1"):
+            if args[0] != self.target_head["id"]:
+                return None
+            if "permission_mode % 10" in compact:
+                caller = args[1]
+                namespace = args[-1]
+                world_readable = self.target_head["permission_mode"] % 10 >= 4
+                if (
+                    self.target_head["namespace"] != namespace
+                    or (
+                        self.target_head["owner_id"] != caller
+                        and not world_readable
+                    )
+                ):
+                    return None
+            return {"ok": 1}
+
+        if compact.startswith("SELECT id, owner_id, namespace, permission_mode FROM memory_versions WHERE id = $1 AND memory_id = $2"):
             return self.target_head
 
         raise AssertionError(f"unexpected fetchrow SQL: {sql}")
@@ -252,7 +272,7 @@ class _FeatureRevertConn:
             return "new-revert-id"
 
         if compact.startswith("SELECT head_version_id FROM memory_branches"):
-            return self.target_head["head_version_id"]
+            return self.target_head["id"]
 
         raise AssertionError(f"unexpected fetchval SQL: {sql}")
 
@@ -290,3 +310,30 @@ def test_feature_branch_revert_preserves_target_head_tenancy(monkeypatch):
             )
         )
     assert exc.value.status_code == 404
+
+
+def test_feature_branch_revert_rejects_invisible_target_head(monkeypatch):
+    conn = _FeatureRevertConn()
+    conn.target_head.update({"owner_id": "bob", "permission_mode": 600})
+    _install_pool(monkeypatch, conn)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            versions_handler.revert_memory(
+                "mem-1", 1, branch="feature", user=_alice(),
+            )
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Branch 'feature' not found"
+    assert conn.inserted_version is None
+    assert not any(
+        "INSERT INTO memory_versions" in sql
+        for sql, _args in conn.fetchval_calls
+    )
+    target_gate_sql = next(
+        sql for sql, _args in conn.fetchrow_calls
+        if "SELECT 1 FROM memory_versions WHERE id = $1" in " ".join(sql.split())
+    )
+    assert "permission_mode % 10" in target_gate_sql
+    assert "namespace = $" in target_gate_sql

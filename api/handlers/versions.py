@@ -496,66 +496,68 @@ async def revert_memory(
                 # → row order, matching merge_branch).
                 import hashlib as _hashlib_local
                 import time as _time_local
-                next_version_num = await conn.fetchval(
-                    "SELECT COALESCE(MAX(version_num), 0) + 1 "
-                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2",
+                # Get current HEAD for parent linkage and target
+                # tenancy. Lock the branch row first, then require
+                # non-root callers to see the resolved HEAD snapshot
+                # before its tenancy can be copied into the revert
+                # commit.
+                target_branch_row = await conn.fetchrow(
+                    "SELECT head_version_id FROM memory_branches "
+                    "WHERE memory_id = $1 AND name = $2 FOR UPDATE",
                     memory_id, branch,
                 )
-                # Get current HEAD for parent linkage and target
-                # tenancy. Resolve via a scoped JOIN so a corrupt
-                # branch row pointing at another memory's version_id
-                # can't launder a cross-memory parent edge into this
+                if (
+                    target_branch_row is None
+                    or target_branch_row["head_version_id"] is None
+                ):
+                    raise HTTPException(
+                        status_code=404,
+                        detail=f"Branch '{branch}' not found",
+                    )
+                target_head_id = target_branch_row["head_version_id"]
+                from api.visibility import _assert_target_head_visible
+                await _assert_target_head_visible(
+                    conn,
+                    target_head_id,
+                    user,
+                    f"Branch '{branch}' not found",
+                )
+                # Resolve via id + memory_id so a corrupt branch row
+                # pointing at another memory's version_id can't
+                # launder a cross-memory parent edge into this
                 # memory's DAG (round-38 finding). The new revert
                 # commit copies CONTENT from ver_row but TENANCY from
                 # the target branch head, matching main-revert and
                 # merge semantics.
                 target_head = await conn.fetchrow(
                     """
-                    SELECT
-                        mb.head_version_id,
-                        mv.owner_id,
-                        mv.namespace,
-                        mv.permission_mode
-                    FROM memory_branches mb
-                    INNER JOIN memory_versions mv
-                        ON mv.id = mb.head_version_id
-                       AND mv.memory_id = mb.memory_id
-                    WHERE mb.memory_id = $1 AND mb.name = $2
+                    SELECT id, owner_id, namespace, permission_mode
+                    FROM memory_versions
+                    WHERE id = $1 AND memory_id = $2
                     """,
-                    memory_id, branch,
+                    target_head_id, memory_id,
                 )
                 if target_head is None:
-                    # Either the branch row is missing (legitimate
-                    # 404) or it exists but its head_version_id
-                    # points outside this memory (corrupt row).
-                    # Distinguish so the operator gets the right
-                    # signal.
-                    bare = await conn.fetchval(
-                        "SELECT head_version_id FROM memory_branches "
-                        "WHERE memory_id = $1 AND name = $2",
-                        memory_id, branch,
+                    logger.error(
+                        f"[VERSION] Corrupt feature branch '{branch}' "
+                        f"for memory {memory_id}: head_version_id "
+                        f"points outside this memory. Refusing to "
+                        f"insert a new version with a cross-memory "
+                        f"parent edge. Operator reconciliation required."
                     )
-                    if bare is not None:
-                        logger.error(
-                            f"[VERSION] Corrupt feature branch '{branch}' "
-                            f"for memory {memory_id}: head_version_id "
-                            f"points outside this memory. Refusing to "
-                            f"insert a new version with a cross-memory "
-                            f"parent edge. Operator reconciliation required."
-                        )
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Branch '{branch}' has a head pointing "
-                                f"outside this memory; manual reconciliation "
-                                f"required before revert can proceed"
-                            ),
-                        )
                     raise HTTPException(
-                        status_code=404,
-                        detail=f"Branch '{branch}' not found",
+                        status_code=409,
+                        detail=(
+                            f"Branch '{branch}' has a head pointing "
+                            f"outside this memory; manual reconciliation "
+                            f"required before revert can proceed"
+                        ),
                     )
-                target_head_id = target_head["head_version_id"]
+                next_version_num = await conn.fetchval(
+                    "SELECT COALESCE(MAX(version_num), 0) + 1 "
+                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2",
+                    memory_id, branch,
+                )
                 revert_hash = _hashlib_local.sha256(
                     f"{memory_id}|{next_version_num}|{ver_row['content']}|"
                     f"revert-to-v{version_num}-{int(_time_local.time() * 1_000_000)}"
