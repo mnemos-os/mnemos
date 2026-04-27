@@ -141,7 +141,11 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   succeeded chain peer across claim, success-finalize, and failure-finalize
   paths, and adds `db/migrations_v3_5_webhook_succeeded_unique.sql` with a
   partial unique index that structurally enforces one terminal succeeded row
-  per retry chain after deduplicating legacy duplicate successes.
+  per retry chain after deduplicating legacy duplicate successes. Round 15
+  excludes the current delivery id from succeeded-chain peer checks, requires
+  active peer-abandon updates to still target live non-superseded attempts, and
+  isolates ordinary stream/client cleanup exceptions after response headers so
+  captured acknowledgements still finalize while `CancelledError` propagates.
 
 ### Conflicts and operator handling
 

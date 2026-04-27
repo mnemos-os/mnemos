@@ -397,7 +397,7 @@ async def _claim_delivery(
                 return None
 
             await _lock_delivery_chain(conn, delivery)
-            if await _has_succeeded_chain_attempt(conn, delivery):
+            if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
                 await _abandon_current_attempt_after_succeeded_chain_peer(conn, delivery_id)
                 return None
 
@@ -545,6 +545,8 @@ async def _send_claimed_delivery_within_deadline(
     client = None
     stream_cm = None
     response = None
+    result: _DeliveryResult | None = None
+    fallback_result: _DeliveryResult | None = None
     try:
         client = await asyncio.wait_for(
             client_cm.__aenter__(),
@@ -562,11 +564,15 @@ async def _send_claimed_delivery_within_deadline(
         )
         response_status = response.status_code
         succeeded = 200 <= response_status < 300
+        result = _DeliveryResult(
+            succeeded=succeeded,
+            response_status=response_status,
+        )
         response_body = await _capture_response_body_for_audit(
             response,
             remaining_header_window=max(0.0, header_deadline - loop.time()),
         )
-        return _DeliveryResult(
+        result = _DeliveryResult(
             succeeded=succeeded,
             response_status=response_status,
             response_body=response_body,
@@ -574,14 +580,43 @@ async def _send_claimed_delivery_within_deadline(
     except asyncio.TimeoutError:
         raise
     except httpx.HTTPError as e:
-        return _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
+        fallback_result = _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
     except Exception as e:  # pragma: no cover
-        return _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
+        fallback_result = _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
     finally:
         if stream_cm is not None and response is not None:
-            await stream_cm.__aexit__(None, None, None)
+            try:
+                await stream_cm.__aexit__(None, None, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if result is None:
+                    raise
+                logger.warning(
+                    "webhook delivery %s stream cleanup failed after response headers; "
+                    "delivery result preserved",
+                    delivery["id"],
+                    exc_info=True,
+                )
         if client is not None:
-            await client_cm.__aexit__(None, None, None)
+            try:
+                await client_cm.__aexit__(None, None, None)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if result is None:
+                    raise
+                logger.warning(
+                    "webhook delivery %s client cleanup failed after response headers; "
+                    "delivery result preserved",
+                    delivery["id"],
+                    exc_info=True,
+                )
+    if result is not None:
+        return result
+    if fallback_result is not None:
+        return fallback_result
+    return _DeliveryResult(succeeded=False, error="send failed before response headers")
 
 
 def _remaining_timeout_seconds(deadline: float) -> float:
@@ -710,16 +745,16 @@ async def _finalize_delivery(
                 )
                 return finalized is not None
 
-            if await _has_succeeded_chain_attempt(conn, delivery):
-                finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
-                    conn,
-                    delivery_id,
-                    lease_token,
-                    result,
-                )
-                return finalized is not None
-
             if result.succeeded:
+                if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
+                    finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                        conn,
+                        delivery_id,
+                        lease_token,
+                        result,
+                    )
+                    return finalized is not None
+
                 try:
                     async with conn.transaction():
                         finalized = await conn.fetchrow(
@@ -761,6 +796,15 @@ async def _finalize_delivery(
                 if successor is not None:
                     await _abandon_live_successor_attempt(conn, str(successor["id"]))
                 return True
+
+            if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
+                finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    result,
+                )
+                return finalized is not None
 
             next_attempt = delivery["attempt_num"] + 1
             if next_attempt > MAX_ATTEMPTS:
@@ -916,6 +960,7 @@ async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Rec
 async def _has_succeeded_chain_attempt(
     conn: asyncpg.Connection,
     delivery: asyncpg.Record,
+    delivery_id: str,
 ) -> bool:
     """Return whether any attempt already completed the chain."""
     return await conn.fetchval(
@@ -927,11 +972,13 @@ async def _has_succeeded_chain_attempt(
             AND peer.event_type = $2
             AND peer.payload_hash = $3
             AND peer.status = 'succeeded'
+            AND peer.id <> $4::uuid
         )
         """,
         delivery["subscription_id"],
         delivery["event_type"],
         delivery["payload_hash"],
+        delivery_id,
     )
 
 
@@ -977,6 +1024,8 @@ async def _abandon_owned_attempt_after_succeeded_chain_peer(
         WHERE id=$1::uuid
           AND lease_token=$2::uuid
           AND lease_expires_at >= clock_timestamp()
+          AND status IN ('pending', 'retrying')
+          AND NOT superseded
         RETURNING id
         """,
         delivery_id,

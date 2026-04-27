@@ -278,6 +278,14 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
+            if (
+                "AND status IN ('pending', 'retrying')" in compact
+                and (
+                    row["status"] not in {"pending", "retrying"}
+                    or row.get("superseded", False)
+                )
+            ):
+                return None
             self._set_status(row, "abandoned")
             row["superseded"] = "superseded=TRUE" in compact
             if "subscription revoked" in compact:
@@ -315,6 +323,8 @@ class _FakeWebhookConn:
                 "payload_hash": args[2],
             }
             if "status = 'succeeded'" in compact:
+                if len(args) > 3:
+                    probe["id"] = str(args[3])
                 return self._has_succeeded_chain_peer(probe)
             probe["attempt_num"] = args[3]
             return self._has_successor(probe)
@@ -567,6 +577,8 @@ class _HTTPClientFactory:
         self.request_headers: list[dict[str, str]] = []
         self.response_headers: list[dict[str, str]] = []
         self.body_errors: list[Exception | None] = []
+        self.stream_exit_errors: list[BaseException | None] = []
+        self.client_exit_errors: list[BaseException | None] = []
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
@@ -606,6 +618,13 @@ class _FakeHTTPStream:
     async def __aexit__(self, exc_type, exc, tb):
         self.factory.active -= 1
         self.factory.exited += 1
+        exit_error = (
+            self.factory.stream_exit_errors.pop(0)
+            if self.factory.stream_exit_errors
+            else None
+        )
+        if exit_error is not None:
+            raise exit_error
         return False
 
 
@@ -617,6 +636,13 @@ class _FakeHTTPClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        exit_error = (
+            self.factory.client_exit_errors.pop(0)
+            if self.factory.client_exit_errors
+            else None
+        )
+        if exit_error is not None:
+            raise exit_error
         return False
 
     def stream(self, method, url, *, content, headers):
@@ -1066,6 +1092,48 @@ def test_finalize_with_stale_lease_token_is_noop(monkeypatch):
     asyncio.run(run())
 
 
+def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000015"
+        dispatcher, conn, _http = await _install(monkeypatch, [row], [])
+
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        # Old workers did not know about leases, so a rolling-upgrade race can
+        # leave the new worker's lease columns on a row already marked succeeded.
+        row["status"] = "succeeded"
+        row["delivered_at"] = datetime.now(timezone.utc)
+        assert row["lease_token"] == lease_token
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            dispatcher._DeliveryResult(
+                succeeded=True,
+                response_status=204,
+                response_body="legacy acknowledged",
+                error=None,
+            ),
+        )
+
+        assert finalized
+        assert conn.store.succeeded_update_attempts == 1
+        assert row["status"] == "succeeded"
+        assert row["superseded"] is False
+        assert row["response_status"] == 204
+        assert row["response_body"] == "legacy acknowledged"
+        assert row["lease_token"] is None
+
+    asyncio.run(run())
+
+
 def test_success_finalize_cancels_free_live_successor(monkeypatch):
     async def run():
         parent = _attempt()
@@ -1288,7 +1356,7 @@ def test_success_finalize_unique_violation_abandons_duplicate_chain_peer(monkeyp
         successor["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
         dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
 
-        async def _race_window_guard(_conn, _delivery):
+        async def _race_window_guard(_conn, _delivery, _delivery_id):
             return False
 
         conn.store.enforce_succeeded_unique = True
@@ -1587,6 +1655,74 @@ def test_pre_claim_monotonic_debits_stalled_claim_update(monkeypatch):
     asyncio.run(run())
 
 
+def test_webhook_send_preserves_2xx_result_when_stream_cleanup_fails(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000031"
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        http.stream_exit_errors = [RuntimeError("stream close failed")]
+
+        result = await dispatcher._send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            result,
+        )
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert result.succeeded is True
+        assert result.response_status == 200
+        assert finalized
+        assert row["status"] == "succeeded"
+        assert row["lease_token"] is None
+        assert recoverable == []
+        assert http.exited == 1
+
+    asyncio.run(run())
+
+
+def test_webhook_send_propagates_cancelled_error_from_stream_cleanup(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000032"
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        http.stream_exit_errors = [asyncio.CancelledError()]
+
+        try:
+            await dispatcher._send_claimed_delivery(
+                claimed.delivery,
+                pre_claim_monotonic=claimed.pre_claim_monotonic,
+            )
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("stream cleanup cancellation must propagate")
+
+        assert row["status"] == "retrying"
+        assert row["lease_token"] == lease_token
+        assert http.exited == 1
+
+    asyncio.run(run())
+
+
 def test_webhook_response_body_is_streamed_and_capped(monkeypatch):
     async def run():
         row = _attempt()
@@ -1853,7 +1989,9 @@ def test_succeeded_chain_guard_source_shape_is_chain_aware():
     assert "async def _abandon_owned_attempt_after_succeeded_chain_peer" in source
     assert "peer.attempt_num < $4" not in compact
     assert "peer.status = 'succeeded'" in compact
-    assert "if await _has_succeeded_chain_attempt(conn, delivery)" in compact
+    assert "peer.id <> $4::uuid" in compact
+    assert "_has_succeeded_chain_attempt(conn, delivery, delivery_id)" in compact
+    assert "AND status IN ('pending', 'retrying') AND NOT superseded" in compact
 
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
