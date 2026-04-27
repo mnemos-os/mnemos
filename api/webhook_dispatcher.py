@@ -1156,7 +1156,7 @@ async def _commit_successful_delivery_row(
     delivery_id: str,
     lease_token: str,
     result: _DeliveryResult,
-) -> tuple[bool, bool]:
+) -> bool:
     """Commit a 2xx result with same-transaction successor convergence."""
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -1170,7 +1170,7 @@ async def _commit_successful_delivery_row(
                     result,
                     require_unexpired_lease=False,
                 )
-                return finalized is not None, False
+                return finalized is not None
 
             finalized = await conn.fetchrow(
                 """
@@ -1203,16 +1203,16 @@ async def _commit_successful_delivery_row(
                     require_unexpired_lease=False,
                 )
                 if finalized is not None:
-                    return True, False
+                    return True
                 await _clear_stale_owned_lease_after_terminal_finalize(
                     conn,
                     delivery_id,
                     lease_token,
                 )
-                return False, False
+                return False
 
-            await _abandon_live_successors_before_success_commit(conn, delivery, delivery_id)
-            return True, True
+            await _abandon_live_successors_before_success_commit(conn, delivery)
+            return True
 
 
 async def _finalize_successful_delivery_row(
@@ -1222,9 +1222,9 @@ async def _finalize_successful_delivery_row(
     lease_token: str,
     result: _DeliveryResult,
 ) -> bool:
-    """Persist a 2xx ACK with atomic common-case successor convergence."""
+    """Persist a 2xx ACK with atomic successor convergence."""
     try:
-        finalized, committed_success = await _commit_successful_delivery_row(
+        finalized = await _commit_successful_delivery_row(
             pool,
             delivery,
             delivery_id,
@@ -1239,47 +1239,34 @@ async def _finalize_successful_delivery_row(
             lease_token,
             result,
         )
+    except asyncio.CancelledError:
+        logger.warning(
+            "webhook delivery %s success finalization cancelled before commit after 2xx ACK; "
+            "success transaction rolled back and retry may resend a bounded duplicate POST",
+            delivery_id,
+            exc_info=True,
+        )
+        raise
+    except Exception:
+        logger.warning(
+            "webhook delivery %s success finalization failed before commit after 2xx ACK; "
+            "success transaction rolled back and retry may resend a bounded duplicate POST",
+            delivery_id,
+            exc_info=True,
+        )
+        raise
 
-    if committed_success:
-        await _abandon_live_successors_after_success_commit(pool, delivery, delivery_id)
     return finalized
 
 
 async def _abandon_live_successors_before_success_commit(
     conn: asyncpg.Connection,
     delivery: asyncpg.Record,
-    delivery_id: str,
 ) -> None:
-    """Abandon free successors inside the success transaction using savepoints."""
+    """Abandon free successors inside the success transaction."""
     successors = await _find_live_unleased_successor_attempts(conn, delivery)
-    for index, successor in enumerate(successors, start=1):
-        successor_id = str(successor["id"])
-        savepoint_name = f"successor_cleanup_{index}"
-        try:
-            await conn.execute(f"SAVEPOINT {savepoint_name}")
-            await _abandon_live_successor_attempt(conn, successor_id)
-            await conn.execute(f"RELEASE SAVEPOINT {savepoint_name}")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            try:
-                await conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint_name}")
-            except Exception:
-                logger.warning(
-                    "webhook delivery %s successor %s cleanup savepoint rollback failed "
-                    "before success commit",
-                    delivery_id,
-                    successor_id,
-                    exc_info=True,
-                )
-                raise
-            logger.warning(
-                "webhook delivery %s successor %s cleanup failed before success commit (%s)",
-                delivery_id,
-                successor_id,
-                type(exc).__name__,
-                exc_info=True,
-            )
+    for successor in successors:
+        await _abandon_live_successor_attempt(conn, str(successor["id"]))
 
 
 async def _abandon_success_duplicate_after_unique_violation(
@@ -1308,43 +1295,6 @@ async def _abandon_success_duplicate_after_unique_violation(
                 )
                 return False
             return True
-
-
-async def _abandon_live_successors_after_success_commit(
-    pool: asyncpg.Pool,
-    delivery: asyncpg.Record,
-    delivery_id: str,
-) -> None:
-    """Best-effort post-commit cleanup for free successors after a 2xx ACK."""
-    while True:
-        successor_id: str | None = None
-        try:
-            async with pool.acquire() as conn:
-                async with conn.transaction():
-                    await _lock_delivery_chain(conn, delivery)
-                    # The predecessor already produced the canonical external delivery.
-                    successor = await _find_live_unleased_successor_attempt(conn, delivery)
-                    if successor is None:
-                        return
-                    successor_id = str(successor["id"])
-                    await _abandon_live_successor_attempt(conn, successor_id)
-        except asyncio.CancelledError:
-            logger.warning(
-                "webhook delivery %s successor %s cleanup cancelled after success commit",
-                delivery_id,
-                successor_id if successor_id is not None else "<unknown>",
-                exc_info=True,
-            )
-            raise
-        except Exception as exc:
-            logger.warning(
-                "webhook delivery %s successor %s cleanup failed after success commit (%s)",
-                delivery_id,
-                successor_id if successor_id is not None else "<unknown>",
-                type(exc).__name__,
-                exc_info=True,
-            )
-            return
 
 
 async def _run_post_finalize_delivery_work(
@@ -1711,32 +1661,6 @@ async def _abandon_owned_attempt_after_succeeded_chain_peer(
         result.response_status,
         result.response_body,
         result.error,
-    )
-
-
-async def _find_live_unleased_successor_attempt(
-    conn: asyncpg.Connection,
-    delivery: asyncpg.Record,
-) -> Optional[asyncpg.Record]:
-    """Return a free live successor that would duplicate this success."""
-    return await conn.fetchrow(
-        """
-        SELECT newer.id
-        FROM webhook_deliveries newer
-        WHERE newer.subscription_id = $1
-          AND newer.event_type = $2
-          AND newer.payload_hash = $3
-          AND newer.attempt_num > $4
-          AND newer.status IN ('pending', 'retrying')
-          AND NOT newer.superseded
-          AND (newer.lease_token IS NULL OR newer.lease_expires_at < clock_timestamp())
-        ORDER BY newer.attempt_num ASC
-        LIMIT 1
-        """,
-        delivery["subscription_id"],
-        delivery["event_type"],
-        delivery["payload_hash"],
-        delivery["attempt_num"],
     )
 
 

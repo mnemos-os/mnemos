@@ -971,6 +971,20 @@ def _successor_for(row: dict[str, Any]) -> dict[str, Any]:
     return successor
 
 
+def _old_v35_succeeded_peer_replay_candidates(rows: list[dict[str, Any]]) -> list[str]:
+    succeeded_chains = {
+        (row["subscription_id"], row["event_type"], row["payload_hash"])
+        for row in rows
+        if row["status"] == "succeeded"
+    }
+    return [
+        row["id"]
+        for row in rows
+        if row["status"] in {"pending", "retrying"}
+        and (row["subscription_id"], row["event_type"], row["payload_hash"]) in succeeded_chains
+    ]
+
+
 def test_failed_attempt_terminalizes_and_only_successor_is_recoverable(monkeypatch):
     async def run():
         first = _attempt()
@@ -1670,10 +1684,10 @@ def test_success_finalize_cancels_free_live_successor(monkeypatch):
     asyncio.run(run())
 
 
-def test_success_commit_savepoint_isolates_successor_cleanup_failure(monkeypatch):
+def test_success_commit_cleanup_failure_rolls_back_ack_and_successors(monkeypatch):
     async def run():
         parent = _attempt()
-        dispatcher, conn, http = await _install(monkeypatch, [parent], [204, 204])
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
         real_send = dispatcher._send_claimed_delivery
         real_abandon = dispatcher._abandon_live_successor_attempt
 
@@ -1696,32 +1710,46 @@ def test_success_commit_savepoint_isolates_successor_cleanup_failure(monkeypatch
             _fail_successor_cleanup_after_update,
         )
 
-        finalized = await dispatcher._attempt_delivery(parent["id"])
+        try:
+            await dispatcher._attempt_delivery(parent["id"])
+        except RuntimeError as exc:
+            assert "successor cleanup failed" in str(exc)
+        else:
+            raise AssertionError("success cleanup failure should roll back the success transaction")
         successor = conn.rows[1]
-        recoverable = await dispatcher._recoverable_delivery_ids(conn)
 
-        assert finalized
         assert http.delivery_ids == [parent["id"]]
-        assert parent["status"] == "succeeded"
+        assert parent["status"] == "retrying"
         assert parent["superseded"] is False
+        assert parent["lease_token"] is not None
+        assert parent["lease_expires_at"] is not None
         assert successor["status"] == "pending"
         assert successor["superseded"] is False
-        assert recoverable == []
-        assert conn.store.savepoint_commands == [
-            "SAVEPOINT successor_cleanup_1",
-            "ROLLBACK TO SAVEPOINT successor_cleanup_1",
-        ]
+        assert conn.store.savepoint_commands == []
 
-        repair_result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+        monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", real_abandon)
+        retry_result = dispatcher._DeliveryResult(
+            succeeded=True,
+            response_status=204,
+            response_body=None,
+        )
+        retried = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(parent),
+            parent["lease_token"],
+            retry_result,
+        )
 
-        assert repair_result == "UPDATE 1"
+        assert retried
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
         assert successor["status"] == "abandoned"
         assert successor["superseded"] is True
 
     asyncio.run(run())
 
 
-def test_success_commit_abandons_successors_atomically_before_fallback(monkeypatch):
+def test_success_commit_abandons_successors_atomically_without_savepoints(monkeypatch):
     async def run():
         parent = _attempt()
         successors = []
@@ -1743,42 +1771,70 @@ def test_success_commit_abandons_successors_atomically_before_fallback(monkeypat
         ]
         assert [successor["superseded"] for successor in successors] == [True, True, True]
         assert conn.store.bulk_successor_fetches == 1
-        assert conn.store.single_successor_fetches == 1
+        assert conn.store.single_successor_fetches == 0
         assert conn.store.successor_cleanup_updates == len(successors)
-        assert conn.store.savepoint_commands == [
-            "SAVEPOINT successor_cleanup_1",
-            "RELEASE SAVEPOINT successor_cleanup_1",
-            "SAVEPOINT successor_cleanup_2",
-            "RELEASE SAVEPOINT successor_cleanup_2",
-            "SAVEPOINT successor_cleanup_3",
-            "RELEASE SAVEPOINT successor_cleanup_3",
-        ]
+        assert conn.store.savepoint_commands == []
 
     asyncio.run(run())
 
 
-def test_success_commit_fallback_abandons_late_successor(monkeypatch):
+def test_mixed_version_cleanup_error_leaves_no_succeeded_predecessor_for_old_worker(monkeypatch):
     async def run():
         parent = _attempt()
-        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+        successor = _successor_for(parent)
+        dispatcher, conn, http = await _install(monkeypatch, [parent, successor], [204])
+        real_abandon = dispatcher._abandon_live_successor_attempt
 
-        def _insert_late_successor():
-            conn.rows.append(_successor_for(parent))
+        pre_fix_parent = dict(parent)
+        pre_fix_parent["status"] = "succeeded"
+        assert _old_v35_succeeded_peer_replay_candidates(
+            [pre_fix_parent, dict(successor)]
+        ) == [successor["id"]]
 
-        conn.store.after_bulk_successor_fetch = _insert_late_successor
+        async def _fail_successor_cleanup_after_update(cleanup_conn, successor_id):
+            await real_abandon(cleanup_conn, successor_id)
+            raise RuntimeError("successor cleanup failed")
 
-        finalized = await dispatcher._attempt_delivery(parent["id"])
-        successor = conn.rows[1]
+        monkeypatch.setattr(
+            dispatcher,
+            "_abandon_live_successor_attempt",
+            _fail_successor_cleanup_after_update,
+        )
+
+        try:
+            await dispatcher._attempt_delivery(parent["id"])
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("success cleanup failure should roll back the success transaction")
+
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "retrying"
+        assert parent["lease_token"] is not None
+        assert successor["status"] == "pending"
+        assert successor["superseded"] is False
+        assert _old_v35_succeeded_peer_replay_candidates(conn.rows) == []
+        assert conn.store.bulk_successor_fetches == 1
+        assert conn.store.successor_cleanup_updates == 1
+        assert conn.store.savepoint_commands == []
+
+        monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", real_abandon)
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(parent),
+            parent["lease_token"],
+            dispatcher._DeliveryResult(
+                succeeded=True,
+                response_status=204,
+                response_body=None,
+            ),
+        )
 
         assert finalized
-        assert http.delivery_ids == [parent["id"]]
         assert parent["status"] == "succeeded"
         assert successor["status"] == "abandoned"
         assert successor["superseded"] is True
-        assert conn.store.bulk_successor_fetches == 1
-        assert conn.store.single_successor_fetches == 2
-        assert conn.store.successor_cleanup_updates == 1
-        assert conn.store.savepoint_commands == []
+        assert _old_v35_succeeded_peer_replay_candidates(conn.rows) == []
 
     asyncio.run(run())
 
@@ -1824,6 +1880,8 @@ def test_success_commit_cancelled_in_transaction_rolls_back_for_retry(monkeypatc
         assert successor["status"] == "pending"
         assert successor["superseded"] is False
 
+        # Production recovery may resend after lease expiry; this direct finalize
+        # models the bounded same-attempt retry once cancellation stops.
         monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", real_abandon)
         retry_result = dispatcher._DeliveryResult(
             succeeded=True,
@@ -3037,14 +3095,17 @@ def test_success_finalize_source_shape_is_chain_aware():
     source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact = " ".join(source.split())
 
-    assert "async def _find_live_unleased_successor_attempt" in source
+    assert "async def _find_live_unleased_successor_attempt(" not in source
+    assert "async def _find_live_unleased_successor_attempts" in source
     assert "async def _abandon_live_successor_attempt" in source
     assert "newer.status IN ('pending', 'retrying')" in compact
     assert "AND NOT newer.superseded" in compact
     assert "newer.lease_token IS NULL OR newer.lease_expires_at < clock_timestamp()" in compact
     assert "status='abandoned', superseded=TRUE, status_updated_at=clock_timestamp()" in compact
     assert "except asyncpg.exceptions.UniqueViolationError" in source
-    assert "canonical external delivery" in source
+    assert "SAVEPOINT" not in source
+    assert "_abandon_live_successors_after_success_commit" not in source
+    assert "bounded duplicate POST" in source
     assert "async def _clear_stale_owned_lease_after_terminal_finalize" in source
     assert "SET lease_token=NULL, lease_expires_at=NULL WHERE id=$1::uuid AND lease_token=$2::uuid" in compact
     assert "webhook delivery %s was already terminal at success finalize time; stale lease cleared" in source

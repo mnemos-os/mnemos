@@ -182,6 +182,14 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   savepoint. A post-commit cleanup pass remains only as a fallback for
   successors inserted after the in-transaction successor query but before the
   success commit.
+  Round 23 makes that convergence fully atomic for rolling-upgrade safety:
+  per-successor savepoints and the post-commit fallback are removed, so a
+  2xx success row and all free successor `status='abandoned'` updates commit
+  or roll back together. Cleanup exceptions and `CancelledError` before commit
+  now roll back the ACK record and partial cleanup, leaving the lease-owned
+  attempt retryable. The rare tradeoff is a bounded duplicate POST after
+  lease expiry, logged for observability, instead of a committed succeeded
+  predecessor with live successors that old v3.5-dev workers could replay.
 
 ### Conflicts and operator handling
 
