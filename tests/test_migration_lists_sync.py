@@ -138,3 +138,24 @@ def test_docker_compose_migration_lists_match_installer():
             "install.py, installer/db.py, docker-compose.yml, "
             "AND docker-compose.staging.yml."
         )
+
+
+def test_staging_compose_runs_trigger_upgrade_for_existing_volumes():
+    """The initdb mount only affects fresh Postgres volumes.
+
+    PROTEUS staging keeps a named postgres_data volume, so the v3.5
+    trigger patch also needs an explicit compose-time upgrade service
+    that runs against already-initialized databases.
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    text = (repo_root / "docker-compose.staging.yml").read_text()
+
+    assert "postgres-upgrade:" in text
+    assert (
+        "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
+        "/migrations/24-trigger-same-memory-parent.sql:ro"
+    ) in text
+    assert "psql -h postgres -U mnemos_user -d mnemos" in text
+    assert "-v ON_ERROR_STOP=1" in text
+    assert "-f /migrations/24-trigger-same-memory-parent.sql" in text
+    assert "postgres-upgrade:\n        condition: service_completed_successfully" in text

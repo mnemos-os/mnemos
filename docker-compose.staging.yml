@@ -80,12 +80,29 @@ services:
       retries: 10
     restart: unless-stopped
 
+  postgres-upgrade:
+    image: pgvector/pgvector:pg17
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env.staging}
+    volumes:
+      - ./db/migrations_v3_5_trigger_same_memory_parent.sql:/migrations/24-trigger-same-memory-parent.sql:ro
+    command: >
+      sh -c "psql -h postgres -U mnemos_user -d mnemos
+      -v ON_ERROR_STOP=1
+      -f /migrations/24-trigger-same-memory-parent.sql"
+    restart: "no"
+
   mnemos:
     build:
       context: .
     depends_on:
       postgres:
         condition: service_healthy
+      postgres-upgrade:
+        condition: service_completed_successfully
     environment:
       # Postgres
       PG_USER: mnemos_user

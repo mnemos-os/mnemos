@@ -31,6 +31,7 @@ from api.models import (
     RehydrationRequest,
     RehydrationResponse,
 )
+from api.visibility import handle_trigger_pgerror
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
@@ -730,18 +731,7 @@ async def update_memory(
                             memory_id, *values, user.user_id, user.namespace,
                         )
                 except asyncpg.PostgresError as exc:
-                    if getattr(exc, "sqlstate", None) == "MN001":
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                "Memory branch state is inconsistent: "
-                                "memory_branches.head_version_id points to "
-                                "a version from another memory. Reconcile "
-                                "memory_branches and memory_versions for this "
-                                "memory before retrying."
-                            ),
-                        ) from exc
-                    raise
+                    handle_trigger_pgerror(exc)
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
                 # mnemos_version_snapshot AFTER UPDATE trigger writes
@@ -787,20 +777,23 @@ async def delete_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            if user.role == "root":
-                result = await conn.execute(
-                    "DELETE FROM memories WHERE id = $1", memory_id,
-                )
-            else:
-                # Two-dimensional check: non-root can only delete
-                # rows in their own namespace, preventing a namespace
-                # A user from deleting a namespace B row even under
-                # the same owner_id.
-                result = await conn.execute(
-                    "DELETE FROM memories "
-                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
-                    memory_id, user.user_id, user.namespace,
-                )
+            try:
+                if user.role == "root":
+                    result = await conn.execute(
+                        "DELETE FROM memories WHERE id = $1", memory_id,
+                    )
+                else:
+                    # Two-dimensional check: non-root can only delete
+                    # rows in their own namespace, preventing a namespace
+                    # A user from deleting a namespace B row even under
+                    # the same owner_id.
+                    result = await conn.execute(
+                        "DELETE FROM memories "
+                        "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                        memory_id, user.user_id, user.namespace,
+                    )
+            except asyncpg.PostgresError as exc:
+                handle_trigger_pgerror(exc)
     if result == "DELETE 0":
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
     if _lc._cache:

@@ -16,7 +16,25 @@ edit a world/group-readable row they happen to be able to read.
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import List, NoReturn, Tuple
+
+from fastapi import HTTPException
+
+
+def handle_trigger_pgerror(exc: Exception) -> NoReturn:
+    """Translate trigger-raised Postgres errors into API conflicts."""
+    if getattr(exc, "sqlstate", None) == "MN001":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Memory branch state is inconsistent: "
+                "memory_branches.head_version_id points to "
+                "a version from another memory. Reconcile "
+                "memory_branches and memory_versions for this "
+                "memory before retrying."
+            ),
+        ) from exc
+    raise exc
 
 
 def read_visibility_predicate(

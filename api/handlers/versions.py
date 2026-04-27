@@ -4,11 +4,13 @@ import json
 import logging
 from typing import List, Optional
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 from api.models import MemoryItem
+from api.visibility import handle_trigger_pgerror
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["versions"])
@@ -470,18 +472,21 @@ async def revert_memory(
                 await conn.execute(
                     "SELECT set_config('mnemos.current_branch', 'main', true)"
                 )
-                row = await conn.fetchrow(
-                    "UPDATE memories SET "
-                    "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
-                    "verbatim_content=$5, updated=NOW() "
-                    f"WHERE id=$6 RETURNING {_lc._MEMORY_COLS}",
-                    ver_row["content"],
-                    ver_row["category"],
-                    ver_row["subcategory"],
-                    meta_str,
-                    ver_row["verbatim_content"],
-                    memory_id,
-                )
+                try:
+                    row = await conn.fetchrow(
+                        "UPDATE memories SET "
+                        "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
+                        "verbatim_content=$5, updated=NOW() "
+                        f"WHERE id=$6 RETURNING {_lc._MEMORY_COLS}",
+                        ver_row["content"],
+                        ver_row["category"],
+                        ver_row["subcategory"],
+                        meta_str,
+                        ver_row["verbatim_content"],
+                        memory_id,
+                    )
+                except asyncpg.PostgresError as exc:
+                    handle_trigger_pgerror(exc)
             else:
                 # Feature-branch revert: PURE DAG operation (per
                 # round-25 fix). MNEMOS convention is `memories`
