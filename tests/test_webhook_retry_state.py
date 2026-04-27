@@ -132,6 +132,7 @@ class _FakeWebhookConn:
             raise AssertionError(f"unexpected fetch SQL: {sql}")
         max_attempts = args[0]
         limit = args[1] if len(args) > 1 else 50
+        legacy_grace_seconds = args[2] if len(args) > 2 else 0
         now = datetime.now(timezone.utc)
         recoverable = []
         for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
@@ -142,7 +143,11 @@ class _FakeWebhookConn:
             if row["status"] == "pending":
                 if self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
-            elif row["status"] == "retrying" and not self._has_successor(row):
+            elif (
+                row["status"] == "retrying"
+                and not self._has_successor(row)
+                and self._legacy_retrying_settled(row, now, legacy_grace_seconds)
+            ):
                 if self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
         return recoverable[:limit]
@@ -161,15 +166,24 @@ class _FakeWebhookConn:
         if compact.startswith("UPDATE webhook_deliveries d SET lease_token"):
             row = self._row(args[0])
             max_attempts = args[3]
+            legacy_grace_seconds = args[4] if len(args) > 4 else 0
             if row is None or not self._due_live_and_leaseable(row, max_attempts):
                 return None
             if row["status"] == "retrying" and self._has_successor(row):
                 return None
+            claim_db_now = datetime.now(timezone.utc)
+            if (
+                row["status"] == "retrying"
+                and not self._legacy_retrying_settled(row, claim_db_now, legacy_grace_seconds)
+            ):
+                return None
             row["lease_token"] = str(args[1])
-            row["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=int(args[2]))
+            row["lease_expires_at"] = claim_db_now + timedelta(seconds=int(args[2]))
             if row["status"] == "pending":
                 row["status"] = "retrying"
-            return self._with_subscription(row)
+            delivery = self._with_subscription(row)
+            delivery["claim_db_now"] = claim_db_now
+            return delivery
 
         if "SET status='succeeded'" in compact:
             row = self._row(args[0])
@@ -314,6 +328,17 @@ class _FakeWebhookConn:
             and self._lease_available(row)
         )
 
+    def _legacy_retrying_settled(
+        self,
+        row: dict[str, Any],
+        now: datetime,
+        grace_seconds: int,
+    ) -> bool:
+        return (
+            row.get("lease_token") is not None
+            or row["scheduled_at"] + timedelta(seconds=grace_seconds) <= now
+        )
+
     def _with_subscription(self, row: dict[str, Any]) -> dict[str, Any]:
         return {
             **row,
@@ -380,6 +405,7 @@ class _HTTPClientFactory:
         self.exited = 0
         self.chunks_yielded = 0
         self.cancelled = False
+        self.request_headers: list[dict[str, str]] = []
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
@@ -402,6 +428,7 @@ class _FakeHTTPStream:
             else [f"status={status_code}".encode("utf-8")]
         )
         self.factory.delivery_ids.append(self.headers["X-MNEMOS-Delivery-ID"])
+        self.factory.request_headers.append(dict(self.headers))
         self.factory.started.set()
         return _FakeResponse(
             status_code,
@@ -437,6 +464,7 @@ class _FakeHTTPClient:
             if self.factory.delay:
                 await asyncio.sleep(self.factory.delay)
             self.factory.delivery_ids.append(headers["X-MNEMOS-Delivery-ID"])
+            self.factory.request_headers.append(dict(headers))
             status_code = self.factory.statuses.pop(0)
             return _FakeResponse(
                 status_code,
@@ -587,15 +615,52 @@ def test_recovery_dequeue_uses_skip_locked_claim():
 
     assert "FOR UPDATE SKIP LOCKED" in compact
     assert "SET lease_token=$2::uuid" in compact
-    assert "await _send_claimed_delivery(delivery)" in compact
+    assert "claim_observed_monotonic = time.monotonic()" in compact
+    assert "claim_observed_monotonic=claim_observed_monotonic" in compact
     assert "FOR UPDATE OF d SKIP LOCKED" not in compact
     assert "_attempt_delivery_locked" not in compact
+
+
+def test_recoverable_retrying_predicate_requires_legacy_grace_for_lease_less_rows():
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    compact = " ".join(source.split())
+
+    assert "WEBHOOK_LEGACY_GRACE_SECONDS" in source
+    assert (
+        "d.lease_token IS NOT NULL "
+        "OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= NOW()"
+    ) in compact
+    assert (
+        "d.lease_token IS NOT NULL "
+        "OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= NOW()"
+    ) in compact
+
+
+def test_lease_less_legacy_retrying_waits_for_grace_before_recovery(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "retrying"
+        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=10)
+        before_grace = await dispatcher._recoverable_delivery_ids(conn)
+        assert before_grace == []
+
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
+        after_grace = await dispatcher._recoverable_delivery_ids(conn)
+        assert [row["id"] for row in after_grace] == [parent["id"]]
+
+    asyncio.run(run())
 
 
 def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
     async def run():
         retrying = _attempt()
         retrying["status"] = "retrying"
+        retrying["lease_token"] = "00000000-0000-0000-0000-000000000001"
+        retrying["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
         dispatcher, conn, http = await _install(monkeypatch, [retrying], [204])
         http.delay = 0.05
 
@@ -688,7 +753,7 @@ def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore
         row = _attempt()
         dispatcher, conn, http = await _install(monkeypatch, [row], [200])
         lease_seconds = 2
-        finalize_buffer = 1.9
+        finalize_buffer = 0.9
         send_deadline = dispatcher._derive_total_send_deadline_seconds(
             lease_seconds,
             finalize_buffer,
@@ -729,6 +794,36 @@ def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore
     asyncio.run(run())
 
 
+def test_webhook_send_refuses_post_when_claim_window_elapsed_before_send(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        semaphore = asyncio.Semaphore(1)
+        ticks = [100.0, 106.0]
+
+        def _fake_monotonic():
+            if ticks:
+                return ticks.pop(0)
+            return 106.0
+
+        monkeypatch.setattr(dispatcher, "WEBHOOK_LEASE_SECONDS", 5)
+        monkeypatch.setattr(dispatcher, "WEBHOOK_FINALIZE_BUFFER_SECONDS", 1.0)
+        monkeypatch.setattr(dispatcher, "_send_semaphore", semaphore)
+        monkeypatch.setattr(dispatcher.time, "monotonic", _fake_monotonic)
+
+        finalized = await dispatcher._attempt_delivery(row["id"])
+
+        assert finalized
+        assert http.delivery_ids == []
+        assert not semaphore.locked()
+        assert row["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert row["error"].startswith("lease-expired-before-send:")
+        assert len(conn.rows) == 2
+        assert conn.rows[1]["status"] == "pending"
+
+    asyncio.run(run())
+
+
 def test_webhook_response_body_is_streamed_and_capped(monkeypatch):
     async def run():
         row = _attempt()
@@ -743,6 +838,26 @@ def test_webhook_response_body_is_streamed_and_capped(monkeypatch):
         assert row["response_body"] == "abcdefghij"
         assert len(row["response_body"].encode("utf-8")) == 10
         assert http.chunks_yielded == 2
+        assert http.request_headers[0]["Accept-Encoding"] == "identity"
+
+    asyncio.run(run())
+
+
+def test_webhook_response_body_cap_bounds_decoded_gzip_body(monkeypatch):
+    async def run():
+        from api import webhook_dispatcher as dispatcher
+
+        class _DecodedGzipResponse:
+            headers = {"content-encoding": "gzip"}
+
+            async def aiter_bytes(self):
+                yield b"x" * 1000
+
+        monkeypatch.setattr(dispatcher, "WEBHOOK_RESPONSE_BODY_MAX_BYTES", 10)
+
+        body = await dispatcher._read_capped_response_body(_DecodedGzipResponse())
+
+        assert body == "x" * 10
 
     asyncio.run(run())
 

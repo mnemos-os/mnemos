@@ -52,19 +52,27 @@ existing deployment:
 
 Do not run this migration while old v3.5-dev webhook writers are still active.
 Older writers update a parent attempt and insert its successor in separate
-statements, which can interleave with new recovery workers. New workers use
-per-attempt leases plus per-chain advisory locks, and startup runs repeated
-repair sweeps for the first minute, but the one-time migration window still
-requires draining old writers first.
+statements, which can interleave with new recovery workers. Draining those
+writers remains the operationally correct upgrade path. New workers use
+per-attempt leases plus per-chain advisory locks, startup runs repeated repair
+sweeps for the first minute, and `WEBHOOK_LEGACY_GRACE_SECONDS` adds a safety
+net for rollouts that skip the drain: lease-less legacy `retrying` rows are not
+recoverable until `scheduled_at + WEBHOOK_LEGACY_GRACE_SECONDS` has elapsed.
+The default is 300 seconds. Tune it to cover the maximum expected old-writer
+rollout overlap; after the grace expires, the new recovery worker treats any
+still-running old writer in that gap as crashed.
 
 `WEBHOOK_LEASE_SECONDS` is the authoritative webhook delivery ownership knob.
-The dispatcher derives the DNS-validation + HTTP-send + response-body-read
-deadline from it as `WEBHOOK_LEASE_SECONDS - WEBHOOK_FINALIZE_BUFFER_SECONDS`
-(5s by default). Startup fails if the lease is not larger than that finalize
-buffer, because recovery must never reclaim an attempt while an external POST
-can still be in flight. Keep `WEBHOOK_HTTP_TIMEOUT` at or below the derived
-send deadline if you tune it; `httpx` phase timeouts are not a replacement for
-the wall-clock lease deadline.
+Claims return both the DB-written `lease_expires_at` and DB `NOW()`, and the
+sender subtracts app-side monotonic elapsed time plus
+`WEBHOOK_FINALIZE_BUFFER_SECONDS` before starting DNS validation or HTTP POST.
+If less than the minimum send window remains, the worker records a retryable
+failure instead of posting with a stale lease. Startup still validates that the
+configured lease is larger than the finalize buffer. Keep `WEBHOOK_HTTP_TIMEOUT`
+at or below the lease-derived send budget if you tune it; `httpx` phase timeouts
+are not a replacement for the lease-anchored wall-clock deadline. Outbound
+webhook requests send `Accept-Encoding: identity` so the audited response-body
+cap is not bypassed by automatic decompression.
 
 ---
 

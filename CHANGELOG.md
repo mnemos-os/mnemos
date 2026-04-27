@@ -98,7 +98,12 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   `WEBHOOK_LEASE_SECONDS`, reserves a finalize buffer, wraps DNS validation,
   the HTTP POST, and the response-body read in that deadline, and streams
   response bodies into a fixed audit cap so a slow receiver cannot outlive
-  the lease or hold a semaphore slot indefinitely.
+  the lease or hold a semaphore slot indefinitely. Round 5 adds
+  `WEBHOOK_LEGACY_GRACE_SECONDS` so lease-less legacy `retrying` rows are
+  not recoverable during old-writer successor-insert gaps, anchors each send
+  timeout to the DB-returned claim timestamps instead of a fresh static
+  budget, and sends `Accept-Encoding: identity` on webhook POSTs so automatic
+  response decompression cannot bypass the retained body cap.
 
 ### Conflicts and operator handling
 

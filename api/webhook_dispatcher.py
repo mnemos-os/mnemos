@@ -31,6 +31,7 @@ import hmac
 import json
 import logging
 import os
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -53,6 +54,8 @@ WEBHOOK_LEASE_SECONDS = int(os.getenv(
 WEBHOOK_FINALIZE_BUFFER_SECONDS = float(os.getenv("WEBHOOK_FINALIZE_BUFFER_SECONDS", "5.0"))
 WEBHOOK_RESPONSE_BODY_MAX_BYTES = int(os.getenv("WEBHOOK_RESPONSE_BODY_MAX_BYTES", "2048"))
 WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
+WEBHOOK_LEGACY_GRACE_SECONDS = int(os.getenv("WEBHOOK_LEGACY_GRACE_SECONDS", "300"))
+MIN_SEND_WINDOW_SECONDS = 1.0
 RECOVERY_POLL_INTERVAL = 30.0          # seconds between recovery-worker passes
 REPAIR_BURST_SECONDS = float(os.getenv("WEBHOOK_REPAIR_BURST_SECONDS", "60.0"))
 REPAIR_BURST_INTERVAL = float(os.getenv("WEBHOOK_REPAIR_BURST_INTERVAL", "5.0"))
@@ -85,10 +88,12 @@ def _derive_total_send_deadline_seconds(
 
 if WEBHOOK_RESPONSE_BODY_MAX_BYTES <= 0:
     raise ValueError("WEBHOOK_RESPONSE_BODY_MAX_BYTES must be positive")
+if WEBHOOK_LEGACY_GRACE_SECONDS < 0:
+    raise ValueError("WEBHOOK_LEGACY_GRACE_SECONDS must be non-negative")
 
-# Keep the lease as the only operator-facing ownership budget. The send
-# deadline is derived at import/startup so it cannot drift beyond the lease and
-# let recovery replay a still-running external POST.
+# Keep the lease as the only operator-facing ownership budget. This derived
+# value validates startup configuration; actual sends use the DB-returned claim
+# timestamp pair so an app pause after claim cannot spend a stale full budget.
 TOTAL_SEND_DEADLINE_SECONDS = _derive_total_send_deadline_seconds(
     WEBHOOK_LEASE_SECONDS,
     WEBHOOK_FINALIZE_BUFFER_SECONDS,
@@ -257,13 +262,17 @@ async def _recoverable_delivery_ids(
                   AND newer.payload_hash = d.payload_hash
                   AND newer.attempt_num > d.attempt_num
               )
+              AND (
+                d.lease_token IS NOT NULL
+                OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= NOW()
+              )
             )
           )
         ORDER BY d.scheduled_at
         LIMIT $2
         FOR UPDATE SKIP LOCKED
         """,
-        MAX_ATTEMPTS, limit,
+        MAX_ATTEMPTS, limit, WEBHOOK_LEGACY_GRACE_SECONDS,
     )
 
 
@@ -315,7 +324,11 @@ async def _attempt_delivery(delivery_id: str, *, pool: Optional[asyncpg.Pool] = 
         delivery = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
         if not delivery:
             return False
-        result = await _send_claimed_delivery(delivery)
+        claim_observed_monotonic = time.monotonic()
+        result = await _send_claimed_delivery(
+            delivery,
+            claim_observed_monotonic=claim_observed_monotonic,
+        )
         return await _finalize_delivery(pool, delivery, lease_token, result)
 
 
@@ -374,29 +387,55 @@ async def _claim_delivery(
                           AND newer.payload_hash = d.payload_hash
                           AND newer.attempt_num > d.attempt_num
                       )
+                      AND (
+                        d.lease_token IS NOT NULL
+                        OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= NOW()
+                      )
                     )
                   )
                 RETURNING d.id, d.subscription_id, d.event_type, d.payload,
                           d.payload_hash, d.attempt_num, d.status,
+                          d.lease_expires_at, NOW() AS claim_db_now,
                           s.url, s.secret, s.revoked
                 """,
-                delivery_id, lease_token, lease_seconds, MAX_ATTEMPTS,
+                delivery_id,
+                lease_token,
+                lease_seconds,
+                MAX_ATTEMPTS,
+                WEBHOOK_LEGACY_GRACE_SECONDS,
             )
 
 
-async def _send_claimed_delivery(delivery: asyncpg.Record) -> _DeliveryResult:
+async def _send_claimed_delivery(
+    delivery: asyncpg.Record,
+    *,
+    claim_observed_monotonic: float,
+) -> _DeliveryResult:
     """Perform DNS validation and HTTP POST for an already leased row."""
+    remaining_seconds = _claim_remaining_send_window_seconds(
+        delivery,
+        claim_observed_monotonic=claim_observed_monotonic,
+    )
+    if remaining_seconds <= MIN_SEND_WINDOW_SECONDS:
+        return _DeliveryResult(
+            succeeded=False,
+            error=(
+                "lease-expired-before-send: remaining lease send window "
+                f"{remaining_seconds:.3f}s <= {MIN_SEND_WINDOW_SECONDS:.1f}s minimum"
+            ),
+        )
+
     try:
         return await asyncio.wait_for(
             _send_claimed_delivery_within_deadline(delivery),
-            timeout=TOTAL_SEND_DEADLINE_SECONDS,
+            timeout=remaining_seconds,
         )
     except asyncio.TimeoutError:
         return _DeliveryResult(
             succeeded=False,
             error=(
                 "send-timeout: DNS validation, HTTP send, and response body read "
-                f"exceeded {TOTAL_SEND_DEADLINE_SECONDS:.1f}s wall-clock deadline"
+                f"exceeded {remaining_seconds:.1f}s lease-anchored wall-clock deadline"
             ),
         )
 
@@ -412,6 +451,7 @@ async def _send_claimed_delivery_within_deadline(delivery: asyncpg.Record) -> _D
     headers = {
         "Content-Type": "application/json",
         "User-Agent": "MNEMOS-Webhook/1.0",
+        "Accept-Encoding": "identity",
         "X-MNEMOS-Event": delivery["event_type"],
         "X-MNEMOS-Signature": f"sha256={signature}",
         "X-MNEMOS-Delivery-ID": str(delivery["id"]),
@@ -469,6 +509,26 @@ async def _read_capped_response_body(response: httpx.Response) -> str:
         if remaining <= 0:
             break
     return bytes(body).decode("utf-8", errors="replace")
+
+
+def _claim_remaining_send_window_seconds(
+    delivery: asyncpg.Record,
+    *,
+    claim_observed_monotonic: float,
+) -> float:
+    """Compute remaining send time from DB claim timestamps plus app elapsed time."""
+    lease_expires_at = _as_aware_utc(delivery["lease_expires_at"])
+    claim_db_now = _as_aware_utc(delivery["claim_db_now"])
+    db_claim_window = (lease_expires_at - claim_db_now).total_seconds()
+    elapsed_since_claim_observed = max(0.0, time.monotonic() - claim_observed_monotonic)
+    return db_claim_window - elapsed_since_claim_observed - WEBHOOK_FINALIZE_BUFFER_SECONDS
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    """Normalize asyncpg timestamp values for arithmetic."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
 
 
 async def _finalize_delivery(
