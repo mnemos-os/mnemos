@@ -167,8 +167,14 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   finalization ahead of response-body capture and stream/client cleanup:
   headers first persist `response_status` with `response_body=NULL`, then a
   post-finalize audit update fills the body only if capture finishes within its
-  own timeout. Cleanup is also post-finalize best-effort, so the ACK race window
-  is reduced to the chain advisory lock plus the terminal UPDATE.
+  own timeout. Cleanup is also post-finalize best-effort. Round 21 splits the
+  successful 2xx terminal UPDATE into its own short committed transaction, then
+  reacquires the chain advisory lock for best-effort free-successor cleanup so
+  cleanup lock contention, exceptions, or shutdown cancellation cannot roll back
+  an already ACKed `status='succeeded'`. It also makes recovery-preclaimed sends
+  re-check for live successors, including active-leased successors, under the
+  pre-POST chain lock and abandon/supersede the older attempt before any
+  duplicate outbound delivery.
 
 ### Conflicts and operator handling
 

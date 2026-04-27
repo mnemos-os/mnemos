@@ -48,6 +48,17 @@ class _FakeWebhookStore:
             for other in self.rows
         )
 
+    def has_live_successor(self, row: dict[str, Any]) -> bool:
+        return any(
+            other["subscription_id"] == row["subscription_id"]
+            and other["event_type"] == row["event_type"]
+            and other["payload_hash"] == row["payload_hash"]
+            and other["attempt_num"] > row["attempt_num"]
+            and other["status"] in {"pending", "retrying"}
+            and not other.get("superseded", False)
+            for other in self.rows
+        )
+
     def has_succeeded_chain_peer(self, row: dict[str, Any]) -> bool:
         return any(
             other["subscription_id"] == row["subscription_id"]
@@ -339,6 +350,26 @@ class _FakeWebhookConn:
             self._clear_lease(row)
             return {"id": row["id"]}
 
+        if (
+            compact.startswith(
+                "UPDATE webhook_deliveries SET status='abandoned', "
+                "superseded=TRUE, status_updated_at=clock_timestamp()"
+            )
+            and "lease_token=$2::uuid" in compact
+        ):
+            row = self._row(args[0])
+            if (
+                row is None
+                or not self._owns_live_lease(row, args[1])
+                or row["status"] not in {"pending", "retrying"}
+                or row.get("superseded", False)
+            ):
+                return None
+            self._set_status(row, "abandoned")
+            row["superseded"] = True
+            self._clear_lease(row)
+            return {"id": row["id"]}
+
         if "SET status='abandoned'" in compact:
             row = self._row(args[0])
             if row is None or not self._owns_lease_token(row, args[1]):
@@ -405,6 +436,8 @@ class _FakeWebhookConn:
                     probe["id"] = str(args[3])
                 return self._has_succeeded_chain_peer(probe)
             probe["attempt_num"] = args[3]
+            if "newer.status IN ('pending', 'retrying')" in compact:
+                return self.store.has_live_successor(probe)
             return self._has_successor(probe)
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
@@ -1529,6 +1562,100 @@ def test_success_finalize_cancels_free_live_successor(monkeypatch):
     asyncio.run(run())
 
 
+def test_success_commit_survives_successor_cleanup_failure(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204, 204])
+        real_send = dispatcher._send_claimed_delivery
+
+        async def _send_then_old_writer_successor(delivery, *, pre_claim_monotonic):
+            result = await real_send(
+                delivery,
+                pre_claim_monotonic=pre_claim_monotonic,
+            )
+            conn.rows.append(_successor_for(parent))
+            return result
+
+        async def _fail_successor_cleanup(_conn, _successor_id):
+            raise RuntimeError("successor cleanup failed")
+
+        monkeypatch.setattr(dispatcher, "_send_claimed_delivery", _send_then_old_writer_successor)
+        monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", _fail_successor_cleanup)
+
+        finalized = await dispatcher._attempt_delivery(parent["id"])
+        successor = conn.rows[1]
+        replayed = await dispatcher._attempt_delivery(parent["id"])
+
+        assert finalized
+        assert not replayed
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert parent["superseded"] is False
+        assert successor["status"] == "pending"
+        assert successor["superseded"] is False
+
+        repair_result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+
+        assert repair_result == "UPDATE 1"
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+
+    asyncio.run(run())
+
+
+def test_success_commit_survives_shutdown_cancel_mid_successor_cleanup(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204, 204])
+        real_send = dispatcher._send_claimed_delivery
+        cleanup_started = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+
+        async def _send_then_old_writer_successor(delivery, *, pre_claim_monotonic):
+            result = await real_send(
+                delivery,
+                pre_claim_monotonic=pre_claim_monotonic,
+            )
+            conn.rows.append(_successor_for(parent))
+            return result
+
+        async def _block_successor_cleanup(_conn, _successor_id):
+            cleanup_started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cleanup_cancelled.set()
+                raise
+
+        monkeypatch.setattr(dispatcher, "_send_claimed_delivery", _send_then_old_writer_successor)
+        monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", _block_successor_cleanup)
+
+        task = asyncio.create_task(dispatcher._attempt_delivery(parent["id"]))
+        await asyncio.wait_for(cleanup_started.wait(), timeout=0.5)
+
+        assert parent["status"] == "succeeded"
+
+        task.cancel()
+        try:
+            await asyncio.wait_for(task, timeout=0.5)
+        except asyncio.CancelledError:
+            pass
+        else:
+            raise AssertionError("successor cleanup cancellation should propagate")
+        successor = conn.rows[1]
+        replayed = await dispatcher._attempt_delivery(parent["id"])
+
+        assert cleanup_cancelled.is_set()
+        assert not replayed
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert parent["superseded"] is False
+        assert successor["status"] == "pending"
+        assert successor["superseded"] is False
+
+    asyncio.run(run())
+
+
 def test_success_finalize_leaves_active_successor_lease_alone(monkeypatch):
     async def run():
         parent = _attempt()
@@ -1851,6 +1978,66 @@ def test_preclaimed_successor_waits_for_predecessor_success_before_post(monkeypa
         assert successor["superseded"] is True
         assert successor["lease_token"] is None
         assert conn.store.advisory_acquisitions >= 2
+
+    asyncio.run(run())
+
+
+def test_preclaim_then_successor_inserted_before_send_abandons_parent(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "retrying"
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+        claimed = await dispatcher._claim_recoverable_deliveries(conn, limit=1)
+        successor = _successor_for(parent)
+        conn.rows.append(successor)
+
+        sent = await dispatcher._attempt_delivery(
+            parent["id"],
+            pool=conn.pool,
+            claimed=claimed[0],
+        )
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert not sent
+        assert http.delivery_ids == []
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
+        assert parent["lease_token"] is None
+        assert successor["status"] == "pending"
+        assert successor["superseded"] is False
+        assert [row["id"] for row in recoverable] == [successor["id"]]
+
+    asyncio.run(run())
+
+
+def test_preclaim_with_active_leased_successor_abandons_parent(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "retrying"
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+        claimed = await dispatcher._claim_recoverable_deliveries(conn, limit=1)
+        successor = _successor_for(parent)
+        successor["status"] = "retrying"
+        successor["lease_token"] = "00000000-0000-0000-0000-000000000099"
+        successor["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        conn.rows.append(successor)
+
+        sent = await dispatcher._attempt_delivery(
+            parent["id"],
+            pool=conn.pool,
+            claimed=claimed[0],
+        )
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert not sent
+        assert http.delivery_ids == []
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
+        assert parent["lease_token"] is None
+        assert successor["status"] == "retrying"
+        assert successor["superseded"] is False
+        assert successor["lease_token"] == "00000000-0000-0000-0000-000000000099"
+        assert recoverable == []
 
     asyncio.run(run())
 

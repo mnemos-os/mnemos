@@ -639,6 +639,14 @@ async def _guard_preclaimed_delivery_before_send(
                 )
                 return False
 
+            if await _has_live_successor_attempt(conn, delivery):
+                await _abandon_owned_attempt_after_live_successor(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                )
+                return False
+
             return True
 
 
@@ -1028,11 +1036,22 @@ async def _finalize_delivery_row(
 ) -> bool:
     """Persist the send result while preserving the attempt ownership rules."""
     delivery_id = str(delivery["id"])
-    async with pool.acquire() as conn:
-        async with conn.transaction():
-            if isinstance(result, _LeaseExpiredBeforeSend):
+    if isinstance(result, _LeaseExpiredBeforeSend):
+        async with pool.acquire() as conn:
+            async with conn.transaction():
                 return await _release_owned_lease_for_reclaim(conn, delivery_id, lease_token)
 
+    if result.succeeded and not delivery["revoked"]:
+        return await _finalize_successful_delivery_row(
+            pool,
+            delivery,
+            delivery_id,
+            lease_token,
+            result,
+        )
+
+    async with pool.acquire() as conn:
+        async with conn.transaction():
             await _lock_delivery_chain(conn, delivery)
 
             if delivery["revoked"]:
@@ -1055,75 +1074,6 @@ async def _finalize_delivery_row(
                     delivery_id, lease_token,
                 )
                 return finalized is not None
-
-            if result.succeeded:
-                if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
-                    finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
-                        conn,
-                        delivery_id,
-                        lease_token,
-                        result,
-                        require_unexpired_lease=False,
-                    )
-                    return finalized is not None
-
-                try:
-                    async with conn.transaction():
-                        finalized = await conn.fetchrow(
-                            """
-                            UPDATE webhook_deliveries
-                            SET status='succeeded',
-                                superseded=FALSE,
-                                response_status=$3,
-                                response_body=$4,
-                                error=NULL,
-                                delivered_at=clock_timestamp(),
-                                lease_token=NULL,
-                                lease_expires_at=NULL
-                            WHERE id=$1::uuid
-                              AND lease_token=$2::uuid
-                              AND status IN ('pending', 'retrying')
-                              AND NOT superseded
-                            RETURNING id
-                            """,
-                            delivery_id,
-                            lease_token,
-                            result.response_status,
-                            result.response_body,
-                        )
-                except asyncpg.exceptions.UniqueViolationError:
-                    finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
-                        conn,
-                        delivery_id,
-                        lease_token,
-                        result,
-                        require_unexpired_lease=False,
-                    )
-                    return finalized is not None
-                if finalized is None:
-                    finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
-                        conn,
-                        delivery_id,
-                        lease_token,
-                        result,
-                        require_unexpired_lease=False,
-                    )
-                    if finalized is not None:
-                        return True
-                    await _clear_stale_owned_lease_after_terminal_finalize(
-                        conn,
-                        delivery_id,
-                        lease_token,
-                    )
-                    return False
-
-                # A live successor after our externally ACKed 2xx is a mixed-version
-                # artifact. This attempt already produced the canonical external delivery,
-                # so cancel a free successor instead of re-posting it.
-                successor = await _find_live_unleased_successor_attempt(conn, delivery)
-                if successor is not None:
-                    await _abandon_live_successor_attempt(conn, str(successor["id"]))
-                return True
 
             if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
                 finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
@@ -1198,6 +1148,165 @@ async def _finalize_delivery_row(
                 delivery_id, delivery["attempt_num"], result.response_status, result.error, backoff,
             )
             return True
+
+
+async def _commit_successful_delivery_row(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    delivery_id: str,
+    lease_token: str,
+    result: _DeliveryResult,
+) -> tuple[bool, bool]:
+    """Commit a 2xx result without doing successor cleanup in the same txn."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _lock_delivery_chain(conn, delivery)
+
+            if await _has_succeeded_chain_attempt(conn, delivery, delivery_id):
+                finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    result,
+                    require_unexpired_lease=False,
+                )
+                return finalized is not None, False
+
+            finalized = await conn.fetchrow(
+                """
+                UPDATE webhook_deliveries
+                SET status='succeeded',
+                    superseded=FALSE,
+                    response_status=$3,
+                    response_body=$4,
+                    error=NULL,
+                    delivered_at=clock_timestamp(),
+                    lease_token=NULL,
+                    lease_expires_at=NULL
+                WHERE id=$1::uuid
+                  AND lease_token=$2::uuid
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
+                RETURNING id
+                """,
+                delivery_id,
+                lease_token,
+                result.response_status,
+                result.response_body,
+            )
+            if finalized is None:
+                finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    result,
+                    require_unexpired_lease=False,
+                )
+                if finalized is not None:
+                    return True, False
+                await _clear_stale_owned_lease_after_terminal_finalize(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                )
+                return False, False
+
+            return True, True
+
+
+async def _finalize_successful_delivery_row(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    delivery_id: str,
+    lease_token: str,
+    result: _DeliveryResult,
+) -> bool:
+    """Persist a 2xx ACK before best-effort successor convergence cleanup."""
+    try:
+        finalized, committed_success = await _commit_successful_delivery_row(
+            pool,
+            delivery,
+            delivery_id,
+            lease_token,
+            result,
+        )
+    except asyncpg.exceptions.UniqueViolationError:
+        return await _abandon_success_duplicate_after_unique_violation(
+            pool,
+            delivery,
+            delivery_id,
+            lease_token,
+            result,
+        )
+
+    if committed_success:
+        await _abandon_live_successors_after_success_commit(pool, delivery, delivery_id)
+    return finalized
+
+
+async def _abandon_success_duplicate_after_unique_violation(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    delivery_id: str,
+    lease_token: str,
+    result: _DeliveryResult,
+) -> bool:
+    """Converge a duplicate 2xx after the succeeded-chain unique index wins."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await _lock_delivery_chain(conn, delivery)
+            finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                conn,
+                delivery_id,
+                lease_token,
+                result,
+                require_unexpired_lease=False,
+            )
+            if finalized is None:
+                await _clear_stale_owned_lease_after_terminal_finalize(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                )
+                return False
+            return True
+
+
+async def _abandon_live_successors_after_success_commit(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    delivery_id: str,
+) -> None:
+    """Best-effort post-commit cleanup for free successors after a 2xx ACK."""
+    while True:
+        successor_id: str | None = None
+        try:
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await _lock_delivery_chain(conn, delivery)
+                    # The predecessor already produced the canonical external delivery.
+                    successor = await _find_live_unleased_successor_attempt(conn, delivery)
+                    if successor is None:
+                        return
+                    successor_id = str(successor["id"])
+                    await _abandon_live_successor_attempt(conn, successor_id)
+        except asyncio.CancelledError:
+            logger.warning(
+                "webhook delivery %s successor %s cleanup cancelled after success commit",
+                delivery_id,
+                successor_id if successor_id is not None else "<unknown>",
+                exc_info=True,
+            )
+            raise
+        except Exception as exc:
+            logger.warning(
+                "webhook delivery %s successor %s cleanup failed after success commit (%s)",
+                delivery_id,
+                successor_id if successor_id is not None else "<unknown>",
+                type(exc).__name__,
+                exc_info=True,
+            )
+            return
 
 
 async def _run_post_finalize_delivery_work(
@@ -1414,6 +1523,28 @@ async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Rec
     )
 
 
+async def _has_live_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Record) -> bool:
+    """Return whether a live newer attempt owns the chain's forward direction."""
+    return await conn.fetchval(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM webhook_deliveries newer
+          WHERE newer.subscription_id = $1
+            AND newer.event_type = $2
+            AND newer.payload_hash = $3
+            AND newer.attempt_num > $4
+            AND newer.status IN ('pending', 'retrying')
+            AND NOT newer.superseded
+        )
+        """,
+        delivery["subscription_id"],
+        delivery["event_type"],
+        delivery["payload_hash"],
+        delivery["attempt_num"],
+    )
+
+
 async def _has_succeeded_chain_attempt(
     conn: asyncpg.Connection,
     delivery: asyncpg.Record,
@@ -1436,6 +1567,32 @@ async def _has_succeeded_chain_attempt(
         delivery["event_type"],
         delivery["payload_hash"],
         delivery_id,
+    )
+
+
+async def _abandon_owned_attempt_after_live_successor(
+    conn: asyncpg.Connection,
+    delivery_id: str,
+    lease_token: str,
+) -> Optional[asyncpg.Record]:
+    """Terminalize an owned preclaimed attempt made obsolete before POST."""
+    return await conn.fetchrow(
+        """
+        UPDATE webhook_deliveries
+        SET status='abandoned',
+            superseded=TRUE,
+            status_updated_at=clock_timestamp(),
+            lease_token=NULL,
+            lease_expires_at=NULL
+        WHERE id=$1::uuid
+          AND lease_token=$2::uuid
+          AND lease_expires_at > clock_timestamp()
+          AND status IN ('pending', 'retrying')
+          AND NOT superseded
+        RETURNING id
+        """,
+        delivery_id,
+        lease_token,
     )
 
 
