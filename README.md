@@ -364,7 +364,7 @@ Pull-based one-way federation between MNEMOS instances. Remote peer exposes `/v1
 
 **Dedup:** re-pulls are safe. Local id `fed:{peer}:{remote_id}` is stable; only rows with a newer `federation_remote_updated` overwrite existing ones.
 
-**Cursoring:** `/v1/federation/feed` uses an opaque compound cursor over `(updated, id)` and orders by the same pair, so pagination cannot skip memories when many rows share one `updated` timestamp.
+**Cursoring:** `/v1/federation/feed` uses an opaque compound cursor over `(updated, id)` and orders by the same pair, so pagination cannot skip memories when many rows share one `updated` timestamp. Legacy timestamp-only cursors are accepted with one inclusive boundary page (`updated >= since`) and then upgraded to a compound cursor; that boundary page may redeliver rows the peer already saw, but remote-id-aware UPSERT makes the replay idempotent.
 
 **Filters:** `namespace_filter` and `category_filter` (both arrays) restrict what gets pulled from a peer; NULL = pull everything the peer will serve.
 

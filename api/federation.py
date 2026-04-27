@@ -16,9 +16,8 @@ import base64
 import binascii
 import json
 import logging
-from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 import asyncpg
 import httpx
@@ -36,11 +35,10 @@ FEDERATION_MAX_METADATA = 64 * 1024  # 64 KB metadata json
 FEDERATION_MAX_NAME = 256            # category/subcategory/namespace length
 
 
-@dataclass(frozen=True)
-class FederationFeedCursor:
+class FederationFeedCursor(NamedTuple):
     updated: datetime
-    memory_id: str
-    raw: str
+    memory_id: Optional[str]
+    is_legacy: bool
 
 
 def _cursor_timestamp_for_wire(updated: datetime) -> str:
@@ -83,20 +81,25 @@ def _decode_feed_cursor(raw: str) -> FederationFeedCursor:
         updated_raw = payload.get("updated")
         if not isinstance(updated_raw, str):
             raise ValueError("cursor payload missing updated")
+        updated = _parse_cursor_timestamp(updated_raw)
         memory_id = payload.get("id")
-        if not isinstance(memory_id, str) or not memory_id:
-            memory_id = FEDERATION_CURSOR_LOWER_ID
+        if not isinstance(memory_id, str):
+            return FederationFeedCursor(
+                updated=updated,
+                memory_id=None,
+                is_legacy=True,
+            )
         return FederationFeedCursor(
-            updated=_parse_cursor_timestamp(updated_raw),
+            updated=updated,
             memory_id=memory_id,
-            raw=raw,
+            is_legacy=False,
         )
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
         updated = _parse_cursor_timestamp(raw)
         return FederationFeedCursor(
             updated=updated,
-            memory_id=FEDERATION_CURSOR_LOWER_ID,
-            raw=raw,
+            memory_id=None,
+            is_legacy=True,
         )
 
 
@@ -610,7 +613,10 @@ async def _pull_batch(
     params: Dict[str, Any] = {"limit": FEDERATION_BATCH_LIMIT}
     if since is not None:
         if isinstance(since, FederationFeedCursor):
-            params["since"] = since.raw
+            if since.is_legacy or since.memory_id is None:
+                params["since"] = _legacy_cursor_param(since.updated)
+            else:
+                params["since"] = _encode_feed_cursor(since.updated, since.memory_id)
         else:
             params["since"] = _legacy_cursor_param(since)
     if namespace_filter:

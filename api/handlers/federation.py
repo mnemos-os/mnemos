@@ -374,14 +374,18 @@ async def federation_feed(
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     since_ts: Optional[datetime] = None
-    since_id = _fed.FEDERATION_CURSOR_LOWER_ID
+    since_cursor_updated: Optional[datetime] = None
+    since_id: Optional[str] = None
+    since_is_legacy = False
     if since:
         try:
             cursor = _fed._decode_feed_cursor(since)
         except ValueError:
             raise HTTPException(status_code=422, detail="since must be a federation cursor")
+        since_cursor_updated = cursor.updated
         since_ts = _fed._cursor_timestamp_for_db(cursor.updated)
         since_id = cursor.memory_id
+        since_is_legacy = cursor.is_legacy
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
@@ -405,12 +409,15 @@ async def federation_feed(
     if since_ts is not None:
         args.append(since_ts)
         since_updated_arg = len(args)
-        args.append(since_id)
-        since_id_arg = len(args)
-        query_parts.append(
-            f"(m.updated > ${since_updated_arg} "
-            f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
-        )
+        if since_is_legacy:
+            query_parts.append(f"m.updated >= ${since_updated_arg}")
+        else:
+            args.append(since_id)
+            since_id_arg = len(args)
+            query_parts.append(
+                f"(m.updated > ${since_updated_arg} "
+                f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+            )
     if namespaces:
         args.append(namespaces)
         query_parts.append(f"m.namespace = ANY(${len(args)})")
@@ -462,6 +469,8 @@ async def federation_feed(
     ]
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(rows[-1]["updated"], rows[-1]["id"])
+    elif since_is_legacy and since_cursor_updated is not None:
+        next_cursor = _fed._encode_feed_cursor(since_cursor_updated, "")
     else:
         next_cursor = since
 
