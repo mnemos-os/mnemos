@@ -132,19 +132,24 @@ async def get_memory_log(
         async with pool.acquire() as conn:
             await _assert_memory_access(conn, memory_id, user)
             # Recursive CTE: walk from HEAD backward through parent_version_id.
-            # Carries owner_id/namespace/permission_mode through both arms so
-            # the post-walk filter can drop snapshots the caller can't read.
+            # Carries owner_id/namespace/permission_mode and the actual parent
+            # identity through both arms so the post-walk filter can drop
+            # snapshots the caller can't read without inventing parent edges.
             rows = await conn.fetch(
                 """
                 WITH RECURSIVE commit_walk AS (
                     -- Base: START from branch HEAD
                     SELECT
                         mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
+                        parent_mv.commit_hash AS parent_commit_hash,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
                         mv.owner_id, mv.namespace, mv.permission_mode,
                         1 AS depth
                     FROM memory_versions mv
+                    LEFT JOIN memory_versions parent_mv
+                        ON parent_mv.id = mv.parent_version_id
+                       AND parent_mv.memory_id = mv.memory_id
                     INNER JOIN memory_branches mb ON (
                         mb.memory_id = mv.memory_id AND
                         mb.name = $2 AND
@@ -161,18 +166,23 @@ async def get_memory_log(
                     -- HTTP log surfaces only intra-memory ancestry.
                     SELECT
                         mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
+                        parent_mv.commit_hash AS parent_commit_hash,
                         mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
                         mv.owner_id, mv.namespace, mv.permission_mode,
                         cw.depth + 1
                     FROM memory_versions mv
+                    LEFT JOIN memory_versions parent_mv
+                        ON parent_mv.id = mv.parent_version_id
+                       AND parent_mv.memory_id = mv.memory_id
                     INNER JOIN commit_walk cw
                         ON mv.id = cw.parent_version_id
                        AND mv.memory_id = cw.memory_id
                     WHERE cw.depth < $3
                 )
                 SELECT
-                    commit_hash, version_num, branch, content, category, subcategory,
+                    id, commit_hash, parent_version_id, parent_commit_hash,
+                    version_num, branch, content, category, subcategory,
                     snapshot_at, snapshot_by, change_type,
                     owner_id, namespace, permission_mode
                 FROM commit_walk
@@ -204,10 +214,18 @@ async def get_memory_log(
                     )
                 rows = [r for r in rows if _snap_visible(r)]
 
-            # Assemble with parent hashes
+            # Assemble with parent hashes. The parent edge is reported only if
+            # the actual immediate parent survived the same visibility filter.
+            # Do not chain to the next visible row: an invisible snapshot in
+            # between means the visible child has no visible parent edge.
+            visible_ids = {r["id"] for r in rows}
             commits = []
-            for i, row in enumerate(rows):
-                parent_hash = rows[i + 1]["commit_hash"] if i + 1 < len(rows) else None
+            for row in rows:
+                parent_hash = (
+                    row["parent_commit_hash"]
+                    if row["parent_version_id"] in visible_ids
+                    else None
+                )
                 commits.append(
                     CommitInfo(
                         commit_hash=row["commit_hash"],
