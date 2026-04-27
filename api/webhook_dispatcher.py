@@ -739,6 +739,8 @@ async def _finalize_delivery(
                     WHERE id=$1::uuid
                       AND lease_token=$2::uuid
                       AND lease_expires_at >= clock_timestamp()
+                      AND status IN ('pending', 'retrying')
+                      AND NOT superseded
                     RETURNING id
                     """,
                     delivery_id, lease_token,
@@ -822,6 +824,8 @@ async def _finalize_delivery(
                     WHERE id=$1::uuid
                       AND lease_token=$2::uuid
                       AND lease_expires_at >= clock_timestamp()
+                      AND status IN ('pending', 'retrying')
+                      AND NOT superseded
                     RETURNING id
                     """,
                     delivery_id, lease_token, result.response_status, result.response_body, result.error,
@@ -844,6 +848,8 @@ async def _finalize_delivery(
                 WHERE id=$1::uuid
                   AND lease_token=$2::uuid
                   AND lease_expires_at >= clock_timestamp()
+                  AND status IN ('pending', 'retrying')
+                  AND NOT superseded
                 RETURNING id
                 """,
                 delivery_id,

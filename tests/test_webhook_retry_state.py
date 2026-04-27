@@ -1134,6 +1134,103 @@ def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
     asyncio.run(run())
 
 
+def test_failure_finalize_does_not_clobber_same_row_legacy_success(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000016"
+        dispatcher, conn, _http = await _install(monkeypatch, [row], [])
+
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        # Old workers did not know about leases, so they can terminalize the
+        # same row while leaving a new worker's lease columns intact.
+        row["status"] = "succeeded"
+        row["response_status"] = 204
+        row["response_body"] = "legacy acknowledged"
+        row["delivered_at"] = datetime.now(timezone.utc)
+        assert row["lease_token"] == lease_token
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            dispatcher._DeliveryResult(
+                succeeded=False,
+                response_status=500,
+                response_body="server error",
+                error=None,
+            ),
+        )
+
+        assert not finalized
+        assert len(conn.rows) == 1
+        assert sum(candidate["status"] == "succeeded" for candidate in conn.rows) == 1
+        assert not any(
+            candidate["status"] in {"pending", "retrying"}
+            and candidate["attempt_num"] > row["attempt_num"]
+            for candidate in conn.rows
+        )
+        assert row["status"] == "succeeded"
+        assert row["superseded"] is False
+        assert row["response_status"] == 204
+        assert row["response_body"] == "legacy acknowledged"
+        assert row["lease_token"] == lease_token
+
+    asyncio.run(run())
+
+
+def test_failure_finalize_does_not_clobber_same_row_legacy_abandon(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000017"
+        dispatcher, conn, _http = await _install(monkeypatch, [row], [])
+
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        row["status"] = "abandoned"
+        row["superseded"] = False
+        row["error"] = "legacy abandoned"
+        row["delivered_at"] = datetime.now(timezone.utc)
+        assert row["lease_token"] == lease_token
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            dispatcher._DeliveryResult(
+                succeeded=False,
+                response_status=500,
+                response_body="server error",
+                error=None,
+            ),
+        )
+
+        assert not finalized
+        assert len(conn.rows) == 1
+        assert not any(
+            candidate["status"] in {"pending", "retrying"}
+            and candidate["attempt_num"] > row["attempt_num"]
+            for candidate in conn.rows
+        )
+        assert row["status"] == "abandoned"
+        assert row["superseded"] is False
+        assert row["response_status"] is None
+        assert row["error"] == "legacy abandoned"
+        assert row["lease_token"] == lease_token
+
+    asyncio.run(run())
+
+
 def test_success_finalize_cancels_free_live_successor(monkeypatch):
     async def run():
         parent = _attempt()
@@ -1992,6 +2089,23 @@ def test_succeeded_chain_guard_source_shape_is_chain_aware():
     assert "peer.id <> $4::uuid" in compact
     assert "_has_succeeded_chain_attempt(conn, delivery, delivery_id)" in compact
     assert "AND status IN ('pending', 'retrying') AND NOT superseded" in compact
+
+
+def test_failure_finalize_source_shape_requires_live_owned_attempt():
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    finalize_source = source[
+        source.index("async def _finalize_delivery"):
+        source.index("async def _load_delivery_for_claim")
+    ]
+    compact = " ".join(finalize_source.split())
+
+    assert "SET status='succeeded'" in compact
+    assert compact.count(
+        "AND lease_expires_at >= clock_timestamp() "
+        "AND status IN ('pending', 'retrying') "
+        "AND NOT superseded RETURNING id"
+    ) == 3
 
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():

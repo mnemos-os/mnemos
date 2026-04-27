@@ -146,6 +146,10 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   active peer-abandon updates to still target live non-superseded attempts, and
   isolates ordinary stream/client cleanup exceptions after response headers so
   captured acknowledgements still finalize while `CancelledError` propagates.
+  Round 16 makes revocation, final-failure, and retry-failure terminal UPDATEs
+  require the leased row to still be live (`pending`/`retrying` and not
+  superseded), so failure finalization cannot overwrite same-row legacy
+  succeeded or abandoned terminal writes during rolling upgrades.
 
 ### Conflicts and operator handling
 
