@@ -128,7 +128,12 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   deadline anchor inside `_claim_delivery` immediately before the lease UPDATE,
   makes lease-valid success finalization cancel free live successors under the
   chain advisory lock, and drains in-flight webhook delivery attempts during
-  graceful shutdown before any last-resort cancellation.
+  graceful shutdown before any last-resort cancellation. Round 12 schedules
+  recovered rows into the lifecycle-tracked delivery-attempt registry instead
+  of awaiting sends inside the recovery worker, adds succeeded-predecessor
+  guards to claim, failure-finalize, and repair paths so active successors
+  converge after canonical success, and treats response headers as the delivery
+  acknowledgement while response-body capture becomes best-effort audit data.
 
 ### Conflicts and operator handling
 

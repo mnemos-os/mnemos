@@ -95,7 +95,10 @@ at or below the lease-derived send budget if you tune it; `httpx` phase timeouts
 are not a replacement for the lease-anchored wall-clock deadline. Outbound
 webhook requests send `Accept-Encoding: identity`, response bodies are read
 with raw-byte streaming, and any non-identity `Content-Encoding` is not
-decompressed; only a small bounded raw preview is retained for audit.
+decompressed; only a small bounded raw preview is retained for audit. Delivery
+acknowledgement is based on the HTTP status code once response headers arrive:
+2xx is finalized as success even if the body is slow, truncated, or unavailable.
+Body capture failures are recorded as audit markers and do not create retries.
 
 `WEBHOOK_SHUTDOWN_DRAIN_SECONDS` controls graceful webhook shutdown. Lifespan
 teardown cancels perpetual worker loops first, which stops new recovery

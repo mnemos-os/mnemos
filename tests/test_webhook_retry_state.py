@@ -44,6 +44,16 @@ class _FakeWebhookStore:
             for other in self.rows
         )
 
+    def has_succeeded_predecessor(self, row: dict[str, Any]) -> bool:
+        return any(
+            other["subscription_id"] == row["subscription_id"]
+            and other["event_type"] == row["event_type"]
+            and other["payload_hash"] == row["payload_hash"]
+            and other["attempt_num"] < row["attempt_num"]
+            and other["status"] == "succeeded"
+            for other in self.rows
+        )
+
     def has_live_attempt_conflict(
         self,
         subscription_id: str,
@@ -297,6 +307,8 @@ class _FakeWebhookConn:
                 "payload_hash": args[2],
                 "attempt_num": args[3],
             }
+            if "predecessor.attempt_num < $4" in compact:
+                return self._has_succeeded_predecessor(probe)
             return self._has_successor(probe)
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
@@ -324,7 +336,10 @@ class _FakeWebhookConn:
                 if (
                     row["status"] in {"pending", "retrying"}
                     and self._lease_available(row)
-                    and self._has_successor(row)
+                    and (
+                        self._has_successor(row)
+                        or self._has_succeeded_predecessor(row)
+                    )
                 ):
                     self._set_status(row, "abandoned")
                     row["superseded"] = True
@@ -384,6 +399,9 @@ class _FakeWebhookConn:
 
     def _has_successor(self, row: dict[str, Any]) -> bool:
         return self.store.has_successor(row)
+
+    def _has_succeeded_predecessor(self, row: dict[str, Any]) -> bool:
+        return self.store.has_succeeded_predecessor(row)
 
     def _insert_delivery(self, *args):
         if self.store.has_live_attempt_conflict(args[0], args[1], args[3], args[4]):
@@ -492,6 +510,7 @@ class _FakeResponse:
         never_complete: bool,
         factory: "_HTTPClientFactory",
         headers: dict[str, str] | None = None,
+        body_error: Exception | None = None,
     ):
         self.status_code = status_code
         self.chunks = chunks
@@ -499,6 +518,7 @@ class _FakeResponse:
         self.never_complete = never_complete
         self.factory = factory
         self.headers = headers or {}
+        self.body_error = body_error
 
     async def aiter_bytes(self):
         async for chunk in self.aiter_raw():
@@ -511,6 +531,8 @@ class _FakeResponse:
                     await asyncio.sleep(self.chunk_delay)
                 self.factory.chunks_yielded += 1
                 yield chunk
+            if self.body_error is not None:
+                raise self.body_error
             while self.never_complete:
                 await asyncio.sleep(self.chunk_delay or 3600)
                 self.factory.chunks_yielded += 1
@@ -536,6 +558,7 @@ class _HTTPClientFactory:
         self.cancelled = False
         self.request_headers: list[dict[str, str]] = []
         self.response_headers: list[dict[str, str]] = []
+        self.body_errors: list[Exception | None] = []
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
@@ -558,6 +581,7 @@ class _FakeHTTPStream:
             else [f"status={status_code}".encode("utf-8")]
         )
         response_headers = self.factory.response_headers.pop(0) if self.factory.response_headers else {}
+        body_error = self.factory.body_errors.pop(0) if self.factory.body_errors else None
         self.factory.delivery_ids.append(self.headers["X-MNEMOS-Delivery-ID"])
         self.factory.request_headers.append(dict(self.headers))
         self.factory.started.set()
@@ -568,6 +592,7 @@ class _FakeHTTPStream:
             never_complete=self.factory.never_complete,
             factory=self.factory,
             headers=response_headers,
+            body_error=body_error,
         )
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -955,19 +980,24 @@ def test_status_updated_at_trigger_model_advances_on_status_change(monkeypatch):
 
 def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
     async def run():
+        from api import lifecycle
+
         retrying = _attempt()
         retrying["status"] = "retrying"
         retrying["lease_token"] = "00000000-0000-0000-0000-000000000001"
         retrying["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
         dispatcher, conn, http = await _install(monkeypatch, [retrying], [204])
         http.delay = 0.05
+        monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
 
         recovered = await asyncio.gather(
             dispatcher._recover_due_deliveries(conn.pool, limit=1),
             dispatcher._recover_due_deliveries(conn.pool, limit=1),
         )
+        tasks = list(lifecycle._delivery_attempt_tasks)
+        await asyncio.wait_for(asyncio.gather(*tasks), timeout=1.0)
 
-        assert sum(recovered) == 1
+        assert sum(recovered) >= 1
         assert conn.store.advisory_acquisitions >= 1
         assert retrying["status"] == "succeeded"
         assert http.delivery_ids == [retrying["id"]]
@@ -1093,6 +1123,95 @@ def test_success_finalize_leaves_active_successor_lease_alone(monkeypatch):
     asyncio.run(run())
 
 
+def test_active_successor_failure_after_predecessor_success_closes_chain(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+        real_send = dispatcher._send_claimed_delivery
+
+        async def _send_then_active_successor(delivery, *, pre_claim_monotonic):
+            result = await real_send(
+                delivery,
+                pre_claim_monotonic=pre_claim_monotonic,
+            )
+            successor = _successor_for(parent)
+            successor["status"] = "retrying"
+            successor["lease_token"] = "00000000-0000-0000-0000-000000000099"
+            successor["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+            conn.rows.append(successor)
+            return result
+
+        monkeypatch.setattr(dispatcher, "_send_claimed_delivery", _send_then_active_successor)
+
+        parent_finalized = await dispatcher._attempt_delivery(parent["id"])
+        successor = conn.rows[1]
+        successor_finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(successor),
+            successor["lease_token"],
+            dispatcher._DeliveryResult(
+                succeeded=False,
+                response_status=500,
+                response_body="server error",
+                error=None,
+            ),
+        )
+
+        assert parent_finalized
+        assert successor_finalized
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+        assert successor["response_status"] == 500
+        assert len(conn.rows) == 2
+
+    asyncio.run(run())
+
+
+def test_expired_successor_after_predecessor_success_is_repaired(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "succeeded"
+        successor = _successor_for(parent)
+        successor["status"] = "retrying"
+        successor["lease_token"] = "00000000-0000-0000-0000-000000000099"
+        successor["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert result == "UPDATE 1"
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+        assert successor["lease_token"] is None
+        assert recoverable == []
+
+    asyncio.run(run())
+
+
+def test_claim_after_predecessor_success_terminalizes_without_send(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "succeeded"
+        successor = _successor_for(parent)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            successor["id"],
+            lease_token="00000000-0000-0000-0000-000000000099",
+        )
+
+        assert claimed is None
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+        assert successor["lease_token"] is None
+
+    asyncio.run(run())
+
+
 def test_webhook_send_concurrency_cap(monkeypatch):
     async def run():
         rows = [_attempt(), _attempt(), _attempt()]
@@ -1111,12 +1230,12 @@ def test_webhook_send_concurrency_cap(monkeypatch):
     asyncio.run(run())
 
 
-def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore(monkeypatch):
+def test_slow_2xx_body_finalizes_success_without_retry(monkeypatch):
     async def run():
         row = _attempt()
         dispatcher, conn, http = await _install(monkeypatch, [row], [200])
-        lease_seconds = 2
-        finalize_buffer = 0.9
+        lease_seconds = 5
+        finalize_buffer = 1.0
         send_deadline = dispatcher._derive_total_send_deadline_seconds(
             lease_seconds,
             finalize_buffer,
@@ -1125,9 +1244,10 @@ def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore
         monkeypatch.setattr(dispatcher, "WEBHOOK_LEASE_SECONDS", lease_seconds)
         monkeypatch.setattr(dispatcher, "WEBHOOK_FINALIZE_BUFFER_SECONDS", finalize_buffer)
         monkeypatch.setattr(dispatcher, "TOTAL_SEND_DEADLINE_SECONDS", send_deadline)
+        monkeypatch.setattr(dispatcher, "WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS", 0.01)
         monkeypatch.setattr(dispatcher, "_send_semaphore", semaphore)
         http.response_chunks = [[b"trickle"]]
-        http.chunk_delay = 0.02
+        http.chunk_delay = 0.1
         http.never_complete = True
 
         loop = asyncio.get_running_loop()
@@ -1145,15 +1265,56 @@ def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore
         elapsed = loop.time() - started_at
 
         assert finalized
-        assert elapsed < send_deadline + 0.35
+        assert elapsed < 0.5
         assert http.cancelled
         assert http.exited == 1
         assert not semaphore.locked()
+        assert row["status"] == "succeeded"
+        assert row["superseded"] is False
+        assert row["response_status"] == 200
+        assert row["response_body"] == "[body capture timed out]"
+        assert row["error"] is None
+        assert len(conn.rows) == 1
+
+    asyncio.run(run())
+
+
+def test_5xx_with_fast_body_still_retries(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [503])
+        http.response_chunks = [[b"try later"]]
+
+        finalized = await dispatcher._attempt_delivery(row["id"])
+
+        assert finalized
         assert row["status"] == "abandoned"
         assert row["superseded"] is True
-        assert row["error"].startswith("send-timeout:")
+        assert row["response_status"] == 503
+        assert row["response_body"] == "try later"
         assert len(conn.rows) == 2
         assert conn.rows[1]["status"] == "pending"
+
+    asyncio.run(run())
+
+
+def test_2xx_connection_reset_mid_body_finalizes_success(monkeypatch):
+    async def run():
+        import httpx
+
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        http.response_chunks = [[b"partial"]]
+        http.body_errors = [httpx.ReadError("reset")]
+
+        finalized = await dispatcher._attempt_delivery(row["id"])
+
+        assert finalized
+        assert row["status"] == "succeeded"
+        assert row["response_status"] == 200
+        assert row["response_body"] == "[body capture: ReadError]"
+        assert row["error"] is None
+        assert len(conn.rows) == 1
 
     asyncio.run(run())
 
@@ -1491,6 +1652,8 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
     )
     assert "WHERE d.status = 'retrying' AND NOT d.superseded" not in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
+    assert "predecessor.attempt_num < d.attempt_num" in compact_dispatcher
+    assert "predecessor.status = 'succeeded'" in compact_dispatcher
 
 
 def test_success_finalize_source_shape_is_chain_aware():
@@ -1507,10 +1670,27 @@ def test_success_finalize_source_shape_is_chain_aware():
     assert "canonical external delivery" in source
 
 
+def test_succeeded_predecessor_guard_source_shape_is_chain_aware():
+    repo_root = Path(__file__).resolve().parents[1]
+    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    compact = " ".join(source.split())
+
+    assert "async def _has_succeeded_predecessor_attempt" in source
+    assert "async def _abandon_current_attempt_after_succeeded_predecessor" in source
+    assert "async def _abandon_owned_attempt_after_succeeded_predecessor" in source
+    assert "predecessor.attempt_num < $4" in compact
+    assert "predecessor.status = 'succeeded'" in compact
+    assert "if await _has_succeeded_predecessor_attempt(conn, delivery)" in compact
+
+
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_source = (repo_root / "api" / "lifecycle.py").read_text()
     dispatcher_source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    recover_source = dispatcher_source[
+        dispatcher_source.index("async def _recover_due_deliveries"):
+        dispatcher_source.index("async def _recoverable_delivery_ids")
+    ]
 
     assert "_worker_tasks: set = set()" in lifecycle_source
     assert "_delivery_attempt_tasks: set = set()" in lifecycle_source
@@ -1520,6 +1700,8 @@ def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     assert "await _cancel_tracked_tasks(\n        _worker_tasks" in lifecycle_source
     assert "await _drain_delivery_attempt_tasks()" in lifecycle_source
     assert "_schedule_delivery_attempt(_attempt_delivery(str(delivery_id)))" in dispatcher_source
+    assert "_schedule_delivery_attempt" in recover_source
+    assert "await _attempt_delivery" not in recover_source
     assert "may replay on restart" in lifecycle_source
     assert (
         lifecycle_source.index("await _cancel_tracked_tasks(\n        _worker_tasks")
@@ -1565,6 +1747,51 @@ def test_lifecycle_shutdown_during_finalize_drains_delivery_attempt(monkeypatch)
 
         assert cancelled == []
         assert task.done()
+        assert row["status"] == "succeeded"
+        assert await dispatcher._recoverable_delivery_ids(conn) == []
+
+    asyncio.run(run())
+
+
+def test_recovered_send_shutdown_drains_tracked_attempt(monkeypatch):
+    async def run():
+        from api import lifecycle
+
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [204])
+        monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
+        monkeypatch.setattr(lifecycle, "WEBHOOK_SHUTDOWN_DRAIN_SECONDS", 1.0)
+        finalize_started = asyncio.Event()
+        finalize_can_commit = asyncio.Event()
+        cancelled = []
+        real_finalize = dispatcher._finalize_delivery
+
+        async def _slow_finalize(pool, delivery, lease_token, result):
+            finalize_started.set()
+            try:
+                await finalize_can_commit.wait()
+            except asyncio.CancelledError:
+                cancelled.append(True)
+                raise
+            return await real_finalize(pool, delivery, lease_token, result)
+
+        monkeypatch.setattr(dispatcher, "_finalize_delivery", _slow_finalize)
+
+        recovered = await dispatcher._recover_due_deliveries(conn.pool, limit=1)
+        assert recovered == 1
+        assert len(lifecycle._delivery_attempt_tasks) == 1
+
+        await asyncio.wait_for(finalize_started.wait(), timeout=0.5)
+        drain_task = asyncio.create_task(lifecycle._drain_delivery_attempt_tasks())
+        await asyncio.sleep(0)
+
+        assert http.delivery_ids == [row["id"]]
+        assert row["status"] == "retrying"
+
+        finalize_can_commit.set()
+        await asyncio.wait_for(drain_task, timeout=0.5)
+
+        assert cancelled == []
         assert row["status"] == "succeeded"
         assert await dispatcher._recoverable_delivery_ids(conn) == []
 

@@ -15,9 +15,11 @@ Design notes
   retry-chain advancement from final-attempt failure. Workers claim due rows
   by writing a short-lived lease, release the database connection, and only
   then perform DNS validation and the outbound POST. The lease is the
-  authoritative delivery budget: DNS validation, HTTP send, and capped response
-  body read run under one wall-clock deadline derived from the lease, leaving a
-  buffer for the finalize transaction before recovery can reclaim the attempt.
+  authoritative delivery budget: DNS validation and HTTP response headers run
+  under a wall-clock deadline derived from the lease, leaving a buffer for the
+  finalize transaction before recovery can reclaim the attempt. Once headers are
+  received, the status code is the delivery acknowledgement; response-body
+  capture is best-effort audit data and cannot turn a 2xx into a retry.
 - HMAC-SHA256 signature over the raw JSON body bytes. Receivers verify with
   the per-subscription secret returned once at create time.
 
@@ -54,6 +56,7 @@ WEBHOOK_LEASE_SECONDS = int(os.getenv(
 ))
 WEBHOOK_FINALIZE_BUFFER_SECONDS = float(os.getenv("WEBHOOK_FINALIZE_BUFFER_SECONDS", "5.0"))
 WEBHOOK_RESPONSE_BODY_MAX_BYTES = int(os.getenv("WEBHOOK_RESPONSE_BODY_MAX_BYTES", "2048"))
+WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS = 5.0
 WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
 WEBHOOK_LEGACY_GRACE_SECONDS = int(os.getenv("WEBHOOK_LEGACY_GRACE_SECONDS", "300"))
 NEW_CODE_WRITER_REVISION = 1
@@ -109,13 +112,24 @@ WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
         lease_expires_at = NULL
     WHERE d.status IN ('pending', 'retrying')
       AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
-      AND EXISTS (
-        SELECT 1
-        FROM webhook_deliveries newer
-        WHERE newer.subscription_id = d.subscription_id
-          AND newer.event_type = d.event_type
-          AND newer.payload_hash = d.payload_hash
-          AND newer.attempt_num > d.attempt_num
+      AND (
+        EXISTS (
+          SELECT 1
+          FROM webhook_deliveries newer
+          WHERE newer.subscription_id = d.subscription_id
+            AND newer.event_type = d.event_type
+            AND newer.payload_hash = d.payload_hash
+            AND newer.attempt_num > d.attempt_num
+        )
+        OR EXISTS (
+          SELECT 1
+          FROM webhook_deliveries predecessor
+          WHERE predecessor.subscription_id = d.subscription_id
+            AND predecessor.event_type = d.event_type
+            AND predecessor.payload_hash = d.payload_hash
+            AND predecessor.attempt_num < d.attempt_num
+            AND predecessor.status = 'succeeded'
+        )
       )
 """
 
@@ -250,20 +264,23 @@ async def _repair_superseded_retrying_deliveries_safely(
 
 
 async def repair_superseded_retrying_deliveries(pool: asyncpg.Pool) -> str:
-    """Terminalize live-looking attempts that already have a newer successor row."""
+    """Terminalize live attempts made obsolete by successor rows or predecessor success."""
     async with pool.acquire() as conn:
         return await conn.execute(WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL)
 
 
 async def _recover_due_deliveries(pool: asyncpg.Pool, *, limit: int = 50) -> int:
-    """Recover due deliveries by taking short leases before each send."""
+    """Recover due deliveries by scheduling lifecycle-tracked send attempts."""
     recovered = 0
     async with pool.acquire() as conn:
         async with conn.transaction():
             rows = await _recoverable_delivery_ids(conn, limit=limit)
+    from api.lifecycle import _schedule_delivery_attempt  # noqa: WPS433
     for row in rows:
-        if await _attempt_delivery(str(row["id"]), pool=pool):
-            recovered += 1
+        _schedule_delivery_attempt(_attempt_delivery(str(row["id"]), pool=pool))
+        recovered += 1
+    if recovered:
+        await asyncio.sleep(0)
     return recovered
 
 
@@ -381,6 +398,10 @@ async def _claim_delivery(
                 return None
 
             await _lock_delivery_chain(conn, delivery)
+            if await _has_succeeded_predecessor_attempt(conn, delivery):
+                await _abandon_current_attempt_after_succeeded_predecessor(conn, delivery_id)
+                return None
+
             if delivery["status"] == "retrying" and await _has_successor_attempt(conn, delivery):
                 await conn.execute(
                     """
@@ -470,21 +491,25 @@ async def _send_claimed_delivery(
         )
 
     try:
-        return await asyncio.wait_for(
-            _send_claimed_delivery_within_deadline(delivery),
-            timeout=remaining_seconds,
+        return await _send_claimed_delivery_within_deadline(
+            delivery,
+            send_window_seconds=remaining_seconds,
         )
     except asyncio.TimeoutError:
         return _DeliveryResult(
             succeeded=False,
             error=(
-                "send-timeout: DNS validation, HTTP send, and response body read "
+                "send-timeout: DNS validation, HTTP send, and response headers "
                 f"exceeded {remaining_seconds:.1f}s lease-anchored wall-clock deadline"
             ),
         )
 
 
-async def _send_claimed_delivery_within_deadline(delivery: asyncpg.Record) -> _DeliveryResult:
+async def _send_claimed_delivery_within_deadline(
+    delivery: asyncpg.Record,
+    *,
+    send_window_seconds: float,
+) -> _DeliveryResult:
     """Run the network send path; caller supplies the wall-clock deadline."""
     if not delivery:
         return _DeliveryResult(succeeded=False, error="delivery not found")
@@ -503,42 +528,87 @@ async def _send_claimed_delivery_within_deadline(delivery: asyncpg.Record) -> _D
         "X-MNEMOS-Attempt": str(delivery["attempt_num"]),
     }
 
-    response_status: Optional[int] = None
-    response_body: Optional[str] = None
-    error: Optional[str] = None
+    loop = asyncio.get_running_loop()
+    header_deadline = loop.time() + send_window_seconds
 
-    # Re-validate URL at dispatch time (defense-in-depth against SSRF if a
-    # subscription's url field was set outside the handler validation path).
-    # This narrows but does not fully close the DNS-rebinding window — see
-    # validate_webhook_url's docstring.
     try:
         from api.handlers.webhooks import validate_webhook_url
-        await validate_webhook_url(delivery["url"])
+        await asyncio.wait_for(
+            validate_webhook_url(delivery["url"]),
+            timeout=_remaining_timeout_seconds(header_deadline),
+        )
+    except asyncio.TimeoutError:
+        raise
     except Exception as e:
-        error = f"url-rejected: {type(e).__name__}: {e}"
-    else:
-        try:
-            async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT, follow_redirects=False) as client:
-                async with client.stream(
-                    "POST",
-                    delivery["url"],
-                    content=delivery["payload"].encode("utf-8"),
-                    headers=headers,
-                ) as response:
-                    response_status = response.status_code
-                    response_body = await _read_capped_response_body(response)
-        except httpx.HTTPError as e:
-            error = f"{type(e).__name__}: {e}"
-        except Exception as e:  # pragma: no cover
-            error = f"{type(e).__name__}: {e}"
+        return _DeliveryResult(succeeded=False, error=f"url-rejected: {type(e).__name__}: {e}")
 
-    succeeded = response_status is not None and 200 <= response_status < 300
-    return _DeliveryResult(
-        succeeded=succeeded,
-        response_status=response_status,
-        response_body=response_body,
-        error=error,
+    client_cm = httpx.AsyncClient(timeout=DELIVERY_TIMEOUT, follow_redirects=False)
+    client = None
+    stream_cm = None
+    response = None
+    try:
+        client = await asyncio.wait_for(
+            client_cm.__aenter__(),
+            timeout=_remaining_timeout_seconds(header_deadline),
+        )
+        stream_cm = client.stream(
+            "POST",
+            delivery["url"],
+            content=delivery["payload"].encode("utf-8"),
+            headers=headers,
+        )
+        response = await asyncio.wait_for(
+            stream_cm.__aenter__(),
+            timeout=_remaining_timeout_seconds(header_deadline),
+        )
+        response_status = response.status_code
+        succeeded = 200 <= response_status < 300
+        response_body = await _capture_response_body_for_audit(
+            response,
+            remaining_header_window=max(0.0, header_deadline - loop.time()),
+        )
+        return _DeliveryResult(
+            succeeded=succeeded,
+            response_status=response_status,
+            response_body=response_body,
+        )
+    except asyncio.TimeoutError:
+        raise
+    except httpx.HTTPError as e:
+        return _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
+    except Exception as e:  # pragma: no cover
+        return _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
+    finally:
+        if stream_cm is not None and response is not None:
+            await stream_cm.__aexit__(None, None, None)
+        if client is not None:
+            await client_cm.__aexit__(None, None, None)
+
+
+def _remaining_timeout_seconds(deadline: float) -> float:
+    """Return a small positive timeout if the header deadline is exhausted."""
+    return max(0.001, deadline - asyncio.get_running_loop().time())
+
+
+async def _capture_response_body_for_audit(
+    response: httpx.Response,
+    *,
+    remaining_header_window: float,
+) -> str:
+    """Read response body for audit without changing status-code delivery outcome."""
+    timeout_seconds = min(
+        WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS,
+        max(0.001, remaining_header_window / 2),
     )
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            return await _read_capped_response_body(response)
+    except asyncio.TimeoutError:
+        return "[body capture timed out]"
+    except httpx.HTTPError as e:
+        return f"[body capture: {type(e).__name__}]"
+    except Exception as e:  # pragma: no cover
+        return f"[body capture: {type(e).__name__}]"
 
 
 async def _read_capped_response_body(response: httpx.Response) -> str:
@@ -670,6 +740,15 @@ async def _finalize_delivery(
                 if successor is not None:
                     await _abandon_live_successor_attempt(conn, str(successor["id"]))
                 return True
+
+            if await _has_succeeded_predecessor_attempt(conn, delivery):
+                finalized = await _abandon_owned_attempt_after_succeeded_predecessor(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    result,
+                )
+                return finalized is not None
 
             next_attempt = delivery["attempt_num"] + 1
             if next_attempt > MAX_ATTEMPTS:
@@ -819,6 +898,82 @@ async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Rec
         delivery["event_type"],
         delivery["payload_hash"],
         delivery["attempt_num"],
+    )
+
+
+async def _has_succeeded_predecessor_attempt(
+    conn: asyncpg.Connection,
+    delivery: asyncpg.Record,
+) -> bool:
+    """Return whether an earlier attempt already completed the chain."""
+    return await conn.fetchval(
+        """
+        SELECT EXISTS (
+          SELECT 1
+          FROM webhook_deliveries predecessor
+          WHERE predecessor.subscription_id = $1
+            AND predecessor.event_type = $2
+            AND predecessor.payload_hash = $3
+            AND predecessor.attempt_num < $4
+            AND predecessor.status = 'succeeded'
+        )
+        """,
+        delivery["subscription_id"],
+        delivery["event_type"],
+        delivery["payload_hash"],
+        delivery["attempt_num"],
+    )
+
+
+async def _abandon_current_attempt_after_succeeded_predecessor(
+    conn: asyncpg.Connection,
+    delivery_id: str,
+) -> None:
+    """Terminalize a lease-free attempt whose chain already converged."""
+    await conn.execute(
+        """
+        UPDATE webhook_deliveries
+        SET status='abandoned',
+            superseded=TRUE,
+            status_updated_at=clock_timestamp(),
+            lease_token=NULL,
+            lease_expires_at=NULL
+        WHERE id=$1::uuid
+          AND status IN ('pending', 'retrying')
+          AND NOT superseded
+          AND (lease_token IS NULL OR lease_expires_at < clock_timestamp())
+        """,
+        delivery_id,
+    )
+
+
+async def _abandon_owned_attempt_after_succeeded_predecessor(
+    conn: asyncpg.Connection,
+    delivery_id: str,
+    lease_token: str,
+    result: _DeliveryResult,
+) -> Optional[asyncpg.Record]:
+    """Finalize a failed active successor without extending a completed chain."""
+    return await conn.fetchrow(
+        """
+        UPDATE webhook_deliveries
+        SET status='abandoned',
+            superseded=TRUE,
+            response_status=$3,
+            response_body=$4,
+            error=$5,
+            lease_token=NULL,
+            lease_expires_at=NULL
+        WHERE id=$1::uuid
+          AND lease_token=$2::uuid
+          AND lease_expires_at >= clock_timestamp()
+        RETURNING id
+        """,
+        delivery_id,
+        lease_token,
+        result.response_status,
+        result.response_body,
+        result.error,
     )
 
 
