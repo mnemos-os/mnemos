@@ -32,6 +32,11 @@ class _FakeWebhookStore:
         self.enforce_succeeded_unique = False
         self.unique_violation_cls: type[Exception] = RuntimeError
         self.succeeded_update_attempts = 0
+        self.savepoint_commands: list[str] = []
+        self.bulk_successor_fetches = 0
+        self.single_successor_fetches = 0
+        self.successor_cleanup_updates = 0
+        self.after_bulk_successor_fetch = None
 
     def row(self, row_id: str):
         for row in self.rows:
@@ -87,7 +92,10 @@ class _FakeWebhookStore:
         )
 
     def live_unleased_successor(self, row: dict[str, Any]):
-        successors = [
+        return min(self.live_unleased_successors(row), key=lambda item: item["attempt_num"], default=None)
+
+    def live_unleased_successors(self, row: dict[str, Any]):
+        return [
             other
             for other in self.rows
             if other["subscription_id"] == row["subscription_id"]
@@ -104,7 +112,6 @@ class _FakeWebhookStore:
                 )
             )
         ]
-        return min(successors, key=lambda item: item["attempt_num"], default=None)
 
     def release_locks(self, conn_id: int) -> None:
         self.locked_by = {
@@ -127,11 +134,16 @@ class _FakeTransaction:
 
     async def __aenter__(self):
         self.conn.in_transaction += 1
+        self.conn._transaction_logs.append({})
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        log = self.conn._transaction_logs.pop()
+        if exc_type is not None:
+            self.conn._restore_log(log)
         self.conn.in_transaction -= 1
         if self.conn.in_transaction == 0:
+            self.conn._savepoint_logs.clear()
             self.conn.store.release_locks(self.conn.conn_id)
             self.conn.release_advisory_locks()
         return False
@@ -165,6 +177,8 @@ class _FakeWebhookConn:
         self.conn_id = conn_id
         self.in_transaction = 0
         self.advisory_keys: list[int] = []
+        self._transaction_logs: list[dict[str, dict[str, Any] | None]] = []
+        self._savepoint_logs: list[tuple[str, dict[str, dict[str, Any] | None]]] = []
 
     @property
     def rows(self):
@@ -191,6 +205,57 @@ class _FakeWebhookConn:
             lock = self.store.advisory_lock(key)
             if lock.locked():
                 lock.release()
+
+    def _active_change_logs(self):
+        return [
+            *self._transaction_logs,
+            *(log for _name, log in self._savepoint_logs),
+        ]
+
+    def _record_row_change(self, row: dict[str, Any]) -> None:
+        row_id = str(row["id"])
+        for log in self._active_change_logs():
+            if row_id not in log:
+                log[row_id] = dict(row)
+
+    def _record_row_insert(self, row_id: str) -> None:
+        for log in self._active_change_logs():
+            if row_id not in log:
+                log[row_id] = None
+
+    def _restore_log(self, log: dict[str, dict[str, Any] | None]) -> None:
+        for row_id, snapshot in reversed(list(log.items())):
+            row = self._row(row_id)
+            if snapshot is None:
+                if row is not None:
+                    self.rows.remove(row)
+                continue
+            if row is None:
+                self.rows.append(dict(snapshot))
+            else:
+                row.clear()
+                row.update(snapshot)
+
+    def _create_savepoint(self, name: str) -> None:
+        self._savepoint_logs.append((name, {}))
+
+    def _rollback_to_savepoint(self, name: str) -> None:
+        for index in range(len(self._savepoint_logs) - 1, -1, -1):
+            savepoint_name, log = self._savepoint_logs[index]
+            if savepoint_name == name:
+                self._restore_log(log)
+                self._savepoint_logs[index] = (savepoint_name, {})
+                del self._savepoint_logs[index + 1 :]
+                return
+        raise AssertionError(f"unknown savepoint: {name}")
+
+    def _release_savepoint(self, name: str) -> None:
+        for index in range(len(self._savepoint_logs) - 1, -1, -1):
+            savepoint_name, _log = self._savepoint_logs[index]
+            if savepoint_name == name:
+                del self._savepoint_logs[index]
+                return
+        raise AssertionError(f"unknown savepoint: {name}")
 
     async def fetch(self, sql: str, *args):
         compact = " ".join(sql.split())
@@ -224,6 +289,7 @@ class _FakeWebhookConn:
                         continue
                 else:
                     continue
+                self._record_row_change(row)
                 row["lease_token"] = lease_token
                 row["lease_expires_at"] = claim_db_now + timedelta(seconds=lease_seconds)
                 if row["status"] == "pending":
@@ -235,6 +301,26 @@ class _FakeWebhookConn:
                 if len(claimed) >= limit:
                     break
             return claimed
+
+        if compact.startswith("SELECT newer.id FROM webhook_deliveries newer"):
+            self.store.bulk_successor_fetches += 1
+            probe = {
+                "subscription_id": args[0],
+                "event_type": args[1],
+                "payload_hash": args[2],
+                "attempt_num": args[3],
+            }
+            successors = sorted(
+                self.store.live_unleased_successors(probe),
+                key=lambda item: item["attempt_num"],
+            )
+            hook = self.store.after_bulk_successor_fetch
+            if hook is not None:
+                self.store.after_bulk_successor_fetch = None
+                result = hook()
+                if asyncio.iscoroutine(result):
+                    await result
+            return [{"id": successor["id"]} for successor in successors]
 
         if "SELECT d.id FROM webhook_deliveries d" not in sql:
             raise AssertionError(f"unexpected fetch SQL: {sql}")
@@ -297,6 +383,7 @@ class _FakeWebhookConn:
                 )
             ):
                 return None
+            self._record_row_change(row)
             row["lease_token"] = str(args[1])
             row["lease_expires_at"] = claim_db_now + timedelta(seconds=int(args[2]))
             if row["status"] == "pending":
@@ -306,6 +393,7 @@ class _FakeWebhookConn:
             return delivery
 
         if compact.startswith("SELECT newer.id FROM webhook_deliveries newer"):
+            self.store.single_successor_fetches += 1
             probe = {
                 "subscription_id": args[0],
                 "event_type": args[1],
@@ -452,6 +540,21 @@ class _FakeWebhookConn:
 
     async def execute(self, sql: str, *args):
         compact = " ".join(sql.split())
+        if compact.startswith("SAVEPOINT "):
+            name = compact.split()[1]
+            self.store.savepoint_commands.append(compact)
+            self._create_savepoint(name)
+            return "SAVEPOINT"
+        if compact.startswith("ROLLBACK TO SAVEPOINT "):
+            name = compact.split()[3]
+            self.store.savepoint_commands.append(compact)
+            self._rollback_to_savepoint(name)
+            return "ROLLBACK"
+        if compact.startswith("RELEASE SAVEPOINT "):
+            name = compact.split()[2]
+            self.store.savepoint_commands.append(compact)
+            self._release_savepoint(name)
+            return "RELEASE"
         if compact.startswith("SELECT pg_advisory_xact_lock"):
             key = int(args[0])
             lock = self.store.advisory_lock(key)
@@ -479,6 +582,7 @@ class _FakeWebhookConn:
             "UPDATE webhook_deliveries SET status='abandoned', superseded=TRUE, "
             "status_updated_at=clock_timestamp()"
         ):
+            self.store.successor_cleanup_updates += 1
             row = self._row(args[0])
             if (
                 row is None
@@ -522,6 +626,7 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None:
                 return "UPDATE 0"
+            self._record_row_change(row)
             row["response_body"] = args[1]
             return "UPDATE 1"
         if compact.startswith("INSERT INTO webhook_deliveries"):
@@ -560,6 +665,7 @@ class _FakeWebhookConn:
             "lease_expires_at": None,
             "writer_revision": args[6] if len(args) > 6 else 1,
         }
+        self._record_row_insert(row["id"])
         self.rows.append(row)
         return {"id": row["id"]}
 
@@ -580,6 +686,7 @@ class _FakeWebhookConn:
         return expires_at is not None and expires_at >= datetime.now(timezone.utc)
 
     def _clear_lease(self, row: dict[str, Any]) -> None:
+        self._record_row_change(row)
         row["lease_token"] = None
         row["lease_expires_at"] = None
 
@@ -590,6 +697,7 @@ class _FakeWebhookConn:
         *,
         changed_at: datetime | None = None,
     ) -> None:
+        self._record_row_change(row)
         if row.get("status") != status:
             row["status_updated_at"] = changed_at or datetime.now(timezone.utc)
         row["status"] = status
@@ -1562,11 +1670,12 @@ def test_success_finalize_cancels_free_live_successor(monkeypatch):
     asyncio.run(run())
 
 
-def test_success_commit_survives_successor_cleanup_failure(monkeypatch):
+def test_success_commit_savepoint_isolates_successor_cleanup_failure(monkeypatch):
     async def run():
         parent = _attempt()
         dispatcher, conn, http = await _install(monkeypatch, [parent], [204, 204])
         real_send = dispatcher._send_claimed_delivery
+        real_abandon = dispatcher._abandon_live_successor_attempt
 
         async def _send_then_old_writer_successor(delivery, *, pre_claim_monotonic):
             result = await real_send(
@@ -1576,23 +1685,32 @@ def test_success_commit_survives_successor_cleanup_failure(monkeypatch):
             conn.rows.append(_successor_for(parent))
             return result
 
-        async def _fail_successor_cleanup(_conn, _successor_id):
+        async def _fail_successor_cleanup_after_update(cleanup_conn, successor_id):
+            await real_abandon(cleanup_conn, successor_id)
             raise RuntimeError("successor cleanup failed")
 
         monkeypatch.setattr(dispatcher, "_send_claimed_delivery", _send_then_old_writer_successor)
-        monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", _fail_successor_cleanup)
+        monkeypatch.setattr(
+            dispatcher,
+            "_abandon_live_successor_attempt",
+            _fail_successor_cleanup_after_update,
+        )
 
         finalized = await dispatcher._attempt_delivery(parent["id"])
         successor = conn.rows[1]
-        replayed = await dispatcher._attempt_delivery(parent["id"])
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
 
         assert finalized
-        assert not replayed
         assert http.delivery_ids == [parent["id"]]
         assert parent["status"] == "succeeded"
         assert parent["superseded"] is False
         assert successor["status"] == "pending"
         assert successor["superseded"] is False
+        assert recoverable == []
+        assert conn.store.savepoint_commands == [
+            "SAVEPOINT successor_cleanup_1",
+            "ROLLBACK TO SAVEPOINT successor_cleanup_1",
+        ]
 
         repair_result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
 
@@ -1603,21 +1721,76 @@ def test_success_commit_survives_successor_cleanup_failure(monkeypatch):
     asyncio.run(run())
 
 
-def test_success_commit_survives_shutdown_cancel_mid_successor_cleanup(monkeypatch):
+def test_success_commit_abandons_successors_atomically_before_fallback(monkeypatch):
     async def run():
         parent = _attempt()
-        dispatcher, conn, http = await _install(monkeypatch, [parent], [204, 204])
-        real_send = dispatcher._send_claimed_delivery
+        successors = []
+        for attempt_num in (2, 3, 4):
+            successor = _successor_for(parent)
+            successor["attempt_num"] = attempt_num
+            successors.append(successor)
+        dispatcher, conn, http = await _install(monkeypatch, [parent, *successors], [204])
+
+        finalized = await dispatcher._attempt_delivery(parent["id"])
+
+        assert finalized
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert [successor["status"] for successor in successors] == [
+            "abandoned",
+            "abandoned",
+            "abandoned",
+        ]
+        assert [successor["superseded"] for successor in successors] == [True, True, True]
+        assert conn.store.bulk_successor_fetches == 1
+        assert conn.store.single_successor_fetches == 1
+        assert conn.store.successor_cleanup_updates == len(successors)
+        assert conn.store.savepoint_commands == [
+            "SAVEPOINT successor_cleanup_1",
+            "RELEASE SAVEPOINT successor_cleanup_1",
+            "SAVEPOINT successor_cleanup_2",
+            "RELEASE SAVEPOINT successor_cleanup_2",
+            "SAVEPOINT successor_cleanup_3",
+            "RELEASE SAVEPOINT successor_cleanup_3",
+        ]
+
+    asyncio.run(run())
+
+
+def test_success_commit_fallback_abandons_late_successor(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+
+        def _insert_late_successor():
+            conn.rows.append(_successor_for(parent))
+
+        conn.store.after_bulk_successor_fetch = _insert_late_successor
+
+        finalized = await dispatcher._attempt_delivery(parent["id"])
+        successor = conn.rows[1]
+
+        assert finalized
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+        assert conn.store.bulk_successor_fetches == 1
+        assert conn.store.single_successor_fetches == 2
+        assert conn.store.successor_cleanup_updates == 1
+        assert conn.store.savepoint_commands == []
+
+    asyncio.run(run())
+
+
+def test_success_commit_cancelled_in_transaction_rolls_back_for_retry(monkeypatch):
+    async def run():
+        parent = _attempt()
+        successor = _successor_for(parent)
+        dispatcher, conn, http = await _install(monkeypatch, [parent, successor], [204])
+        real_abandon = dispatcher._abandon_live_successor_attempt
         cleanup_started = asyncio.Event()
         cleanup_cancelled = asyncio.Event()
-
-        async def _send_then_old_writer_successor(delivery, *, pre_claim_monotonic):
-            result = await real_send(
-                delivery,
-                pre_claim_monotonic=pre_claim_monotonic,
-            )
-            conn.rows.append(_successor_for(parent))
-            return result
 
         async def _block_successor_cleanup(_conn, _successor_id):
             cleanup_started.set()
@@ -1627,7 +1800,6 @@ def test_success_commit_survives_shutdown_cancel_mid_successor_cleanup(monkeypat
                 cleanup_cancelled.set()
                 raise
 
-        monkeypatch.setattr(dispatcher, "_send_claimed_delivery", _send_then_old_writer_successor)
         monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", _block_successor_cleanup)
 
         task = asyncio.create_task(dispatcher._attempt_delivery(parent["id"]))
@@ -1642,16 +1814,34 @@ def test_success_commit_survives_shutdown_cancel_mid_successor_cleanup(monkeypat
             pass
         else:
             raise AssertionError("successor cleanup cancellation should propagate")
-        successor = conn.rows[1]
-        replayed = await dispatcher._attempt_delivery(parent["id"])
 
         assert cleanup_cancelled.is_set()
-        assert not replayed
         assert http.delivery_ids == [parent["id"]]
-        assert parent["status"] == "succeeded"
+        assert parent["status"] == "retrying"
         assert parent["superseded"] is False
+        assert parent["lease_token"] is not None
+        assert parent["lease_expires_at"] is not None
         assert successor["status"] == "pending"
         assert successor["superseded"] is False
+
+        monkeypatch.setattr(dispatcher, "_abandon_live_successor_attempt", real_abandon)
+        retry_result = dispatcher._DeliveryResult(
+            succeeded=True,
+            response_status=204,
+            response_body=None,
+        )
+        retried = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(parent),
+            parent["lease_token"],
+            retry_result,
+        )
+
+        assert retried
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
 
     asyncio.run(run())
 

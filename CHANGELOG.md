@@ -175,6 +175,13 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   re-check for live successors, including active-leased successors, under the
   pre-POST chain lock and abandon/supersede the older attempt before any
   duplicate outbound delivery.
+  Round 22 keeps the ACK-protecting behavior for ordinary per-successor
+  cleanup failures while closing the mixed-version replay window in the common
+  case: the success UPDATE now finds and abandons free live successors in the
+  same chain-locked transaction, with each abandon isolated by an explicit
+  savepoint. A post-commit cleanup pass remains only as a fallback for
+  successors inserted after the in-transaction successor query but before the
+  success commit.
 
 ### Conflicts and operator handling
 
