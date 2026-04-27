@@ -86,6 +86,10 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   attempt (`api/webhook_dispatcher.py:353-392`). The new migration
   `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs
   existing superseded `retrying` rows and keeps them out of replay.
+  Round 2 holds a `FOR UPDATE SKIP LOCKED` claim through recovery send
+  and finalize, and adds an idempotent startup repair sweep for
+  upgrade-window retry rows that gained a successor after the migration
+  snapshot.
 
 ### Conflicts and operator handling
 

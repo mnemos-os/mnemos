@@ -14,8 +14,12 @@
 COMMENT ON COLUMN webhook_deliveries.status IS
     'pending | retrying | succeeded | retry_scheduled | abandoned';
 
--- One-time data repair: terminalize retrying rows that already have a newer
--- attempt for the same subscription/event/payload chain.
+-- One-time best-effort data repair: terminalize retrying rows that already
+-- have a newer attempt for the same subscription/event/payload chain. This
+-- statement sees one migration-time snapshot; api.lifecycle also runs the
+-- same idempotent sweep on every startup to close the online-upgrade race
+-- where an older process commits status='retrying' before inserting its
+-- successor row.
 UPDATE webhook_deliveries d
 SET status = 'retry_scheduled'
 WHERE d.status = 'retrying'
