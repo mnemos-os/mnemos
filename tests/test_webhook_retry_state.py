@@ -313,7 +313,12 @@ class _FakeWebhookConn:
 
         if "SET status='succeeded'" in compact:
             row = self._row(args[0])
-            if row is None or not self._owns_live_lease(row, args[1]):
+            if row is None or not self._owns_lease_token(row, args[1]):
+                return None
+            if (
+                "lease_expires_at >= clock_timestamp()" in compact
+                and not self._lease_unexpired(row)
+            ):
                 return None
             self.store.succeeded_update_attempts += 1
             if (
@@ -336,7 +341,12 @@ class _FakeWebhookConn:
 
         if "SET status='abandoned'" in compact:
             row = self._row(args[0])
-            if row is None or not self._owns_live_lease(row, args[1]):
+            if row is None or not self._owns_lease_token(row, args[1]):
+                return None
+            if (
+                "lease_expires_at >= clock_timestamp()" in compact
+                and not self._lease_unexpired(row)
+            ):
                 return None
             if (
                 "AND status IN ('pending', 'retrying')" in compact
@@ -521,12 +531,14 @@ class _FakeWebhookConn:
         )
 
     def _owns_live_lease(self, row: dict[str, Any], lease_token: str) -> bool:
+        return self._owns_lease_token(row, lease_token) and self._lease_unexpired(row)
+
+    def _owns_lease_token(self, row: dict[str, Any], lease_token: str) -> bool:
+        return row.get("lease_token") == str(lease_token)
+
+    def _lease_unexpired(self, row: dict[str, Any]) -> bool:
         expires_at = row.get("lease_expires_at")
-        return (
-            row.get("lease_token") == str(lease_token)
-            and expires_at is not None
-            and expires_at >= datetime.now(timezone.utc)
-        )
+        return expires_at is not None and expires_at >= datetime.now(timezone.utc)
 
     def _clear_lease(self, row: dict[str, Any]) -> None:
         row["lease_token"] = None
@@ -647,6 +659,10 @@ class _HTTPClientFactory:
         self.body_errors: list[Exception | None] = []
         self.stream_exit_errors: list[BaseException | None] = []
         self.client_exit_errors: list[BaseException | None] = []
+        self.stream_exit_delay = 0.0
+        self.client_exit_delay = 0.0
+        self.stream_exit_cancelled = False
+        self.client_exit_cancelled = False
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
@@ -686,6 +702,12 @@ class _FakeHTTPStream:
     async def __aexit__(self, exc_type, exc, tb):
         self.factory.active -= 1
         self.factory.exited += 1
+        try:
+            if self.factory.stream_exit_delay:
+                await asyncio.sleep(self.factory.stream_exit_delay)
+        except asyncio.CancelledError:
+            self.factory.stream_exit_cancelled = True
+            raise
         exit_error = (
             self.factory.stream_exit_errors.pop(0)
             if self.factory.stream_exit_errors
@@ -704,6 +726,12 @@ class _FakeHTTPClient:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        try:
+            if self.factory.client_exit_delay:
+                await asyncio.sleep(self.factory.client_exit_delay)
+        except asyncio.CancelledError:
+            self.factory.client_exit_cancelled = True
+            raise
         exit_error = (
             self.factory.client_exit_errors.pop(0)
             if self.factory.client_exit_errors
@@ -1256,8 +1284,9 @@ def test_finalize_with_stale_lease_token_is_noop(monkeypatch):
     async def run():
         row = _attempt()
         row["status"] = "retrying"
-        row["lease_token"] = "00000000-0000-0000-0000-000000000001"
-        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        row["lease_token"] = "00000000-0000-0000-0000-000000000002"
+        row["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        current_lease_expires_at = row["lease_expires_at"]
         dispatcher, conn, _http = await _install(monkeypatch, [row], [])
         delivery = conn._with_subscription(row)
 
@@ -1271,8 +1300,8 @@ def test_finalize_with_stale_lease_token_is_noop(monkeypatch):
         assert not finalized
         assert row["status"] == "retrying"
         assert row["response_status"] is None
-        assert row["lease_token"] is None
-        assert row["lease_expires_at"] is None
+        assert row["lease_token"] == "00000000-0000-0000-0000-000000000002"
+        assert row["lease_expires_at"] == current_lease_expires_at
 
     asyncio.run(run())
 
@@ -2110,6 +2139,169 @@ def test_webhook_send_preserves_2xx_result_when_stream_cleanup_fails(monkeypatch
     asyncio.run(run())
 
 
+def test_late_2xx_finalize_persists_success_after_lease_expiry(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000041"
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        result = await dispatcher._send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            result,
+        )
+        recovered = await dispatcher._recover_due_deliveries(conn.pool, limit=1)
+
+        assert result.succeeded is True
+        assert finalized
+        assert conn.store.succeeded_update_attempts == 1
+        assert row["status"] == "succeeded"
+        assert row["superseded"] is False
+        assert row["response_status"] == 200
+        assert row["lease_token"] is None
+        assert recovered == 0
+        assert http.delivery_ids == [row["id"]]
+
+    asyncio.run(run())
+
+
+def test_late_2xx_finalize_with_succeeded_peer_abandons_current_attempt(monkeypatch):
+    async def run():
+        row = _attempt()
+        peer = _successor_for(row)
+        lease_token = "00000000-0000-0000-0000-000000000042"
+        dispatcher, conn, http = await _install(monkeypatch, [row, peer], [200])
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        result = await dispatcher._send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        peer["status"] = "succeeded"
+        peer["response_status"] = 204
+        peer["delivered_at"] = datetime.now(timezone.utc)
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            result,
+        )
+        recovered = await dispatcher._recover_due_deliveries(conn.pool, limit=1)
+
+        assert result.succeeded is True
+        assert finalized
+        assert conn.store.succeeded_update_attempts == 0
+        assert row["status"] == "abandoned"
+        assert row["superseded"] is True
+        assert row["response_status"] == 200
+        assert row["response_body"] == "status=200"
+        assert row["lease_token"] is None
+        assert peer["status"] == "succeeded"
+        assert sum(candidate["status"] == "succeeded" for candidate in conn.rows) == 1
+        assert recovered == 0
+        assert http.delivery_ids == [row["id"]]
+
+    asyncio.run(run())
+
+
+def test_failure_finalize_still_requires_unexpired_lease(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000043"
+        dispatcher, conn, http = await _install(monkeypatch, [row], [503])
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        result = await dispatcher._send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            result,
+        )
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert result.succeeded is False
+        assert finalized is False
+        assert row["status"] == "retrying"
+        assert row["superseded"] is False
+        assert row["response_status"] is None
+        assert row["lease_token"] == lease_token
+        assert [candidate["id"] for candidate in recoverable] == [row["id"]]
+        assert http.delivery_ids == [row["id"]]
+
+    asyncio.run(run())
+
+
+def test_webhook_send_cleanup_timeout_preserves_2xx_result(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000044"
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        monkeypatch.setattr(dispatcher, "WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS", 0.01)
+        http.stream_exit_delay = 1.0
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        result = await dispatcher._send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+        elapsed = loop.time() - started_at
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            result,
+        )
+        await asyncio.sleep(0)
+
+        assert result.succeeded is True
+        assert finalized
+        assert elapsed < 0.2
+        assert http.stream_exit_cancelled
+        assert row["status"] == "succeeded"
+        assert row["response_status"] == 200
+        assert row["lease_token"] is None
+
+    asyncio.run(run())
+
+
 def test_webhook_send_propagates_cancelled_error_from_stream_cleanup(monkeypatch):
     async def run():
         row = _attempt()
@@ -2423,13 +2615,19 @@ def test_failure_finalize_source_shape_requires_live_owned_attempt():
         source.index("async def _load_delivery_for_claim")
     ]
     compact = " ".join(finalize_source.split())
+    success_update = compact[
+        compact.index("SET status='succeeded'"):
+        compact.index("except asyncpg.exceptions.UniqueViolationError")
+    ]
 
     assert "SET status='succeeded'" in compact
+    assert "AND lease_token=$2::uuid AND status IN ('pending', 'retrying')" in success_update
+    assert "lease_expires_at >= clock_timestamp()" not in success_update
     assert compact.count(
         "AND lease_expires_at >= clock_timestamp() "
         "AND status IN ('pending', 'retrying') "
         "AND NOT superseded RETURNING id"
-    ) == 4
+    ) == 3
 
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():

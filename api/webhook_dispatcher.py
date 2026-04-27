@@ -18,8 +18,10 @@ Design notes
   authoritative delivery budget: DNS validation and HTTP response headers run
   under a wall-clock deadline derived from the lease, leaving a buffer for the
   finalize transaction before recovery can reclaim the attempt. Once headers are
-  received, the status code is the delivery acknowledgement; response-body
-  capture is best-effort audit data and cannot turn a 2xx into a retry.
+  received, the status code is the delivery acknowledgement; a matching lease
+  token can persist a 2xx even if the lease expires before finalize commits.
+  Response-body capture is best-effort audit data and cannot turn a 2xx into a
+  retry.
 - HMAC-SHA256 signature over the raw JSON body bytes. Receivers verify with
   the per-subscription secret returned once at create time.
 
@@ -38,7 +40,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, Iterable, Optional
+from typing import Any, Awaitable, Dict, Iterable, Optional
 
 import asyncpg
 import httpx
@@ -57,6 +59,9 @@ WEBHOOK_LEASE_SECONDS = int(os.getenv(
 WEBHOOK_FINALIZE_BUFFER_SECONDS = float(os.getenv("WEBHOOK_FINALIZE_BUFFER_SECONDS", "5.0"))
 WEBHOOK_RESPONSE_BODY_MAX_BYTES = int(os.getenv("WEBHOOK_RESPONSE_BODY_MAX_BYTES", "2048"))
 WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS = 5.0
+WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS = float(
+    os.getenv("WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS", "5.0")
+)
 WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
 WEBHOOK_LEGACY_GRACE_SECONDS = int(os.getenv("WEBHOOK_LEGACY_GRACE_SECONDS", "300"))
 NEW_CODE_WRITER_REVISION = 1
@@ -92,6 +97,8 @@ def _derive_total_send_deadline_seconds(
 
 if WEBHOOK_RESPONSE_BODY_MAX_BYTES <= 0:
     raise ValueError("WEBHOOK_RESPONSE_BODY_MAX_BYTES must be positive")
+if WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS <= 0:
+    raise ValueError("WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS must be positive")
 if WEBHOOK_LEGACY_GRACE_SECONDS < 0:
     raise ValueError("WEBHOOK_LEGACY_GRACE_SECONDS must be non-negative")
 
@@ -763,38 +770,91 @@ async def _send_claimed_delivery_within_deadline(
         fallback_result = _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
     finally:
         if stream_cm is not None and response is not None:
-            try:
-                await stream_cm.__aexit__(None, None, None)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                if result is None:
-                    raise
-                logger.warning(
-                    "webhook delivery %s stream cleanup failed after response headers; "
-                    "delivery result preserved",
-                    delivery["id"],
-                    exc_info=True,
-                )
+            await _run_post_header_cleanup(
+                stream_cm.__aexit__(None, None, None),
+                delivery_id=delivery["id"],
+                cleanup_name="stream",
+                result=result,
+            )
         if client is not None:
-            try:
-                await client_cm.__aexit__(None, None, None)
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                if result is None:
-                    raise
-                logger.warning(
-                    "webhook delivery %s client cleanup failed after response headers; "
-                    "delivery result preserved",
-                    delivery["id"],
-                    exc_info=True,
-                )
+            await _run_post_header_cleanup(
+                client_cm.__aexit__(None, None, None),
+                delivery_id=delivery["id"],
+                cleanup_name="client",
+                result=result,
+            )
     if result is not None:
         return result
     if fallback_result is not None:
         return fallback_result
     return _DeliveryResult(succeeded=False, error="send failed before response headers")
+
+
+async def _run_post_header_cleanup(
+    cleanup: Awaitable[object],
+    *,
+    delivery_id: Any,
+    cleanup_name: str,
+    result: _DeliveryResult | None,
+) -> None:
+    """Bound post-header cleanup so finalization is not stuck behind __aexit__."""
+    cleanup_task = asyncio.ensure_future(cleanup)
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(cleanup_task),
+            timeout=WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        cleanup_task.cancel()
+        cleanup_task.add_done_callback(
+            lambda task: _consume_timed_out_cleanup_result(
+                task,
+                delivery_id,
+                cleanup_name,
+            )
+        )
+        if result is None:
+            raise
+        logger.warning(
+            "webhook delivery %s %s cleanup timed out after %.1fs after response headers; "
+            "delivery result preserved",
+            delivery_id,
+            cleanup_name,
+            WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS,
+            exc_info=True,
+        )
+    except asyncio.CancelledError:
+        cleanup_task.cancel()
+        raise
+    except Exception:
+        if result is None:
+            raise
+        logger.warning(
+            "webhook delivery %s %s cleanup failed after response headers; "
+            "delivery result preserved",
+            delivery_id,
+            cleanup_name,
+            exc_info=True,
+        )
+
+
+def _consume_timed_out_cleanup_result(
+    task: asyncio.Future[object],
+    delivery_id: Any,
+    cleanup_name: str,
+) -> None:
+    """Drain a timed-out cleanup task if it finishes after finalization moved on."""
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        return
+    except Exception:
+        logger.debug(
+            "webhook delivery %s %s cleanup finished with an error after timeout",
+            delivery_id,
+            cleanup_name,
+            exc_info=True,
+        )
 
 
 def _remaining_timeout_seconds(deadline: float) -> float:
@@ -898,7 +958,7 @@ async def _finalize_delivery(
     lease_token: str,
     result: _DeliveryResult,
 ) -> bool:
-    """Persist the send result only if this worker still owns the lease."""
+    """Persist the send result while preserving the attempt ownership rules."""
     delivery_id = str(delivery["id"])
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -935,6 +995,7 @@ async def _finalize_delivery(
                         delivery_id,
                         lease_token,
                         result,
+                        require_unexpired_lease=False,
                     )
                     return finalized is not None
 
@@ -953,7 +1014,6 @@ async def _finalize_delivery(
                                 lease_expires_at=NULL
                             WHERE id=$1::uuid
                               AND lease_token=$2::uuid
-                              AND lease_expires_at >= clock_timestamp()
                               AND status IN ('pending', 'retrying')
                               AND NOT superseded
                             RETURNING id
@@ -969,9 +1029,19 @@ async def _finalize_delivery(
                         delivery_id,
                         lease_token,
                         result,
+                        require_unexpired_lease=False,
                     )
                     return finalized is not None
                 if finalized is None:
+                    finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                        conn,
+                        delivery_id,
+                        lease_token,
+                        result,
+                        require_unexpired_lease=False,
+                    )
+                    if finalized is not None:
+                        return True
                     await _clear_stale_owned_lease_after_terminal_finalize(
                         conn,
                         delivery_id,
@@ -979,7 +1049,7 @@ async def _finalize_delivery(
                     )
                     return False
 
-                # A live successor after our lease-valid 2xx is a mixed-version
+                # A live successor after our externally ACKed 2xx is a mixed-version
                 # artifact. This attempt already produced the canonical external delivery,
                 # so cancel a free successor instead of re-posting it.
                 successor = await _find_live_unleased_successor_attempt(conn, delivery)
@@ -1264,8 +1334,35 @@ async def _abandon_owned_attempt_after_succeeded_chain_peer(
     delivery_id: str,
     lease_token: str,
     result: _DeliveryResult,
+    *,
+    require_unexpired_lease: bool = True,
 ) -> Optional[asyncpg.Record]:
     """Finalize an active duplicate without extending a completed chain."""
+    if require_unexpired_lease:
+        return await conn.fetchrow(
+            """
+            UPDATE webhook_deliveries
+            SET status='abandoned',
+                superseded=TRUE,
+                response_status=$3,
+                response_body=$4,
+                error=$5,
+                lease_token=NULL,
+                lease_expires_at=NULL
+            WHERE id=$1::uuid
+              AND lease_token=$2::uuid
+              AND lease_expires_at >= clock_timestamp()
+              AND status IN ('pending', 'retrying')
+              AND NOT superseded
+            RETURNING id
+            """,
+            delivery_id,
+            lease_token,
+            result.response_status,
+            result.response_body,
+            result.error,
+        )
+
     return await conn.fetchrow(
         """
         UPDATE webhook_deliveries
@@ -1278,7 +1375,6 @@ async def _abandon_owned_attempt_after_succeeded_chain_peer(
             lease_expires_at=NULL
         WHERE id=$1::uuid
           AND lease_token=$2::uuid
-          AND lease_expires_at >= clock_timestamp()
           AND status IN ('pending', 'retrying')
           AND NOT superseded
         RETURNING id

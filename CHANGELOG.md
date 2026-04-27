@@ -158,7 +158,12 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   send semaphore's current free slots, treats `lease-expired-before-send` as a
   non-consumptive lease release instead of a failed attempt, and makes
   recovery-preclaimed sends take the retry-chain advisory lock for a final
-  live-lease and succeeded-peer recheck before any outbound POST.
+  live-lease and succeeded-peer recheck before any outbound POST. Round 19
+  makes external 2xx ACKs trump later lease expiry during success finalization:
+  matching token ownership plus a still-live row is enough to persist
+  `status='succeeded'`, while failure paths still require lease validity.
+  Post-header stream/client cleanup is also bounded so a stuck `__aexit__`
+  cannot delay finalization indefinitely.
 
 ### Conflicts and operator handling
 
