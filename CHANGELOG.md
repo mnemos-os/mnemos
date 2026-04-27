@@ -163,7 +163,12 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   matching token ownership plus a still-live row is enough to persist
   `status='succeeded'`, while failure paths still require lease validity.
   Post-header stream/client cleanup is also bounded so a stuck `__aexit__`
-  cannot delay finalization indefinitely.
+  cannot delay finalization indefinitely. Round 20 moves status-code
+  finalization ahead of response-body capture and stream/client cleanup:
+  headers first persist `response_status` with `response_body=NULL`, then a
+  post-finalize audit update fills the body only if capture finishes within its
+  own timeout. Cleanup is also post-finalize best-effort, so the ACK race window
+  is reduced to the chain advisory lock plus the terminal UPDATE.
 
 ### Conflicts and operator handling
 

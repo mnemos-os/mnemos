@@ -485,6 +485,12 @@ class _FakeWebhookConn:
                 return "UPDATE 0"
             self._set_status(row, "pending")
             return "UPDATE 1"
+        if compact.startswith("UPDATE webhook_deliveries SET response_body=$2"):
+            row = self._row(args[0])
+            if row is None:
+                return "UPDATE 0"
+            row["response_body"] = args[1]
+            return "UPDATE 1"
         if compact.startswith("INSERT INTO webhook_deliveries"):
             inserted = self._insert_delivery(*args)
             return "INSERT 0 1" if inserted else "INSERT 0 0"
@@ -1938,8 +1944,13 @@ def test_slow_2xx_body_finalizes_success_without_retry(monkeypatch):
         task = asyncio.create_task(dispatcher._attempt_delivery(row["id"]))
         await asyncio.wait_for(http.started.wait(), timeout=0.5)
 
-        assert row["status"] == "retrying"
-        assert row["lease_expires_at"] > datetime.now(timezone.utc)
+        for _ in range(20):
+            if row["status"] == "succeeded":
+                break
+            await asyncio.sleep(0)
+        assert row["status"] == "succeeded"
+        assert row["lease_token"] is None
+        assert row["response_body"] is None
         recovered_while_leased = await dispatcher._recover_due_deliveries(conn.pool, limit=1)
         assert recovered_while_leased == 0
         assert http.delivery_ids == [row["id"]]
@@ -1955,9 +1966,72 @@ def test_slow_2xx_body_finalizes_success_without_retry(monkeypatch):
         assert row["status"] == "succeeded"
         assert row["superseded"] is False
         assert row["response_status"] == 200
-        assert row["response_body"] == "[body capture timed out]"
+        assert row["response_body"] is None
         assert row["error"] is None
         assert len(conn.rows) == 1
+
+    asyncio.run(run())
+
+
+def test_late_2xx_with_recovery_steal_finalizes_before_body_capture(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        capture_started = asyncio.Event()
+        capture_can_finish = asyncio.Event()
+        real_read = dispatcher._read_capped_response_body
+        http.response_chunks = [[b"late body"]]
+        monkeypatch.setattr(dispatcher, "WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS", 60.0)
+
+        async def _blocked_body_read(response):
+            capture_started.set()
+            await capture_can_finish.wait()
+            return await real_read(response)
+
+        monkeypatch.setattr(dispatcher, "_read_capped_response_body", _blocked_body_read)
+
+        task = asyncio.create_task(dispatcher._attempt_delivery(row["id"]))
+        await asyncio.wait_for(capture_started.wait(), timeout=0.5)
+
+        row["lease_expires_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        recovered = await dispatcher._recover_due_deliveries(conn.pool, limit=1)
+
+        assert row["status"] == "succeeded"
+        assert row["lease_token"] is None
+        assert row["response_status"] == 200
+        assert row["response_body"] is None
+        assert recovered == 0
+        assert http.delivery_ids == [row["id"]]
+
+        capture_can_finish.set()
+        finalized = await asyncio.wait_for(task, timeout=0.5)
+
+        assert finalized
+        assert row["response_body"] == "late body"
+        assert http.delivery_ids == [row["id"]]
+
+    asyncio.run(run())
+
+
+def test_body_capture_timeout_after_finalize_leaves_response_body_null(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        monkeypatch.setattr(dispatcher, "WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS", 0.01)
+        http.response_chunks = [[b"slow"]]
+        http.chunk_delay = 0.1
+        http.never_complete = True
+
+        finalized = await dispatcher._attempt_delivery(row["id"])
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert finalized
+        assert row["status"] == "succeeded"
+        assert row["response_status"] == 200
+        assert row["response_body"] is None
+        assert row["lease_token"] is None
+        assert recoverable == []
+        assert http.delivery_ids == [row["id"]]
 
     asyncio.run(run())
 
@@ -2316,18 +2390,25 @@ def test_webhook_send_propagates_cancelled_error_from_stream_cleanup(monkeypatch
 
         http.stream_exit_errors = [asyncio.CancelledError()]
 
+        result = await dispatcher._send_claimed_delivery(
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
+        )
+
         try:
-            await dispatcher._send_claimed_delivery(
+            await dispatcher._finalize_delivery(
+                conn.pool,
                 claimed.delivery,
-                pre_claim_monotonic=claimed.pre_claim_monotonic,
+                lease_token,
+                result,
             )
         except asyncio.CancelledError:
             pass
         else:
             raise AssertionError("stream cleanup cancellation must propagate")
 
-        assert row["status"] == "retrying"
-        assert row["lease_token"] == lease_token
+        assert row["status"] == "succeeded"
+        assert row["lease_token"] is None
         assert http.exited == 1
 
     asyncio.run(run())

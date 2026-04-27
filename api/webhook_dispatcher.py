@@ -18,10 +18,10 @@ Design notes
   authoritative delivery budget: DNS validation and HTTP response headers run
   under a wall-clock deadline derived from the lease, leaving a buffer for the
   finalize transaction before recovery can reclaim the attempt. Once headers are
-  received, the status code is the delivery acknowledgement; a matching lease
-  token can persist a 2xx even if the lease expires before finalize commits.
-  Response-body capture is best-effort audit data and cannot turn a 2xx into a
-  retry.
+  received, the status code is the delivery acknowledgement and the attempt is
+  finalized immediately with response_body=NULL before any body capture or
+  stream cleanup. Response-body capture is best-effort post-finalize audit data
+  and cannot turn a 2xx into a retry.
 - HMAC-SHA256 signature over the raw JSON body bytes. Receivers verify with
   the per-subscription secret returned once at create time.
 
@@ -38,7 +38,7 @@ import logging
 import os
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Dict, Iterable, Optional
 
@@ -151,6 +151,16 @@ class _DeliveryResult:
 @dataclass(frozen=True)
 class _LeaseExpiredBeforeSend(_DeliveryResult):
     """Marker result for a lease window that elapsed before any POST began."""
+
+
+@dataclass(frozen=True)
+class _PostHeaderDeliveryResult(_DeliveryResult):
+    """Status-code result plus open response resources for post-finalize audit work."""
+
+    delivery_id: Any = field(default=None, repr=False, compare=False)
+    response: Any = field(default=None, repr=False, compare=False)
+    stream_cm: Any = field(default=None, repr=False, compare=False)
+    client_cm: Any = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True)
@@ -729,9 +739,6 @@ async def _send_claimed_delivery_within_deadline(
     client_cm = httpx.AsyncClient(timeout=DELIVERY_TIMEOUT, follow_redirects=False)
     client = None
     stream_cm = None
-    response = None
-    result: _DeliveryResult | None = None
-    fallback_result: _DeliveryResult | None = None
     try:
         client = await asyncio.wait_for(
             client_cm.__aenter__(),
@@ -749,45 +756,83 @@ async def _send_claimed_delivery_within_deadline(
         )
         response_status = response.status_code
         succeeded = 200 <= response_status < 300
-        result = _DeliveryResult(
+        return _PostHeaderDeliveryResult(
             succeeded=succeeded,
             response_status=response_status,
-        )
-        response_body = await _capture_response_body_for_audit(
-            response,
-            remaining_header_window=max(0.0, header_deadline - loop.time()),
-        )
-        result = _DeliveryResult(
-            succeeded=succeeded,
-            response_status=response_status,
-            response_body=response_body,
+            delivery_id=delivery["id"],
+            response=response,
+            stream_cm=stream_cm,
+            client_cm=client_cm,
         )
     except asyncio.TimeoutError:
+        await _cleanup_unacknowledged_send_context(
+            delivery_id=delivery["id"],
+            stream_cm=stream_cm,
+            client_cm=client_cm,
+            client=client,
+        )
         raise
     except httpx.HTTPError as e:
-        fallback_result = _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
+        await _cleanup_unacknowledged_send_context(
+            delivery_id=delivery["id"],
+            stream_cm=stream_cm,
+            client_cm=client_cm,
+            client=client,
+        )
+        return _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
     except Exception as e:  # pragma: no cover
-        fallback_result = _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
-    finally:
-        if stream_cm is not None and response is not None:
-            await _run_post_header_cleanup(
-                stream_cm.__aexit__(None, None, None),
-                delivery_id=delivery["id"],
-                cleanup_name="stream",
-                result=result,
-            )
-        if client is not None:
-            await _run_post_header_cleanup(
-                client_cm.__aexit__(None, None, None),
-                delivery_id=delivery["id"],
-                cleanup_name="client",
-                result=result,
-            )
-    if result is not None:
-        return result
-    if fallback_result is not None:
-        return fallback_result
-    return _DeliveryResult(succeeded=False, error="send failed before response headers")
+        await _cleanup_unacknowledged_send_context(
+            delivery_id=delivery["id"],
+            stream_cm=stream_cm,
+            client_cm=client_cm,
+            client=client,
+        )
+        return _DeliveryResult(succeeded=False, error=f"{type(e).__name__}: {e}")
+
+
+async def _cleanup_unacknowledged_send_context(
+    *,
+    delivery_id: Any,
+    stream_cm: Any,
+    client_cm: Any,
+    client: Any,
+) -> None:
+    """Best-effort cleanup when the POST did not produce response headers."""
+    if stream_cm is not None:
+        await _run_pre_header_cleanup(
+            stream_cm.__aexit__(None, None, None),
+            delivery_id=delivery_id,
+            cleanup_name="stream",
+        )
+    if client is not None:
+        await _run_pre_header_cleanup(
+            client_cm.__aexit__(None, None, None),
+            delivery_id=delivery_id,
+            cleanup_name="client",
+        )
+
+
+async def _run_pre_header_cleanup(
+    cleanup: Awaitable[object],
+    *,
+    delivery_id: Any,
+    cleanup_name: str,
+) -> None:
+    """Drain failed pre-header send resources without changing the delivery result."""
+    try:
+        await asyncio.wait_for(
+            cleanup,
+            timeout=WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS,
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "webhook delivery %s %s cleanup failed before response headers",
+            delivery_id,
+            cleanup_name,
+            exc_info=True,
+        )
 
 
 async def _run_post_header_cleanup(
@@ -865,18 +910,21 @@ def _remaining_timeout_seconds(deadline: float) -> float:
 async def _capture_response_body_for_audit(
     response: httpx.Response,
     *,
-    remaining_header_window: float,
-) -> str:
-    """Read response body for audit without changing status-code delivery outcome."""
-    timeout_seconds = min(
-        WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS,
-        max(0.001, remaining_header_window / 2),
-    )
+    delivery_id: Any,
+) -> Optional[str]:
+    """Read response body for audit after the status-code result is finalized."""
     try:
-        async with asyncio.timeout(timeout_seconds):
+        async with asyncio.timeout(WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS):
             return await _read_capped_response_body(response)
     except asyncio.TimeoutError:
-        return "[body capture timed out]"
+        logger.warning(
+            "webhook delivery %s response-body audit capture timed out after %.1fs; "
+            "leaving response_body NULL",
+            delivery_id,
+            WEBHOOK_RESPONSE_BODY_CAPTURE_TIMEOUT_SECONDS,
+            exc_info=True,
+        )
+        return None
     except httpx.HTTPError as e:
         return f"[body capture: {type(e).__name__}]"
     except Exception as e:  # pragma: no cover
@@ -953,6 +1001,26 @@ def _as_aware_utc(value: datetime) -> datetime:
 
 
 async def _finalize_delivery(
+    pool: asyncpg.Pool,
+    delivery: asyncpg.Record,
+    lease_token: str,
+    result: _DeliveryResult,
+) -> bool:
+    """Finalize the delivery row before post-header body capture or cleanup."""
+    finalized = False
+    try:
+        finalized = await _finalize_delivery_row(pool, delivery, lease_token, result)
+        return finalized
+    finally:
+        if isinstance(result, _PostHeaderDeliveryResult):
+            await _run_post_finalize_delivery_work(
+                pool,
+                result,
+                finalized=finalized,
+            )
+
+
+async def _finalize_delivery_row(
     pool: asyncpg.Pool,
     delivery: asyncpg.Record,
     lease_token: str,
@@ -1130,6 +1198,70 @@ async def _finalize_delivery(
                 delivery_id, delivery["attempt_num"], result.response_status, result.error, backoff,
             )
             return True
+
+
+async def _run_post_finalize_delivery_work(
+    pool: asyncpg.Pool,
+    result: _PostHeaderDeliveryResult,
+    *,
+    finalized: bool,
+) -> None:
+    """Capture audit body and close HTTP resources after the DB result is durable."""
+    try:
+        if finalized:
+            response_body = await _capture_response_body_for_audit(
+                result.response,
+                delivery_id=result.delivery_id,
+            )
+            if response_body is not None:
+                await _persist_response_body_for_audit(
+                    pool,
+                    delivery_id=result.delivery_id,
+                    response_body=response_body,
+                )
+    finally:
+        if result.stream_cm is not None:
+            await _run_post_header_cleanup(
+                result.stream_cm.__aexit__(None, None, None),
+                delivery_id=result.delivery_id,
+                cleanup_name="stream",
+                result=result,
+            )
+        if result.client_cm is not None:
+            await _run_post_header_cleanup(
+                result.client_cm.__aexit__(None, None, None),
+                delivery_id=result.delivery_id,
+                cleanup_name="client",
+                result=result,
+            )
+
+
+async def _persist_response_body_for_audit(
+    pool: asyncpg.Pool,
+    *,
+    delivery_id: Any,
+    response_body: str,
+) -> None:
+    """Store post-finalize response audit data without lease ownership checks."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE webhook_deliveries
+                SET response_body=$2
+                WHERE id=$1::uuid
+                """,
+                str(delivery_id),
+                response_body,
+            )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning(
+            "webhook delivery %s response-body audit update failed after finalization",
+            delivery_id,
+            exc_info=True,
+        )
 
 
 async def _release_owned_lease_for_reclaim(
