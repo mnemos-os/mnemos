@@ -168,16 +168,26 @@ class FakeConnection:
                 "cost": args[5],
                 "latency_ms": args[6],
                 "mode": args[7],
+                "owner_id": args[8],
                 "created": _utcnow(),
             }
             self.state["consultations"][consultation_id] = record
             return {"id": consultation_id}
 
         if "SELECT id, prompt, task_type, consensus_response" in compact:
-            return self.state["consultations"].get(args[0])
+            consultation = self.state["consultations"].get(args[0])
+            if "AND owner_id = $2" in compact and (
+                not consultation or consultation.get("owner_id") != args[1]
+            ):
+                return None
+            return consultation
 
         if "SELECT id, created FROM graeae_consultations WHERE id = $1" in compact:
             consultation = self.state["consultations"].get(args[0])
+            if "AND owner_id = $2" in compact and (
+                not consultation or consultation.get("owner_id") != args[1]
+            ):
+                return None
             if not consultation:
                 return None
             return {"id": consultation["id"], "created": consultation["created"]}
@@ -228,11 +238,32 @@ class FakeConnection:
     async def fetch(self, query: str, *args):
         compact = " ".join(query.split())
 
-        if "FROM graeae_audit_log ORDER BY sequence_num DESC" in compact:
-            return list(reversed(self.state["audit_log"]))
-
-        if "FROM graeae_audit_log ORDER BY sequence_num ASC" in compact:
-            return list(self.state["audit_log"])
+        if "FROM graeae_audit_log" in compact and "ORDER BY" in compact:
+            rows = list(self.state["audit_log"])
+            if "actual_prev_chain_hash" in compact:
+                chain_by_id = {row["id"]: row["chain_hash"] for row in rows}
+                rows = [
+                    {
+                        **row,
+                        "actual_prev_chain_hash": (
+                            chain_by_id.get(row["prev_id"]) if row["prev_id"] else None
+                        ),
+                    }
+                    for row in rows
+                ]
+            if "c.owner_id = $1" in compact:
+                owner_id = args[0]
+                rows = [
+                    row for row in rows
+                    if (
+                        self.state["consultations"]
+                        .get(row["consultation_id"], {})
+                        .get("owner_id") == owner_id
+                    )
+                ]
+            if "DESC" in compact:
+                rows = list(reversed(rows))
+            return rows
 
         if "FROM consultation_memory_refs WHERE consultation_id = $1" in compact:
             return [
