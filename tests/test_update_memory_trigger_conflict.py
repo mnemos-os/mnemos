@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import asyncpg
@@ -29,19 +30,20 @@ def _root() -> UserContext:
     )
 
 
-def _mn001_error() -> asyncpg.PostgresError:
-    exc = asyncpg.PostgresError("cross-memory branch head")
+def _mn001_error(message: str = "cross-memory branch head") -> asyncpg.PostgresError:
+    exc = asyncpg.PostgresError(message)
     exc.sqlstate = "MN001"
     return exc
 
 
 class _Conn:
-    def __init__(self):
+    def __init__(self, message: str = "cross-memory branch head"):
+        self.message = message
         self.fetchrow_calls: list[tuple[str, tuple]] = []
 
     async def fetchrow(self, sql: str, *args):
         self.fetchrow_calls.append((sql, args))
-        raise _mn001_error()
+        raise _mn001_error(self.message)
 
     def transaction(self):
         class _NullCtx:
@@ -167,8 +169,8 @@ def _install(monkeypatch, conn):
     monkeypatch.setattr(lc, "_cache", None)
 
 
-def test_update_memory_translates_mn001_trigger_error_to_conflict(monkeypatch):
-    conn = _Conn()
+def _assert_update_memory_conflict(monkeypatch, message: str):
+    conn = _Conn(message)
     _install(monkeypatch, conn)
 
     with pytest.raises(HTTPException) as exc_info:
@@ -188,6 +190,82 @@ def test_update_memory_translates_mn001_trigger_error_to_conflict(monkeypatch):
     assert "owner_id=$" in sql
     assert "namespace=$" in sql
     assert args[-2:] == ("alice", "alice-ns")
+    return exc_info.value
+
+
+def _trigger_sql() -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    return (repo_root / "db" / "migrations_v3_5_trigger_same_memory_parent.sql").read_text()
+
+
+def _extract_update_branch(sql: str) -> str:
+    try:
+        return sql.split("ELSIF TG_OP = 'UPDATE' THEN", 1)[1].split(
+            "ELSIF TG_OP = 'DELETE' THEN", 1,
+        )[0]
+    except IndexError as exc:
+        raise AssertionError("could not isolate mnemos_version_snapshot UPDATE branch") from exc
+
+
+def _extract_delete_branch(sql: str) -> str:
+    try:
+        return sql.split("ELSIF TG_OP = 'DELETE' THEN", 1)[1].split(
+            "\n    IF TG_OP = 'DELETE' THEN", 1,
+        )[0]
+    except IndexError as exc:
+        raise AssertionError("could not isolate mnemos_version_snapshot DELETE branch") from exc
+
+
+def test_trigger_update_delete_reject_missing_null_and_foreign_heads_before_insert():
+    sql = _trigger_sql()
+
+    for branch_sql, row_id in (
+        (_extract_update_branch(sql), "NEW.id"),
+        (_extract_delete_branch(sql), "OLD.id"),
+    ):
+        compact = " ".join(branch_sql.split())
+        insert_pos = compact.index("INSERT INTO memory_versions")
+
+        existence_check = (
+            "SELECT EXISTS ( SELECT 1 FROM memory_branches "
+            f"WHERE memory_id = {row_id} AND name = _branch ) INTO _branch_exists"
+        )
+        bare_head_check = (
+            "SELECT head_version_id INTO _bare_head FROM memory_branches "
+            f"WHERE memory_id = {row_id} AND name = _branch"
+        )
+
+        assert existence_check in compact
+        assert bare_head_check in compact
+        assert "IF NOT _branch_exists THEN RAISE EXCEPTION" in compact
+        assert "has NULL head_version_id" in compact
+        assert "AND mv.memory_id = mb.memory_id" in compact
+        assert "points outside this memory" in compact
+        assert compact.index("IF NOT _branch_exists") < insert_pos
+        assert compact.index("IF _bare_head IS NULL") < insert_pos
+        assert compact.index("IF _parent_version IS NULL") < insert_pos
+
+
+def test_update_memory_translates_missing_branch_row_mn001_to_conflict(monkeypatch):
+    exc = _assert_update_memory_conflict(
+        monkeypatch,
+        "mnemos: branch main for memory memory-1 is missing",
+    )
+
+    assert "branch row is missing" in exc.detail
+
+
+def test_update_memory_translates_null_branch_head_mn001_to_conflict(monkeypatch):
+    exc = _assert_update_memory_conflict(
+        monkeypatch,
+        "mnemos: branch main for memory memory-1 has NULL head_version_id",
+    )
+
+    assert "NULL head_version_id" in exc.detail
+
+
+def test_update_memory_translates_mn001_trigger_error_to_conflict(monkeypatch):
+    _assert_update_memory_conflict(monkeypatch, "cross-memory branch head")
 
 
 def test_delete_memory_translates_mn001_trigger_error_to_conflict(monkeypatch):

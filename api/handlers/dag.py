@@ -394,7 +394,8 @@ async def get_commit(
                         mv.commit_hash, mv.version_num, mv.branch, mv.content, mv.category,
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
                         (SELECT commit_hash FROM memory_versions mv2
-                         WHERE mv2.id = mv.parent_version_id) AS parent_hash
+                         WHERE mv2.id = mv.parent_version_id
+                           AND mv2.memory_id = mv.memory_id) AS parent_hash
                     FROM memory_versions mv
                     WHERE mv.memory_id = $1 AND mv.commit_hash = $2
                     """,
@@ -429,6 +430,7 @@ async def get_commit(
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
                         (SELECT mv2.commit_hash FROM memory_versions mv2
                          WHERE mv2.id = mv.parent_version_id
+                           AND mv2.memory_id = mv.memory_id
                            AND {vis_mv2} AND mv2.namespace = {ns_mv2_ph}) AS parent_hash
                     FROM memory_versions mv
                     WHERE mv.memory_id = $1 AND mv.commit_hash = $2

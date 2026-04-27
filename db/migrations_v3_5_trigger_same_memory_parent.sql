@@ -26,13 +26,13 @@
 -- trigger, so the same vulnerability remains live at the
 -- highest-frequency write surface.
 --
--- Fix: replace the trigger function. Resolve parent_version_id
--- through a scoped JOIN that requires the version's memory_id to
--- match the branch's memory_id. If the resolved head exists but
--- does NOT match (corrupt pointer), RAISE EXCEPTION with a
--- distinct SQLSTATE so the application layer can map it to a 409
--- + reconciliation message rather than silently writing a bad
--- parent edge.
+-- Fix: replace the trigger function. For UPDATE/DELETE, verify the
+-- branch row exists separately from its head_version_id, reject NULL
+-- heads, then resolve parent_version_id through a scoped JOIN that
+-- requires the version's memory_id to match the branch's memory_id.
+-- Any broken branch state raises a distinct SQLSTATE so the
+-- application layer can map it to a 409 + reconciliation message
+-- rather than silently writing a root or cross-memory parent edge.
 --
 -- The DELETE branch remains live for deployments that still have
 -- trg_memory_version_delete attached. Keep it consistent with UPDATE:
@@ -55,6 +55,7 @@ DECLARE
     _parent_version  UUID;
     _new_version_id  UUID;
     _bare_head       UUID;
+    _branch_exists   BOOLEAN;
 BEGIN
     _by := NULLIF(current_setting('mnemos.current_user_id', TRUE), '');
     _branch := COALESCE(NULLIF(current_setting('mnemos.current_branch', TRUE), ''), 'main');
@@ -97,10 +98,34 @@ BEGIN
             FROM   memory_versions
             WHERE  memory_id = NEW.id AND branch = _branch;
 
-            -- Scoped parent resolution. JOIN through memory_versions
-            -- with mv.memory_id = mb.memory_id so a corrupt
-            -- cross-memory head_version_id returns NULL here even
-            -- when a bare memory_branches row exists.
+            -- Ordinary UPDATE must be based on an existing same-memory
+            -- branch HEAD. Missing branch rows and NULL heads are
+            -- broken state here; only the explicit branch-creation path
+            -- may create a new branch root.
+            SELECT EXISTS (
+                SELECT 1
+                FROM memory_branches
+                WHERE memory_id = NEW.id AND name = _branch
+            ) INTO _branch_exists;
+
+            IF NOT _branch_exists THEN
+                RAISE EXCEPTION
+                    'mnemos: branch % for memory % is missing',
+                    _branch, NEW.id
+                    USING ERRCODE = 'MN001';
+            END IF;
+
+            SELECT head_version_id INTO _bare_head
+            FROM memory_branches
+            WHERE memory_id = NEW.id AND name = _branch;
+
+            IF _bare_head IS NULL THEN
+                RAISE EXCEPTION
+                    'mnemos: branch % for memory % has NULL head_version_id',
+                    _branch, NEW.id
+                    USING ERRCODE = 'MN001';
+            END IF;
+
             SELECT mb.head_version_id INTO _parent_version
             FROM memory_branches mb
             INNER JOIN memory_versions mv
@@ -109,30 +134,10 @@ BEGIN
             WHERE mb.memory_id = NEW.id AND mb.name = _branch;
 
             IF _parent_version IS NULL THEN
-                -- Distinguish "no branch row" (legitimate first-write
-                -- on a non-main branch via API the parent NULL is
-                -- expected for v1) from "branch row exists but its
-                -- head points outside this memory" (corruption).
-                SELECT head_version_id INTO _bare_head
-                FROM memory_branches
-                WHERE memory_id = NEW.id AND name = _branch;
-                IF _bare_head IS NOT NULL THEN
-                    -- Distinct SQLSTATE 'MN001' so application code
-                    -- can map this to HTTP 409 with reconciliation
-                    -- guidance.
-                    RAISE EXCEPTION
-                        'mnemos: branch % for memory % has corrupt head_version_id (points outside this memory)',
-                        _branch, NEW.id
-                        USING ERRCODE = 'MN001';
-                END IF;
-                -- _bare_head IS NULL: no branch row at all. Falls
-                -- through with _parent_version NULL, which is
-                -- legitimate for the first version on a fresh
-                -- branch (the trigger creates the row below via
-                -- ON CONFLICT DO UPDATE on INSERT, but the UPDATE
-                -- branch can also be reached if a memory exists
-                -- without a branch row — caller should be using
-                -- the explicit branch-creation path instead).
+                RAISE EXCEPTION
+                    'mnemos: branch % for memory % has corrupt head_version_id (points outside this memory)',
+                    _branch, NEW.id
+                    USING ERRCODE = 'MN001';
             END IF;
 
             _commit_hash := encode(
@@ -167,6 +172,30 @@ BEGIN
         FROM   memory_versions
         WHERE  memory_id = OLD.id AND branch = _branch;
 
+        SELECT EXISTS (
+            SELECT 1
+            FROM memory_branches
+            WHERE memory_id = OLD.id AND name = _branch
+        ) INTO _branch_exists;
+
+        IF NOT _branch_exists THEN
+            RAISE EXCEPTION
+                'mnemos: branch % for memory % is missing',
+                _branch, OLD.id
+                USING ERRCODE = 'MN001';
+        END IF;
+
+        SELECT head_version_id INTO _bare_head
+        FROM memory_branches
+        WHERE memory_id = OLD.id AND name = _branch;
+
+        IF _bare_head IS NULL THEN
+            RAISE EXCEPTION
+                'mnemos: branch % for memory % has NULL head_version_id',
+                _branch, OLD.id
+                USING ERRCODE = 'MN001';
+        END IF;
+
         SELECT mb.head_version_id INTO _parent_version
         FROM memory_branches mb
         INNER JOIN memory_versions mv
@@ -175,15 +204,10 @@ BEGIN
         WHERE mb.memory_id = OLD.id AND mb.name = _branch;
 
         IF _parent_version IS NULL THEN
-            SELECT head_version_id INTO _bare_head
-            FROM memory_branches
-            WHERE memory_id = OLD.id AND name = _branch;
-            IF _bare_head IS NOT NULL THEN
-                RAISE EXCEPTION
-                    'mnemos: branch % for memory % has corrupt head_version_id (points outside this memory)',
-                    _branch, OLD.id
-                    USING ERRCODE = 'MN001';
-            END IF;
+            RAISE EXCEPTION
+                'mnemos: branch % for memory % has corrupt head_version_id (points outside this memory)',
+                _branch, OLD.id
+                USING ERRCODE = 'MN001';
         END IF;
 
         _commit_hash := encode(

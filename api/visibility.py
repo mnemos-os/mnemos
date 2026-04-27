@@ -28,10 +28,10 @@ def handle_trigger_pgerror(exc: Exception) -> NoReturn:
             status_code=409,
             detail=(
                 "Memory branch state is inconsistent: "
-                "memory_branches.head_version_id points to "
-                "a version from another memory. Reconcile "
-                "memory_branches and memory_versions for this "
-                "memory before retrying."
+                "the branch row is missing, has a NULL "
+                "head_version_id, or points to a version from "
+                "another memory. Reconcile memory_branches and "
+                "memory_versions for this memory before retrying."
             ),
         ) from exc
     raise exc
