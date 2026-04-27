@@ -269,19 +269,42 @@ async def get_memory_branches(
             # the scoped JOIN, mismatched rows return NULL for
             # commit_hash; the `head_commit_hash` field then
             # surfaces the corruption rather than papering over it.
-            branches = await conn.fetch(
-                """
-                SELECT
-                    mb.name, mv.commit_hash, mb.created_at, mb.created_by
-                FROM memory_branches mb
-                LEFT JOIN memory_versions mv
-                    ON mv.id = mb.head_version_id
-                   AND mv.memory_id = mb.memory_id
-                WHERE mb.memory_id = $1
-                ORDER BY mb.created_at DESC
-                """,
-                memory_id,
-            )
+            if user.role == "root":
+                branches = await conn.fetch(
+                    """
+                    SELECT
+                        mb.name, mv.commit_hash, mb.created_at, mb.created_by
+                    FROM memory_branches mb
+                    LEFT JOIN memory_versions mv
+                        ON mv.id = mb.head_version_id
+                       AND mv.memory_id = mb.memory_id
+                    WHERE mb.memory_id = $1
+                    ORDER BY mb.created_at DESC
+                    """,
+                    memory_id,
+                )
+            else:
+                from api.visibility import version_visibility_predicate
+
+                vis_clause, vis_params = version_visibility_predicate(
+                    user.user_id, start_param_idx=2, table_alias="mv",
+                )
+                ns_ph = f"${len(vis_params) + 2}"
+                branches = await conn.fetch(
+                    f"""
+                    SELECT
+                        mb.name, mv.commit_hash, mb.created_at, mb.created_by
+                    FROM memory_branches mb
+                    LEFT JOIN memory_versions mv
+                        ON mv.id = mb.head_version_id
+                       AND mv.memory_id = mb.memory_id
+                       AND {vis_clause}
+                       AND mv.namespace = {ns_ph}
+                    WHERE mb.memory_id = $1
+                    ORDER BY mb.created_at DESC
+                    """,
+                    memory_id, *vis_params, user.namespace,
+                )
 
             # Filter out rows where the scoped JOIN returned NULL
             # commit_hash — those are branches pointing at a
@@ -295,8 +318,9 @@ async def get_memory_branches(
                     logger.error(
                         f"[DAG] Corrupt branch '{b['name']}' for memory "
                         f"{memory_id}: head_version_id points outside "
-                        f"this memory; omitting from response. Operator "
-                        f"reconciliation required."
+                        f"this memory or is not visible to the caller; "
+                        f"omitting from response. Operator reconciliation "
+                        f"may be required."
                     )
                     continue
                 result.append(BranchInfo(
@@ -307,6 +331,8 @@ async def get_memory_branches(
                 ))
             return result
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"[DAG] Branches failed: {e}")
         raise HTTPException(status_code=500, detail="internal server error")
@@ -326,24 +352,57 @@ async def create_branch(
             await _assert_memory_access(conn, memory_id, user)
             # Resolve starting point (HEAD or specific commit)
             if request.from_commit:
-                start_version = await conn.fetchrow(
-                    "SELECT id, commit_hash, created_at FROM memory_versions WHERE memory_id = $1 AND commit_hash = $2",
-                    memory_id,
-                    request.from_commit,
-                )
+                if user.role == "root":
+                    start_version = await conn.fetchrow(
+                        "SELECT id, commit_hash, created_at FROM memory_versions "
+                        "WHERE memory_id = $1 AND commit_hash = $2",
+                        memory_id,
+                        request.from_commit,
+                    )
+                else:
+                    from api.visibility import version_visibility_predicate
+
+                    vis_clause, vis_params = version_visibility_predicate(
+                        user.user_id, start_param_idx=3,
+                    )
+                    ns_ph = f"${len(vis_params) + 3}"
+                    start_version = await conn.fetchrow(
+                        "SELECT id, commit_hash, created_at FROM memory_versions "
+                        "WHERE memory_id = $1 AND commit_hash = $2 "
+                        f"AND {vis_clause} AND namespace = {ns_ph}",
+                        memory_id, request.from_commit, *vis_params, user.namespace,
+                    )
                 if not start_version:
                     raise HTTPException(status_code=404, detail="Commit hash not found")
             else:
                 # Default: use current main branch HEAD
-                start_version = await conn.fetchrow(
-                    """
-                    SELECT mv.id, mv.commit_hash, mv.created_at
-                    FROM memory_versions mv
-                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                    WHERE mv.memory_id = $1 AND mb.name = 'main'
-                    """,
-                    memory_id,
-                )
+                if user.role == "root":
+                    start_version = await conn.fetchrow(
+                        """
+                        SELECT mv.id, mv.commit_hash, mv.created_at
+                        FROM memory_versions mv
+                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                        WHERE mv.memory_id = $1 AND mb.name = 'main'
+                        """,
+                        memory_id,
+                    )
+                else:
+                    from api.visibility import version_visibility_predicate
+
+                    vis_clause, vis_params = version_visibility_predicate(
+                        user.user_id, start_param_idx=2, table_alias="mv",
+                    )
+                    ns_ph = f"${len(vis_params) + 2}"
+                    start_version = await conn.fetchrow(
+                        f"""
+                        SELECT mv.id, mv.commit_hash, mv.created_at
+                        FROM memory_versions mv
+                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                        WHERE mv.memory_id = $1 AND mb.name = 'main'
+                          AND {vis_clause} AND mv.namespace = {ns_ph}
+                        """,
+                        memory_id, *vis_params, user.namespace,
+                    )
                 if not start_version:
                     raise HTTPException(status_code=404, detail="main branch HEAD not found")
 

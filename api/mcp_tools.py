@@ -235,23 +235,55 @@ async def tool_branch_memory(
 
                 # Resolve starting point
                 if from_commit:
-                    start = await conn.fetchrow(
-                        "SELECT id, commit_hash FROM memory_versions "
-                        "WHERE memory_id = $1 AND commit_hash = $2",
-                        memory_id, from_commit,
-                    )
+                    if _mcp_is_root(user):
+                        start = await conn.fetchrow(
+                            "SELECT id, commit_hash FROM memory_versions "
+                            "WHERE memory_id = $1 AND commit_hash = $2",
+                            memory_id, from_commit,
+                        )
+                    else:
+                        from api.visibility import version_visibility_predicate
+
+                        vis_clause, vis_params = version_visibility_predicate(
+                            user.user_id, start_param_idx=3,
+                        )
+                        ns_ph = f"${len(vis_params) + 3}"
+                        start = await conn.fetchrow(
+                            "SELECT id, commit_hash FROM memory_versions "
+                            "WHERE memory_id = $1 AND commit_hash = $2 "
+                            f"AND {vis_clause} AND namespace = {ns_ph}",
+                            memory_id, from_commit, *vis_params, user.namespace,
+                        )
                     if not start:
                         return {"success": False, "error": "Commit not found"}
                 else:
-                    start = await conn.fetchrow(
-                        """
-                        SELECT mv.id, mv.commit_hash
-                        FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                        WHERE mv.memory_id = $1 AND mb.name = 'main'
-                        """,
-                        memory_id,
-                    )
+                    if _mcp_is_root(user):
+                        start = await conn.fetchrow(
+                            """
+                            SELECT mv.id, mv.commit_hash
+                            FROM memory_versions mv
+                            INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                            WHERE mv.memory_id = $1 AND mb.name = 'main'
+                            """,
+                            memory_id,
+                        )
+                    else:
+                        from api.visibility import version_visibility_predicate
+
+                        vis_clause, vis_params = version_visibility_predicate(
+                            user.user_id, start_param_idx=2, table_alias="mv",
+                        )
+                        ns_ph = f"${len(vis_params) + 2}"
+                        start = await conn.fetchrow(
+                            f"""
+                            SELECT mv.id, mv.commit_hash
+                            FROM memory_versions mv
+                            INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                            WHERE mv.memory_id = $1 AND mb.name = 'main'
+                              AND {vis_clause} AND mv.namespace = {ns_ph}
+                            """,
+                            memory_id, *vis_params, user.namespace,
+                        )
                     if not start:
                         return {"success": False, "error": "main branch not found"}
 
@@ -275,25 +307,46 @@ async def tool_branch_memory(
                 # let an idempotent retry return that foreign
                 # commit_hash and silently legitimize the corrupt
                 # branch (round-37 finding).
-                existing = await conn.fetchrow(
-                    "SELECT mb.head_version_id, mv.commit_hash "
-                    "FROM memory_branches mb "
-                    "INNER JOIN memory_versions mv "
-                    "    ON mv.id = mb.head_version_id "
-                    "   AND mv.memory_id = mb.memory_id "
-                    "WHERE mb.memory_id = $1 AND mb.name = $2",
-                    memory_id, name,
-                )
+                if _mcp_is_root(user):
+                    existing = await conn.fetchrow(
+                        "SELECT mb.head_version_id, mv.commit_hash "
+                        "FROM memory_branches mb "
+                        "INNER JOIN memory_versions mv "
+                        "    ON mv.id = mb.head_version_id "
+                        "   AND mv.memory_id = mb.memory_id "
+                        "WHERE mb.memory_id = $1 AND mb.name = $2",
+                        memory_id, name,
+                    )
+                else:
+                    from api.visibility import version_visibility_predicate
+
+                    vis_clause, vis_params = version_visibility_predicate(
+                        user.user_id, start_param_idx=3, table_alias="mv",
+                    )
+                    ns_ph = f"${len(vis_params) + 3}"
+                    existing = await conn.fetchrow(
+                        "SELECT mb.head_version_id, mv.commit_hash "
+                        "FROM memory_branches mb "
+                        "INNER JOIN memory_versions mv "
+                        "    ON mv.id = mb.head_version_id "
+                        "   AND mv.memory_id = mb.memory_id "
+                        f"   AND {vis_clause} "
+                        f"   AND mv.namespace = {ns_ph} "
+                        "WHERE mb.memory_id = $1 AND mb.name = $2",
+                        memory_id, name, *vis_params, user.namespace,
+                    )
                 if existing is None:
                     # Either the branch row was missing (race) or
-                    # it was a corrupt cross-memory pointer that
-                    # the scoped JOIN excluded. Either way: don't
-                    # claim idempotent success.
+                    # it was a corrupt cross-memory pointer or an
+                    # invisible per-snapshot head that the scoped JOIN
+                    # excluded. Either way: don't claim idempotent
+                    # success or leak a hidden commit hash.
                     return {
                         "success": False,
                         "error": (
-                            "branch exists but points at a foreign "
-                            "memory version; reconciliation required"
+                            "branch exists but its head is not visible "
+                            "or points at a foreign memory version; "
+                            "reconciliation required"
                         ),
                     }
                 # Implicit-HEAD retries (from_commit=None) are

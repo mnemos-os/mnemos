@@ -501,15 +501,22 @@ async def revert_memory(
                     "FROM memory_versions WHERE memory_id = $1 AND branch = $2",
                     memory_id, branch,
                 )
-                # Get current HEAD for parent linkage. Resolve
-                # via a scoped JOIN so a corrupt branch row pointing
-                # at another memory's version_id can't launder a
-                # cross-memory parent edge into this memory's DAG
-                # (round-38 finding). We return mb's head_version_id
-                # ONLY if the version belongs to the same memory.
-                target_head_id = await conn.fetchval(
+                # Get current HEAD for parent linkage and target
+                # tenancy. Resolve via a scoped JOIN so a corrupt
+                # branch row pointing at another memory's version_id
+                # can't launder a cross-memory parent edge into this
+                # memory's DAG (round-38 finding). The new revert
+                # commit copies CONTENT from ver_row but TENANCY from
+                # the target branch head, matching main-revert and
+                # merge semantics.
+                target_head = await conn.fetchrow(
                     """
-                    SELECT mb.head_version_id FROM memory_branches mb
+                    SELECT
+                        mb.head_version_id,
+                        mv.owner_id,
+                        mv.namespace,
+                        mv.permission_mode
+                    FROM memory_branches mb
                     INNER JOIN memory_versions mv
                         ON mv.id = mb.head_version_id
                        AND mv.memory_id = mb.memory_id
@@ -517,7 +524,7 @@ async def revert_memory(
                     """,
                     memory_id, branch,
                 )
-                if target_head_id is None:
+                if target_head is None:
                     # Either the branch row is missing (legitimate
                     # 404) or it exists but its head_version_id
                     # points outside this memory (corrupt row).
@@ -548,6 +555,7 @@ async def revert_memory(
                         status_code=404,
                         detail=f"Branch '{branch}' not found",
                     )
+                target_head_id = target_head["head_version_id"]
                 revert_hash = _hashlib_local.sha256(
                     f"{memory_id}|{next_version_num}|{ver_row['content']}|"
                     f"revert-to-v{version_num}-{int(_time_local.time() * 1_000_000)}"
@@ -574,7 +582,8 @@ async def revert_memory(
                     memory_id, next_version_num,
                     ver_row["content"], ver_row["category"], ver_row["subcategory"],
                     meta_str, ver_row["verbatim_content"],
-                    ver_row["owner_id"], ver_row["namespace"], ver_row["permission_mode"],
+                    target_head["owner_id"], target_head["namespace"],
+                    target_head["permission_mode"],
                     ver_row["source_model"], ver_row["source_provider"],
                     ver_row["source_session"], ver_row["source_agent"],
                     branch, revert_hash, target_head_id, user.user_id,
