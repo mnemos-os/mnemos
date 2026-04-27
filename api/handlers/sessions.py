@@ -2,7 +2,7 @@
 
 Sessions store conversation history server-side, accumulate memory context across turns,
 and track compression/cost metrics per session. Integrates with gateway memory injection
-and compression tiers.
+and context routing.
 """
 
 import logging
@@ -35,20 +35,7 @@ async def create_session(
     request: SessionRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Create a new session for multi-turn conversation.
-
-    Args:
-        model: LLM model (default: gpt-4o)
-        compression_tier: vestigial — accepted on the wire for backwards-
-            compat with v3.0–v3.2 callers and persisted alongside session
-            metadata. The current session-injection path ships raw-slice
-            truncation (doc['content'][:500]), NOT compressed text; real
-            compression here is queued for a later slice.
-        initial_context: Optional initial system context
-
-    Returns:
-        SessionResponse with session_id and metadata
-    """
+    """Create a new session for multi-turn conversation."""
     pool = _require_pool()
 
     session_id = None
@@ -56,13 +43,12 @@ async def create_session(
         async with pool.acquire() as conn:
             session_id = await conn.fetchval(
                 """
-                INSERT INTO sessions (user_id, model, compression_tier)
-                VALUES ($1, $2, $3)
+                INSERT INTO sessions (user_id, model)
+                VALUES ($1, $2)
                 RETURNING id
                 """,
                 user.user_id,
                 request.model or "gpt-4o",
-                request.compression_tier or 1,
             )
 
             # Optionally add initial system context
@@ -81,7 +67,7 @@ async def create_session(
         # Return session metadata
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, created_at, model, compression_tier FROM sessions WHERE id = $1",
+                "SELECT id, created_at, model FROM sessions WHERE id = $1",
                 session_id,
             )
 
@@ -89,7 +75,6 @@ async def create_session(
             session_id=row["id"],
             created_at=row["created_at"].isoformat(),
             model=row["model"],
-            compression_tier=row["compression_tier"],
         )
 
     except Exception as e:
@@ -136,7 +121,6 @@ async def get_session(
         message_count=session["message_count"],
         total_tokens=session["total_tokens"],
         model=session["model"],
-        compression_tier=session["compression_tier"],
         injected_memories=[m["memory_id"] for m in injections],
     )
 

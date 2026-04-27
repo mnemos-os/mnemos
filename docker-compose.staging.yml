@@ -10,9 +10,7 @@
 #     staging consultations exercise the real reasoning fabric instead
 #     of standing up a duplicate.
 #
-#   - INFERENCE_EMBED_HOST uses the new canonical name (post-c560333);
-#     OLLAMA_EMBED_* aliases are NOT set so the deprecation warning
-#     stays quiet on this fresh deploy.
+#   - INFERENCE_EMBED_HOST points at the embedding inference endpoint.
 #
 #   - MNEMOS_PROFILE=staging signals the "this is dev/staging, not prod"
 #     posture to the app. Auth still required (MNEMOS_AUTH_ENABLED=1).
@@ -138,8 +136,7 @@ services:
       PG_HOST: postgres
 
       # Embedding inference — delegates to CERBERUS llama-server.
-      # Note: we use INFERENCE_EMBED_HOST (canonical post-c560333),
-      # NOT OLLAMA_EMBED_HOST. CERBERUS runs llama-server, not Ollama.
+      # CERBERUS runs llama-server for embedding inference.
       INFERENCE_EMBED_HOST: ${INFERENCE_EMBED_HOST:-http://192.168.207.96:8080}
       INFERENCE_EMBED_MODEL: ${INFERENCE_EMBED_MODEL:-nomic-embed-text}
       INFERENCE_EMBED_TIMEOUT: ${INFERENCE_EMBED_TIMEOUT:-15}

@@ -12,8 +12,8 @@ v3.3 S-IC (landed):
   * Rule-based narration (S-II replaces with cached small-LLM readback).
 
 v3.3 S-II (this slice):
-  * ANAMNESIS-pattern LLM fallback (httpx against GPU_PROVIDER_HOST)
-    for content that misses every registered schema. With fallback
+  * LLM fallback (httpx against GPU_PROVIDER_HOST) for content that
+    misses every registered schema. With fallback
     enabled (default), supports() is unconditionally True so the
     contest's audit log records APOLLO's decision on every memory.
   * Fallback dense form:
@@ -28,7 +28,7 @@ Still ahead (S-II tail and S-III):
   * GET /v1/memories/{id}/narrate endpoint with cached small-LLM
     readback.
   * Judge-LLM fidelity scoring replacing the heuristic quality
-    score (fallback currently pins to 0.65 — see QUALITY SCORE
+    score (fallback currently pins to 0.55 — see QUALITY SCORE
     block below).
   * Additional schemas: decision, person, event.
 
@@ -64,8 +64,7 @@ from .gpu_guard import get_guard
 
 logger = logging.getLogger(__name__)
 
-# GPU provider endpoint (shared with ANAMNESIS via the same env vars —
-# single GPU host runs both engines' fallback calls).
+# GPU provider endpoint for APOLLO's LLM fallback.
 _GPU_PROVIDER_HOST = os.getenv("GPU_PROVIDER_HOST", "http://localhost")
 _GPU_PROVIDER_PORT = os.getenv("GPU_PROVIDER_PORT", "8000")
 _GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
@@ -89,8 +88,8 @@ _DEFAULT_SCHEMAS: List[Schema] = [
 ]
 
 
-# LLM-fallback prompt. Designed for the ANAMNESIS-style output
-# contract: one line, four required sections, pipe-separated lists.
+# LLM-fallback prompt. Contract: one line, four required sections,
+# pipe-separated lists.
 # The parser below accepts both `;` and `|` as section separators —
 # gemma4-class 7B models empirically conflate "use pipe inside
 # lists" with "use pipe everywhere". A concrete example in the
@@ -183,7 +182,7 @@ class APOLLOEngine(CompressionEngine):
 
       2. **LLM fallback (S-II):** when no schema matches and
          `enable_llm_fallback=True` (default), call the GPU provider
-         with an ANAMNESIS-pattern prompt. Output is a strict
+         with a strict extraction prompt. Output is a strict
          one-line dense form (summary / facts / entities / concepts).
          Parser rejects malformed output rather than shipping broken
          encodings. gpu_used=True; IdentifierPolicy.OFF (LLM may

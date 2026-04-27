@@ -145,9 +145,7 @@ class TestDAGImplementation:
 class TestCompressionStackV33:
     """Verify the v3.3 going-forward stack (APOLLO + ARTEMIS).
 
-    Replaces the prior TestCompressionStackRename class which checked
-    for LETHE / ANAMNESIS / ALETHEIA modules + CompressionManager —
-    all removed in the v3.3 legacy-compression cleanup. See
+    Retired engine modules and CompressionManager stay removed. See
     EVOLUTION.md "v3.2 tail" for the rationale."""
 
     def test_apollo_engine_importable(self):
@@ -166,18 +164,18 @@ class TestCompressionStackV33:
         except ImportError as e:
             pytest.fail(f"ARTEMISEngine missing: {e}")
 
-    def test_legacy_engines_removed(self):
+    def test_retired_engines_removed(self):
         """LETHE / ANAMNESIS / ALETHEIA must NOT be importable anymore.
         If a future commit re-introduces them, this test catches it."""
-        for legacy in ("compression.lethe", "compression.anamnesis", "compression.aletheia"):
+        for module_name in ("compression.lethe", "compression.anamnesis", "compression.aletheia"):
             try:
-                __import__(legacy)
-                pytest.fail(f"{legacy} should be gone in v3.3 — found it importable")
+                __import__(module_name)
+                pytest.fail(f"{module_name} should be gone in v3.3 — found it importable")
             except ImportError:
                 pass  # expected
 
     def test_compression_manager_removed(self):
-        """The legacy CompressionManager was deleted in v3.3."""
+        """CompressionManager was deleted in v3.3."""
         try:
             __import__("compression.manager")
             pytest.fail("compression.manager should be gone in v3.3")

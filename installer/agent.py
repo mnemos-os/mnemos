@@ -67,7 +67,7 @@ class Config:
     auth_enabled: bool = False
     rls_enabled: bool = False
     graeae_providers: dict[str, Any] = field(default_factory=dict)
-    ollama_embed_host: str = "http://localhost:11434"
+    inference_embed_host: str = "http://localhost:11434"
     install_docling: bool = False
     create_service: bool = True
 
@@ -204,7 +204,7 @@ class AgentInstaller:
             "clear, friendly questions. Collect: profile (personal/team/enterprise), "
             "db_name, db_user, db_password, listen_port (default 5002), and "
             "optionally: db_host, db_port, service_user, auth_enabled, rls_enabled, "
-            "ollama_embed_host, install_docling, create_service. "
+            "inference_embed_host, install_docling, create_service. "
             "Ask one or two questions at a time. When you have all required values "
             "(profile, db_name, db_user, db_password, listen_port), output ONLY a "
             "JSON block wrapped in ```json ... ``` with all collected Config fields. "
@@ -376,8 +376,8 @@ class AgentInstaller:
                     cfg.rls_enabled = bool(raw["rls_enabled"])
                 if "graeae_providers" in raw:
                     cfg.graeae_providers = dict(raw["graeae_providers"])
-                if "ollama_embed_host" in raw:
-                    cfg.ollama_embed_host = str(raw["ollama_embed_host"])
+                if "inference_embed_host" in raw:
+                    cfg.inference_embed_host = str(raw["inference_embed_host"])
                 if "install_docling" in raw:
                     cfg.install_docling = bool(raw["install_docling"])
                 if "create_service" in raw:

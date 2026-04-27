@@ -71,7 +71,7 @@ def _write_env_file(config: Config, env_path: str) -> bool:
             f"PG_PASSWORD={config.db_password}",
             f"MNEMOS_LISTEN_PORT={config.listen_port}",
             f"MNEMOS_SERVICE_USER={config.service_user}",
-            f"OLLAMA_EMBED_HOST={config.ollama_embed_host}",
+            f"INFERENCE_EMBED_HOST={config.inference_embed_host}",
         ]
         for provider, key in config.graeae_providers.items():
             lines.append(f"{provider.upper()}_API_KEY={key}")
@@ -215,7 +215,7 @@ def install_launchd(config: Config, repo_path: str) -> bool:
         "PG_USER": config.db_user,
         "PG_PASSWORD": config.db_password,
         "MNEMOS_LISTEN_PORT": str(config.listen_port),
-        "OLLAMA_EMBED_HOST": config.ollama_embed_host,
+        "INFERENCE_EMBED_HOST": config.inference_embed_host,
     }
     for provider, key in config.graeae_providers.items():
         env_vars[f"{provider.upper()}_API_KEY"] = key

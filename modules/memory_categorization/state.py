@@ -7,7 +7,6 @@ Provides:
 - delete(key): Remove key
 - list_keys(): All state keys
 - load_identity() / load_today() / load_workspace(): Convenience accessors
-- save_state(key, value): Alias for set()
 """
 
 # Library API: This module provides a programmatic interface to the journal/state/entities
@@ -87,7 +86,7 @@ class StateManager:
             logger.error(f"Error listing state keys: {e}", exc_info=True)
             return []
 
-    # ── Convenience accessors (backward-compat) ──────────────────────────────
+    # ── Convenience accessors ────────────────────────────────────────────────
 
     async def load_identity(self) -> Dict[str, Any]:
         val = await self.get('identity')
@@ -108,10 +107,6 @@ class StateManager:
     async def load_workspace(self) -> Dict[str, Any]:
         val = await self.get('workspace')
         return val or {'id': 'default', 'name': 'Default Workspace', 'projects': []}
-
-    async def save_state(self, state: Any, key: str) -> None:
-        """Backward-compat alias for set()."""
-        await self.set(key, state)
 
     def clear_cache(self) -> None:
         self._cache.clear()

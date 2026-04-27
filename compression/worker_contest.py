@@ -5,9 +5,7 @@ Separate module so the queue-draining code can be unit-tested in
 isolation (mock pool + mock engines) and live-tested against a
 throwaway Postgres without booting the full MemoryDistillationWorker.
 The existing `distillation_worker.py` keeps its direct-memory-polling
-loop for v3.0 backward compat; in v3.1 it calls
-`process_contest_queue()` once per loop iteration alongside the legacy
-path.
+    loop; it calls `process_contest_queue()` once per loop iteration.
 
 Queue lifecycle per row:
 
@@ -254,18 +252,14 @@ async def process_contest_queue(
     unit tests stub this with AsyncMock). Each queue row runs its
     contest in a separate connection so one row's DB activity doesn't
     stall or transact with another's. `max_attempts` caps retries per
-    row (default 3, matching the legacy distillation worker's
-    MAX_ATTEMPTS).
+    row (default 3, matching the distillation worker's MAX_ATTEMPTS).
 
     `min_content_length` (default 0 = no gate) skips memories below
     the threshold BEFORE running the contest. Surfaced by the 2026-04-23
     CERBERUS benchmark: short templated content (git commit headers,
     GRAEAE consultation stubs) can't be meaningfully compressed by any
-    engine at the balanced profile's floor — LETHE returns ratio~1.0,
-    ANAMNESIS's summary+bullet rendering inflates past ratio=1.0,
-    both score composite=0, contest fails with 'no winner'. On slower
-    GPU systems this wastes ANAMNESIS's multi-second call per memory
-    for a guaranteed failure. Setting this to e.g. 500 tells the worker
+    engine at the balanced profile's floor. Setting this to e.g. 500
+    tells the worker
     to mark those rows `failed` immediately with
     `error='too_short: N chars < threshold M'` and move on. Recommended
     for GPU-constrained installs; leave at 0 for full-contest behavior

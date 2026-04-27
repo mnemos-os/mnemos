@@ -64,12 +64,8 @@ async def _user_context_from_id(pool, user_id: str, authenticated: bool) -> "Use
     """Build a UserContext for a resolved user_id (role + groups +
     namespace from DB).
 
-    v3.2: `namespace` is now a per-user column on the `users` table
-    (added by migrations_v3_2_user_namespace.sql). Prior releases
-    used the config's `default_namespace` for every user, which
-    collapsed every two-dim tenancy gate to one dimension on
-    multi-user installs. The config value survives as the fallback
-    for the auth-disabled / personal singleton path.
+    `namespace` is a per-user column on the `users` table. The config
+    default is only used for the auth-disabled / personal singleton path.
     """
     async with pool.acquire() as conn:
         user_row = await conn.fetchrow(
@@ -85,7 +81,7 @@ async def _user_context_from_id(pool, user_id: str, authenticated: bool) -> "Use
         user_id=user_id,
         group_ids=[r["group_id"] for r in group_rows],
         role=user_row["role"],
-        namespace=user_row["namespace"] or _default_namespace,
+        namespace=user_row["namespace"],
         authenticated=authenticated,
     )
 
@@ -129,10 +125,7 @@ async def get_current_user(
             user_id=row["user_id"],
             group_ids=[r["group_id"] for r in group_rows],
             role=row["role"],
-            # v3.2: per-user namespace from the users table. Fallback
-            # to the config default only if the column is NULL (shouldn't
-            # happen post-migration since DEFAULT 'default' + NOT NULL).
-            namespace=row["namespace"] or _default_namespace,
+            namespace=row["namespace"],
             authenticated=True,
         )
 

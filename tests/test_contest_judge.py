@@ -166,9 +166,7 @@ def test_judge_replaces_engine_quality_score():
 
 
 def test_no_judge_keeps_engine_scores():
-    """Backward-compat: contest without a judge behaves exactly as it
-    did pre-S-II. Engine self-reported quality_score wins or loses on
-    its own; judge_model stays None."""
+    """Contest without a judge uses engine self-reported quality scores."""
     engine = _StaticEngine(id="stubA", quality=0.85, ratio=0.3, elapsed_ms=50)
 
     outcome = asyncio.run(run_contest([engine], _request()))
@@ -287,7 +285,7 @@ class _RecordingJudge(Judge):
 
 def test_judge_sees_narrated_form_for_apollo_candidate():
     """APOLLO emits dense form; the contest narrates it to prose
-    before handing to the judge. LETHE/ANAMNESIS emit prose-shaped
+    before handing to the judge. ARTEMIS emits prose-shaped
     output directly and pass through verbatim."""
     # An APOLLO-id engine that emits a portfolio dense form.
     apollo_stub = _StaticEngine(
@@ -297,9 +295,9 @@ def test_judge_sees_narrated_form_for_apollo_candidate():
         elapsed_ms=80,
         content="AAPL:100@150.25/175.50:tech",
     )
-    # A LETHE-id engine that emits plain prose.
-    lethe_stub = _StaticEngine(
-        id="lethe",
+    # An ARTEMIS-id engine that emits plain prose.
+    artemis_stub = _StaticEngine(
+        id="artemis",
         quality=0.75,
         ratio=0.4,
         elapsed_ms=10,
@@ -308,7 +306,7 @@ def test_judge_sees_narrated_form_for_apollo_candidate():
     judge = _RecordingJudge()
 
     asyncio.run(run_contest(
-        [apollo_stub, lethe_stub],
+        [apollo_stub, artemis_stub],
         _request(),
         judge=judge,
     ))
@@ -318,5 +316,5 @@ def test_judge_sees_narrated_form_for_apollo_candidate():
     apollo_narrated = judge.narrations["apollo"]
     assert "AAPL" in apollo_narrated
     assert "150.25" in apollo_narrated
-    # LETHE output passes through verbatim.
-    assert judge.narrations["lethe"] == "Some extractive prose output."
+    # ARTEMIS output passes through verbatim.
+    assert judge.narrations["artemis"] == "Some extractive prose output."

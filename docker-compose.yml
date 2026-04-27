@@ -108,7 +108,7 @@ services:
       PG_PASSWORD: ${POSTGRES_PASSWORD:-mnemos_local}
       PG_DATABASE: mnemos
       PG_HOST: postgres
-      OLLAMA_EMBED_HOST: http://ollama:11434
+      INFERENCE_EMBED_HOST: http://ollama:11434
       # On Linux: use http://172.17.0.1:5001 or add --add-host=host.docker.internal:host-gateway
       GRAEAE_URL: ${GRAEAE_URL:-http://host.docker.internal:5001}
       MNEMOS_PROFILE: personal

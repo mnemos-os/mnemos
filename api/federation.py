@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 FEDERATION_HTTP_TIMEOUT = 30.0
 FEDERATION_BATCH_LIMIT = 100
 FEDERATION_ID_PREFIX = "fed:"
-FEDERATION_CURSOR_LOWER_ID = "00000000-0000-0000-0000-000000000000"
+FEDERATION_CURSOR_LOWER_ID = ""
 # Per-field size caps for incoming peer payloads. Hostile peers can otherwise
 # fill disk by pushing 50MB blobs; these caps bound a single memory to ~1.5MB.
 FEDERATION_MAX_CONTENT = 1_000_000  # 1 MB per content body
@@ -37,8 +37,7 @@ FEDERATION_MAX_NAME = 256            # category/subcategory/namespace length
 
 class FederationFeedCursor(NamedTuple):
     updated: datetime
-    memory_id: Optional[str]
-    is_legacy: bool
+    memory_id: str
 
 
 def _cursor_timestamp_for_wire(updated: datetime) -> str:
@@ -72,7 +71,7 @@ def _encode_feed_cursor(updated: datetime, memory_id: str) -> str:
 
 
 def _decode_feed_cursor(raw: str) -> FederationFeedCursor:
-    """Decode a v3.5 compound cursor, accepting legacy ISO timestamp cursors."""
+    """Decode a compound federation cursor."""
     try:
         padded = raw + "=" * (-len(raw) % 4)
         payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
@@ -84,27 +83,10 @@ def _decode_feed_cursor(raw: str) -> FederationFeedCursor:
         updated = _parse_cursor_timestamp(updated_raw)
         memory_id = payload.get("id")
         if not isinstance(memory_id, str):
-            return FederationFeedCursor(
-                updated=updated,
-                memory_id=None,
-                is_legacy=True,
-            )
-        return FederationFeedCursor(
-            updated=updated,
-            memory_id=memory_id,
-            is_legacy=False,
-        )
+            raise ValueError("cursor payload missing id")
+        return FederationFeedCursor(updated=updated, memory_id=memory_id)
     except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        updated = _parse_cursor_timestamp(raw)
-        return FederationFeedCursor(
-            updated=updated,
-            memory_id=None,
-            is_legacy=True,
-        )
-
-
-def _legacy_cursor_param(updated: datetime) -> str:
-    return _cursor_timestamp_for_wire(updated)
+        raise ValueError("invalid federation cursor")
 
 
 def _cap(value, limit: int):
@@ -613,12 +595,9 @@ async def _pull_batch(
     params: Dict[str, Any] = {"limit": FEDERATION_BATCH_LIMIT}
     if since is not None:
         if isinstance(since, FederationFeedCursor):
-            if since.is_legacy or since.memory_id is None:
-                params["since"] = _legacy_cursor_param(since.updated)
-            else:
-                params["since"] = _encode_feed_cursor(since.updated, since.memory_id)
+            params["since"] = _encode_feed_cursor(since.updated, since.memory_id)
         else:
-            params["since"] = _legacy_cursor_param(since)
+            params["since"] = _encode_feed_cursor(since, FEDERATION_CURSOR_LOWER_ID)
     if namespace_filter:
         params["namespace"] = ",".join(namespace_filter)
     if category_filter:

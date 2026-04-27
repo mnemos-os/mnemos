@@ -1,6 +1,6 @@
 #!/bin/bash
-# MNEMOS v3.0.0 Deployment Verification Script
-# Checks database migrations, endpoints, and backward compatibility
+# MNEMOS Deployment Verification Script
+# Checks database migrations, endpoints, and deployment hygiene
 
 set -e
 

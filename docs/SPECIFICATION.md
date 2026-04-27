@@ -170,19 +170,17 @@ Tracing → Prometheus → BodySizeLimit → handler.
 
 | ID | Module | Role |
 |----|--------|------|
-| distillation_worker | `distillation_worker.py` | Drains `memory_compression_queue` via `process_contest_queue`; runs LETHE + ANAMNESIS + APOLLO engines in parallel per memory; writes winner to `memory_compressed_variants` + full audit to `memory_compression_candidates`; stranded-running sweep at batch head |
+| distillation_worker | `distillation_worker.py` | Drains `memory_compression_queue` via `process_contest_queue`; runs ARTEMIS + APOLLO engines in parallel per memory; writes winner to `memory_compressed_variants` + full audit to `memory_compression_candidates`; stranded-running sweep at batch head |
 | registry_sync      | `modules/registry_sync.py` | Scheduled pull from provider APIs + Arena.ai Elo rankings into `model_registry` |
 
-### 3.9 Compression platform (3 active engines + plugin ABC)
+### 3.9 Compression platform (2 active engines + plugin ABC)
 
 Engines are not REST-addressable; they're contest participants.
 
 | Engine | Module | gpu_intent | Identifier policy | Role |
 |--------|--------|------------|-------------------|------|
-| LETHE     | `compression/lethe.py`     | `cpu_only`     | STRICT | Fast extractive (token + sentence modes) |
-| ANAMNESIS | `compression/anamnesis.py` | `gpu_required` | OFF    | LLM fact extraction for archival |
-| APOLLO    | `compression/apollo.py` + `compression/apollo_schemas/` | `gpu_optional` | STRICT (schema) / OFF (LLM fallback) | Schema-aware dense encoding with ANAMNESIS-pattern LLM fallback (v3.3 S-II landed) |
-| ALETHEIA  | `compression/aletheia.py`  | `gpu_required` | OFF    | **DEPRECATED v3.2 tail**; kept importable; v4.0 removes |
+| ARTEMIS   | `compression/artemis.py`   | `cpu_only`     | STRICT | CPU extractive compression with identifier preservation |
+| APOLLO    | `compression/apollo.py` + `compression/apollo_schemas/` | `gpu_optional` | STRICT (schema) / OFF (LLM fallback) | Schema-aware dense encoding with optional LLM fallback |
 
 Contest orchestrator: `compression/contest.py`. Persistence:
 `compression/contest_store.py`. Plugin ABC: `compression/base.py`.
@@ -373,8 +371,7 @@ MCP contract-wire regression test: `tests/test_mcp_stdio_wire.py`.
   `model_registry` first, falls back to substring heuristic, 400s on
   complete miss (no default-to-Groq as of 337aac9).
 - **Gateway ↔ Memories**: `_search_mnemos_context` left-joins
-  `memory_compressed_variants` and COALESCEs winner → v3.0 column →
-  raw content (three-tier).
+  `memory_compressed_variants` and COALESCEs winner → raw content.
 - **Worker ↔ Queue**: `process_contest_queue` dequeues with
   `FOR UPDATE SKIP LOCKED`, runs engines in parallel, persists via
   `persist_contest` in a single transaction. Stranded-running sweep
@@ -502,7 +499,7 @@ timestamp)`. Chain-verify endpoint: `GET /v1/consultations/audit/verify`
   corpus.
 - **Network (outbound)**: whatever the caller's LLM providers need
   (OpenAI, Together, Groq, etc.); optional GPU inference endpoint for
-  ANAMNESIS and APOLLO LLM fallback (`GPU_PROVIDER_HOST`).
+  APOLLO LLM fallback (`GPU_PROVIDER_HOST`).
 
 ### 8.2 Python dependencies (required, 18 packages)
 
@@ -570,7 +567,6 @@ Grouped by concern:
 - `MNEMOS_CONTEST_ENABLED` (true)
 - `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` (0)
 - `MNEMOS_CONTEST_STALE_THRESHOLD_SECS` (600)
-- `MNEMOS_ALETHEIA_ENABLED` (false; DEPRECATED)
 - `MNEMOS_APOLLO_ENABLED` (true)
 - `MNEMOS_APOLLO_LLM_FALLBACK_ENABLED` (true)
 
@@ -670,8 +666,8 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
 - API request latency (cached path): 5–30 ms.
 - API request latency (DB path): 20–100 ms.
 - Vector search: <50 ms for corpus ≤100k rows with HNSW.
-- Compression contest: ~10 memories/minute with LETHE + ANAMNESIS
-  on CERBERUS-class GPU (RTX 4500 ADA).
+- Compression contest throughput depends on APOLLO fallback/judge use;
+  ARTEMIS and APOLLO schema matches are CPU-cheap.
 
 ### 11.3 Horizontal scaling
 
@@ -845,13 +841,13 @@ morpheus_runs,
 oauth_identities, oauth_providers, oauth_sessions,
 session_memory_injections, session_messages, sessions, state,
 user_groups, users, webhook_deliveries, webhook_subscriptions,
-memory_stats (v3.0 legacy).
+memory_stats.
 
 ## D. Migration inventory (24)
 
 Ordered as applied (see §4.2 for detail).
 
-## E. Test inventory (60 test files)
+## E. Test inventory (59 test files)
 
 Unit + integration + live-GPU-gated E2E:
 
@@ -863,7 +859,7 @@ audit_high_fixes, branch_visibility, charon_roundtrip,
 compression_base, compression_hot_paths,
 compression_manifests_endpoint, contest, contest_judge, contest_store,
 custom_query, dag_cross_memory, dag_tenancy, dag_visibility_gap,
-distillation_engine_async, document_import, e2e, federation,
+document_import, e2e, federation,
 gateway_provider_routing, gpu_guard, installer_api_keys_schema,
 integration, judge, judge_cross_encoder, kg_tenancy, knossos_phase1,
 live_e2e, mcp_stdio_wire, migration_lists_sync, models_registry,
@@ -887,12 +883,10 @@ See §9.1.
 Mnemosyne, Titan goddess of memory.
 **GRAEAE** — the multi-LLM consensus reasoning layer; Greek myth, the
 three sisters sharing one eye.
-**THE MOIRAI** — the compression platform (LETHE / ANAMNESIS / APOLLO,
-with ALETHEIA deprecated); named after the three Fates.
-**LETHE** — CPU extractive compression engine; river of forgetfulness.
-**ANAMNESIS** — LLM-based fact-extraction engine; recollection.
+**THE MOIRAI** — the compression platform (ARTEMIS / APOLLO); named
+after the three Fates.
+**ARTEMIS** — CPU extractive compression engine.
 **APOLLO** — schema-aware dense encoding engine; god of oracles.
-**ALETHEIA** — retired LLM token-score engine; disclosure, un-forgetting.
 **MPF** — MNEMOS Portability Format (v0.1).
 **CERBERUS** — deployment hostname for the test instance (RTX 4500 ADA).
 **PYTHIA** — deployment hostname for the production instance.

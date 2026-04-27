@@ -48,22 +48,12 @@ case where a page could end in the middle of many memories sharing one
 `updated` value.
 
 No database migration is required. `federation_peers.last_sync_cursor` remains
-the existing timestamp column; the puller uses the compound cursor between
-pages during a sync and persists the timestamp portion for the next completed
-sync.
-
-New feed servers accept legacy timestamp-only `since` cursors with a one-page
-inclusive boundary query: `m.updated >= since`. The returned `next_cursor` is
-the new compound JSON-base64 form, so the following page uses the strict
-`(updated, id)` tie-breaker and the peer naturally upgrades without operator
-action.
-
-That legacy-to-compound boundary page can redeliver rows the peer already saw at
-the same `updated` timestamp. This is expected and bounded to one page for a
-given cursor transition; the importer keys federated rows by remote id and uses
-UPSERT semantics, so redelivery is idempotent and does not create duplicates.
-During a mixed-version rollout, pulls that involve an old feed implementation
-may still skip rows on timestamp tie boundaries until both ends are upgraded.
+the existing timestamp column; the puller sends that timestamp as a compound
+cursor with the lowest id boundary, uses the peer's compound cursor between
+pages during a sync, and persists the timestamp portion for the next completed
+sync. Feed servers do not accept timestamp-only cursors; malformed cursors are
+treated the same as a missing cursor and start an initial fetch from the
+beginning.
 
 ---
 
@@ -77,45 +67,31 @@ existing deployment:
 2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, `db/migrations_v3_5_webhook_attempt_unique.sql`, `db/migrations_v3_5_webhook_succeeded_unique.sql`, and `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`.
 3. Restart MNEMOS workers on the new build.
 
-Draining those writers remains the operationally clean upgrade path, but the
-round-8 compatibility path also protects deployments that cannot fully drain.
-Superseded attempts use `status='abandoned'` plus `superseded=TRUE`, so old
-v3.5-dev workers that only skip `succeeded` and `abandoned` still skip the row.
+Draining those writers remains the operationally clean upgrade path.
+Superseded attempts use `status='abandoned'` plus `superseded=TRUE`, so retry
+chain advancement is visible to audit queries while keeping live recovery
+predicates simple.
 The live unique index on `(subscription_id, event_type, payload_hash,
-attempt_num)` structurally prevents duplicate successor rows if an old writer
-races after a new worker's no-successor check. The succeeded unique index on
+attempt_num)` structurally prevents duplicate successor rows if writers race
+after a no-successor check. The succeeded unique index on
 `(subscription_id, event_type, payload_hash) WHERE status='succeeded'`
 structurally enforces one terminal success per retry chain if workers race
-past the app-level chain-peer guard. New workers use per-attempt leases plus
-per-chain advisory locks, lifecycle starts a dedicated repair
-worker that runs repeated sweeps for the first minute independent of delivery
-send latency, and the `writer_revision` marker is the technically correct
-compatibility path: current code explicitly writes `NEW_CODE_WRITER_REVISION=1`,
-while legacy or unknown rows are `NULL` or `0`.
-`WEBHOOK_LEGACY_GRACE_SECONDS` remains the safety net for rollouts that skip
-the drain: lease-less legacy `pending` and `retrying` rows are not recoverable
-until `status_updated_at + WEBHOOK_LEGACY_GRACE_SECONDS` has elapsed. The
-`status_updated_at` column is maintained by a database trigger on every status
-change, so old-writer `UPDATE status='retrying'` statements automatically
-advance the grace clock even though that code knows nothing about the column.
-The migration backfill gives live lease-less legacy rows a fresh
-`clock_timestamp()` value, so the grace window starts from the migration run
-instead of from an old `scheduled_at`.
+past the app-level chain-peer guard. Workers use per-attempt leases plus
+per-chain advisory locks, lifecycle starts a dedicated repair worker that runs
+repeated sweeps for the first minute independent of delivery send latency, and
+current code explicitly writes `NEW_CODE_WRITER_REVISION=1`.
 `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` adds a database
 trigger that fires before any `webhook_deliveries` UPDATE attempting to move a
-row away from `status='succeeded'`. During mixed-version overlap, old id-only
-writers that try to revert an ACK to `pending` or `retrying` fail with
-SQLSTATE `23514` (`check_violation`) at the trigger boundary; audit-only
-updates such as response-body capture or lease cleanup still succeed.
+row away from `status='succeeded'`. A stale writer that tries to revert an ACK
+to `pending` or `retrying` fails with SQLSTATE `23514` (`check_violation`) at
+the trigger boundary; audit-only updates such as response-body capture or lease
+cleanup still succeed.
 The startup/periodic repair worker is idempotent and terminalizes any
 lease-free `pending` or `retrying` row with a newer successor, including
-old-worker status overwrites of rows already marked `superseded=TRUE`. It skips
+out-of-order status overwrites of rows already marked `superseded=TRUE`. It skips
 rows with an unexpired `lease_token` / `lease_expires_at` pair so an in-flight
 new worker can finalize without losing ownership.
-New-code rows with `writer_revision=1` are recoverable immediately. The default
-grace is 300 seconds. Tune it to cover the maximum expected old-writer rollout
-overlap; after the grace expires, the new recovery worker treats any
-still-running old writer in that gap as crashed.
+Rows with `writer_revision=1` are recoverable immediately.
 
 `WEBHOOK_LEASE_SECONDS` is the authoritative webhook delivery ownership knob.
 Claims write and return `lease_expires_at` / `claim_db_now` from PostgreSQL
@@ -183,7 +159,6 @@ See `.env.example` for complete options including GPU setup, compression tiers, 
 ### When You Need GPU
 
 MNEMOS works great on CPU alone. GPU is only beneficial if:
-- You want fact extraction (ANAMNESIS: 500ms-2s per memory)
 - You want APOLLO's LLM fallback for content that misses a schema (v3.3+)
 - You're running large local LLMs (70B+ parameters)
 
@@ -378,7 +353,7 @@ curl -X GET http://localhost:5002/v1/models \
 curl -X POST http://localhost:5002/sessions \
   -H "Authorization: Bearer $MNEMOS_API_KEY" \
   -H "Content-Type: application/json" \
-  -d '{"model": "auto", "compression_tier": 1}'
+  -d '{"model": "auto"}'
 
 # POST /v1/sessions/{id}/messages - Add message to session
 curl -X POST http://localhost:5002/v1/sessions/{id}/messages \
@@ -521,7 +496,7 @@ psql -U mnemos -d mnemos -c "SELECT COUNT(*) FROM memories;"
 curl http://$GPU_PROVIDER_HOST:$GPU_PROVIDER_PORT/health
 
 # Check MNEMOS logs
-grep "GPU\|compression\|ANAMNESIS\|APOLLO" /var/log/mnemos.log
+grep "GPU\|compression\|APOLLO" /var/log/mnemos.log
 ```
 
 ### Memory Search Slow

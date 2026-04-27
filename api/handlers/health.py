@@ -90,16 +90,16 @@ async def get_stats() -> StatsResponse:
                 'SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL'
             )
             total_compressions = (
-                await conn.fetchval("SELECT COUNT(*) FROM memories WHERE llm_optimized = true") or 0
+                await conn.fetchval("SELECT COUNT(*) FROM memory_compressed_variants") or 0
             )
             avg_ratio_row = await conn.fetchval("""
-                SELECT AVG(LENGTH(compressed_content)::float / NULLIF(LENGTH(content), 0))
-                FROM memories WHERE llm_optimized = true AND compressed_content IS NOT NULL
+                SELECT AVG(v.compression_ratio)
+                FROM memory_compressed_variants v
             """)
             unreviewed_compressions = (
                 await conn.fetchval(
-                    "SELECT COUNT(*) FROM memories "
-                    "WHERE llm_optimized = true AND quality_rating IS NULL"
+                    "SELECT COUNT(*) FROM memory_compressed_variants "
+                    "WHERE quality_score IS NULL"
                 ) or 0
             )
 

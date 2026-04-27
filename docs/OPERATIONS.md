@@ -248,7 +248,7 @@ sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
   -f db/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
-See `installer/db.py:51-63` (`_psql_superuser`) and `installer/db.py:230-254` (migration sequence) for canonical order. `install.py:150-169` carries the legacy installer list and must stay in the same order.
+See `installer/db.py:51-63` (`_psql_superuser`) and `installer/db.py:230-254` (migration sequence) for canonical order. `install.py:150-169` carries the ordered installer migration list and must stay in the same order.
 
 ### 5.3 Pre-migration backup (mandatory)
 

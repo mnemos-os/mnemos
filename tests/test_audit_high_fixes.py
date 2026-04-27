@@ -56,10 +56,8 @@ def _install_pool(monkeypatch, conn):
     monkeypatch.setattr(lc, "_pool", pool)
 
 
-def test_h1_fts_fetch_owner_clause_includes_federation(monkeypatch):
-    """_fts_fetch with owner_id set must emit a WHERE clause that
-    matches either the caller's owner_id OR any row carrying a
-    federation_source (i.e., pulled from a peer)."""
+def test_h1_fts_fetch_owner_clause_uses_full_visibility(monkeypatch):
+    """_fts_fetch with owner_id set must emit the shared read predicate."""
     from api.lifecycle import _fts_fetch
 
     conn = _Conn()
@@ -68,9 +66,11 @@ def test_h1_fts_fetch_owner_clause_includes_federation(monkeypatch):
     sql = conn.fetches[-1][0]
     assert "owner_id=$" in sql
     assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql
+    assert "(permission_mode / 10) % 10" in sql
 
 
-def test_h1_vector_search_owner_clause_includes_federation(monkeypatch):
+def test_h1_vector_search_owner_clause_uses_full_visibility(monkeypatch):
     """Same contract for the pgvector variant."""
     from api.lifecycle import _vector_search
 
@@ -80,6 +80,8 @@ def test_h1_vector_search_owner_clause_includes_federation(monkeypatch):
     sql = conn.fetches[-1][0]
     assert "owner_id=$" in sql
     assert "federation_source IS NOT NULL" in sql
+    assert "permission_mode % 10" in sql
+    assert "(permission_mode / 10) % 10" in sql
 
 
 def test_h1_fts_fetch_no_owner_filter_leaves_query_clean(monkeypatch):

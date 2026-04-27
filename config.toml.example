@@ -17,55 +17,10 @@ pool_min_size = 10
 pool_max_size = 20
 
 [compression]
-enabled = true
-# LETHE is the Tier 1 CPU compressor. Mode selects between:
-#   "token"    — importance-weighted token filtering (~0.5ms, ~57% reduction)
-#   "sentence" — structure-preserving sentence extraction (~2-5ms, ~50% reduction)
-#   "auto"     — pick per content shape (default)
-default_strategy = "auto"  # 'auto' | 'token' | 'sentence'
-
-[compression.storage]
-enabled = true
-
-[compression.storage.ratios]
-reasoning = 0.45
-code_generation = 0.30
-architecture_design = 0.50
-api_design = 0.40
-data_modeling = 0.45
-debugging = 0.35
-refactoring = 0.40
-
-[compression.rehydration]
-enabled = true
-
-[compression.rehydration.tier_ratios]
-"1" = 0.20
-"2" = 0.35
-"3" = 0.50
-"4" = 1.00
-
-[compression.graeae]
-enabled = true
-store_uncompressed = true
-store_compressed = true
-compression_ratio = 0.4
-
-[compression.quality]
-enabled = true
-analyzer = "heuristic"
-warn_if_rating_below = 80
-error_if_rating_below = 70
-
-[compression.quality.requirements]
-security_review = 95
-architecture_design = 90
-code_generation = 88
-reasoning = 85
-general = 80
-
-[compression.storage_strategy]
-always_store_original = true
+contest_enabled = true
+apollo_enabled = true
+apollo_llm_fallback_enabled = true
+judge_enabled = false
 
 [hooks]
 enabled = true

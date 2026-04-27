@@ -158,14 +158,12 @@ class SessionContext(BaseModel):
     message_count: int
     total_tokens: int
     model: str
-    compression_tier: int = 1  # vestigial post-v3.3; ARTEMIS is the actual engine
     injected_memories: Optional[List[str]] = None
 
 
 class SessionRequest(BaseModel):
     """Create a new session."""
     model: Optional[str] = "gpt-4o"
-    compression_tier: Optional[int] = 1
     initial_context: Optional[str] = None
 
 
@@ -174,7 +172,6 @@ class SessionResponse(BaseModel):
     session_id: str
     created_at: str
     model: str
-    compression_tier: int
 
 
 class SessionMessage(BaseModel):

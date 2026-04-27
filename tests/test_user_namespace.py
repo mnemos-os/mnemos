@@ -1,17 +1,12 @@
-"""Per-user namespace loaded from the users table (v3.2).
-
-Pre-v3.2: UserContext.namespace was sourced from one config default
-(`_default_namespace`). Every two-dim tenancy gate collapsed to
-owner-only in practice on multi-user installs. Codex memory-OS
-audit 019dbd11 flagged this as a governance gap.
+"""Per-user namespace loaded from the users table.
 
 This test module verifies:
   * `_user_context_from_id` SELECT includes the namespace column
     and populates UserContext.namespace from it.
   * API-key auth path SELECT joins users.namespace and populates
     UserContext.namespace from the joined row.
-  * The config default (`_default_namespace`) only fires as a
-    fallback when the DB value is NULL — never as the primary source.
+  * The config default (`_default_namespace`) is reserved for the
+    auth-disabled singleton path, never authenticated DB users.
 """
 
 from __future__ import annotations
@@ -80,21 +75,6 @@ def test_session_path_loads_namespace_from_users_row():
     assert user.namespace == "alice-ns"  # from DB, not config default
     assert user.group_ids == ["g-1"]
     assert user.authenticated is True
-
-
-def test_session_path_falls_back_to_config_default_when_namespace_null():
-    """Defensive path: if some legacy row has NULL namespace, fall
-    back to the config default rather than crashing. Migrations set
-    NOT NULL DEFAULT 'default' so this shouldn't happen post-migration,
-    but don't 500 on a transitional DB state."""
-    from api.auth import _user_context_from_id, _default_namespace
-
-    conn = _Conn(
-        user_row={"role": "user", "namespace": None},
-        group_rows=[],
-    )
-    user = asyncio.run(_user_context_from_id(_pool(conn), "legacy-user", authenticated=True))
-    assert user.namespace == _default_namespace
 
 
 def test_session_path_selects_both_role_and_namespace():
@@ -175,31 +155,3 @@ def test_api_key_path_loads_namespace_from_joined_users_row(monkeypatch):
     # against someone "simplifying" the query back to role-only
     key_sql = conn.fetchrow_calls[0][0]
     assert "u.namespace" in key_sql or "namespace" in key_sql
-
-
-def test_api_key_path_falls_back_to_config_when_namespace_null(monkeypatch):
-    from api.auth import get_current_user, _default_namespace
-    import api.auth as auth_mod
-
-    conn = _Conn(
-        api_key_row={
-            "id": "key-1",
-            "user_id": "old-user",
-            "revoked": False,
-            "role": "user",
-            "namespace": None,
-        },
-        group_rows=[],
-    )
-    monkeypatch.setattr(auth_mod, "_auth_enabled", True)
-    import api.lifecycle as lc
-    monkeypatch.setattr(lc, "_schedule_background", lambda coro: coro.close())
-
-    request = MagicMock()
-    request.app.state.pool = _pool(conn)
-    request.cookies = {}
-    creds = MagicMock()
-    creds.credentials = "test-key"
-
-    user = asyncio.run(get_current_user(request, creds))
-    assert user.namespace == _default_namespace

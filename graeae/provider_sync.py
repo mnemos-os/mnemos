@@ -36,10 +36,12 @@ import httpx
 logger = logging.getLogger(__name__)
 
 # ── Key store ──────────────────────────────────────────────────────────────────
-_KEY_FILE = Path(os.getenv("API_KEYS_FILE", Path.home() / ".api_keys_master.json"))
+_KEY_FILE = Path(
+    os.getenv("API_KEYS_FILE", Path.home() / ".config" / "mnemos" / "api_keys.json")
+)
 
 def _load_key(provider: str) -> Optional[str]:
-    """Load API key from ~/.api_keys_master.json (llm_providers.<provider>.api_key)."""
+    """Load API key from the Provider Registry File."""
     try:
         data = json.loads(_KEY_FILE.read_text())
         return data.get("llm_providers", {}).get(provider, {}).get("api_key")

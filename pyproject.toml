@@ -88,7 +88,6 @@ py-modules = [
   "config",
   "distillation_worker",
   "mcp_server",
-  "inference_backend",
 ]
 # Ship every file listed in MANIFEST.in (SQL migrations, config example,
 # systemd unit) into the sdist and, via package-data below, into the wheel.

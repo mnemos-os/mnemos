@@ -612,7 +612,7 @@ async def run_contest(
     # mcc_winner_has_output CHECK in the DB (persist coerces 0 to NULL
     # for audit clarity, and NULL composite on a winner row is invalid
     # by design). Found in the 49-memory CERBERUS drain on 2026-04-23
-    # where a short memory produced LETHE ratio=1.0 -> composite=0.
+    # where a short memory produced ratio=1.0 -> composite=0.
     winning_pool = [c for c in survivors if c.composite_score > 0]
     for c in survivors:
         outcome.candidates.append(c)

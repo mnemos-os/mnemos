@@ -10,7 +10,6 @@ Resolution order (first hit wins per provider):
   2. Canonical MNEMOS key file (first readable path below):
        $MNEMOS_KEYS_PATH                   — explicit override
        ~/.config/mnemos/api_keys.json      — preferred standard location
-       ~/.api_keys_master.json             — legacy fallback
 
 File format (MNEMOS-native, self-contained — do not symlink to
 third-party service key files):
@@ -43,7 +42,6 @@ logger = logging.getLogger(__name__)
 _SEARCH_PATHS = [
     os.getenv("MNEMOS_KEYS_PATH", ""),
     os.path.expanduser("~/.config/mnemos/api_keys.json"),
-    os.path.expanduser("~/.api_keys_master.json"),  # legacy fallback
 ]
 
 # Canonical names in the key file may differ from GRAEAE provider names.
@@ -125,12 +123,6 @@ def load_provider_registry() -> dict:
         key_file, len(nested),
     )
     return nested
-
-
-# Backward-compat alias: the function was called `load_api_keys()` in
-# earlier releases. Keep the old name importable so out-of-tree
-# callers don't break on upgrade. Internal call sites use the new name.
-load_api_keys = load_provider_registry
 
 
 # Loaded once at module import; refresh by calling load_provider_registry() again if needed.

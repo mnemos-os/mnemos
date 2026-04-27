@@ -81,7 +81,7 @@ the MemPalace tool-response shape.
 | Cross-instance portability | ❌ (no native export) | ✅ — Memory Portability Format (MPF) round-trip |
 | Version DAG (diff/revert/branch) | ❌ | ✅ — memory_versions table + commit_hash |
 | Audit chain | ❌ | ✅ — every mutation hashed, verifiable |
-| Compression (APOLLO/ARTEMIS contest) | AAAK only (~30× on a subset) | Full contest — APOLLO schema + ARTEMIS extractive + LETHE, judge-scored |
+| Compression (APOLLO/ARTEMIS contest) | AAAK only (~30× on a subset) | Full contest — APOLLO schema + ARTEMIS extractive, judge-scored |
 | Federation across instances | ❌ | ✅ — `/v1/federation/*`, pull-based |
 | Knowledge graph (temporal) | ✅ — SQLite-backed | ✅ — Postgres-backed, same temporal semantics |
 | MCP surface | 29 native tools | 29 via KNOSSOS + MNEMOS-native MCP tools |

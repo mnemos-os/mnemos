@@ -75,23 +75,32 @@ federation compound-cursor tie-breaker.
   pinning.
 - **Project URLs moved.** `pyproject.toml` metadata points at
   `mnemos-os/mnemos`.
+- **Legacy compatibility shims removed.** Federation cursors are compound-only,
+  webhook recovery assumes current writer rows (`writer_revision=1`), session
+  creation no longer accepts `compression_tier`, and the ARTEMIS compression
+  path no longer exposes the `DistillationEngine` compatibility wrapper.
+  Search helpers also use the full read-visibility predicate whenever
+  `owner_id` is supplied instead of preserving the owner/federation-only
+  fallback for omitted `group_ids`.
 
 ### Fixed
 
+- **Slice 5 round-2 search compression probe cleanup** — large
+  `/v1/memories/search` result sets no longer call the retired
+  distillation backend health check or log misleading "compression
+  disabled" telemetry. The live compression path remains the
+  queue-driven APOLLO/ARTEMIS contest and its persisted variants.
 - **Federation feed cursor tie-breaker** — `/v1/federation/feed` now
   paginates with an opaque cursor carrying both `updated` and `id`, filters
   with `(m.updated > cursor_updated OR (m.updated = cursor_updated AND
   m.id > cursor_id))`, and orders by `m.updated ASC, m.id ASC`. The puller
   decodes the cursor for the next page while persisting the existing
-  timestamp cursor column, so no schema migration is required. Legacy
-  timestamp-only cursors use a one-page inclusive `updated >= cursor_updated`
-  compatibility shim before the server emits a compound cursor. That upgrade
-  page can redeliver boundary-timestamp rows, but remote-id-aware federation
-  UPSERTs keep the replay idempotent and prevent same-timestamp rows with
-  low-sorting text ids from being skipped.
+  timestamp cursor column, so no schema migration is required. Feed servers
+  are compound-cursor-only; malformed or missing cursors start an initial
+  fetch from the beginning.
 - **Webhook retry replay state machine** — `api/webhook_dispatcher.py:121-146`
   now recovers due `pending` rows plus `retrying` rows only when no
-  successor attempt exists. Superseded attempts use old-worker-compatible
+  successor attempt exists. Superseded attempts use
   `status='abandoned'` plus `superseded=TRUE`, while final failures keep
   `superseded=FALSE`; `db/migrations_v3_5_webhook_superseded_marker.sql`
   adds the audit marker and converts rows from the pre-round-8 branch-only
@@ -100,12 +109,12 @@ federation compound-cursor tie-breaker.
   attempt_num)`, and successor inserts now use `ON CONFLICT DO NOTHING
   RETURNING` after an in-transaction successor recheck.
   `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs existing
-  superseded `retrying` rows with `abandoned` so old workers skip them.
+  superseded `retrying` rows with `abandoned`.
   Round 3 replaces the long-held `FOR UPDATE SKIP LOCKED` send lock with
   `lease_token` / `lease_expires_at` persisted claims in
   `db/migrations_v3_5_webhook_attempt_lease.sql`, so DNS validation and
   outbound HTTP no longer hold shared DB connections. It also caps active
-  sends per process, gates new-code recovery claims and successor inserts
+  sends per process, gates recovery claims and successor inserts
   with a per-chain advisory lock, and runs a startup repair burst before
   backing off to periodic repair sweeps. Operators must drain webhook
   writers before applying the v3.5 webhook retry migrations during rolling
@@ -113,24 +122,18 @@ federation compound-cursor tie-breaker.
   `WEBHOOK_LEASE_SECONDS`, reserves a finalize buffer, wraps DNS validation,
   the HTTP POST, and the response-body read in that deadline, and streams
   response bodies into a fixed audit cap so a slow receiver cannot outlive
-  the lease or hold a semaphore slot indefinitely. Round 5 adds
-  `WEBHOOK_LEGACY_GRACE_SECONDS` so lease-less legacy `retrying` rows are
-  not recoverable during old-writer successor-insert gaps, anchors each send
+  the lease or hold a semaphore slot indefinitely. Round 5 anchors each send
   timeout to the DB-returned claim timestamps instead of a fresh static
   budget, and sends `Accept-Encoding: identity` on webhook POSTs as the first
   response-compression defense. Round 6 switches
   webhook lease/expiry SQL from transaction-snapshot `NOW()` to
   `clock_timestamp()`, reads audited response bodies through `aiter_raw()` and
   rejects non-identity response encodings before decompression, and adds
-  `db/migrations_v3_5_webhook_writer_revision.sql` so lease-less legacy or
-  unknown `pending` and `retrying` rows wait for legacy grace while current
-  writer rows remain immediately recoverable. Round 7 adds
+  `db/migrations_v3_5_webhook_writer_revision.sql` so current-writer rows are
+  explicitly stamped with `writer_revision=1`. Round 7 adds
   `db/migrations_v3_5_webhook_status_updated_at.sql`, a trigger-maintained
-  status-transition timestamp, and anchors legacy grace to it so old-writer
-  `retrying` transitions cannot bypass grace with an old `scheduled_at`.
-  Round 8 makes the status backfill conservative for live lease-less legacy
-  rows by starting their grace clock at migration time. Round 9 relaxes the
-  idempotent repair sweep so old-worker `pending`/`retrying` overwrites of an
+  status-transition timestamp for audit and repair observability. Round 9 relaxes the
+  idempotent repair sweep so out-of-order `pending`/`retrying` overwrites of an
   already superseded attempt are terminalized again whenever a newer successor
   exists. Round 10 splits retry repair and delivery recovery into independent
   lifespan tasks so slow webhook POSTs cannot starve the repair cadence, and
@@ -152,17 +155,17 @@ federation compound-cursor tie-breaker.
   succeeded chain peer across claim, success-finalize, and failure-finalize
   paths, and adds `db/migrations_v3_5_webhook_succeeded_unique.sql` with a
   partial unique index that structurally enforces one terminal succeeded row
-  per retry chain after deduplicating legacy duplicate successes. Round 15
+  per retry chain. Round 15
   excludes the current delivery id from succeeded-chain peer checks, requires
   active peer-abandon updates to still target live non-superseded attempts, and
   isolates ordinary stream/client cleanup exceptions after response headers so
   captured acknowledgements still finalize while `CancelledError` propagates.
   Round 16 makes revocation, final-failure, and retry-failure terminal UPDATEs
   require the leased row to still be live (`pending`/`retrying` and not
-  superseded), so failure finalization cannot overwrite same-row legacy
-  succeeded or abandoned terminal writes during rolling upgrades. Round 17
+  superseded), so failure finalization cannot overwrite same-row terminal
+  writes that already won. Round 17
   applies the same live-row guard to the success finalize UPDATE, clearing only
-  stale lease columns when a same-row legacy terminal write has already won, and
+  stale lease columns when a same-row terminal write has already won, and
   moves recovery to claim due rows with a lease in the dequeue CTE before
   scheduling send tasks so repeated recovery polls do not enqueue duplicates
   behind the send semaphore. Round 18 sizes each recovery claim batch to the

@@ -18,16 +18,11 @@ import redis.asyncio as aioredis
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import PG_CONFIG
-from inference_backend import get_backend as _get_backend
 from graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
 
 from .models import MemoryItem
 
 logger = logging.getLogger(__name__)
-
-# Compression thresholds
-COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
-COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
 # Background task registries — keep finite webhook sends out of the cancel-first
 # worker pool so graceful shutdown can let them finalize their leases.
@@ -158,57 +153,21 @@ async def _drain_delivery_attempt_tasks() -> None:
 # below auto-detects the wire shape (OpenAI-compat /v1/embeddings vs
 # Ollama-compat /api/embeddings), so the same env var works against:
 #   - llama.cpp llama-server in embeddings mode (CERBERUS/TYPHON/PYTHIA)
-#   - Ollama (legacy / dev workstations)
+#   - Ollama (dev workstations)
 #   - vLLM with --task embed
 #   - NVIDIA NIM embedding containers (e.g. llama-3.2-nv-embedqa-1b-v2)
 #   - any OpenAI-compatible /v1/embeddings endpoint
 #
-# Canonical env vars are INFERENCE_EMBED_* (matches the broader
-# _inference_backend namespacing in this module). The OLLAMA_EMBED_*
-# names are kept as deprecated fallbacks for backward compat with
-# existing .env.prod files; new deployments should use INFERENCE_EMBED_*.
-# Deprecation removal scheduled for v4.0 per docs/V4_PLAN.md. The
-# OLLAMA_ prefix was a historical artifact — the actual fleet runs
-# llama-server, not Ollama, on every host.
-_EMBED_HOST = (
-    os.getenv('INFERENCE_EMBED_HOST')
-    or os.getenv('OLLAMA_EMBED_HOST')
-    or 'http://localhost:11434'
-)
-_EMBED_MODEL = (
-    os.getenv('INFERENCE_EMBED_MODEL')
-    or os.getenv('OLLAMA_EMBED_MODEL')
-    or 'nomic-embed-text'
-)
-_EMBED_TIMEOUT = float(
-    os.getenv('INFERENCE_EMBED_TIMEOUT')
-    or os.getenv('OLLAMA_EMBED_TIMEOUT')
-    or '10'
-)
-if os.getenv('OLLAMA_EMBED_HOST') and not os.getenv('INFERENCE_EMBED_HOST'):
-    import logging as _logging
-    _logging.getLogger(__name__).warning(
-        "[EMBED] OLLAMA_EMBED_HOST is deprecated and will be removed in v4.0. "
-        "Rename to INFERENCE_EMBED_HOST in your .env. The endpoint is "
-        "backend-agnostic — works with llama-server, Ollama, vLLM, NVIDIA "
-        "NIM, or any OpenAI-compat embeddings server. The OLLAMA_ prefix "
-        "was a historical artifact; the actual fleet runs llama-server, "
-        "not Ollama."
-    )
+# Canonical env vars are INFERENCE_EMBED_* so embedding config is not
+# tied to any one inference server implementation.
+_EMBED_HOST = os.getenv('INFERENCE_EMBED_HOST', 'http://localhost:11434')
+_EMBED_MODEL = os.getenv('INFERENCE_EMBED_MODEL', 'nomic-embed-text')
+_EMBED_TIMEOUT = float(os.getenv('INFERENCE_EMBED_TIMEOUT', '10'))
 
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
 _cache: Optional[aioredis.Redis] = None
-_inference_backend = None  # initialized on startup via _get_backend()
 _rls_enabled: bool = False   # set from config at startup; read by handlers
-
-
-def get_inference_backend():
-    """Get the distillation backend (Ollama or LlamaCpp)."""
-    global _inference_backend
-    if _inference_backend is None:
-        _inference_backend = _get_backend()
-    return _inference_backend
 
 
 def _load_config() -> dict:
@@ -287,7 +246,7 @@ async def _run_distillation_worker():
 
 @asynccontextmanager
 async def lifespan(app):
-    """FastAPI lifespan: initialize and teardown DB pool, Redis, inference provider, and workers."""
+    """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
     global _pool, _cache, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
@@ -360,13 +319,6 @@ async def lifespan(app):
         _cache = None
         app.state.cache = None
 
-    backend = get_inference_backend()
-    healthy = await backend.health_check()
-    if healthy:
-        logger.info("[backend] Distillation backend CONNECTED")
-    else:
-        logger.warning("[backend] Distillation backend UNREACHABLE - compression disabled")
-
     # Start background distillation worker (optional)
     worker_enabled = config.get("worker", {}).get("enabled", True)
     if worker_enabled and _pool:
@@ -433,7 +385,6 @@ async def lifespan(app):
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
-    await backend.close()
     logger.info("Shutting down MNEMOS API Server")
 
 
@@ -509,7 +460,7 @@ def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
 async def _get_embedding(text: str) -> list:
     """Get embedding vector from nomic-embed-text. Returns [] on failure.
 
-    Accepts either wire format from the configured OLLAMA_EMBED_HOST:
+    Accepts either wire format from the configured INFERENCE_EMBED_HOST:
       * Ollama-compat /api/embeddings: {"prompt": ...} → {"embedding": [...]}
         (phi_server.py fastembed, Ollama itself)
       * OpenAI-compat /v1/embeddings: {"input": ...} →
@@ -557,16 +508,15 @@ async def _vector_search(conn, embedding: list, limit: int,
     Supports optional provenance filters (source_provider, source_model,
     source_agent, namespace) ANDed into the WHERE clause.
 
-    When the caller passes ``owner_id`` AND ``group_ids`` (a list, possibly
-    empty), the visibility predicate is the full v1_multiuser-mirror from
-    api.visibility — owner / federation / world-readable / group-readable.
+    When the caller passes ``owner_id``, the visibility predicate is the
+    full v1_multiuser-mirror from api.visibility — owner / federation /
+    world-readable / group-readable.
     Non-root callers from /memories/search pin owner_id=user.user_id and
     pass group_ids=user.group_ids; the same predicate is used by list/get,
     so a memory visible to one read path is visible to all.
 
-    Backward-compat: callers that pass owner_id alone (without group_ids)
-    keep the older (owner_id OR federation_source) shape — used for any
-    legacy call sites that haven't been audited yet.
+    ``group_ids`` may be an empty list; omitted group_ids are treated as
+    no group memberships.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
@@ -585,20 +535,12 @@ async def _vector_search(conn, embedding: list, limit: int,
             params.append(val)
             conditions.append(f"{col}=${len(params)}")
     if owner_id is not None:
-        if group_ids is not None:
-            # Full v1_multiuser-mirror predicate via the shared module.
-            from api.visibility import read_visibility_predicate
-            clause, vis_params = read_visibility_predicate(
-                owner_id, list(group_ids), len(params) + 1,
-            )
-            conditions.append(clause)
-            params.extend(vis_params)
-        else:
-            # Legacy backward-compat: owner-or-federation only.
-            params.append(owner_id)
-            conditions.append(
-                f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
-            )
+        from api.visibility import read_visibility_predicate
+        clause, vis_params = read_visibility_predicate(
+            owner_id, list(group_ids or []), len(params) + 1,
+        )
+        conditions.append(clause)
+        params.extend(vis_params)
     params.append(limit)
     limit_ph = f"${len(params)}"
 
@@ -625,12 +567,11 @@ async def _fts_fetch(conn, query: str, limit: int,
     Supports optional provenance filters (source_provider, source_model,
     source_agent, namespace) ANDed into the WHERE clause.
 
-    When the caller passes ``owner_id`` AND ``group_ids``, the visibility
-    predicate is the full v1_multiuser-mirror — owner / federation /
-    world-readable / group-readable. Same shape used by list/get; consistent
-    across all read paths so a row visible via one path is visible via all.
-    Backward-compat: passing owner_id alone keeps the older (owner_id OR
-    federation_source) shape.
+    When the caller passes ``owner_id``, the visibility predicate is the
+    full v1_multiuser-mirror — owner / federation / world-readable /
+    group-readable. Same shape used by list/get; consistent across all read
+    paths so a row visible via one path is visible via all. ``group_ids`` may
+    be an empty list; omitted group_ids are treated as no group memberships.
     """
     if select_cols is None:
         select_cols = _MEMORY_COLS
@@ -651,18 +592,12 @@ async def _fts_fetch(conn, query: str, limit: int,
                 params.append(val)
                 conditions.append(f"{col}=${len(params)}")
         if owner_id is not None:
-            if group_ids is not None:
-                from api.visibility import read_visibility_predicate
-                clause, vis_params = read_visibility_predicate(
-                    owner_id, list(group_ids), len(params) + 1,
-                )
-                conditions.append(clause)
-                params.extend(vis_params)
-            else:
-                params.append(owner_id)
-                conditions.append(
-                    f"(owner_id=${len(params)} OR federation_source IS NOT NULL)"
-                )
+            from api.visibility import read_visibility_predicate
+            clause, vis_params = read_visibility_predicate(
+                owner_id, list(group_ids or []), len(params) + 1,
+            )
+            conditions.append(clause)
+            params.extend(vis_params)
         return conditions, params
 
     # FTS path: $1=query, $2=limit; filter params at $3+

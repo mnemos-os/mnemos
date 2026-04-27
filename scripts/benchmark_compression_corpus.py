@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compression-contest benchmark harness (v3.3 S-II).
 
-Runs LETHE + ANAMNESIS + APOLLO on a corpus of memories against a
+Runs ARTEMIS + APOLLO on a corpus of memories against a
 live GPU inference endpoint. Captures per-engine judge scores,
 composite scores, winners, and latencies to JSONL for offline
 analysis.
@@ -46,7 +46,7 @@ Output JSONL schema
       "winner_composite": 0.67,
       "candidates": [
         {
-          "engine_id": "lethe",
+          "engine_id": "artemis",
           "quality_score": 0.85,
           "compression_ratio": 0.40,
           "elapsed_ms": 2,
@@ -433,11 +433,7 @@ async def _run(args) -> int:
         names = [m.get("id") or m.get("name") for m in models]
         print(f"[info] endpoint up; models: {names}", file=sys.stderr)
 
-    # v3.3 default contest stack: Artemis + Apollo.
-    # Prior engines (LETHE, ANAMNESIS) included here for benchmark
-    # comparability across stack revisions. LETHE / ANAMNESIS were
-    # removed in v3.3 (see EVOLUTION.md "v3.2 tail") so the harness
-    # now benchmarks the going-forward stack only.
+    # Default contest stack: Artemis + Apollo.
     engines = [
         ARTEMISEngine(),
         APOLLOEngine(enable_llm_fallback=True, gpu_url=args.gpu_url),

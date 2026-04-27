@@ -18,7 +18,6 @@ from api.lifecycle import (
     _get_embedding,
     _row_to_memory,
     _vector_search,
-    COMPRESSION_RESULT_SET_THRESHOLD,
 )
 from api.models import (
     BulkCreateRequest,
@@ -51,22 +50,6 @@ async def _rls_context(conn, user: UserContext):
             yield conn
     else:
         yield conn
-
-
-async def _persist_compression(memory_id: str, compressed_text: str) -> None:
-    """Persist on-the-fly compression back to DB. Guard: only updates if compressed_content IS NULL."""
-    if not _lc._pool:
-        return
-    try:
-        async with _lc._pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE memories SET compressed_content=$1, llm_optimized=true "
-                "WHERE id=$2 AND compressed_content IS NULL",
-                compressed_text, memory_id,
-            )
-        logger.debug(f"[PHASE2] Persisted compression for {memory_id[:8]}")
-    except Exception as e:
-        logger.warning(f"[PHASE2] Failed to persist compression for {memory_id}: {e}")
 
 
 def _is_root(user: UserContext) -> bool:
@@ -394,7 +377,7 @@ async def search_memories(
     request: MemorySearchRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Search memories with optional compression of large result sets (cached 5 min)."""
+    """Search memories with optional 5-minute response caching."""
     request_limit = min(request.limit, 500)  # server-side cap regardless of model field
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
@@ -505,21 +488,6 @@ async def search_memories(
 
     compression_applied = False
     compression_metadata = {}
-    total_size = sum(len(m.content) for m in memories)
-
-    if total_size > COMPRESSION_RESULT_SET_THRESHOLD:
-        backend = _lc.get_inference_backend()
-        backend_healthy = await backend.health_check()
-        if backend_healthy:
-            # Phase 2 complete: compression stack available (LETHE + ANAMNESIS; APOLLO in v3.3+)
-            # On-the-fly search result compression deferred to Phase 8A (batch optimization)
-            # Gateway uses LETHE compression for memory injection (critical path)
-            logger.debug(
-                f"[COMPRESSION] Result set {total_size} bytes > threshold; "
-                f"on-the-fly compression deferred to Phase 8A"
-            )
-        else:
-            logger.warning("[PHASE2] distillation backend unavailable, skipping compression")
 
     response = MemoryListResponse(
         count=len(memories),
@@ -836,9 +804,8 @@ async def rehydrate_memories(
 
     # v3.2 compression-in-hot-paths: rehydrate is the canonical
     # "fit memories into a token budget" path, so it benefits most
-    # from preferring the v3.1 contest winner variant over the raw
-    # content. Fallback chain: contest winner -> v3.0
-    # memories.compressed_content -> raw content.
+    # from preferring the contest winner variant over the raw content.
+    # Fallback chain: contest winner -> raw content.
     #
     # Inlined here (rather than routed through _fts_fetch) because
     # the JOIN shape is rehydrate-specific: one-to-one with
@@ -879,7 +846,7 @@ async def rehydrate_memories(
     sql = (
         "SELECT m.id, m.category, m.created, m.quality_rating, "
         "       m.content AS raw_content, "
-        "       COALESCE(v.compressed_content, m.compressed_content) AS compressed_content, "
+        "       v.compressed_content AS compressed_content, "
         "       v.compressed_content IS NOT NULL AS variant_used, "
         "       ts_rank(to_tsvector('english', m.content), "
         "               plainto_tsquery('english', $1)) AS rank "
@@ -903,7 +870,7 @@ async def rehydrate_memories(
     raw_size = 0
     variant_hits = 0
     for row in rows:
-        # Prefer contest winner (variant_used=True) or v3.0 column, else raw.
+        # Prefer contest winner (variant_used=True), else raw.
         effective = row["compressed_content"] or row["raw_content"]
         raw_size += len(row["raw_content"] or "")
         if row["variant_used"]:

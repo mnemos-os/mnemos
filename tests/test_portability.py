@@ -1806,7 +1806,7 @@ def test_import_post_verification_rolls_back_when_memory_unversioned(monkeypatch
 def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkeypatch):
     """Codex review #4: post-verification must scope to records THIS
     request actually INSERTed, not the full envelope.records list.
-    Otherwise a pre-existing legacy memory with no v1 history (which
+    Otherwise a pre-existing memory with no v1 history (which
     this transaction did not create) could roll back an unrelated
     import. _DupeConn returns INSERT 0 0 for everything → nothing
     new was inserted → no post-verification rollback even though
@@ -1845,7 +1845,7 @@ def test_import_post_verification_ignores_pre_existing_uncovered_memories(monkey
     conn = _DupeConn(routed_rows={
         "FROM memories WHERE id = ANY": [_allowlist_row(memory_id="mem_alice1")],
         # Coverage SELECT: returns empty (the pre-existing memory has
-        # no v1 — legacy data). Without the inserted-set scope, this
+        # no v1). Without the inserted-set scope, this
         # would trigger the 500 rollback.
         "SELECT DISTINCT memory_id FROM memory_versions": [],
         "FROM memory_versions WHERE id = $1::uuid": [matching_existing],

@@ -266,8 +266,7 @@ class _FakeWebhookConn:
             lease_token = str(args[1])
             limit = args[2]
             lease_seconds = int(args[3])
-            legacy_grace_seconds = args[4]
-            current_revision = args[5]
+            current_revision = args[4]
             claim_db_now = datetime.now(timezone.utc)
             claimed = []
             for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
@@ -277,9 +276,7 @@ class _FakeWebhookConn:
                     continue
                 if not self._lease_available(row):
                     continue
-                if not self._legacy_lease_less_settled(
-                    row, claim_db_now, legacy_grace_seconds, current_revision,
-                ):
+                if row.get("writer_revision") != current_revision:
                     continue
                 if self._has_succeeded_chain_peer(row):
                     continue
@@ -328,8 +325,7 @@ class _FakeWebhookConn:
             raise AssertionError(f"unexpected fetch SQL: {sql}")
         max_attempts = args[0]
         limit = args[1] if len(args) > 1 else 50
-        legacy_grace_seconds = args[2] if len(args) > 2 else 0
-        current_revision = args[3] if len(args) > 3 else 1
+        current_revision = args[2] if len(args) > 2 else 1
         now = datetime.now(timezone.utc)
         recoverable = []
         for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
@@ -342,14 +338,12 @@ class _FakeWebhookConn:
             if self._has_succeeded_chain_peer(row):
                 continue
             if row["status"] == "pending":
-                if self._legacy_lease_less_settled(
-                    row, now, legacy_grace_seconds, current_revision,
-                ) and self._try_lock(row["id"]):
+                if row.get("writer_revision") == current_revision and self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
             elif (
                 row["status"] == "retrying"
                 and not self._has_successor(row)
-                and self._legacy_lease_less_settled(row, now, legacy_grace_seconds, current_revision)
+                and row.get("writer_revision") == current_revision
             ):
                 if self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
@@ -369,8 +363,7 @@ class _FakeWebhookConn:
         if compact.startswith("UPDATE webhook_deliveries d SET lease_token"):
             row = self._row(args[0])
             max_attempts = args[3]
-            legacy_grace_seconds = args[4] if len(args) > 4 else 0
-            current_revision = args[5] if len(args) > 5 else 1
+            current_revision = args[4] if len(args) > 4 else 1
             if row is None or not self._due_live_and_leaseable(row, max_attempts):
                 return None
             if row["status"] == "retrying" and self._has_successor(row):
@@ -380,9 +373,7 @@ class _FakeWebhookConn:
             claim_db_now = datetime.now(timezone.utc)
             if (
                 row["status"] in {"pending", "retrying"}
-                and not self._legacy_lease_less_settled(
-                    row, claim_db_now, legacy_grace_seconds, current_revision,
-                )
+                and row.get("writer_revision") != current_revision
             ):
                 return None
             self._record_row_change(row)
@@ -720,20 +711,6 @@ class _FakeWebhookConn:
             and not row.get("superseded", False)
             and row["status"] in {"pending", "retrying"}
             and self._lease_available(row)
-        )
-
-    def _legacy_lease_less_settled(
-        self,
-        row: dict[str, Any],
-        now: datetime,
-        grace_seconds: int,
-        current_revision: int,
-    ) -> bool:
-        status_updated_at = row.get("status_updated_at", row["scheduled_at"])
-        return (
-            row.get("lease_token") is not None
-            or row.get("writer_revision") == current_revision
-            or status_updated_at + timedelta(seconds=grace_seconds) <= now
         )
 
     def _with_subscription(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -1142,26 +1119,6 @@ def test_successor_insert_uses_live_chain_attempt_uniqueness(monkeypatch):
     asyncio.run(run())
 
 
-def test_migration_backfill_gives_live_legacy_rows_fresh_grace_clock(monkeypatch):
-    async def run():
-        parent = _attempt()
-        parent["writer_revision"] = None
-        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(minutes=10)
-        migration_moment = datetime.now(timezone.utc)
-        parent["status_updated_at"] = migration_moment
-        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
-        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
-
-        before_grace = await dispatcher._recoverable_delivery_ids(conn)
-        assert before_grace == []
-
-        parent["status_updated_at"] = migration_moment - timedelta(seconds=61)
-        after_grace = await dispatcher._recoverable_delivery_ids(conn)
-        assert [row["id"] for row in after_grace] == [parent["id"]]
-
-    asyncio.run(run())
-
-
 def test_recovery_dequeue_uses_skip_locked_claim():
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
@@ -1182,71 +1139,48 @@ def test_recovery_dequeue_uses_skip_locked_claim():
     assert "_attempt_delivery_locked" not in compact
 
 
-def test_recoverable_predicate_requires_legacy_grace_for_lease_less_old_writer_rows():
+def test_recoverable_predicate_requires_current_writer_revision():
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact = " ".join(source.split())
 
-    assert "WEBHOOK_LEGACY_GRACE_SECONDS" in source
     assert "NEW_CODE_WRITER_REVISION = 1" in source
-    assert "status_updated_at" in source
     assert "AND d.status NOT IN ('succeeded', 'abandoned') AND NOT d.superseded" in compact
     assert "AND NOT d.superseded AND d.status IN ('pending', 'retrying')" in compact
-    assert (
-        "d.lease_token IS NOT NULL "
-        "OR d.writer_revision = $4 "
-        "OR d.status_updated_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()"
-    ) in compact
-    assert (
-        "d.lease_token IS NOT NULL "
-        "OR d.writer_revision = $6 "
-        "OR d.status_updated_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now"
-    ) in compact
-    assert "OR d.scheduled_at + ($3::int * INTERVAL '1 second')" not in compact
-    assert "OR d.scheduled_at + ($5::int * INTERVAL '1 second')" not in compact
+    assert "AND d.writer_revision = $3" in compact
+    assert "AND d.writer_revision = $5" in compact
+    assert "status_updated_at + " not in compact
     assert "lease_expires_at=claim_clock.claim_now + ($3::int * INTERVAL '1 second')" in compact
     assert "claim_clock.claim_now AS claim_db_now" in compact
     assert "NOW() AS claim_db_now" not in compact
 
 
-def test_lease_less_legacy_retrying_grace_uses_status_transition_time(monkeypatch):
+def test_non_current_writer_retrying_is_not_recoverable(monkeypatch):
     async def run():
         for writer_revision in (None, 0):
             parent = _attempt()
             parent["status"] = "retrying"
             parent["writer_revision"] = writer_revision
             dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
-            monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
 
             parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(minutes=10)
-            parent["status_updated_at"] = datetime.now(timezone.utc)
-            before_grace = await dispatcher._recoverable_delivery_ids(conn)
-            assert before_grace == []
-
-            parent["status_updated_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
-            after_grace = await dispatcher._recoverable_delivery_ids(conn)
-            assert [row["id"] for row in after_grace] == [parent["id"]]
+            parent["status_updated_at"] = datetime.now(timezone.utc) - timedelta(minutes=10)
+            recoverable = await dispatcher._recoverable_delivery_ids(conn)
+            assert recoverable == []
 
     asyncio.run(run())
 
 
-def test_lease_less_legacy_pending_waits_for_grace_before_recovery(monkeypatch):
+def test_non_current_writer_pending_is_not_recoverable(monkeypatch):
     async def run():
         parent = _attempt()
         parent["writer_revision"] = None
         dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
-        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
 
-        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=10)
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(minutes=10)
         parent["status_updated_at"] = parent["scheduled_at"]
-        assert parent["status_updated_at"] == parent["scheduled_at"]
-        before_grace = await dispatcher._recoverable_delivery_ids(conn)
-        assert before_grace == []
-
-        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
-        parent["status_updated_at"] = parent["scheduled_at"]
-        after_grace = await dispatcher._recoverable_delivery_ids(conn)
-        assert [row["id"] for row in after_grace] == [parent["id"]]
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+        assert recoverable == []
 
     asyncio.run(run())
 
@@ -1258,7 +1192,6 @@ def test_lease_less_new_writer_pending_and_retrying_recover_immediately(monkeypa
             parent["status"] = status
             dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
             parent["writer_revision"] = dispatcher.NEW_CODE_WRITER_REVISION
-            monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
 
             parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
             parent["status_updated_at"] = datetime.now(timezone.utc)
@@ -1478,7 +1411,7 @@ def test_finalize_with_stale_lease_token_is_noop(monkeypatch):
     asyncio.run(run())
 
 
-def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
+def test_success_finalize_does_not_abandon_same_row_prior_success(monkeypatch):
     async def run():
         row = _attempt()
         lease_token = "00000000-0000-0000-0000-000000000015"
@@ -1491,11 +1424,11 @@ def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
         )
         assert claimed is not None
 
-        # Old workers did not know about leases, so a rolling-upgrade race can
-        # leave the new worker's lease columns on a row already marked succeeded.
+        # The live-row guard prevents any out-of-order terminal writer from
+        # turning an already succeeded row into a fresh success transaction.
         row["status"] = "succeeded"
         row["response_status"] = 202
-        row["response_body"] = "legacy metadata"
+        row["response_body"] = "prior metadata"
         row["delivered_at"] = datetime.now(timezone.utc)
         assert row["lease_token"] == lease_token
 
@@ -1506,7 +1439,7 @@ def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
             dispatcher._DeliveryResult(
                 succeeded=True,
                 response_status=204,
-                response_body="legacy acknowledged",
+                response_body="new acknowledged",
                 error=None,
             ),
         )
@@ -1516,13 +1449,13 @@ def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
         assert row["status"] == "succeeded"
         assert row["superseded"] is False
         assert row["response_status"] == 202
-        assert row["response_body"] == "legacy metadata"
+        assert row["response_body"] == "prior metadata"
         assert row["lease_token"] is None
 
     asyncio.run(run())
 
 
-def test_success_finalize_does_not_resurrect_same_row_legacy_abandon(monkeypatch):
+def test_success_finalize_does_not_resurrect_same_row_prior_abandon(monkeypatch):
     async def run():
         row = _attempt()
         lease_token = "00000000-0000-0000-0000-000000000018"
@@ -1538,8 +1471,8 @@ def test_success_finalize_does_not_resurrect_same_row_legacy_abandon(monkeypatch
         row["status"] = "abandoned"
         row["superseded"] = False
         row["response_status"] = 410
-        row["response_body"] = "legacy gone"
-        row["error"] = "legacy abandoned"
+        row["response_body"] = "prior gone"
+        row["error"] = "prior abandoned"
         row["delivered_at"] = datetime.now(timezone.utc)
         assert row["lease_token"] == lease_token
 
@@ -1560,14 +1493,14 @@ def test_success_finalize_does_not_resurrect_same_row_legacy_abandon(monkeypatch
         assert row["status"] == "abandoned"
         assert row["superseded"] is False
         assert row["response_status"] == 410
-        assert row["response_body"] == "legacy gone"
-        assert row["error"] == "legacy abandoned"
+        assert row["response_body"] == "prior gone"
+        assert row["error"] == "prior abandoned"
         assert row["lease_token"] is None
 
     asyncio.run(run())
 
 
-def test_failure_finalize_does_not_clobber_same_row_legacy_success(monkeypatch):
+def test_failure_finalize_does_not_clobber_same_row_prior_success(monkeypatch):
     async def run():
         row = _attempt()
         lease_token = "00000000-0000-0000-0000-000000000016"
@@ -1580,11 +1513,11 @@ def test_failure_finalize_does_not_clobber_same_row_legacy_success(monkeypatch):
         )
         assert claimed is not None
 
-        # Old workers did not know about leases, so they can terminalize the
-        # same row while leaving a new worker's lease columns intact.
+        # The live-row guard keeps a stale failure finalize from overwriting
+        # any already terminal same-row success.
         row["status"] = "succeeded"
         row["response_status"] = 204
-        row["response_body"] = "legacy acknowledged"
+        row["response_body"] = "prior acknowledged"
         row["delivered_at"] = datetime.now(timezone.utc)
         assert row["lease_token"] == lease_token
 
@@ -1611,13 +1544,13 @@ def test_failure_finalize_does_not_clobber_same_row_legacy_success(monkeypatch):
         assert row["status"] == "succeeded"
         assert row["superseded"] is False
         assert row["response_status"] == 204
-        assert row["response_body"] == "legacy acknowledged"
+        assert row["response_body"] == "prior acknowledged"
         assert row["lease_token"] == lease_token
 
     asyncio.run(run())
 
 
-def test_failure_finalize_does_not_clobber_same_row_legacy_abandon(monkeypatch):
+def test_failure_finalize_does_not_clobber_same_row_prior_abandon(monkeypatch):
     async def run():
         row = _attempt()
         lease_token = "00000000-0000-0000-0000-000000000017"
@@ -1632,7 +1565,7 @@ def test_failure_finalize_does_not_clobber_same_row_legacy_abandon(monkeypatch):
 
         row["status"] = "abandoned"
         row["superseded"] = False
-        row["error"] = "legacy abandoned"
+        row["error"] = "prior abandoned"
         row["delivered_at"] = datetime.now(timezone.utc)
         assert row["lease_token"] == lease_token
 
@@ -1658,7 +1591,7 @@ def test_failure_finalize_does_not_clobber_same_row_legacy_abandon(monkeypatch):
         assert row["status"] == "abandoned"
         assert row["superseded"] is False
         assert row["response_status"] is None
-        assert row["error"] == "legacy abandoned"
+        assert row["error"] == "prior abandoned"
         assert row["lease_token"] == lease_token
 
     asyncio.run(run())

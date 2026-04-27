@@ -1,8 +1,8 @@
 """CompressionEngine ABC — contract tests.
 
 Static / in-process checks only (no DB, no GPU). Pins the shape of the
-plugin interface that every built-in engine (LETHE/ALETHEIA/ANAMNESIS/
-APOLLO) and every operator-registered plugin must honor:
+plugin interface that every built-in engine (APOLLO/ARTEMIS) and every
+operator-registered plugin must honor:
 
   * class-level id/label are required; __init__ raises NotImplementedError
     if either is empty (protects against copy-paste subclasses that

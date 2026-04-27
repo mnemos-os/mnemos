@@ -123,7 +123,7 @@ def test_cross_encoder_judge_clamps_out_of_range(monkeypatch):
     judge = CrossEncoderJudge()
     r = asyncio.run(judge.score(
         original="x", candidate_encoded="y", candidate_narrated="y",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert r is not None
     assert r.fidelity == 1.0
@@ -134,7 +134,7 @@ def test_cross_encoder_judge_clamps_negative(monkeypatch):
     judge = CrossEncoderJudge()
     r = asyncio.run(judge.score(
         original="x", candidate_encoded="y", candidate_narrated="y",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert r is not None
     assert r.fidelity == 0.0
@@ -146,11 +146,11 @@ def test_cross_encoder_judge_empty_inputs_short_circuit(monkeypatch):
 
     r1 = asyncio.run(judge.score(
         original="", candidate_encoded="y", candidate_narrated="y",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     r2 = asyncio.run(judge.score(
         original="x", candidate_encoded="y", candidate_narrated="",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert r1 is None and r2 is None
     assert fake.calls == [], "empty inputs must short-circuit before model load"
@@ -173,7 +173,7 @@ def test_cross_encoder_judge_predict_exception_returns_none(monkeypatch):
     judge = CrossEncoderJudge()
     r = asyncio.run(judge.score(
         original="x", candidate_encoded="y", candidate_narrated="y",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert r is None
 
@@ -184,7 +184,7 @@ def test_cross_encoder_judge_truncates_long_inputs(monkeypatch):
     long = "x" * 10000
     asyncio.run(judge.score(
         original=long, candidate_encoded=long, candidate_narrated=long,
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     pair = fake.calls[0]["pairs"][0]
     # Both elements of the pair truncated to 4000 chars.
