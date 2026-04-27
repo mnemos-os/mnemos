@@ -168,6 +168,7 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_4_federation_compat.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_trigger_same_memory_parent.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_rls_group_select_unix_bits.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_retry_terminal_state.sql"),
     ]
 
     print("=" * 60)

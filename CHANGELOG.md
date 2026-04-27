@@ -76,6 +76,17 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 - **Project URLs moved.** `pyproject.toml` metadata points at
   `mnemos-os/mnemos`.
 
+### Fixed
+
+- **Webhook retry replay state machine** — `api/webhook_dispatcher.py:121-146`
+  now recovers due `pending` rows plus `retrying` rows only when no
+  successor attempt exists; `_attempt_delivery` treats
+  `retry_scheduled` as terminal (`api/webhook_dispatcher.py:198-231`)
+  and atomically inserts the successor before terminalizing the failed
+  attempt (`api/webhook_dispatcher.py:353-392`). The new migration
+  `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs
+  existing superseded `retrying` rows and keeps them out of replay.
+
 ### Conflicts and operator handling
 
 - Trigger-raised `MN001` maps to HTTP 409 with reconciliation guidance:
@@ -86,7 +97,6 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 
 ### Still open on the v3.5 backlog
 
-- #20 webhook retry state machine.
 - #21 federation per-peer ACL + stable cursor.
 - #22 audit endpoint scoping + lifespan teardown.
 - #23 entity namespace conflict-key migration.

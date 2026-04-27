@@ -10,9 +10,10 @@ Design notes
   before the HTTP call so crashes between queue and send can be replayed.
 - Initial attempt runs inline as a background task (asyncio.create_task via
   _schedule_background). On failure, a new delivery row is scheduled at the
-  next backoff interval; a recovery worker started at app lifespan wakes
-  periodically and picks up any rows whose `scheduled_at <= NOW()` and whose
-  `status IN ('pending', 'retrying')`.
+  next backoff interval; the failed attempt is marked `retry_scheduled` so it
+  remains available for audit without being replayed. A recovery worker
+  started at app lifespan wakes periodically and picks up due `pending` rows,
+  plus due `retrying` rows that do not already have a successor attempt.
 - HMAC-SHA256 signature over the raw JSON body bytes. Receivers verify with
   the per-subscription secret returned once at create time.
 
@@ -39,6 +40,13 @@ BACKOFF_SCHEDULE = [60, 300, 1800, 7200]
 MAX_ATTEMPTS = len(BACKOFF_SCHEDULE)  # = 4
 DELIVERY_TIMEOUT = 10.0                # seconds per HTTP POST
 RECOVERY_POLL_INTERVAL = 30.0          # seconds between recovery-worker passes
+SUPERSEDED_RETRY_STATUS = "retry_scheduled"
+TERMINAL_DELIVERY_STATUSES = frozenset((
+    "succeeded",
+    "abandoned",
+    SUPERSEDED_RETRY_STATUS,
+))
+LIVE_DELIVERY_STATUSES = frozenset(("pending", "retrying"))
 
 
 # ── Public surface ────────────────────────────────────────────────────────────
@@ -96,17 +104,7 @@ async def recovery_worker_loop(pool: asyncpg.Pool) -> None:
         try:
             await asyncio.sleep(RECOVERY_POLL_INTERVAL)
             async with pool.acquire() as conn:
-                rows = await conn.fetch(
-                    """
-                    SELECT id FROM webhook_deliveries
-                    WHERE status IN ('pending', 'retrying')
-                      AND scheduled_at <= NOW()
-                      AND attempt_num <= $1
-                    ORDER BY scheduled_at
-                    LIMIT 50
-                    """,
-                    MAX_ATTEMPTS,
-                )
+                rows = await _recoverable_delivery_ids(conn)
             for row in rows:
                 from api.lifecycle import _schedule_background  # noqa: WPS433
                 _schedule_background(_attempt_delivery(str(row["id"])))
@@ -118,6 +116,34 @@ async def recovery_worker_loop(pool: asyncpg.Pool) -> None:
 
 
 # ── Internals ─────────────────────────────────────────────────────────────────
+
+
+async def _recoverable_delivery_ids(conn: asyncpg.Connection) -> Iterable[asyncpg.Record]:
+    """Return due delivery rows that are safe for recovery to schedule."""
+    return await conn.fetch(
+        """
+        SELECT d.id FROM webhook_deliveries d
+        WHERE d.scheduled_at <= NOW()
+          AND d.attempt_num <= $1
+          AND (
+            d.status = 'pending'
+            OR (
+              d.status = 'retrying'
+              AND NOT EXISTS (
+                SELECT 1
+                FROM webhook_deliveries newer
+                WHERE newer.subscription_id = d.subscription_id
+                  AND newer.event_type = d.event_type
+                  AND newer.payload_hash = d.payload_hash
+                  AND newer.attempt_num > d.attempt_num
+              )
+            )
+          )
+        ORDER BY d.scheduled_at
+        LIMIT 50
+        """,
+        MAX_ATTEMPTS,
+    )
 
 
 async def _matching_subscriptions(
@@ -158,7 +184,7 @@ async def _attempt_delivery(delivery_id: str) -> None:
         delivery = await conn.fetchrow(
             """
             SELECT d.id, d.subscription_id, d.event_type, d.payload,
-                   d.attempt_num, d.status,
+                   d.payload_hash, d.attempt_num, d.status,
                    s.url, s.secret, s.revoked
             FROM webhook_deliveries d
             JOIN webhook_subscriptions s ON s.id = d.subscription_id
@@ -169,12 +195,59 @@ async def _attempt_delivery(delivery_id: str) -> None:
         if not delivery:
             logger.warning("webhook delivery %s not found", delivery_id)
             return
-        if delivery["status"] in ("succeeded", "abandoned"):
+        if delivery["status"] in TERMINAL_DELIVERY_STATUSES:
             return  # already terminal
+        if delivery["status"] not in LIVE_DELIVERY_STATUSES:
+            logger.warning(
+                "webhook delivery %s has unsupported status %s",
+                delivery_id, delivery["status"],
+            )
+            return
+        if delivery["status"] == "retrying":
+            has_successor = await conn.fetchval(
+                """
+                SELECT EXISTS (
+                  SELECT 1
+                  FROM webhook_deliveries newer
+                  WHERE newer.subscription_id = $1
+                    AND newer.event_type = $2
+                    AND newer.payload_hash = $3
+                    AND newer.attempt_num > $4
+                )
+                """,
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload_hash"],
+                delivery["attempt_num"],
+            )
+            if has_successor:
+                await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status=$2
+                    WHERE id=$1::uuid AND status='retrying'
+                    """,
+                    delivery_id, SUPERSEDED_RETRY_STATUS,
+                )
+                return
+        else:
+            claimed = await conn.fetchval(
+                """
+                UPDATE webhook_deliveries
+                SET status='retrying'
+                WHERE id=$1::uuid
+                  AND status='pending'
+                  AND scheduled_at <= NOW()
+                RETURNING id
+                """,
+                delivery_id,
+            )
+            if claimed is None:
+                return
         if delivery["revoked"]:
             await conn.execute(
                 "UPDATE webhook_deliveries SET status='abandoned', error='subscription revoked' "
-                "WHERE id=$1::uuid",
+                "WHERE id=$1::uuid AND status='retrying'",
                 delivery_id,
             )
             return
@@ -222,63 +295,102 @@ async def _attempt_delivery(delivery_id: str) -> None:
 
     async with _pool.acquire() as conn:
         if succeeded:
-            await conn.execute(
-                """
-                UPDATE webhook_deliveries
-                SET status='succeeded',
-                    response_status=$2,
-                    response_body=$3,
-                    delivered_at=NOW()
-                WHERE id=$1::uuid
-                """,
-                delivery_id, response_status, response_body,
-            )
+            async with conn.transaction():
+                current_status = await conn.fetchval(
+                    "SELECT status FROM webhook_deliveries WHERE id=$1::uuid FOR UPDATE",
+                    delivery_id,
+                )
+                if current_status in TERMINAL_DELIVERY_STATUSES:
+                    return
+                if current_status not in LIVE_DELIVERY_STATUSES:
+                    logger.warning(
+                        "webhook delivery %s has unsupported status %s",
+                        delivery_id, current_status,
+                    )
+                    return
+                await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='succeeded',
+                        response_status=$2,
+                        response_body=$3,
+                        delivered_at=NOW()
+                    WHERE id=$1::uuid
+                    """,
+                    delivery_id, response_status, response_body,
+                )
             return
 
         next_attempt = delivery["attempt_num"] + 1
         if next_attempt > MAX_ATTEMPTS:
+            async with conn.transaction():
+                current_status = await conn.fetchval(
+                    "SELECT status FROM webhook_deliveries WHERE id=$1::uuid FOR UPDATE",
+                    delivery_id,
+                )
+                if current_status in TERMINAL_DELIVERY_STATUSES:
+                    return
+                if current_status not in LIVE_DELIVERY_STATUSES:
+                    logger.warning(
+                        "webhook delivery %s has unsupported status %s",
+                        delivery_id, current_status,
+                    )
+                    return
+                await conn.execute(
+                    """
+                    UPDATE webhook_deliveries
+                    SET status='abandoned',
+                        response_status=$2,
+                        response_body=$3,
+                        error=$4,
+                        delivered_at=NOW()
+                    WHERE id=$1::uuid
+                    """,
+                    delivery_id, response_status, response_body, error,
+                )
+            return
+
+        # Enqueue the next attempt row, then terminalize this failed attempt.
+        backoff = BACKOFF_SCHEDULE[delivery["attempt_num"] - 1]
+        scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+        async with conn.transaction():
+            current_status = await conn.fetchval(
+                "SELECT status FROM webhook_deliveries WHERE id=$1::uuid FOR UPDATE",
+                delivery_id,
+            )
+            if current_status in TERMINAL_DELIVERY_STATUSES:
+                return
+            if current_status not in LIVE_DELIVERY_STATUSES:
+                logger.warning(
+                    "webhook delivery %s has unsupported status %s",
+                    delivery_id, current_status,
+                )
+                return
+            await conn.execute(
+                """
+                INSERT INTO webhook_deliveries
+                  (subscription_id, event_type, payload, payload_hash,
+                   attempt_num, status, scheduled_at)
+                VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+                """,
+                delivery["subscription_id"],
+                delivery["event_type"],
+                delivery["payload"],
+                delivery["payload_hash"],
+                next_attempt,
+                scheduled_at,
+            )
             await conn.execute(
                 """
                 UPDATE webhook_deliveries
-                SET status='abandoned',
-                    response_status=$2,
-                    response_body=$3,
-                    error=$4,
-                    delivered_at=NOW()
+                SET status=$2,
+                    response_status=$3,
+                    response_body=$4,
+                    error=$5
                 WHERE id=$1::uuid
                 """,
-                delivery_id, response_status, response_body, error,
+                delivery_id, SUPERSEDED_RETRY_STATUS, response_status, response_body, error,
             )
-            return
-
-        # Mark current attempt as retrying and enqueue the next attempt row
-        backoff = BACKOFF_SCHEDULE[delivery["attempt_num"] - 1]
-        scheduled_at = datetime.now(timezone.utc) + timedelta(seconds=backoff)
-        await conn.execute(
-            """
-            UPDATE webhook_deliveries
-            SET status='retrying',
-                response_status=$2,
-                response_body=$3,
-                error=$4
-            WHERE id=$1::uuid
-            """,
-            delivery_id, response_status, response_body, error,
-        )
-        await conn.execute(
-            """
-            INSERT INTO webhook_deliveries
-              (subscription_id, event_type, payload, payload_hash,
-               attempt_num, status, scheduled_at)
-            VALUES ($1, $2, $3, $4, $5, 'pending', $6)
-            """,
-            delivery["subscription_id"],
-            delivery["event_type"],
-            delivery["payload"],
-            hashlib.sha256(delivery["payload"].encode("utf-8")).hexdigest(),
-            next_attempt,
-            scheduled_at,
-        )
         logger.info(
             "webhook delivery %s attempt %d failed (status=%s error=%s), retry in %ds",
             delivery_id, delivery["attempt_num"], response_status, error, backoff,
