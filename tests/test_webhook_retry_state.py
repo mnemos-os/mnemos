@@ -335,9 +335,35 @@ class _FakeWebhookConn:
 
 
 class _FakeResponse:
-    def __init__(self, status_code: int):
+    def __init__(
+        self,
+        status_code: int,
+        *,
+        chunks: list[bytes],
+        chunk_delay: float,
+        never_complete: bool,
+        factory: "_HTTPClientFactory",
+    ):
         self.status_code = status_code
-        self.text = f"status={status_code}"
+        self.chunks = chunks
+        self.chunk_delay = chunk_delay
+        self.never_complete = never_complete
+        self.factory = factory
+
+    async def aiter_bytes(self):
+        try:
+            for chunk in self.chunks:
+                if self.chunk_delay:
+                    await asyncio.sleep(self.chunk_delay)
+                self.factory.chunks_yielded += 1
+                yield chunk
+            while self.never_complete:
+                await asyncio.sleep(self.chunk_delay or 3600)
+                self.factory.chunks_yielded += 1
+                yield b"x"
+        except asyncio.CancelledError:
+            self.factory.cancelled = True
+            raise
 
 
 class _HTTPClientFactory:
@@ -347,9 +373,48 @@ class _HTTPClientFactory:
         self.delay = 0.0
         self.active = 0
         self.max_active = 0
+        self.response_chunks: list[list[bytes]] = []
+        self.chunk_delay = 0.0
+        self.never_complete = False
+        self.started = asyncio.Event()
+        self.exited = 0
+        self.chunks_yielded = 0
+        self.cancelled = False
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
+
+
+class _FakeHTTPStream:
+    def __init__(self, factory: _HTTPClientFactory, headers):
+        self.factory = factory
+        self.headers = headers
+
+    async def __aenter__(self):
+        self.factory.active += 1
+        self.factory.max_active = max(self.factory.max_active, self.factory.active)
+        if self.factory.delay:
+            await asyncio.sleep(self.factory.delay)
+        status_code = self.factory.statuses.pop(0)
+        chunks = (
+            self.factory.response_chunks.pop(0)
+            if self.factory.response_chunks
+            else [f"status={status_code}".encode("utf-8")]
+        )
+        self.factory.delivery_ids.append(self.headers["X-MNEMOS-Delivery-ID"])
+        self.factory.started.set()
+        return _FakeResponse(
+            status_code,
+            chunks=chunks,
+            chunk_delay=self.factory.chunk_delay,
+            never_complete=self.factory.never_complete,
+            factory=self.factory,
+        )
+
+    async def __aexit__(self, exc_type, exc, tb):
+        self.factory.active -= 1
+        self.factory.exited += 1
+        return False
 
 
 class _FakeHTTPClient:
@@ -362,6 +427,9 @@ class _FakeHTTPClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
+    def stream(self, method, url, *, content, headers):
+        return _FakeHTTPStream(self.factory, headers)
+
     async def post(self, url, *, content, headers):
         self.factory.active += 1
         self.factory.max_active = max(self.factory.max_active, self.factory.active)
@@ -369,7 +437,14 @@ class _FakeHTTPClient:
             if self.factory.delay:
                 await asyncio.sleep(self.factory.delay)
             self.factory.delivery_ids.append(headers["X-MNEMOS-Delivery-ID"])
-            return _FakeResponse(self.factory.statuses.pop(0))
+            status_code = self.factory.statuses.pop(0)
+            return _FakeResponse(
+                status_code,
+                chunks=[f"status={status_code}".encode("utf-8")],
+                chunk_delay=0.0,
+                never_complete=False,
+                factory=self.factory,
+            )
         finally:
             self.factory.active -= 1
 
@@ -606,6 +681,86 @@ def test_webhook_send_concurrency_cap(monkeypatch):
         assert conn.store.advisory_acquisitions >= 6
 
     asyncio.run(run())
+
+
+def test_webhook_send_deadline_aborts_before_lease_replay_and_releases_semaphore(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        lease_seconds = 2
+        finalize_buffer = 1.9
+        send_deadline = dispatcher._derive_total_send_deadline_seconds(
+            lease_seconds,
+            finalize_buffer,
+        )
+        semaphore = asyncio.Semaphore(1)
+        monkeypatch.setattr(dispatcher, "WEBHOOK_LEASE_SECONDS", lease_seconds)
+        monkeypatch.setattr(dispatcher, "WEBHOOK_FINALIZE_BUFFER_SECONDS", finalize_buffer)
+        monkeypatch.setattr(dispatcher, "TOTAL_SEND_DEADLINE_SECONDS", send_deadline)
+        monkeypatch.setattr(dispatcher, "_send_semaphore", semaphore)
+        http.response_chunks = [[b"trickle"]]
+        http.chunk_delay = 0.02
+        http.never_complete = True
+
+        loop = asyncio.get_running_loop()
+        started_at = loop.time()
+        task = asyncio.create_task(dispatcher._attempt_delivery(row["id"]))
+        await asyncio.wait_for(http.started.wait(), timeout=0.5)
+
+        assert row["status"] == "retrying"
+        assert row["lease_expires_at"] > datetime.now(timezone.utc)
+        recovered_while_leased = await dispatcher._recover_due_deliveries(conn.pool, limit=1)
+        assert recovered_while_leased == 0
+        assert http.delivery_ids == [row["id"]]
+
+        finalized = await task
+        elapsed = loop.time() - started_at
+
+        assert finalized
+        assert elapsed < send_deadline + 0.35
+        assert http.cancelled
+        assert http.exited == 1
+        assert not semaphore.locked()
+        assert row["status"] == dispatcher.SUPERSEDED_RETRY_STATUS
+        assert row["error"].startswith("send-timeout:")
+        assert len(conn.rows) == 2
+        assert conn.rows[1]["status"] == "pending"
+
+    asyncio.run(run())
+
+
+def test_webhook_response_body_is_streamed_and_capped(monkeypatch):
+    async def run():
+        row = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [row], [200])
+        monkeypatch.setattr(dispatcher, "WEBHOOK_RESPONSE_BODY_MAX_BYTES", 10)
+        http.response_chunks = [[b"abcde", b"fghij", b"klmnop"]]
+
+        finalized = await dispatcher._attempt_delivery(row["id"])
+
+        assert finalized
+        assert row["status"] == "succeeded"
+        assert row["response_body"] == "abcdefghij"
+        assert len(row["response_body"].encode("utf-8")) == 10
+        assert http.chunks_yielded == 2
+
+    asyncio.run(run())
+
+
+def test_webhook_send_deadline_is_derived_from_lease_with_finalize_buffer():
+    from api import webhook_dispatcher as dispatcher
+
+    assert dispatcher._derive_total_send_deadline_seconds(2, 0.5) == 1.5
+    assert (
+        dispatcher.TOTAL_SEND_DEADLINE_SECONDS
+        == dispatcher.WEBHOOK_LEASE_SECONDS - dispatcher.WEBHOOK_FINALIZE_BUFFER_SECONDS
+    )
+    try:
+        dispatcher._derive_total_send_deadline_seconds(2, 2)
+    except ValueError as exc:
+        assert "WEBHOOK_LEASE_SECONDS" in str(exc)
+    else:
+        raise AssertionError("invalid webhook lease/deadline contract did not fail fast")
 
 
 def test_rolling_upgrade_interleaving_waits_for_chain_advisory_lock_before_no_successor_check(monkeypatch):

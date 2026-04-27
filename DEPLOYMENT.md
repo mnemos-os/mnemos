@@ -57,6 +57,15 @@ per-attempt leases plus per-chain advisory locks, and startup runs repeated
 repair sweeps for the first minute, but the one-time migration window still
 requires draining old writers first.
 
+`WEBHOOK_LEASE_SECONDS` is the authoritative webhook delivery ownership knob.
+The dispatcher derives the DNS-validation + HTTP-send + response-body-read
+deadline from it as `WEBHOOK_LEASE_SECONDS - WEBHOOK_FINALIZE_BUFFER_SECONDS`
+(5s by default). Startup fails if the lease is not larger than that finalize
+buffer, because recovery must never reclaim an attempt while an external POST
+can still be in flight. Keep `WEBHOOK_HTTP_TIMEOUT` at or below the derived
+send deadline if you tune it; `httpx` phase timeouts are not a replacement for
+the wall-clock lease deadline.
+
 ---
 
 ## Configuration

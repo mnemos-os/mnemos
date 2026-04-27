@@ -94,7 +94,11 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   with a per-chain advisory lock, and runs a startup repair burst before
   backing off to periodic repair sweeps. Operators must drain webhook
   writers before applying the v3.5 webhook retry migrations during rolling
-  upgrades.
+  upgrades. Round 4 derives one wall-clock send deadline from
+  `WEBHOOK_LEASE_SECONDS`, reserves a finalize buffer, wraps DNS validation,
+  the HTTP POST, and the response-body read in that deadline, and streams
+  response bodies into a fixed audit cap so a slow receiver cannot outlive
+  the lease or hold a semaphore slot indefinitely.
 
 ### Conflicts and operator handling
 

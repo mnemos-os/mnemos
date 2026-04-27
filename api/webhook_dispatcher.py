@@ -13,7 +13,10 @@ Design notes
   next backoff interval; the failed attempt is marked `retry_scheduled` so it
   remains available for audit without being replayed. Workers claim due rows
   by writing a short-lived lease, release the database connection, and only
-  then perform DNS validation and the outbound POST.
+  then perform DNS validation and the outbound POST. The lease is the
+  authoritative delivery budget: DNS validation, HTTP send, and capped response
+  body read run under one wall-clock deadline derived from the lease, leaving a
+  buffer for the finalize transaction before recovery can reclaim the attempt.
 - HMAC-SHA256 signature over the raw JSON body bytes. Receivers verify with
   the per-subscription secret returned once at create time.
 
@@ -47,6 +50,8 @@ WEBHOOK_LEASE_SECONDS = int(os.getenv(
     "WEBHOOK_LEASE_SECONDS",
     str(max(90, int(DNS_TIMEOUT + DELIVERY_TIMEOUT + 30))),
 ))
+WEBHOOK_FINALIZE_BUFFER_SECONDS = float(os.getenv("WEBHOOK_FINALIZE_BUFFER_SECONDS", "5.0"))
+WEBHOOK_RESPONSE_BODY_MAX_BYTES = int(os.getenv("WEBHOOK_RESPONSE_BODY_MAX_BYTES", "2048"))
 WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
 RECOVERY_POLL_INTERVAL = 30.0          # seconds between recovery-worker passes
 REPAIR_BURST_SECONDS = float(os.getenv("WEBHOOK_REPAIR_BURST_SECONDS", "60.0"))
@@ -60,6 +65,34 @@ TERMINAL_DELIVERY_STATUSES = frozenset((
 ))
 LIVE_DELIVERY_STATUSES = frozenset(("pending", "retrying"))
 _send_semaphore: asyncio.Semaphore | None = None
+
+
+def _derive_total_send_deadline_seconds(
+    lease_seconds: int,
+    finalize_buffer_seconds: float,
+) -> float:
+    """Derive the single wall-clock DNS+HTTP budget from the attempt lease."""
+    if finalize_buffer_seconds <= 0:
+        raise ValueError("WEBHOOK_FINALIZE_BUFFER_SECONDS must be positive")
+    deadline = float(lease_seconds) - finalize_buffer_seconds
+    if deadline <= 0:
+        raise ValueError(
+            "WEBHOOK_LEASE_SECONDS must be greater than WEBHOOK_FINALIZE_BUFFER_SECONDS "
+            "so webhook sends leave time for finalization before lease expiry"
+        )
+    return deadline
+
+
+if WEBHOOK_RESPONSE_BODY_MAX_BYTES <= 0:
+    raise ValueError("WEBHOOK_RESPONSE_BODY_MAX_BYTES must be positive")
+
+# Keep the lease as the only operator-facing ownership budget. The send
+# deadline is derived at import/startup so it cannot drift beyond the lease and
+# let recovery replay a still-running external POST.
+TOTAL_SEND_DEADLINE_SECONDS = _derive_total_send_deadline_seconds(
+    WEBHOOK_LEASE_SECONDS,
+    WEBHOOK_FINALIZE_BUFFER_SECONDS,
+)
 
 WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
     UPDATE webhook_deliveries d
@@ -291,9 +324,11 @@ async def _claim_delivery(
     delivery_id: str,
     *,
     lease_token: str,
-    lease_seconds: int = WEBHOOK_LEASE_SECONDS,
+    lease_seconds: int | None = None,
 ) -> Optional[asyncpg.Record]:
     """Persist a short lease for one due live delivery row."""
+    if lease_seconds is None:
+        lease_seconds = WEBHOOK_LEASE_SECONDS
     async with pool.acquire() as conn:
         async with conn.transaction():
             delivery = await _load_delivery_for_claim(conn, delivery_id)
@@ -351,6 +386,23 @@ async def _claim_delivery(
 
 async def _send_claimed_delivery(delivery: asyncpg.Record) -> _DeliveryResult:
     """Perform DNS validation and HTTP POST for an already leased row."""
+    try:
+        return await asyncio.wait_for(
+            _send_claimed_delivery_within_deadline(delivery),
+            timeout=TOTAL_SEND_DEADLINE_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        return _DeliveryResult(
+            succeeded=False,
+            error=(
+                "send-timeout: DNS validation, HTTP send, and response body read "
+                f"exceeded {TOTAL_SEND_DEADLINE_SECONDS:.1f}s wall-clock deadline"
+            ),
+        )
+
+
+async def _send_claimed_delivery_within_deadline(delivery: asyncpg.Record) -> _DeliveryResult:
+    """Run the network send path; caller supplies the wall-clock deadline."""
     if not delivery:
         return _DeliveryResult(succeeded=False, error="delivery not found")
     if delivery["revoked"]:
@@ -377,21 +429,20 @@ async def _send_claimed_delivery(delivery: asyncpg.Record) -> _DeliveryResult:
     # validate_webhook_url's docstring.
     try:
         from api.handlers.webhooks import validate_webhook_url
-        await asyncio.wait_for(validate_webhook_url(delivery["url"]), timeout=DNS_TIMEOUT)
-    except asyncio.TimeoutError:
-        error = f"url-rejected: TimeoutError: DNS validation exceeded {DNS_TIMEOUT:.1f}s"
+        await validate_webhook_url(delivery["url"])
     except Exception as e:
         error = f"url-rejected: {type(e).__name__}: {e}"
     else:
         try:
             async with httpx.AsyncClient(timeout=DELIVERY_TIMEOUT, follow_redirects=False) as client:
-                r = await client.post(
+                async with client.stream(
+                    "POST",
                     delivery["url"],
                     content=delivery["payload"].encode("utf-8"),
                     headers=headers,
-                )
-                response_status = r.status_code
-                response_body = r.text[:2048]
+                ) as response:
+                    response_status = response.status_code
+                    response_body = await _read_capped_response_body(response)
         except httpx.HTTPError as e:
             error = f"{type(e).__name__}: {e}"
         except Exception as e:  # pragma: no cover
@@ -404,6 +455,20 @@ async def _send_claimed_delivery(delivery: asyncpg.Record) -> _DeliveryResult:
         response_body=response_body,
         error=error,
     )
+
+
+async def _read_capped_response_body(response: httpx.Response) -> str:
+    """Read at most WEBHOOK_RESPONSE_BODY_MAX_BYTES from a streamed response."""
+    remaining = WEBHOOK_RESPONSE_BODY_MAX_BYTES
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if not chunk:
+            continue
+        body.extend(chunk[:remaining])
+        remaining -= min(len(chunk), remaining)
+        if remaining <= 0:
+            break
+    return bytes(body).decode("utf-8", errors="replace")
 
 
 async def _finalize_delivery(
