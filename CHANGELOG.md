@@ -118,7 +118,10 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   status-transition timestamp, and anchors legacy grace to it so old-writer
   `retrying` transitions cannot bypass grace with an old `scheduled_at`.
   Round 8 makes the status backfill conservative for live lease-less legacy
-  rows by starting their grace clock at migration time.
+  rows by starting their grace clock at migration time. Round 9 relaxes the
+  idempotent repair sweep so old-worker `pending`/`retrying` overwrites of an
+  already superseded attempt are terminalized again whenever a newer successor
+  exists.
 
 ### Conflicts and operator handling
 

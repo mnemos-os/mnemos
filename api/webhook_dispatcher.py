@@ -104,10 +104,10 @@ WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
     UPDATE webhook_deliveries d
     SET status = 'abandoned',
         superseded = TRUE,
+        status_updated_at = clock_timestamp(),
         lease_token = NULL,
         lease_expires_at = NULL
-    WHERE d.status = 'retrying'
-      AND NOT d.superseded
+    WHERE d.status IN ('pending', 'retrying')
       AND EXISTS (
         SELECT 1
         FROM webhook_deliveries newer
@@ -223,7 +223,7 @@ async def _repair_superseded_retrying_deliveries_safely(
 
 
 async def repair_superseded_retrying_deliveries(pool: asyncpg.Pool) -> str:
-    """Terminalize retrying attempts that already have a newer successor row."""
+    """Terminalize live-looking attempts that already have a newer successor row."""
     async with pool.acquire() as conn:
         return await conn.execute(WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL)
 

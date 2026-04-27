@@ -70,6 +70,9 @@ advance the grace clock even though that code knows nothing about the column.
 The migration backfill gives live lease-less legacy rows a fresh
 `clock_timestamp()` value, so the grace window starts from the migration run
 instead of from an old `scheduled_at`.
+The startup/periodic repair sweep is idempotent and terminalizes any
+`pending` or `retrying` row with a newer successor, including old-worker status
+overwrites of rows already marked `superseded=TRUE`.
 New-code rows with `writer_revision=1` are recoverable immediately. The default
 grace is 300 seconds. Tune it to cover the maximum expected old-writer rollout
 overlap; after the grace expires, the new recovery worker treats any

@@ -267,7 +267,7 @@ class _FakeWebhookConn:
             return self._has_successor(probe)
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
-            if row is None or row["status"] != "pending":
+            if row is None:
                 return None
             self._set_status(row, "retrying")
             return row["id"]
@@ -289,8 +289,7 @@ class _FakeWebhookConn:
             updated = 0
             for row in self.rows:
                 if (
-                    row["status"] == "retrying"
-                    and not row.get("superseded", False)
+                    row["status"] in {"pending", "retrying"}
                     and self._has_successor(row)
                 ):
                     self._set_status(row, "abandoned")
@@ -315,9 +314,15 @@ class _FakeWebhookConn:
             return "UPDATE 1"
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
-            if row is None or row["status"] != "pending":
+            if row is None:
                 return "UPDATE 0"
             self._set_status(row, "retrying")
+            return "UPDATE 1"
+        if compact.startswith("UPDATE webhook_deliveries SET status='pending'"):
+            row = self._row(args[0])
+            if row is None:
+                return "UPDATE 0"
+            self._set_status(row, "pending")
             return "UPDATE 1"
         if compact.startswith("INSERT INTO webhook_deliveries"):
             inserted = self._insert_delivery(*args)
@@ -601,6 +606,17 @@ async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int])
 
 def _make_due(row: dict[str, Any]) -> None:
     row["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+
+
+def _successor_for(row: dict[str, Any]) -> dict[str, Any]:
+    successor = _attempt(attempt_num=row["attempt_num"] + 1)
+    successor.update({
+        "subscription_id": row["subscription_id"],
+        "event_type": row["event_type"],
+        "payload": row["payload"],
+        "payload_hash": row["payload_hash"],
+    })
+    return successor
 
 
 def test_failed_attempt_terminalizes_and_only_successor_is_recoverable(monkeypatch):
@@ -1187,6 +1203,60 @@ def test_startup_repair_sweep_closes_upgrade_race(monkeypatch):
     asyncio.run(run())
 
 
+def test_repair_sweep_normalizes_old_worker_retrying_resurrect(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "abandoned"
+        parent["superseded"] = True
+        successor = _successor_for(parent)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        resurrected = await conn.execute(
+            "UPDATE webhook_deliveries SET status='retrying' WHERE id=$1::uuid",
+            parent["id"],
+        )
+        assert resurrected == "UPDATE 1"
+        assert parent["status"] == "retrying"
+        assert parent["superseded"] is True
+
+        result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert result == "UPDATE 1"
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
+        assert parent["id"] not in [row["id"] for row in recoverable]
+
+    asyncio.run(run())
+
+
+def test_repair_sweep_normalizes_old_worker_pending_resurrect(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["status"] = "abandoned"
+        parent["superseded"] = True
+        successor = _successor_for(parent)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        resurrected = await conn.execute(
+            "UPDATE webhook_deliveries SET status='pending' WHERE id=$1::uuid",
+            parent["id"],
+        )
+        assert resurrected == "UPDATE 1"
+        assert parent["status"] == "pending"
+        assert parent["superseded"] is True
+
+        result = await dispatcher.repair_superseded_retrying_deliveries(conn.pool)
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+
+        assert result == "UPDATE 1"
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
+        assert parent["id"] not in [row["id"] for row in recoverable]
+
+    asyncio.run(run())
+
+
 def test_lifecycle_runs_webhook_retry_repair_on_startup():
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_source = (repo_root / "api" / "lifecycle.py").read_text()
@@ -1199,6 +1269,9 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
     assert "REPAIR_PERIODIC_INTERVAL" in dispatcher_source
     assert "_repair_superseded_retrying_deliveries_safely" in dispatcher_source
     assert "UPDATE webhook_deliveries d SET status = 'abandoned', superseded = TRUE" in compact_dispatcher
+    assert "status_updated_at = clock_timestamp()" in compact_dispatcher
+    assert "WHERE d.status IN ('pending', 'retrying')" in compact_dispatcher
+    assert "WHERE d.status = 'retrying' AND NOT d.superseded" not in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
 
 
