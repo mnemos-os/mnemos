@@ -124,7 +124,11 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   exists. Round 10 splits retry repair and delivery recovery into independent
   lifespan tasks so slow webhook POSTs cannot starve the repair cadence, and
   makes the repair predicate skip rows with an unexpired lease so active
-  new-worker sends do not lose ownership.
+  new-worker sends do not lose ownership. Round 11 moves the app-side send
+  deadline anchor inside `_claim_delivery` immediately before the lease UPDATE,
+  makes lease-valid success finalization cancel free live successors under the
+  chain advisory lock, and drains in-flight webhook delivery attempts during
+  graceful shutdown before any last-resort cancellation.
 
 ### Conflicts and operator handling
 

@@ -128,6 +128,12 @@ class _DeliveryResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class _ClaimedDelivery:
+    delivery: asyncpg.Record
+    pre_claim_monotonic: float
+
+
 # ── Public surface ────────────────────────────────────────────────────────────
 
 
@@ -166,11 +172,11 @@ async def dispatch(
             """,
             sub["id"], event_type, body, body_hash, NEW_CODE_WRITER_REVISION,
         )
-        # Schedule the send via the lifecycle-tracked background registry
-        # so pending tasks are cancelled/awaited at shutdown. Import lazily to avoid
+        # Schedule the send via the lifecycle-tracked delivery registry
+        # so graceful shutdown lets in-flight attempts finalize. Import lazily to avoid
         # circular imports at module load time.
-        from api.lifecycle import _schedule_background  # noqa: WPS433
-        _schedule_background(_attempt_delivery(str(delivery_id)))
+        from api.lifecycle import _schedule_delivery_attempt  # noqa: WPS433
+        _schedule_delivery_attempt(_attempt_delivery(str(delivery_id)))
 
 
 async def repair_worker_loop(pool: asyncpg.Pool) -> None:
@@ -348,15 +354,14 @@ async def _attempt_delivery(delivery_id: str, *, pool: Optional[asyncpg.Pool] = 
 
     async with _get_send_semaphore():
         lease_token = str(uuid.uuid4())
-        delivery = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
-        if not delivery:
+        claimed = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
+        if not claimed:
             return False
-        claim_observed_monotonic = time.monotonic()
         result = await _send_claimed_delivery(
-            delivery,
-            claim_observed_monotonic=claim_observed_monotonic,
+            claimed.delivery,
+            pre_claim_monotonic=claimed.pre_claim_monotonic,
         )
-        return await _finalize_delivery(pool, delivery, lease_token, result)
+        return await _finalize_delivery(pool, claimed.delivery, lease_token, result)
 
 
 async def _claim_delivery(
@@ -365,7 +370,7 @@ async def _claim_delivery(
     *,
     lease_token: str,
     lease_seconds: int | None = None,
-) -> Optional[asyncpg.Record]:
+) -> Optional[_ClaimedDelivery]:
     """Persist a short lease for one due live delivery row."""
     if lease_seconds is None:
         lease_seconds = WEBHOOK_LEASE_SECONDS
@@ -390,7 +395,8 @@ async def _claim_delivery(
                 )
                 return None
 
-            return await conn.fetchrow(
+            pre_claim_monotonic = time.monotonic()
+            claimed = await conn.fetchrow(
                 """
                 UPDATE webhook_deliveries d
                 SET lease_token=$2::uuid,
@@ -436,17 +442,23 @@ async def _claim_delivery(
                 WEBHOOK_LEGACY_GRACE_SECONDS,
                 NEW_CODE_WRITER_REVISION,
             )
+            if claimed is None:
+                return None
+            return _ClaimedDelivery(
+                delivery=claimed,
+                pre_claim_monotonic=pre_claim_monotonic,
+            )
 
 
 async def _send_claimed_delivery(
     delivery: asyncpg.Record,
     *,
-    claim_observed_monotonic: float,
+    pre_claim_monotonic: float,
 ) -> _DeliveryResult:
     """Perform DNS validation and HTTP POST for an already leased row."""
     remaining_seconds = _claim_remaining_send_window_seconds(
         delivery,
-        claim_observed_monotonic=claim_observed_monotonic,
+        pre_claim_monotonic=pre_claim_monotonic,
     )
     if remaining_seconds <= MIN_SEND_WINDOW_SECONDS:
         return _DeliveryResult(
@@ -580,14 +592,15 @@ def _decode_capped_response_body(raw: bytes, max_bytes: int) -> str:
 def _claim_remaining_send_window_seconds(
     delivery: asyncpg.Record,
     *,
-    claim_observed_monotonic: float,
+    pre_claim_monotonic: float,
 ) -> float:
     """Compute remaining send time from DB claim timestamps plus app elapsed time."""
     lease_expires_at = _as_aware_utc(delivery["lease_expires_at"])
     claim_db_now = _as_aware_utc(delivery["claim_db_now"])
     db_claim_window = (lease_expires_at - claim_db_now).total_seconds()
-    elapsed_since_claim_observed = max(0.0, time.monotonic() - claim_observed_monotonic)
-    return db_claim_window - elapsed_since_claim_observed - WEBHOOK_FINALIZE_BUFFER_SECONDS
+    now_monotonic = time.monotonic()
+    elapsed_since_pre_claim = max(0.0, now_monotonic - pre_claim_monotonic)
+    return db_claim_window - elapsed_since_pre_claim - WEBHOOK_FINALIZE_BUFFER_SECONDS
 
 
 def _as_aware_utc(value: datetime) -> datetime:
@@ -647,7 +660,16 @@ async def _finalize_delivery(
                     """,
                     delivery_id, lease_token, result.response_status, result.response_body,
                 )
-                return finalized is not None
+                if finalized is None:
+                    return False
+
+                # A live successor after our lease-valid 2xx is a mixed-version
+                # artifact. This attempt already produced the canonical external delivery,
+                # so cancel a free successor instead of re-posting it.
+                successor = await _find_live_unleased_successor_attempt(conn, delivery)
+                if successor is not None:
+                    await _abandon_live_successor_attempt(conn, str(successor["id"]))
+                return True
 
             next_attempt = delivery["attempt_num"] + 1
             if next_attempt > MAX_ATTEMPTS:
@@ -797,6 +819,51 @@ async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Rec
         delivery["event_type"],
         delivery["payload_hash"],
         delivery["attempt_num"],
+    )
+
+
+async def _find_live_unleased_successor_attempt(
+    conn: asyncpg.Connection,
+    delivery: asyncpg.Record,
+) -> Optional[asyncpg.Record]:
+    """Return a free live successor that would duplicate a succeeded predecessor."""
+    return await conn.fetchrow(
+        """
+        SELECT newer.id
+        FROM webhook_deliveries newer
+        WHERE newer.subscription_id = $1
+          AND newer.event_type = $2
+          AND newer.payload_hash = $3
+          AND newer.attempt_num > $4
+          AND newer.status IN ('pending', 'retrying')
+          AND NOT newer.superseded
+          AND (newer.lease_token IS NULL OR newer.lease_expires_at < clock_timestamp())
+        ORDER BY newer.attempt_num ASC
+        LIMIT 1
+        """,
+        delivery["subscription_id"],
+        delivery["event_type"],
+        delivery["payload_hash"],
+        delivery["attempt_num"],
+    )
+
+
+async def _abandon_live_successor_attempt(conn: asyncpg.Connection, successor_id: str) -> None:
+    """Mark a free successor superseded after a predecessor has succeeded."""
+    await conn.execute(
+        """
+        UPDATE webhook_deliveries
+        SET status='abandoned',
+            superseded=TRUE,
+            status_updated_at=clock_timestamp(),
+            lease_token=NULL,
+            lease_expires_at=NULL
+        WHERE id=$1::uuid
+          AND status IN ('pending', 'retrying')
+          AND NOT superseded
+          AND (lease_token IS NULL OR lease_expires_at < clock_timestamp())
+        """,
+        successor_id,
     )
 
 

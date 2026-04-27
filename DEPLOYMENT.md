@@ -84,8 +84,9 @@ still-running old writer in that gap as crashed.
 `WEBHOOK_LEASE_SECONDS` is the authoritative webhook delivery ownership knob.
 Claims write and return `lease_expires_at` / `claim_db_now` from PostgreSQL
 `clock_timestamp()`, not transaction-snapshot `NOW()`, so time spent waiting
-on the per-chain advisory lock cannot backdate the lease. The sender subtracts
-app-side monotonic elapsed time plus
+on the per-chain advisory lock cannot backdate the lease. The sender captures
+an app-side monotonic anchor immediately before issuing the claim UPDATE, then
+subtracts elapsed time since that pre-claim anchor plus
 `WEBHOOK_FINALIZE_BUFFER_SECONDS` before starting DNS validation or HTTP POST.
 If less than the minimum send window remains, the worker records a retryable
 failure instead of posting with a stale lease. Startup still validates that the
@@ -95,6 +96,14 @@ are not a replacement for the lease-anchored wall-clock deadline. Outbound
 webhook requests send `Accept-Encoding: identity`, response bodies are read
 with raw-byte streaming, and any non-identity `Content-Encoding` is not
 decompressed; only a small bounded raw preview is retained for audit.
+
+`WEBHOOK_SHUTDOWN_DRAIN_SECONDS` controls graceful webhook shutdown. Lifespan
+teardown cancels perpetual worker loops first, which stops new recovery
+scheduling, then waits for in-flight webhook delivery attempts to finish
+finalization without cancellation. The default matches the effective
+`WEBHOOK_LEASE_SECONDS` value so a normal lease window can drain. If the drain
+timeout expires, shutdown logs the replay risk and cancels remaining delivery
+attempts as a last resort.
 
 ---
 
