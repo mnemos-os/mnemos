@@ -56,6 +56,7 @@ DECLARE
     _new_version_id  UUID;
     _bare_head       UUID;
     _branch_exists   BOOLEAN;
+    _updated_rows    INTEGER;
 BEGIN
     _by := NULLIF(current_setting('mnemos.current_user_id', TRUE), '');
     _branch := COALESCE(NULLIF(current_setting('mnemos.current_branch', TRUE), ''), 'main');
@@ -102,11 +103,12 @@ BEGIN
             -- branch HEAD. Missing branch rows and NULL heads are
             -- broken state here; only the explicit branch-creation path
             -- may create a new branch root.
-            SELECT EXISTS (
-                SELECT 1
-                FROM memory_branches
-                WHERE memory_id = NEW.id AND name = _branch
-            ) INTO _branch_exists;
+            SELECT mb.head_version_id INTO _bare_head
+            FROM memory_branches mb
+            WHERE mb.memory_id = NEW.id AND mb.name = _branch
+            FOR UPDATE OF mb;
+
+            _branch_exists := FOUND;
 
             IF NOT _branch_exists THEN
                 RAISE EXCEPTION
@@ -114,10 +116,6 @@ BEGIN
                     _branch, NEW.id
                     USING ERRCODE = 'MN001';
             END IF;
-
-            SELECT head_version_id INTO _bare_head
-            FROM memory_branches
-            WHERE memory_id = NEW.id AND name = _branch;
 
             IF _bare_head IS NULL THEN
                 RAISE EXCEPTION
@@ -131,7 +129,8 @@ BEGIN
             INNER JOIN memory_versions mv
                 ON mv.id = mb.head_version_id
                AND mv.memory_id = mb.memory_id
-            WHERE mb.memory_id = NEW.id AND mb.name = _branch;
+            WHERE mb.memory_id = NEW.id AND mb.name = _branch
+            FOR UPDATE OF mb;
 
             IF _parent_version IS NULL THEN
                 RAISE EXCEPTION
@@ -161,6 +160,15 @@ BEGIN
             UPDATE memory_branches
             SET head_version_id = _new_version_id
             WHERE memory_id = NEW.id AND name = _branch;
+
+            GET DIAGNOSTICS _updated_rows = ROW_COUNT;
+
+            IF _updated_rows = 0 THEN
+                RAISE EXCEPTION
+                    'mnemos: branch % for memory % disappeared before head update',
+                    _branch, NEW.id
+                    USING ERRCODE = 'MN001';
+            END IF;
         END IF;
 
     ELSIF TG_OP = 'DELETE' THEN
@@ -172,11 +180,12 @@ BEGIN
         FROM   memory_versions
         WHERE  memory_id = OLD.id AND branch = _branch;
 
-        SELECT EXISTS (
-            SELECT 1
-            FROM memory_branches
-            WHERE memory_id = OLD.id AND name = _branch
-        ) INTO _branch_exists;
+        SELECT mb.head_version_id INTO _bare_head
+        FROM memory_branches mb
+        WHERE mb.memory_id = OLD.id AND mb.name = _branch
+        FOR UPDATE OF mb;
+
+        _branch_exists := FOUND;
 
         IF NOT _branch_exists THEN
             RAISE EXCEPTION
@@ -184,10 +193,6 @@ BEGIN
                 _branch, OLD.id
                 USING ERRCODE = 'MN001';
         END IF;
-
-        SELECT head_version_id INTO _bare_head
-        FROM memory_branches
-        WHERE memory_id = OLD.id AND name = _branch;
 
         IF _bare_head IS NULL THEN
             RAISE EXCEPTION
@@ -201,7 +206,8 @@ BEGIN
         INNER JOIN memory_versions mv
             ON mv.id = mb.head_version_id
            AND mv.memory_id = mb.memory_id
-        WHERE mb.memory_id = OLD.id AND mb.name = _branch;
+        WHERE mb.memory_id = OLD.id AND mb.name = _branch
+        FOR UPDATE OF mb;
 
         IF _parent_version IS NULL THEN
             RAISE EXCEPTION
@@ -231,6 +237,15 @@ BEGIN
         UPDATE memory_branches
         SET head_version_id = _new_version_id
         WHERE memory_id = OLD.id AND name = _branch;
+
+        GET DIAGNOSTICS _updated_rows = ROW_COUNT;
+
+        IF _updated_rows = 0 THEN
+            RAISE EXCEPTION
+                'mnemos: branch % for memory % disappeared before head update',
+                _branch, OLD.id
+                USING ERRCODE = 'MN001';
+        END IF;
     END IF;
 
     IF TG_OP = 'DELETE' THEN

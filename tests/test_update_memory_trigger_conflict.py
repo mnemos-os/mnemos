@@ -226,21 +226,22 @@ def test_trigger_update_delete_reject_missing_null_and_foreign_heads_before_inse
         compact = " ".join(branch_sql.split())
         insert_pos = compact.index("INSERT INTO memory_versions")
 
-        existence_check = (
-            "SELECT EXISTS ( SELECT 1 FROM memory_branches "
-            f"WHERE memory_id = {row_id} AND name = _branch ) INTO _branch_exists"
-        )
-        bare_head_check = (
-            "SELECT head_version_id INTO _bare_head FROM memory_branches "
-            f"WHERE memory_id = {row_id} AND name = _branch"
+        locked_bare_head_check = (
+            "SELECT mb.head_version_id INTO _bare_head FROM memory_branches mb "
+            f"WHERE mb.memory_id = {row_id} AND mb.name = _branch FOR UPDATE OF mb"
         )
 
-        assert existence_check in compact
-        assert bare_head_check in compact
+        assert locked_bare_head_check in compact
+        assert "_branch_exists := FOUND" in compact
         assert "IF NOT _branch_exists THEN RAISE EXCEPTION" in compact
         assert "has NULL head_version_id" in compact
         assert "AND mv.memory_id = mb.memory_id" in compact
+        assert (
+            f"WHERE mb.memory_id = {row_id} AND mb.name = _branch FOR UPDATE OF mb"
+            in compact
+        )
         assert "points outside this memory" in compact
+        assert compact.index("_branch_exists := FOUND") < insert_pos
         assert compact.index("IF NOT _branch_exists") < insert_pos
         assert compact.index("IF _bare_head IS NULL") < insert_pos
         assert compact.index("IF _parent_version IS NULL") < insert_pos
