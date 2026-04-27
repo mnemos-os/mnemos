@@ -123,12 +123,11 @@ WEBHOOK_RETRY_SUCCESSOR_REPAIR_SQL = """
         )
         OR EXISTS (
           SELECT 1
-          FROM webhook_deliveries predecessor
-          WHERE predecessor.subscription_id = d.subscription_id
-            AND predecessor.event_type = d.event_type
-            AND predecessor.payload_hash = d.payload_hash
-            AND predecessor.attempt_num < d.attempt_num
-            AND predecessor.status = 'succeeded'
+          FROM webhook_deliveries peer
+          WHERE peer.subscription_id = d.subscription_id
+            AND peer.event_type = d.event_type
+            AND peer.payload_hash = d.payload_hash
+            AND peer.status = 'succeeded'
         )
       )
 """
@@ -398,8 +397,8 @@ async def _claim_delivery(
                 return None
 
             await _lock_delivery_chain(conn, delivery)
-            if await _has_succeeded_predecessor_attempt(conn, delivery):
-                await _abandon_current_attempt_after_succeeded_predecessor(conn, delivery_id)
+            if await _has_succeeded_chain_attempt(conn, delivery):
+                await _abandon_current_attempt_after_succeeded_chain_peer(conn, delivery_id)
                 return None
 
             if delivery["status"] == "retrying" and await _has_successor_attempt(conn, delivery):
@@ -711,8 +710,8 @@ async def _finalize_delivery(
                 )
                 return finalized is not None
 
-            if await _has_succeeded_predecessor_attempt(conn, delivery):
-                finalized = await _abandon_owned_attempt_after_succeeded_predecessor(
+            if await _has_succeeded_chain_attempt(conn, delivery):
+                finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
                     conn,
                     delivery_id,
                     lease_token,
@@ -721,24 +720,37 @@ async def _finalize_delivery(
                 return finalized is not None
 
             if result.succeeded:
-                finalized = await conn.fetchrow(
-                    """
-                    UPDATE webhook_deliveries
-                    SET status='succeeded',
-                        superseded=FALSE,
-                        response_status=$3,
-                        response_body=$4,
-                        error=NULL,
-                        delivered_at=clock_timestamp(),
-                        lease_token=NULL,
-                        lease_expires_at=NULL
-                    WHERE id=$1::uuid
-                      AND lease_token=$2::uuid
-                      AND lease_expires_at >= clock_timestamp()
-                    RETURNING id
-                    """,
-                    delivery_id, lease_token, result.response_status, result.response_body,
-                )
+                try:
+                    async with conn.transaction():
+                        finalized = await conn.fetchrow(
+                            """
+                            UPDATE webhook_deliveries
+                            SET status='succeeded',
+                                superseded=FALSE,
+                                response_status=$3,
+                                response_body=$4,
+                                error=NULL,
+                                delivered_at=clock_timestamp(),
+                                lease_token=NULL,
+                                lease_expires_at=NULL
+                            WHERE id=$1::uuid
+                              AND lease_token=$2::uuid
+                              AND lease_expires_at >= clock_timestamp()
+                            RETURNING id
+                            """,
+                            delivery_id,
+                            lease_token,
+                            result.response_status,
+                            result.response_body,
+                        )
+                except asyncpg.exceptions.UniqueViolationError:
+                    finalized = await _abandon_owned_attempt_after_succeeded_chain_peer(
+                        conn,
+                        delivery_id,
+                        lease_token,
+                        result,
+                    )
+                    return finalized is not None
                 if finalized is None:
                     return False
 
@@ -901,31 +913,29 @@ async def _has_successor_attempt(conn: asyncpg.Connection, delivery: asyncpg.Rec
     )
 
 
-async def _has_succeeded_predecessor_attempt(
+async def _has_succeeded_chain_attempt(
     conn: asyncpg.Connection,
     delivery: asyncpg.Record,
 ) -> bool:
-    """Return whether an earlier attempt already completed the chain."""
+    """Return whether any attempt already completed the chain."""
     return await conn.fetchval(
         """
         SELECT EXISTS (
           SELECT 1
-          FROM webhook_deliveries predecessor
-          WHERE predecessor.subscription_id = $1
-            AND predecessor.event_type = $2
-            AND predecessor.payload_hash = $3
-            AND predecessor.attempt_num < $4
-            AND predecessor.status = 'succeeded'
+          FROM webhook_deliveries peer
+          WHERE peer.subscription_id = $1
+            AND peer.event_type = $2
+            AND peer.payload_hash = $3
+            AND peer.status = 'succeeded'
         )
         """,
         delivery["subscription_id"],
         delivery["event_type"],
         delivery["payload_hash"],
-        delivery["attempt_num"],
     )
 
 
-async def _abandon_current_attempt_after_succeeded_predecessor(
+async def _abandon_current_attempt_after_succeeded_chain_peer(
     conn: asyncpg.Connection,
     delivery_id: str,
 ) -> None:
@@ -947,13 +957,13 @@ async def _abandon_current_attempt_after_succeeded_predecessor(
     )
 
 
-async def _abandon_owned_attempt_after_succeeded_predecessor(
+async def _abandon_owned_attempt_after_succeeded_chain_peer(
     conn: asyncpg.Connection,
     delivery_id: str,
     lease_token: str,
     result: _DeliveryResult,
 ) -> Optional[asyncpg.Record]:
-    """Finalize a failed active successor without extending a completed chain."""
+    """Finalize an active duplicate without extending a completed chain."""
     return await conn.fetchrow(
         """
         UPDATE webhook_deliveries
@@ -981,7 +991,7 @@ async def _find_live_unleased_successor_attempt(
     conn: asyncpg.Connection,
     delivery: asyncpg.Record,
 ) -> Optional[asyncpg.Record]:
-    """Return a free live successor that would duplicate a succeeded predecessor."""
+    """Return a free live successor that would duplicate this success."""
     return await conn.fetchrow(
         """
         SELECT newer.id

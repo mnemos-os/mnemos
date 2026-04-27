@@ -47,7 +47,7 @@ row locks to persisted attempt leases. Apply this gate when upgrading an
 existing deployment:
 
 1. Stop or drain all MNEMOS processes that can write webhook delivery attempts.
-2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, and `db/migrations_v3_5_webhook_attempt_unique.sql`.
+2. Run the ordered migrations through `db/migrations_v3_5_webhook_retry_terminal_state.sql`, `db/migrations_v3_5_webhook_attempt_lease.sql`, `db/migrations_v3_5_webhook_writer_revision.sql`, `db/migrations_v3_5_webhook_status_updated_at.sql`, `db/migrations_v3_5_webhook_superseded_marker.sql`, `db/migrations_v3_5_webhook_attempt_unique.sql`, and `db/migrations_v3_5_webhook_succeeded_unique.sql`.
 3. Restart MNEMOS workers on the new build.
 
 Draining those writers remains the operationally clean upgrade path, but the
@@ -56,8 +56,11 @@ Superseded attempts use `status='abandoned'` plus `superseded=TRUE`, so old
 v3.5-dev workers that only skip `succeeded` and `abandoned` still skip the row.
 The live unique index on `(subscription_id, event_type, payload_hash,
 attempt_num)` structurally prevents duplicate successor rows if an old writer
-races after a new worker's no-successor check. New workers use per-attempt
-leases plus per-chain advisory locks, lifecycle starts a dedicated repair
+races after a new worker's no-successor check. The succeeded unique index on
+`(subscription_id, event_type, payload_hash) WHERE status='succeeded'`
+structurally enforces one terminal success per retry chain if workers race
+past the app-level chain-peer guard. New workers use per-attempt leases plus
+per-chain advisory locks, lifecycle starts a dedicated repair
 worker that runs repeated sweeps for the first minute independent of delivery
 send latency, and the `writer_revision` marker is the technically correct
 compatibility path: current code explicitly writes `NEW_CODE_WRITER_REVISION=1`,
@@ -230,12 +233,12 @@ existing `postgres_data` volume starts with newer migration files mounted.
 For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
 then applies the v3.5 upgrade migrations through
-`db/migrations_v3_5_webhook_attempt_unique.sql` before the MNEMOS service
+`db/migrations_v3_5_webhook_succeeded_unique.sql` before the MNEMOS service
 starts.
 
 Fresh volumes still receive these migrations from the initdb mounts, ending at
-`/docker-entrypoint-initdb.d/31-webhook-attempt-unique.sql`. Existing volumes
-receive the same SQL through `/migrations/31-webhook-attempt-unique.sql` in
+`/docker-entrypoint-initdb.d/32-webhook-succeeded-unique.sql`. Existing volumes
+receive the same SQL through `/migrations/32-webhook-succeeded-unique.sql` in
 the one-shot service. Keep the compose mounts and `installer/db.py` /
 `install.py` migration order in sync.
 

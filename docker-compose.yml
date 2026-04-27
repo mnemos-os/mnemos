@@ -43,6 +43,7 @@ services:
       - ./db/migrations_v3_5_webhook_status_updated_at.sql:/docker-entrypoint-initdb.d/29-webhook-status-updated-at.sql
       - ./db/migrations_v3_5_webhook_superseded_marker.sql:/docker-entrypoint-initdb.d/30-webhook-superseded-marker.sql
       - ./db/migrations_v3_5_webhook_attempt_unique.sql:/docker-entrypoint-initdb.d/31-webhook-attempt-unique.sql
+      - ./db/migrations_v3_5_webhook_succeeded_unique.sql:/docker-entrypoint-initdb.d/32-webhook-succeeded-unique.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
@@ -67,6 +68,7 @@ services:
       - ./db/migrations_v3_5_webhook_status_updated_at.sql:/migrations/29-webhook-status-updated-at.sql:ro
       - ./db/migrations_v3_5_webhook_superseded_marker.sql:/migrations/30-webhook-superseded-marker.sql:ro
       - ./db/migrations_v3_5_webhook_attempt_unique.sql:/migrations/31-webhook-attempt-unique.sql:ro
+      - ./db/migrations_v3_5_webhook_succeeded_unique.sql:/migrations/32-webhook-succeeded-unique.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -77,7 +79,8 @@ services:
       -f /migrations/28-webhook-writer-revision.sql
       -f /migrations/29-webhook-status-updated-at.sql
       -f /migrations/30-webhook-superseded-marker.sql
-      -f /migrations/31-webhook-attempt-unique.sql"
+      -f /migrations/31-webhook-attempt-unique.sql
+      -f /migrations/32-webhook-succeeded-unique.sql"
     restart: "no"
 
   ollama:

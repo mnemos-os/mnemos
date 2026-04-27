@@ -137,6 +137,11 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   Round 13 extends the succeeded-predecessor guard into success finalization,
   so an active successor that also receives 2xx is abandoned/superseded with
   its response audit metadata instead of creating a second succeeded row.
+  Round 14 broadens the convergence guard from earlier predecessors to any
+  succeeded chain peer across claim, success-finalize, and failure-finalize
+  paths, and adds `db/migrations_v3_5_webhook_succeeded_unique.sql` with a
+  partial unique index that structurally enforces one terminal succeeded row
+  per retry chain after deduplicating legacy duplicate successes.
 
 ### Conflicts and operator handling
 

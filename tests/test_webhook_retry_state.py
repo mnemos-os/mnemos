@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import gzip
 import hashlib
+import sqlite3
 import sys
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,9 @@ class _FakeWebhookStore:
         self.advisory_acquisitions = 0
         self.pool: "_FakePool | None" = None
         self.claim_update_stall = None
+        self.enforce_succeeded_unique = False
+        self.unique_violation_cls: type[Exception] = RuntimeError
+        self.succeeded_update_attempts = 0
 
     def row(self, row_id: str):
         for row in self.rows:
@@ -44,12 +48,12 @@ class _FakeWebhookStore:
             for other in self.rows
         )
 
-    def has_succeeded_predecessor(self, row: dict[str, Any]) -> bool:
+    def has_succeeded_chain_peer(self, row: dict[str, Any]) -> bool:
         return any(
             other["subscription_id"] == row["subscription_id"]
             and other["event_type"] == row["event_type"]
             and other["payload_hash"] == row["payload_hash"]
-            and other["attempt_num"] < row["attempt_num"]
+            and other.get("id") != row.get("id")
             and other["status"] == "succeeded"
             for other in self.rows
         )
@@ -115,9 +119,10 @@ class _FakeTransaction:
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
-        self.conn.store.release_locks(self.conn.conn_id)
-        self.conn.release_advisory_locks()
         self.conn.in_transaction -= 1
+        if self.conn.in_transaction == 0:
+            self.conn.store.release_locks(self.conn.conn_id)
+            self.conn.release_advisory_locks()
         return False
 
 
@@ -258,6 +263,9 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
+            self.store.succeeded_update_attempts += 1
+            if self.store.enforce_succeeded_unique and self.store.has_succeeded_chain_peer(row):
+                raise self.store.unique_violation_cls()
             self._set_status(row, "succeeded")
             row["response_status"] = args[2]
             row["response_body"] = args[3]
@@ -305,10 +313,10 @@ class _FakeWebhookConn:
                 "subscription_id": args[0],
                 "event_type": args[1],
                 "payload_hash": args[2],
-                "attempt_num": args[3],
             }
-            if "predecessor.attempt_num < $4" in compact:
-                return self._has_succeeded_predecessor(probe)
+            if "status = 'succeeded'" in compact:
+                return self._has_succeeded_chain_peer(probe)
+            probe["attempt_num"] = args[3]
             return self._has_successor(probe)
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
@@ -338,7 +346,7 @@ class _FakeWebhookConn:
                     and self._lease_available(row)
                     and (
                         self._has_successor(row)
-                        or self._has_succeeded_predecessor(row)
+                        or self._has_succeeded_chain_peer(row)
                     )
                 ):
                     self._set_status(row, "abandoned")
@@ -400,8 +408,8 @@ class _FakeWebhookConn:
     def _has_successor(self, row: dict[str, Any]) -> bool:
         return self.store.has_successor(row)
 
-    def _has_succeeded_predecessor(self, row: dict[str, Any]) -> bool:
-        return self.store.has_succeeded_predecessor(row)
+    def _has_succeeded_chain_peer(self, row: dict[str, Any]) -> bool:
+        return self.store.has_succeeded_chain_peer(row)
 
     def _insert_delivery(self, *args):
         if self.store.has_live_attempt_conflict(args[0], args[1], args[3], args[4]):
@@ -1217,6 +1225,122 @@ def test_active_successor_success_after_predecessor_success_closes_chain(monkeyp
     asyncio.run(run())
 
 
+def test_predecessor_success_after_successor_success_closes_chain(monkeypatch):
+    async def run():
+        parent = _attempt()
+        successor = _successor_for(parent)
+        parent["status"] = "retrying"
+        parent["lease_token"] = "00000000-0000-0000-0000-000000000011"
+        parent["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        successor["status"] = "retrying"
+        successor["lease_token"] = "00000000-0000-0000-0000-000000000012"
+        successor["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        successor_finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(successor),
+            successor["lease_token"],
+            dispatcher._DeliveryResult(
+                succeeded=True,
+                response_status=204,
+                response_body="successor acknowledged",
+                error=None,
+            ),
+        )
+        parent_finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(parent),
+            parent["lease_token"],
+            dispatcher._DeliveryResult(
+                succeeded=True,
+                response_status=202,
+                response_body="parent acknowledged later",
+                error=None,
+            ),
+        )
+
+        assert successor_finalized
+        assert parent_finalized
+        assert sum(row["status"] == "succeeded" for row in conn.rows) == 1
+        assert successor["status"] == "succeeded"
+        assert parent["status"] == "abandoned"
+        assert parent["superseded"] is True
+        assert parent["response_status"] == 202
+        assert parent["response_body"] == "parent acknowledged later"
+        assert parent["lease_token"] is None
+
+    asyncio.run(run())
+
+
+def test_success_finalize_unique_violation_abandons_duplicate_chain_peer(monkeypatch):
+    class _FakeUniqueViolationError(Exception):
+        pass
+
+    async def run():
+        parent = _attempt()
+        successor = _successor_for(parent)
+        parent["status"] = "retrying"
+        parent["lease_token"] = "00000000-0000-0000-0000-000000000021"
+        parent["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        successor["status"] = "retrying"
+        successor["lease_token"] = "00000000-0000-0000-0000-000000000022"
+        successor["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+        dispatcher, conn, _http = await _install(monkeypatch, [parent, successor], [])
+
+        async def _race_window_guard(_conn, _delivery):
+            return False
+
+        conn.store.enforce_succeeded_unique = True
+        conn.store.unique_violation_cls = _FakeUniqueViolationError
+        monkeypatch.setattr(
+            dispatcher.asyncpg.exceptions,
+            "UniqueViolationError",
+            _FakeUniqueViolationError,
+        )
+        monkeypatch.setattr(dispatcher, "_has_succeeded_chain_attempt", _race_window_guard)
+
+        results = await asyncio.gather(
+            dispatcher._finalize_delivery(
+                conn.pool,
+                conn._with_subscription(parent),
+                parent["lease_token"],
+                dispatcher._DeliveryResult(
+                    succeeded=True,
+                    response_status=200,
+                    response_body="parent acknowledged",
+                    error=None,
+                ),
+            ),
+            dispatcher._finalize_delivery(
+                conn.pool,
+                conn._with_subscription(successor),
+                successor["lease_token"],
+                dispatcher._DeliveryResult(
+                    succeeded=True,
+                    response_status=201,
+                    response_body="successor acknowledged",
+                    error=None,
+                ),
+            ),
+        )
+
+        assert results == [True, True]
+        assert conn.store.succeeded_update_attempts == 2
+        assert sum(row["status"] == "succeeded" for row in conn.rows) == 1
+        abandoned = [row for row in conn.rows if row["status"] == "abandoned"]
+        assert len(abandoned) == 1
+        assert abandoned[0]["superseded"] is True
+        assert abandoned[0]["response_status"] in {200, 201}
+        assert abandoned[0]["response_body"] in {
+            "parent acknowledged",
+            "successor acknowledged",
+        }
+        assert all(row["lease_token"] is None for row in conn.rows)
+
+    asyncio.run(run())
+
+
 def test_expired_successor_after_predecessor_success_is_repaired(monkeypatch):
     async def run():
         parent = _attempt()
@@ -1700,8 +1824,8 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
     )
     assert "WHERE d.status = 'retrying' AND NOT d.superseded" not in compact_dispatcher
     assert "newer.attempt_num > d.attempt_num" in compact_dispatcher
-    assert "predecessor.attempt_num < d.attempt_num" in compact_dispatcher
-    assert "predecessor.status = 'succeeded'" in compact_dispatcher
+    assert "peer.status = 'succeeded'" in compact_dispatcher
+    assert "peer.attempt_num < d.attempt_num" not in compact_dispatcher
 
 
 def test_success_finalize_source_shape_is_chain_aware():
@@ -1715,20 +1839,21 @@ def test_success_finalize_source_shape_is_chain_aware():
     assert "AND NOT newer.superseded" in compact
     assert "newer.lease_token IS NULL OR newer.lease_expires_at < clock_timestamp()" in compact
     assert "status='abandoned', superseded=TRUE, status_updated_at=clock_timestamp()" in compact
+    assert "except asyncpg.exceptions.UniqueViolationError" in source
     assert "canonical external delivery" in source
 
 
-def test_succeeded_predecessor_guard_source_shape_is_chain_aware():
+def test_succeeded_chain_guard_source_shape_is_chain_aware():
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact = " ".join(source.split())
 
-    assert "async def _has_succeeded_predecessor_attempt" in source
-    assert "async def _abandon_current_attempt_after_succeeded_predecessor" in source
-    assert "async def _abandon_owned_attempt_after_succeeded_predecessor" in source
-    assert "predecessor.attempt_num < $4" in compact
-    assert "predecessor.status = 'succeeded'" in compact
-    assert "if await _has_succeeded_predecessor_attempt(conn, delivery)" in compact
+    assert "async def _has_succeeded_chain_attempt" in source
+    assert "async def _abandon_current_attempt_after_succeeded_chain_peer" in source
+    assert "async def _abandon_owned_attempt_after_succeeded_chain_peer" in source
+    assert "peer.attempt_num < $4" not in compact
+    assert "peer.status = 'succeeded'" in compact
+    assert "if await _has_succeeded_chain_attempt(conn, delivery)" in compact
 
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
@@ -2046,3 +2171,95 @@ def test_webhook_attempt_unique_migration_adds_live_chain_attempt_invariant():
         "ON webhook_deliveries(subscription_id, event_type, payload_hash, attempt_num) "
         "WHERE status IN ('pending', 'retrying') AND NOT superseded"
     ) in compact
+
+
+def test_webhook_succeeded_unique_migration_deduplicates_existing_succeeded_rows():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_succeeded_unique.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "PARTITION BY subscription_id, event_type, payload_hash" in compact
+    assert "ORDER BY attempt_num ASC, created ASC, id ASC" in compact
+    assert "SET status = 'abandoned', superseded = TRUE" in compact
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_webhook_deliveries_succeeded_chain" in compact
+    assert (
+        "ON webhook_deliveries(subscription_id, event_type, payload_hash) "
+        "WHERE status = 'succeeded'"
+    ) in compact
+
+    db = sqlite3.connect(":memory:")
+    db.executescript(
+        """
+        CREATE TABLE webhook_deliveries (
+            id TEXT PRIMARY KEY,
+            subscription_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            payload_hash TEXT NOT NULL,
+            attempt_num INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            superseded BOOLEAN NOT NULL DEFAULT FALSE,
+            lease_token TEXT,
+            lease_expires_at TEXT,
+            response_status INTEGER,
+            response_body TEXT,
+            error TEXT,
+            delivered_at TEXT,
+            created TEXT NOT NULL
+        );
+        INSERT INTO webhook_deliveries
+            (id, subscription_id, event_type, payload_hash, attempt_num,
+             status, superseded, response_status, response_body, delivered_at, created)
+        VALUES
+            ('later', 'sub', 'memory.created', 'hash', 2,
+             'succeeded', FALSE, 202, 'later body', '2026-04-27T12:01:00Z',
+             '2026-04-27T12:01:00Z'),
+            ('earliest', 'sub', 'memory.created', 'hash', 1,
+             'succeeded', FALSE, 200, 'earliest body', '2026-04-27T12:00:00Z',
+             '2026-04-27T12:00:00Z');
+        """
+    )
+
+    db.executescript(sql)
+    rows = {
+        row[0]: row
+        for row in db.execute(
+            """
+            SELECT id, status, superseded, response_status, response_body, delivered_at
+            FROM webhook_deliveries
+            """
+        )
+    }
+
+    assert rows["earliest"] == (
+        "earliest",
+        "succeeded",
+        0,
+        200,
+        "earliest body",
+        "2026-04-27T12:00:00Z",
+    )
+    assert rows["later"] == (
+        "later",
+        "abandoned",
+        1,
+        202,
+        "later body",
+        "2026-04-27T12:01:00Z",
+    )
+    try:
+        db.execute(
+            """
+            INSERT INTO webhook_deliveries
+                (id, subscription_id, event_type, payload_hash, attempt_num,
+                 status, created)
+            VALUES
+                ('duplicate', 'sub', 'memory.created', 'hash', 3,
+                 'succeeded', '2026-04-27T12:02:00Z')
+            """
+        )
+    except sqlite3.IntegrityError:
+        pass
+    else:
+        raise AssertionError("succeeded-chain unique index did not reject duplicate success")
