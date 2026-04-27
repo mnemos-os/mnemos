@@ -119,14 +119,21 @@ class TestEventValidation:
         assert "totally.made.up" in str(exc.value.detail)
 
     @pytest.mark.asyncio
-    async def test_url_validation(self):
+    async def test_url_validation(self, monkeypatch):
         """URL validator rejects bad schemes, SSRF targets, and metadata hosts."""
-        from api.handlers.webhooks import _validate_url
+        from api.handlers import webhooks as wh
         from fastapi import HTTPException
 
-        # Public host — validate_webhook_url is async (resolves DNS via the
-        # event loop's getaddrinfo so a slow resolver doesn't block the worker).
-        await _validate_url("https://example.com/hook")
+        async def _fake_resolve_addrs(host: str):
+            if host == "localhost":
+                return ["127.0.0.1"]
+            return ["93.184.216.34"]
+
+        monkeypatch.setattr(wh, "_resolve_addrs", _fake_resolve_addrs)
+
+        # Public host — fake DNS keeps the hostname-resolution path covered
+        # without requiring external DNS in CI/sandboxed runners.
+        await wh._validate_url("https://example.com/hook")
 
         for bad in (
             "ftp://example.com/hook",
@@ -134,7 +141,7 @@ class TestEventValidation:
             "example.com",
         ):
             with pytest.raises(HTTPException):
-                await _validate_url(bad)
+                await wh._validate_url(bad)
 
         # SSRF guards: loopback + link-local metadata IPs must be rejected.
         for blocked in (
@@ -144,7 +151,7 @@ class TestEventValidation:
             "http://metadata.google.internal/",
         ):
             with pytest.raises(HTTPException):
-                await _validate_url(blocked)
+                await wh._validate_url(blocked)
 
 
 # ── Retry schedule constants ─────────────────────────────────────────────────

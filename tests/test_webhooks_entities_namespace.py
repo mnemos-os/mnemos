@@ -74,6 +74,13 @@ def _install(monkeypatch, conn):
     monkeypatch.setattr(lc, "_pool", pool)
 
 
+def _install_public_dns(monkeypatch, wh):
+    async def _fake_resolve_addrs(host: str):
+        return ["93.184.216.34"]
+
+    monkeypatch.setattr(wh, "_resolve_addrs", _fake_resolve_addrs)
+
+
 # ─── entities ────────────────────────────────────────────────────────────────
 
 
@@ -246,6 +253,7 @@ def test_webhook_create_rejects_cross_namespace_for_non_root(monkeypatch):
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
+    _install_public_dns(monkeypatch, wh)
 
     req = wh.WebhookCreateRequest(
         url="https://example.com/hook",
@@ -277,6 +285,7 @@ def test_webhook_create_own_namespace_succeeds_for_non_root(monkeypatch):
     }
     conn = _Conn(row=ok_row)
     _install(monkeypatch, conn)
+    _install_public_dns(monkeypatch, wh)
 
     req = wh.WebhookCreateRequest(
         url="https://example.com/hook",

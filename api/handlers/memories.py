@@ -6,6 +6,7 @@ import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
+import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query
 
 import api.lifecycle as _lc
@@ -709,24 +710,38 @@ async def update_memory(
                 # satisfies the predicate at write time, the update
                 # affects zero rows and we 404.
                 set_sql = ", ".join(set_clauses)
-                if user.role == "root":
-                    row = await conn.fetchrow(
-                        f"UPDATE memories SET {set_sql} "
-                        f"WHERE id=$1 RETURNING {_lc._MEMORY_COLS}",
-                        memory_id, *values,
-                    )
-                else:
-                    # Append owner_id + namespace placeholders after
-                    # the existing $1 (id) + values placeholders.
-                    owner_ph = f"${len(values) + 2}"
-                    ns_ph = f"${len(values) + 3}"
-                    row = await conn.fetchrow(
-                        f"UPDATE memories SET {set_sql} "
-                        f"WHERE id=$1 AND owner_id={owner_ph} "
-                        f"AND namespace={ns_ph} "
-                        f"RETURNING {_lc._MEMORY_COLS}",
-                        memory_id, *values, user.user_id, user.namespace,
-                    )
+                try:
+                    if user.role == "root":
+                        row = await conn.fetchrow(
+                            f"UPDATE memories SET {set_sql} "
+                            f"WHERE id=$1 RETURNING {_lc._MEMORY_COLS}",
+                            memory_id, *values,
+                        )
+                    else:
+                        # Append owner_id + namespace placeholders after
+                        # the existing $1 (id) + values placeholders.
+                        owner_ph = f"${len(values) + 2}"
+                        ns_ph = f"${len(values) + 3}"
+                        row = await conn.fetchrow(
+                            f"UPDATE memories SET {set_sql} "
+                            f"WHERE id=$1 AND owner_id={owner_ph} "
+                            f"AND namespace={ns_ph} "
+                            f"RETURNING {_lc._MEMORY_COLS}",
+                            memory_id, *values, user.user_id, user.namespace,
+                        )
+                except asyncpg.PostgresError as exc:
+                    if getattr(exc, "sqlstate", None) == "MN001":
+                        raise HTTPException(
+                            status_code=409,
+                            detail=(
+                                "Memory branch state is inconsistent: "
+                                "memory_branches.head_version_id points to "
+                                "a version from another memory. Reconcile "
+                                "memory_branches and memory_versions for this "
+                                "memory before retrying."
+                            ),
+                        ) from exc
+                    raise
                 if not row:
                     raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
                 # mnemos_version_snapshot AFTER UPDATE trigger writes
