@@ -85,6 +85,11 @@ federation compound-cursor tie-breaker.
 
 ### Fixed
 
+- **Slice 5 round-2 search compression probe cleanup** — large
+  `/v1/memories/search` result sets no longer call the retired
+  distillation backend health check or log misleading "compression
+  disabled" telemetry. The live compression path remains the
+  queue-driven APOLLO/ARTEMIS contest and its persisted variants.
 - **Federation feed cursor tie-breaker** — `/v1/federation/feed` now
   paginates with an opaque cursor carrying both `updated` and `id`, filters
   with `(m.updated > cursor_updated OR (m.updated = cursor_updated AND

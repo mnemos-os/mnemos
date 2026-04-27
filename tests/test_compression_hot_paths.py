@@ -96,6 +96,58 @@ def test_gateway_uses_variant_content_when_available(monkeypatch):
     assert out[0]["content"] == "short variant form"
 
 
+# ─── search ─────────────────────────────────────────────────────────────────
+
+
+def test_search_large_results_do_not_probe_legacy_backend(monkeypatch):
+    """Large search result sets keep the normal response shape without
+    probing the removed DISTILLATION_BACKEND/OLLAMA_HOST path."""
+    import api.lifecycle as lc
+    from api.handlers import memories
+    from api.models import MemorySearchRequest
+
+    async def _noop_recall_bump(_ids):
+        return None
+
+    conn = _Conn(rows=[
+        {
+            "id": "mem_big",
+            "content": "x" * (51 * 1024),
+            "category": "general",
+            "subcategory": None,
+            "created": datetime(2026, 4, 1, tzinfo=timezone.utc),
+            "updated": datetime(2026, 4, 1, tzinfo=timezone.utc),
+            "metadata": None,
+            "quality_rating": 90,
+            "compressed_content": None,
+            "verbatim_content": None,
+            "owner_id": "alice",
+            "group_id": None,
+            "namespace": "default",
+            "permission_mode": 600,
+            "source_model": None,
+            "source_provider": None,
+            "source_session": None,
+            "source_agent": None,
+        },
+    ])
+    _install(monkeypatch, conn)
+    monkeypatch.setattr(lc, "_cache", None)
+    monkeypatch.setattr(lc, "_rls_enabled", False)
+    monkeypatch.setattr(memories, "_bump_recall_counters", _noop_recall_bump)
+
+    legacy_probe = MagicMock(side_effect=AssertionError("legacy backend probe called"))
+    monkeypatch.setattr(lc, "get_inference_backend", legacy_probe, raising=False)
+
+    req = MemorySearchRequest(query="needle", limit=1)
+    resp = asyncio.run(memories.search_memories(req, user=_alice()))
+
+    assert resp.count == 1
+    assert resp.compression_applied is False
+    assert resp.compression_metadata is None
+    legacy_probe.assert_not_called()
+
+
 # ─── rehydrate ──────────────────────────────────────────────────────────────
 
 

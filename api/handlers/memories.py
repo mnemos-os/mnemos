@@ -18,7 +18,6 @@ from api.lifecycle import (
     _get_embedding,
     _row_to_memory,
     _vector_search,
-    COMPRESSION_RESULT_SET_THRESHOLD,
 )
 from api.models import (
     BulkCreateRequest,
@@ -378,7 +377,7 @@ async def search_memories(
     request: MemorySearchRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    """Search memories with optional compression of large result sets (cached 5 min)."""
+    """Search memories with optional 5-minute response caching."""
     request_limit = min(request.limit, 500)  # server-side cap regardless of model field
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
@@ -489,21 +488,6 @@ async def search_memories(
 
     compression_applied = False
     compression_metadata = {}
-    total_size = sum(len(m.content) for m in memories)
-
-    if total_size > COMPRESSION_RESULT_SET_THRESHOLD:
-        backend = _lc.get_inference_backend()
-        backend_healthy = await backend.health_check()
-        if backend_healthy:
-            # Compression stack available (APOLLO + ARTEMIS)
-            # On-the-fly search result compression deferred to Phase 8A (batch optimization)
-            # Gateway memory injection stays on raw bounded slices in the critical path.
-            logger.debug(
-                f"[COMPRESSION] Result set {total_size} bytes > threshold; "
-                f"on-the-fly compression deferred to Phase 8A"
-            )
-        else:
-            logger.warning("[PHASE2] distillation backend unavailable, skipping compression")
 
     response = MemoryListResponse(
         count=len(memories),

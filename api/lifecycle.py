@@ -18,16 +18,11 @@ import redis.asyncio as aioredis
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config import PG_CONFIG
-from inference_backend import get_backend as _get_backend
 from graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
 
 from .models import MemoryItem
 
 logger = logging.getLogger(__name__)
-
-# Compression thresholds
-COMPRESSION_RESULT_SET_THRESHOLD = 50 * 1024   # 50 KB
-COMPRESSION_ITEM_THRESHOLD = 5 * 1024           # 5 KB per item
 
 # Background task registries — keep finite webhook sends out of the cancel-first
 # worker pool so graceful shutdown can let them finalize their leases.
@@ -163,8 +158,8 @@ async def _drain_delivery_attempt_tasks() -> None:
 #   - NVIDIA NIM embedding containers (e.g. llama-3.2-nv-embedqa-1b-v2)
 #   - any OpenAI-compatible /v1/embeddings endpoint
 #
-# Canonical env vars are INFERENCE_EMBED_* (matches the broader
-# _inference_backend namespacing in this module).
+# Canonical env vars are INFERENCE_EMBED_* so embedding config is not
+# tied to any one inference server implementation.
 _EMBED_HOST = os.getenv('INFERENCE_EMBED_HOST', 'http://localhost:11434')
 _EMBED_MODEL = os.getenv('INFERENCE_EMBED_MODEL', 'nomic-embed-text')
 _EMBED_TIMEOUT = float(os.getenv('INFERENCE_EMBED_TIMEOUT', '10'))
@@ -172,16 +167,7 @@ _EMBED_TIMEOUT = float(os.getenv('INFERENCE_EMBED_TIMEOUT', '10'))
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
 _cache: Optional[aioredis.Redis] = None
-_inference_backend = None  # initialized on startup via _get_backend()
 _rls_enabled: bool = False   # set from config at startup; read by handlers
-
-
-def get_inference_backend():
-    """Get the distillation backend (Ollama or LlamaCpp)."""
-    global _inference_backend
-    if _inference_backend is None:
-        _inference_backend = _get_backend()
-    return _inference_backend
 
 
 def _load_config() -> dict:
@@ -332,13 +318,6 @@ async def lifespan(app):
         logger.warning(f"Redis unavailable at {_redis_url}, caching disabled: {e}")
         _cache = None
         app.state.cache = None
-
-    backend = get_inference_backend()
-    healthy = await backend.health_check()
-    if healthy:
-        logger.info("[backend] Distillation backend CONNECTED")
-    else:
-        logger.warning("[backend] Distillation backend UNREACHABLE - compression disabled")
 
     # Start background distillation worker (optional)
     worker_enabled = config.get("worker", {}).get("enabled", True)
