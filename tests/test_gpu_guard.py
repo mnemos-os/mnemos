@@ -116,8 +116,8 @@ def test_half_open_success_closes_circuit():
     async def drive():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
-        await guard.is_available()  # -> HALF_OPEN
-        await guard.record_success()
+        _admitted, token = await guard.is_available()  # -> HALF_OPEN
+        await guard.record_success(probe_token=token)
 
     asyncio.run(drive())
     assert guard.state is CircuitState.CLOSED
@@ -135,10 +135,11 @@ def test_half_open_failure_reopens_circuit():
         # Wait past the cooldown window so the next is_available()
         # transitions OPEN -> HALF_OPEN.
         await asyncio.sleep(0.15)
-        assert (await guard.is_available())[0] is True
+        _admitted, token = await guard.is_available()
+        assert _admitted is True
         assert guard.state is CircuitState.HALF_OPEN
         # Probe fails -> circuit re-opens with a FRESH cooldown window.
-        await guard.record_failure(RuntimeError("probe failed"))
+        await guard.record_failure(RuntimeError("probe failed"), probe_token=token)
 
     asyncio.run(drive())
     assert guard.state is CircuitState.OPEN
@@ -270,9 +271,10 @@ def test_probe_success_clears_in_flight_flag():
     async def drive():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
-        await guard.is_available()  # probe admitted
+        _admitted, token = await guard.is_available()  # probe admitted
+        assert _admitted is True
         assert guard.snapshot()["probe_in_flight"] is True
-        await guard.record_success()
+        await guard.record_success(probe_token=token)
         assert guard.snapshot()["probe_in_flight"] is False
         assert guard.state is CircuitState.CLOSED
 
@@ -290,9 +292,10 @@ def test_probe_failure_clears_in_flight_flag_and_reopens():
         await guard.record_failure(RuntimeError("a"))
         await guard.record_failure(RuntimeError("b"))
         await asyncio.sleep(0.1)  # cooldown elapses
-        assert (await guard.is_available())[0] is True  # probe admitted
+        _admitted, token = await guard.is_available()  # probe admitted
+        assert _admitted is True
         assert guard.snapshot()["probe_in_flight"] is True
-        await guard.record_failure(RuntimeError("probe died"))
+        await guard.record_failure(RuntimeError("probe died"), probe_token=token)
         # Circuit re-opened with FRESH cooldown; probe flag cleared.
         snap = guard.snapshot()
         assert snap["state"] == "open"
@@ -454,9 +457,8 @@ def test_stale_probe_failure_discarded():
     asyncio.run(drive())
 
 
-def test_record_without_token_keeps_legacy_behavior():
-    """A caller that doesn't opt into the identity handshake (passes
-    no probe_token) still affects the state — legacy compatibility."""
+def test_half_open_record_without_token_is_discarded():
+    """HALF_OPEN probe resolution must include the admitted probe token."""
     guard = _make(failure_threshold=2, cooldown_seconds=0.0)
 
     async def drive():
@@ -464,8 +466,10 @@ def test_record_without_token_keeps_legacy_behavior():
         await guard.record_failure(RuntimeError("b"))
         admitted, token = await guard.is_available()
         assert admitted is True
-        # Record without the token — still closes the circuit
+        assert token is not None
         await guard.record_success()
+        assert guard.state is CircuitState.HALF_OPEN
+        await guard.record_success(probe_token=token)
 
     asyncio.run(drive())
     assert guard.state is CircuitState.CLOSED

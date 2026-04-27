@@ -77,7 +77,9 @@ def _config_from_env() -> "Config":
     cfg.create_new_db = os.environ.get("MNEMOS_CREATE_DB", "true").lower() == "true"
     cfg.install_docling = os.environ.get("MNEMOS_INSTALL_DOCLING", "true").lower() == "true"
     cfg.create_service = os.environ.get("MNEMOS_CREATE_SERVICE", "true").lower() == "true"
-    cfg.ollama_embed_host = os.environ.get("OLLAMA_EMBED_HOST", "http://localhost:11434")
+    cfg.inference_embed_host = os.environ.get(
+        "INFERENCE_EMBED_HOST", "http://localhost:11434"
+    )
 
     # Provider keys from env
     providers = ["openai", "anthropic", "xai", "groq", "perplexity", "gemini", "nvidia", "together"]

@@ -7,8 +7,8 @@ judge cares about, drops what it doesn't.
 Apollo handles schema-typed dense encoding + LLM fallback for prose
 that misses every schema; Artemis handles the pure-CPU path when
 GPU is unavailable or latency-sensitive. Default contest engine
-alongside Apollo; runs as the extractive peer that competes
-directly with ANAMNESIS's LLM extraction on cost.
+alongside Apollo; runs as the extractive peer for latency-sensitive
+or GPU-free compression.
 
 Design grounded in a GRAEAE multi-muse consultation (5 models
 agreed unanimously on the stack): the 0.44 judge-mean of the
@@ -613,7 +613,7 @@ class ARTEMISEngine(CompressionEngine):
 
         # Phase 4: MMR selection to a target length. Caller's
         # request.target_ratio overrides the constructor default —
-        # without this, every distill() with a different ratio produced
+        # without this, every compress() with a different ratio produced
         # identical output (Codex audit P2, 2026-04-25).
         effective_ratio = (
             request.target_ratio

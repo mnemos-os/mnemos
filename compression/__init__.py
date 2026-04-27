@@ -10,14 +10,8 @@ framework.
   rule-based detection; S-II adds LLM fallback, narration endpoint,
   judge-LLM scoring, decision/person/event schemas).
 - ARTEMIS: CPU-only extractive with identifier preservation,
-  labeled-block handling, and evidence-based self-scoring. Drives
-  the legacy DistillationEngine API after LETHE removal.
+  labeled-block handling, and evidence-based self-scoring.
 - QualityAnalyzer: Quality manifest generation.
-
-History note: LETHE / ALETHEIA / ANAMNESIS were the v3.0–v3.2 stack.
-All three were removed in v3.3 after the 2026-04-23 benchmark
-(docs/benchmarks/compression-2026-04-23.md). See EVOLUTION.md
-"v3.2 tail" for the full settlement.
 """
 
 from .base import (
@@ -44,13 +38,6 @@ from .quality_analyzer import QualityAnalyzer, QualityManifest
 from .apollo import APOLLOEngine
 from .apollo_schemas import PortfolioSchema, Schema as APOLLOSchema
 from .artemis import ARTEMISEngine
-from .distillation_engine import (
-    DistillationEngine,
-    CompressionStrategy,
-    get_distillation_engine,
-    distill,
-    get_distillation_stats,
-)
 
 __all__ = [
     # v3.1 competitive-selection plugin ABC
@@ -78,9 +65,4 @@ __all__ = [
     "APOLLOSchema",
     "PortfolioSchema",
     "ARTEMISEngine",
-    "DistillationEngine",
-    "CompressionStrategy",
-    "get_distillation_engine",
-    "distill",
-    "get_distillation_stats",
 ]

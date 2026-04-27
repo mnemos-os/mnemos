@@ -120,9 +120,8 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
             # to_tsvector so we match the 'english' dictionary regardless of
             # the cluster's default_text_search_config and so the index (if
             # present) can actually be used.
-            # v3.2 compression-in-hot-paths: prefer the v3.1 contest
-            # winner's compressed_content when available, fall back
-            # to the v3.0 column, fall back to raw content. Saves
+            # Compression-in-hot-paths: prefer the contest winner's
+            # compressed_content when available, then fall back to raw content. Saves
             # prompt-window tokens on memories that have been
             # through the compression pipeline — the whole point of
             # running the contest. Non-winners' compressed forms
@@ -132,9 +131,7 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
                 memories = await conn.fetch(
                     """
                     SELECT m.id, m.category,
-                           COALESCE(v.compressed_content,
-                                    m.compressed_content,
-                                    m.content) AS content
+                           COALESCE(v.compressed_content, m.content) AS content
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
                         ON v.memory_id = m.id
@@ -169,9 +166,7 @@ async def _search_mnemos_context(query: str, user: UserContext, limit: int = 5) 
                 memories = await conn.fetch(
                     f"""
                     SELECT m.id, m.category,
-                           COALESCE(v.compressed_content,
-                                    m.compressed_content,
-                                    m.content) AS content
+                           COALESCE(v.compressed_content, m.content) AS content
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
                         ON v.memory_id = m.id
@@ -417,12 +412,10 @@ async def _route_to_provider(
 ) -> str:
     """Route request to selected provider via GRAEAE single-provider mode.
 
-    Provider resolution (v3.2): query model_registry for the exact
-    model_id, falling back to substring heuristics only when the
-    registry has no row. Unknown models are rejected with 400 instead
-    of silently routing to a default (pre-v3.2 behavior was
-    "default to groq" which caused surprising misroutes on any new
-    or typo'd model_id).
+    Provider resolution: query model_registry for the exact model_id,
+    falling back to substring heuristics only when the registry has no row.
+    Unknown models are rejected with 400 instead of silently routing to a
+    default.
     """
     graeae = get_graeae_engine()
     # Flatten the full messages array rather than keeping only

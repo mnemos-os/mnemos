@@ -25,7 +25,7 @@ class Config:
     auth_enabled: bool = False       # False for personal
     rls_enabled: bool = False        # False for personal
     graeae_providers: dict = field(default_factory=dict)
-    ollama_embed_host: str = "http://localhost:11434"
+    inference_embed_host: str = "http://localhost:11434"
     install_docling: bool = True
     create_service: bool = True
     create_new_db: bool = True       # True = create DB, False = use existing
@@ -219,11 +219,11 @@ def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
         print("  Skipping provider configuration.")
 
     # ------------------------------------------------------------------ #
-    # 6. Ollama embedding host
+    # 6. Embedding inference host
     # ------------------------------------------------------------------ #
     _section("Embeddings")
-    cfg.ollama_embed_host = _prompt(
-        "Ollama host for embeddings", default="http://localhost:11434"
+    cfg.inference_embed_host = _prompt(
+        "Embedding inference host", default="http://localhost:11434"
     )
 
     # ------------------------------------------------------------------ #
@@ -253,7 +253,7 @@ def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
     print(f"  Service user:    {cfg.service_user}")
     print(f"  Auth enabled:    {cfg.auth_enabled}")
     print(f"  GRAEAE providers: {list(cfg.graeae_providers.keys()) or 'none'}")
-    print(f"  Ollama embed:    {cfg.ollama_embed_host}")
+    print(f"  Embed host:      {cfg.inference_embed_host}")
     print(f"  Install docling: {cfg.install_docling}")
     print(f"  Create service:  {cfg.create_service}")
     print()

@@ -5,17 +5,16 @@ compression contest with a judge-rated fidelity score. The judge is
 a separate LLM call that compares the narrated form of each
 compressed candidate against the root memory and returns a score in
 [0, 1]. This is what lets APOLLO's LLM fallback (currently pinned
-at 0.65 below the 0.70 quality floor) actually win contests on
-fact-shaped content where its dense encoding preserves meaning
-better than LETHE's extract.
+at 0.55 below the quality floors) actually win contests on fact-shaped
+content where its dense encoding preserves meaning.
 
 Design
 
   * ``Judge`` ABC — single async ``score()`` method. Callers supply
     (original, candidate dense form, candidate narrated form,
     engine id). Return is a ``JudgeScore`` or ``None`` on failure.
-  * ``LLMJudge`` — GPU-backed concrete judge. ANAMNESIS-pattern
-    httpx scaffolding against ``GPU_PROVIDER_HOST``; GPUGuard
+  * ``LLMJudge`` — GPU-backed concrete judge. httpx scaffolding
+    against ``GPU_PROVIDER_HOST``; GPUGuard
     integration for circuit-open short-circuit; JSON parse with
     strict shape checking; None on malformed output.
   * ``NullJudge`` — no-op for disabled / test paths. Used as the
@@ -52,7 +51,7 @@ from .gpu_guard import get_guard
 logger = logging.getLogger(__name__)
 
 
-# GPU provider endpoint (shared with ANAMNESIS / APOLLO fallback).
+# GPU provider endpoint for APOLLO fallback and judge calls.
 _GPU_PROVIDER_HOST = os.getenv("GPU_PROVIDER_HOST", "http://localhost")
 _GPU_PROVIDER_PORT = os.getenv("GPU_PROVIDER_PORT", "8000")
 _GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
@@ -144,10 +143,9 @@ Output:"""
 class LLMJudge(Judge):
     """GPU-backed fidelity judge.
 
-    Uses the same ``GPU_PROVIDER_HOST`` endpoint as ANAMNESIS and
-    APOLLO's LLM fallback; a single GPU host serves all three. The
-    circuit breaker is shared — one open-circuit signal skips the
-    judge alongside the other GPU-consuming engines, so a GPU
+    Uses the same ``GPU_PROVIDER_HOST`` endpoint as APOLLO's LLM
+    fallback. The circuit breaker is shared, so one open-circuit
+    signal skips the judge alongside other GPU-consuming work and a GPU
     outage degrades the contest to engine self-reported scoring
     rather than falling over entirely.
     """
@@ -314,9 +312,9 @@ class CrossEncoderJudge(Judge):
 
     The cross-encoder sees (original, candidate_narrated) as a pair.
     For APOLLO candidates the contest narrates the dense form first
-    (same plumbing LLMJudge uses); for LETHE/ANAMNESIS candidates
-    the prose content is passed through. That's consistent with
-    LLMJudge's behavior — both judges score the SAME narrated pair.
+    (same plumbing LLMJudge uses); prose-shaped candidates are passed
+    through. That's consistent with LLMJudge's behavior — both judges
+    score the SAME narrated pair.
 
     Reasoning is empty: cross-encoders produce no narrative. Callers
     that need a reason should use LLMJudge primary; CrossEncoderJudge
@@ -503,5 +501,3 @@ class EnsembleJudge(Judge):
                 ),
             )
         return primary_score
-
-

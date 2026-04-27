@@ -99,18 +99,17 @@ def _fetch_export(
     return payload
 
 
-def _fetch_memories_legacy(
+def _fetch_memories_flat(
     endpoint: str,
     api_key: Optional[str],
     category: Optional[str],
     limit: int,
 ) -> List[Dict[str, Any]]:
-    """Fallback memory fetch for markdown/html/text paths.
+    """Flat memory fetch for markdown/html/text paths.
 
-    Uses ``GET /memories`` which returns a raw array. The markdown /
-    html / text formatters in ``export_memories_for_docling.py``
-    expect flat memory dicts (not MPF records), so we flatten the
-    export envelope or use the legacy endpoint directly.
+    The markdown/html/text formatters in ``export_memories_for_docling.py``
+    expect flat memory dicts (not MPF records), so we flatten the MPF
+    export envelope.
     """
     # Prefer /v1/export (keeps all provenance) and flatten records.
     envelope = _fetch_export(endpoint, api_key, category, limit)
@@ -179,8 +178,8 @@ def cmd_markdown(args: argparse.Namespace) -> None:
     except ImportError:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from tools.export_memories_for_docling import export_memories_markdown  # noqa
-    memories = _fetch_memories_legacy(args.endpoint, args.api_key,
-                                      args.category, args.limit)
+    memories = _fetch_memories_flat(args.endpoint, args.api_key,
+                                    args.category, args.limit)
     out = Path(args.out)
     export_memories_markdown(memories, out)
     print(f"Wrote {len(memories)} memories as Markdown → {out}")
@@ -192,8 +191,8 @@ def cmd_html(args: argparse.Namespace) -> None:
     except ImportError:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from tools.export_memories_for_docling import export_memories_html  # noqa
-    memories = _fetch_memories_legacy(args.endpoint, args.api_key,
-                                      args.category, args.limit)
+    memories = _fetch_memories_flat(args.endpoint, args.api_key,
+                                    args.category, args.limit)
     out = Path(args.out)
     export_memories_html(memories, out)
     print(f"Wrote {len(memories)} memories as HTML → {out}")
@@ -205,8 +204,8 @@ def cmd_text(args: argparse.Namespace) -> None:
     except ImportError:
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from tools.export_memories_for_docling import export_memories_plaintext  # noqa
-    memories = _fetch_memories_legacy(args.endpoint, args.api_key,
-                                      args.category, args.limit)
+    memories = _fetch_memories_flat(args.endpoint, args.api_key,
+                                    args.category, args.limit)
     out = Path(args.out)
     export_memories_plaintext(memories, out)
     print(f"Wrote {len(memories)} memories as plain text → {out}")

@@ -26,18 +26,8 @@ logging.basicConfig(
 # Config — loaded from config.py (single source of truth)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import PG_CONFIG as _PG_CONFIG  # noqa: E402
-from inference_backend import get_backend  # noqa: E402
-try:
-    from compression.distillation_engine import DistillationEngine, CompressionStrategy
-    _COMPRESSION_AVAILABLE = True
-except Exception as _ce:
-    logger.warning(f"Local compression unavailable: {_ce}")
-    _COMPRESSION_AVAILABLE = False
-
-# v3.1 contest path: drains memory_compression_queue via the plugin
-# CompressionEngine ABC + run_contest + persist_contest. Runs alongside
-# the v3.0 direct-memory-polling path; does not replace it. Operators
-# can disable the v3.1 path by setting MNEMOS_CONTEST_ENABLED=false.
+# Contest path: drains memory_compression_queue via the plugin
+# CompressionEngine ABC + run_contest + persist_contest.
 try:
     from compression.apollo import APOLLOEngine
     from compression.artemis import ARTEMISEngine
@@ -45,28 +35,17 @@ try:
     from compression.worker_contest import process_contest_queue
     _CONTEST_AVAILABLE = True
 except Exception as _ce:
-    logger.warning(f"v3.1 contest path unavailable: {_ce}")
+    logger.warning(f"compression contest path unavailable: {_ce}")
     _CONTEST_AVAILABLE = False
 
 _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 
-# v3.3 cleanup: LETHE / ANAMNESIS / ALETHEIA were removed entirely.
-# The 2026-04-23 CERBERUS benchmark recorded ALETHEIA winning 0/49
-# contests; ARTEMIS supersedes LETHE (identifier preservation +
-# structure-aware extraction + TextRank); APOLLO's LLM fallback
-# subsumes ANAMNESIS's fact-extraction role in a denser form. The
-# going-forward stack is APOLLO + ARTEMIS. See
-# docs/benchmarks/compression-2026-04-23.md and EVOLUTION.md
-# "v3.2 tail" for the full settlement.
+# The current built-in compression stack is APOLLO + ARTEMIS.
 
-# Optional minimum-content-length gate for the v3.1 contest path.
+# Optional minimum-content-length gate for the compression contest path.
 # Memories shorter than this value are marked 'failed' with
-# error='too_short' BEFORE any engine runs, avoiding the multi-second
-# ANAMNESIS GPU round-trip on content that cannot be meaningfully
-# compressed (git commit headers, GRAEAE consultation stubs, and
-# other short templated blurbs — see the 2026-04-23 CERBERUS
-# benchmark for the analysis). Default 0 = no gate (full v3.1 GA
-# behavior). Recommended 500 for GPU-constrained installs.
+# error='too_short' before any engine runs. Default 0 = no gate.
+# Recommended 500 for GPU-constrained installs.
 _CONTEST_MIN_CONTENT_LENGTH = int(
     os.getenv("MNEMOS_CONTEST_MIN_CONTENT_LENGTH", "0")
 )
@@ -75,8 +54,7 @@ _CONTEST_MIN_CONTENT_LENGTH = int(
 # GPU_OPTIONAL (schema fast path is pure regex; LLM fallback uses
 # the GPU host when reachable, short-circuits on a closed circuit,
 # returns error on parse failure — see compression/apollo.py). The
-# env var lets operators disable APOLLO entirely (e.g. while
-# benchmarking the LETHE/ANAMNESIS baseline) without editing code.
+# env var lets operators disable APOLLO entirely without editing code.
 _APOLLO_ENABLED = os.getenv("MNEMOS_APOLLO_ENABLED", "true").lower() == "true"
 
 # When APOLLO is on but the LLM fallback is unwanted (operators who
@@ -90,12 +68,10 @@ _APOLLO_LLM_FALLBACK_ENABLED = (
 # Judge-LLM fidelity scoring (v3.3 S-II). When enabled, every
 # successful contest candidate gets its quality_score replaced by a
 # judge-rated fidelity score against the original memory. This is
-# what lets APOLLO's LLM fallback (currently pinned at 0.65) actually
-# win on fact-shaped content where its dense encoding preserves
-# meaning better than LETHE's extract. Off by default to match v3.2
-# behavior on upgrade; operators opt in per the judge's own GPU
-# cost profile. When on, the MNEMOS_JUDGE_MODEL env var stamps the
-# judge's id onto every scored candidate (default 'judge-default').
+# what lets APOLLO's LLM fallback win on fact-shaped content when its
+# dense encoding preserves meaning. Operators opt in per the judge's
+# GPU cost profile. When on, the MNEMOS_JUDGE_MODEL env var stamps
+# the judge's id onto every scored candidate (default 'judge-default').
 _JUDGE_ENABLED = os.getenv("MNEMOS_JUDGE_ENABLED", "false").lower() == "true"
 _JUDGE_MODEL = os.getenv("MNEMOS_JUDGE_MODEL", "judge-default")
 
@@ -144,12 +120,8 @@ def _parse_stale_threshold_secs() -> int:
 _CONTEST_STALE_THRESHOLD_SECS = _parse_stale_threshold_secs()
 
 # Tuning
-SIZE_LIMIT_KB = 5
 BATCH_SIZE = 5
 CHECK_INTERVAL = 30
-DISTILL_TIMEOUT_BASE = 45
-DISTILL_TIMEOUT_PER_KB = 3
-QUALITY_TIMEOUT = 20
 MAX_ATTEMPTS = 3
 
 # DB connection kwargs — never build a DSN string with the password embedded
@@ -162,33 +134,13 @@ _DB_CONNECT_ARGS = {
 }
 
 
-async def _distill_backend_call(backend, text: str) -> str:
-    """Build distillation prompt and call backend.complete()."""
-    prompt = (
-        "Summarize this text to approximately 40% of original length. "
-        "Preserve all critical facts, decisions, and technical details. "
-        "Remove redundancy.\n\nTEXT:\n" + text + "\n\nSUMMARY:"
-    )
-    return await backend.complete(prompt)
-
-
 class MemoryDistillationWorker:
     def __init__(self):
         self.db_pool = None   # asyncpg Pool — set in start()
-        self.llm = get_backend()
-        # Local compression engine (ARTEMIS-backed extractive, no external calls)
-        self._compression_engine = DistillationEngine() if _COMPRESSION_AVAILABLE else None
-        # v3.1 contest engines — populated in start() once config is loaded
+        # Contest engines — populated in start() once config is loaded
         self._contest_engines = []
         # v3.3 S-II judge — populated alongside engines in start()
         self._judge = None
-        self.stats = {
-            "processed": 0,
-            "successful": 0,
-            "timeouts": 0,
-            "errors": 0,
-            "total_bytes_saved": 0
-        }
 
     async def start(self):
         """Start background worker"""
@@ -197,7 +149,7 @@ class MemoryDistillationWorker:
             min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
         )
 
-        # Construct v3.1 contest engines if available. Each engine is
+        # Construct contest engines if available. Each engine is
         # lazy about creating HTTP clients — construction itself is
         # cheap and doesn't touch the network, so we always build the
         # enabled set and let the gpu_guard handle endpoint
@@ -208,9 +160,7 @@ class MemoryDistillationWorker:
             #            structure-aware, TextRank + MMR selection.
             #   Apollo:  Schema-aware dense encoding (portfolio / decision
             #            / person / event) with LLM fallback on misses.
-            # Going-forward stack only: ARTEMIS + (optional) APOLLO.
-            # LETHE / ANAMNESIS / ALETHEIA were removed in the v3.3
-            # cleanup pass.
+            # Built-in stack: ARTEMIS + optional APOLLO.
             self._contest_engines = [ARTEMISEngine()]
             if _APOLLO_ENABLED:
                 self._contest_engines.append(
@@ -285,20 +235,15 @@ class MemoryDistillationWorker:
                 )
         else:
             logger.info(
-                "v3.1 contest path disabled (available=%s, enabled=%s)",
+                "compression contest path disabled (available=%s, enabled=%s)",
                 _CONTEST_AVAILABLE, _CONTEST_ENABLED,
             )
 
         logger.info("[OK] Distillation worker started")
-        logger.info(f"Backend: {self.llm.__class__.__name__}")
-        logger.info(f"Config: size_limit={SIZE_LIMIT_KB}KB, batch={BATCH_SIZE}, "
-                   f"distill_timeout={DISTILL_TIMEOUT_BASE}s+({DISTILL_TIMEOUT_PER_KB}s/KB)")
+        logger.info(f"Config: batch={BATCH_SIZE}, interval={CHECK_INTERVAL}s")
 
         while True:
             try:
-                # v3.0 direct-memory-polling path (backward compat)
-                await self.process_batch()
-                # v3.1 queue-driven contest path (runs alongside, failure-isolated)
                 await self.process_contest_queue_batch()
                 await self.log_stats()
             except Exception as e:
@@ -315,12 +260,10 @@ class MemoryDistillationWorker:
 
     async def process_contest_queue_batch(self):
         """Drain up to BATCH_SIZE rows from memory_compression_queue via
-        the v3.1 contest path. No-op if contest engines aren't configured.
+        the contest path. No-op if contest engines aren't configured.
 
-        Failures here do not propagate — the contest path is additive
-        to v3.0 behavior and must not kill the worker loop if something
-        goes wrong. Errors are logged and the next loop iteration tries
-        again.
+        Failures here do not propagate. Errors are logged and the next
+        loop iteration tries again.
         """
         if not self._contest_engines:
             return
@@ -340,198 +283,28 @@ class MemoryDistillationWorker:
         except Exception as e:
             logger.error("contest queue drain error: %s", e, exc_info=True)
 
-    async def process_batch(self):
-        """Process batch of unoptimized memories"""
-        query = """
-        SELECT id, content, quality_rating, LENGTH(content) as len,
-               COALESCE((metadata->>'distillation_attempts')::int, 0) as attempts
-        FROM memories
-        WHERE llm_optimized = false
-          AND content IS NOT NULL
-          AND LENGTH(content) > 100
-          AND LENGTH(content) <= $1
-          AND COALESCE((metadata->>'distillation_attempts')::int, 0) < $2
-        ORDER BY LENGTH(content) DESC, created DESC
-        LIMIT $3
-        """
-
-        async with self.db_pool.acquire() as conn:
-            rows = await conn.fetch(query, SIZE_LIMIT_KB * 1024, MAX_ATTEMPTS, BATCH_SIZE)
-
-        if not rows:
-            logger.debug("No memories pending optimization")
-            return
-
-        memories = [
-            {
-                'id': row['id'],
-                'content': row['content'],
-                'quality_rating': row['quality_rating'] or 75,
-                'len': row['len'],
-                'attempts': row['attempts'] or 0
-            }
-            for row in rows
-        ]
-
-        logger.info(f"Processing batch of {len(memories)} memories")
-
-        for memory in memories:
-            try:
-                await self.optimize_memory(memory)
-            except Exception as e:
-                logger.error(f"Error processing {memory['id'][:8]}: {e}")
-                await self.increment_attempts(memory['id'])
-
-    async def optimize_memory(self, memory: dict):
-        """Compress and score a single memory"""
-        memory_id = memory["id"]
-        original_text = memory["content"]
-        original_len = memory["len"]
-        current_quality = memory["quality_rating"]
-
-        content_len = len(original_text)
-        if content_len > SIZE_LIMIT_KB * 1024:
-            logger.debug(f"Skipping {memory_id[:8]}: content {content_len}b exceeds {SIZE_LIMIT_KB}KB limit")
-            return
-
-        try:
-            compression_method = None
-            compressed = None
-            quality_score = None
-
-            # --- Primary path: local ARTEMIS compression (no external calls) ---
-            if _COMPRESSION_AVAILABLE and self._compression_engine is not None:
-                try:
-                    # MUST use distill_async — we're inside the worker's
-                    # running event loop. The sync .distill() raises
-                    # RuntimeError here as a safety guard against
-                    # silently falling through to the LLM fallback path.
-                    result = await self._compression_engine.distill_async(
-                        original_text, strategy=CompressionStrategy.AUTO,
-                    )
-                    compressed_candidate = result.get("compressed_text") or result.get("compressed", "")
-                    candidate_quality = float(result.get("quality_score", 0) or 0) * 100  # 0-1 -> 0-100
-                    strategy_used = result.get("strategy_used", "auto")
-                    # ARTEMIS-backed; strategy_used is the API-level
-                    # strategy name (vestigial after the v3.3 LETHE
-                    # removal — ARTEMIS has a single extractive path).
-                    compression_method = f"artemis-{strategy_used}"
-                    if compressed_candidate and len(compressed_candidate) >= 10 and candidate_quality >= 60:
-                        compressed = compressed_candidate
-                        quality_score = candidate_quality
-                        logger.debug(f"Local compression ({compression_method}) quality={quality_score:.1f}")
-                    else:
-                        logger.debug(
-                            f"Local compression quality too low ({candidate_quality:.1f}), falling back to LLM"
-                        )
-                except Exception as ce:
-                    logger.warning(f"Local compression failed for {memory_id[:8]}: {ce}, falling back to LLM")
-
-            # --- Fallback: ExternalInferenceProvider / LLM-assisted compression ---
-            if compressed is None:
-                timeout = DISTILL_TIMEOUT_BASE + (original_len / 1024) * DISTILL_TIMEOUT_PER_KB
-                compressed = await asyncio.wait_for(
-                    _distill_backend_call(self.llm, original_text),
-                    timeout=timeout
-                )
-                if compressed:
-                    quality_score = await asyncio.wait_for(
-                        self.llm.evaluate_quality(original_text, compressed),
-                        timeout=QUALITY_TIMEOUT
-                    )
-                compression_method = "external"
-
-            if not compressed or len(compressed) < 10:
-                logger.warning(f"[WARN]  Empty compression for {memory_id[:8]}")
-                return
-
-            compressed_len = len(compressed)
-            ratio = compressed_len / max(original_len, 1)
-            bytes_saved = original_len - compressed_len
-
-            # Persist
-            update_query = """
-            UPDATE memories
-            SET compressed_content = $1,
-                quality_rating = $2,
-                llm_optimized = true,
-                optimized_at = NOW(),
-                compression_method = $4,
-                metadata = jsonb_set(
-                    metadata,
-                    '{distillation_success}',
-                    'true'
-                )
-            WHERE id = $3
-            """
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    update_query,
-                    compressed, min(100, int(quality_score or 75)), memory_id, compression_method
-                )
-
-            self.stats["successful"] += 1
-            self.stats["total_bytes_saved"] += bytes_saved
-
-            logger.info(
-                f"✅ {memory_id[:8]}... [{compression_method}] | quality {current_quality}→{quality_score:.0f} "
-                f"| {original_len}→{compressed_len} chars ({ratio:.2%}) "
-                f"| saved {bytes_saved} bytes"
-            )
-
-        except asyncio.TimeoutError:
-            self.stats["timeouts"] += 1
-            logger.warning(f"[TIMER] Timeout optimizing {memory_id[:8]} ({original_len} chars)")
-            await self.increment_attempts(memory_id)
-
-        except Exception as e:
-            self.stats["errors"] += 1
-            logger.error(f"[ERROR] Error optimizing {memory_id[:8]}: {e}")
-            await self.increment_attempts(memory_id)
-
-        finally:
-            self.stats["processed"] += 1
-
-    async def increment_attempts(self, memory_id: str):
-        """Increment distillation_attempts in metadata"""
-        try:
-            async with self.db_pool.acquire() as conn:
-              await conn.execute(
-                """
-                UPDATE memories
-                SET metadata = jsonb_set(
-                    COALESCE(metadata, '{}'),
-                    '{distillation_attempts}',
-                    to_jsonb(COALESCE((metadata->>'distillation_attempts')::int, 0) + 1)
-                )
-                WHERE id = $1
-                """,
-                memory_id
-              )
-        except Exception as e:
-            logger.error(f"Could not increment attempts for {memory_id}: {e}")
-
     async def log_stats(self):
         """Log current progress"""
         try:
             async with self.db_pool.acquire() as conn:
-              row = await conn.fetchrow("""
-                SELECT 
-                    COUNT(*) as total,
-                    COUNT(CASE WHEN llm_optimized = true THEN 1 END) as optimized,
-                    COUNT(CASE WHEN llm_optimized = false THEN 1 END) as pending,
-                    AVG(quality_rating) as avg_quality
-                FROM memories
-              """)
-            total, optimized = row['total'], row['optimized']
-
-            if self.stats["processed"] > 0:
-                logger.info(
-                    f"📊 Progress: {optimized}/{total} optimized ({100*optimized/max(total,1):.1f}%) | "
-                    f"Session: {self.stats['successful']} success, {self.stats['timeouts']} timeouts, "
-                    f"{self.stats['errors']} errors | "
-                    f"Saved: {self.stats['total_bytes_saved']/1024:.1f}KB"
+                row = await conn.fetchrow("""
+                    SELECT
+                        COUNT(*) AS total,
+                        COUNT(CASE WHEN status = 'pending' THEN 1 END) AS pending,
+                        COUNT(CASE WHEN status = 'running' THEN 1 END) AS running,
+                        COUNT(CASE WHEN status = 'done' THEN 1 END) AS done,
+                        COUNT(CASE WHEN status = 'failed' THEN 1 END) AS failed
+                    FROM memory_compression_queue
+                """)
+                variants = await conn.fetchval(
+                    "SELECT COUNT(*) FROM memory_compressed_variants"
                 )
+            logger.info(
+                "Compression queue: total=%s pending=%s running=%s done=%s "
+                "failed=%s variants=%s",
+                row["total"], row["pending"], row["running"], row["done"],
+                row["failed"], variants,
+            )
         except Exception as e:
             logger.debug(f"Could not log stats: {e}")
 

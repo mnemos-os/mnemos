@@ -2113,7 +2113,7 @@ async def import_memories(
             # (vs which hit ON CONFLICT DO NOTHING and were
             # pre-existing). The post-import v1 verification scopes
             # to THIS set, not envelope.records — otherwise a
-            # pre-existing legacy memory with no v1 history would
+            # pre-existing memory with no v1 history would
             # roll back an unrelated import (Codex round-4 finding).
             inserted_record_ids: set = set()
 

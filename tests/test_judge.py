@@ -90,7 +90,7 @@ def test_null_judge_returns_none():
         original="o",
         candidate_encoded="e",
         candidate_narrated="n",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert out is None
 
@@ -173,7 +173,7 @@ def test_llmjudge_parse_failure_returns_none():
         original="something",
         candidate_encoded="x",
         candidate_narrated="x",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert out is None
 
@@ -188,7 +188,7 @@ def test_llmjudge_http_failure_returns_none():
         original="something",
         candidate_encoded="x",
         candidate_narrated="x",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert out is None
 
@@ -202,12 +202,12 @@ def test_llmjudge_empty_inputs_short_circuit():
 
     out = asyncio.run(j.score(
         original="", candidate_encoded="x", candidate_narrated="x",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert out is None
     out = asyncio.run(j.score(
         original="x", candidate_encoded="x", candidate_narrated="",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert out is None
     assert fake.calls == []
@@ -227,7 +227,7 @@ def test_llmjudge_circuit_open_short_circuits():
 
     out = asyncio.run(j.score(
         original="x", candidate_encoded="x", candidate_narrated="x",
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
     assert out is None
     assert fake.calls == []  # no HTTP attempt while circuit open
@@ -247,7 +247,7 @@ def test_llmjudge_truncates_long_prompts():
     long = "x" * 10000
     asyncio.run(j.score(
         original=long, candidate_encoded=long, candidate_narrated=long,
-        candidate_engine_id="lethe",
+        candidate_engine_id="artemis",
     ))
 
     prompt = fake.calls[0]["json"]["prompt"]

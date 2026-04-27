@@ -114,7 +114,7 @@ class TestMCPWireContract:
 
     def test_kg_paths_are_v1_prefixed(self):
         """KG routes were moved from /kg to /v1/kg as part of the v3.3
-        legacy-cleanup pass (drop the v2.3 unversioned prefix). Any
+        API cleanup pass. Any
         unversioned /kg/* path in mcp_server.py would 404 against the
         current API."""
         mcp_paths = _extract_mcp_paths()

@@ -226,19 +226,19 @@ async def test_handler_apollo_fallback_narrated(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_handler_non_apollo_variant_passthrough(monkeypatch):
-    """LETHE/ANAMNESIS output is already prose — don't narrate."""
+    """Non-APOLLO output is already prose — don't narrate."""
     _mock_pool(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=_variant_row(
-            engine_id="lethe",
+            engine_id="artemis",
             engine_version="1.0",
             compressed_content="Short extractive prose output.",
         ),
     )
     resp = await narrate(memory_id="m1", format="prose", user=_user())
     assert resp.source == "variant_passthrough"
-    assert resp.engine_id == "lethe"
+    assert resp.engine_id == "artemis"
     assert resp.content == "Short extractive prose output."
 
 

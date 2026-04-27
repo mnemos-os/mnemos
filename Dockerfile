@@ -48,7 +48,7 @@ RUN python -m pip install --no-deps --no-build-isolation .
 ENV PG_USER=mnemos_user \
     PG_DATABASE=mnemos \
     PG_HOST=postgres \
-    OLLAMA_EMBED_HOST=http://ollama:11434 \
+    INFERENCE_EMBED_HOST=http://ollama:11434 \
     MNEMOS_PORT=5002 \
     PYTHONUNBUFFERED=1
 

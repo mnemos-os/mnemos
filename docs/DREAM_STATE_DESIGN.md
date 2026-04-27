@@ -19,8 +19,8 @@ only through explicit merge.
 
 ## 1. Why this is not already covered by existing compression
 
-The v3.1 compression contest (LETHE / ANAMNESIS / ALETHEIA) and the
-APOLLO program (v3.2–v3.4) all do **convergent** work: take a memory,
+The current compression contest (APOLLO / ARTEMIS) and the
+APOLLO program (v3.2-v3.4) all do **convergent** work: take a memory,
 produce a compacter, denser, or schema-typed form of *that same memory*.
 Outputs are faithful; the judge-LLM scores fidelity against the root.
 
@@ -368,11 +368,10 @@ cost-multiplier called out in §1a. The dream-writer prefers in this
 order:
 
 1. `memory_compressed_variants` winner (APOLLO dense form if a
-   schema fit existed; ANAMNESIS/LETHE/ALETHEIA output otherwise).
-2. v3.0 legacy compression column if present.
-3. Raw `memories.content` as last resort.
+   schema fit existed; ARTEMIS extractive output otherwise).
+2. Raw `memories.content` as last resort.
 
-This is the same three-tier COALESCE the gateway and rehydrate paths
+This is the same variant-to-raw COALESCE the gateway and rehydrate paths
 use, so dreams inherit the same compression visibility contract as
 the rest of the retrieval pipeline.
 
@@ -461,8 +460,8 @@ Dreams reference their parents by version ID. The caller can walk the
 DAG to trace any dream back to its seeds — which are real memories —
 using the existing `/v1/dag/...` endpoints.
 
-Callers that don't want dreams set `include_dreams=false` and get the
-flat pre-v3.3 shape under `results`.
+Callers that don't want dreams set `include_dreams=false`; the response
+keeps only recall results.
 
 ### 8.2 Gateway inject path
 
@@ -653,8 +652,8 @@ capability is re-delivered in v3.4 in a cleaner form.
 
 ### v3.4 — real v1, paired with APOLLO S-IVB
 
-- APOLLO dense-form seeds via the three-tier COALESCE
-  (`memory_compressed_variants` → v3.0 column → raw).
+- APOLLO dense-form seeds via the COALESCE
+  (`memory_compressed_variants` → raw).
 - Schema-aware seed strategies: `cluster_gap` (now including
   same-field joins across typed memories), `co_access`, `orphan`.
 - Coherence critic via APOLLO's judge-LLM harness; rating stored on

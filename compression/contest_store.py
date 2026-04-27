@@ -187,9 +187,8 @@ async def persist_contest(
                 await conn.execute(_MARK_DONE_SQL, queue_id)
 
     `judge_model` is used as a fallback for candidates whose result
-    didn't record one (e.g., LETHE which self-assesses quality without
-    an external judge). If the candidate already set judge_model,
-    that value wins.
+    didn't record one. If the candidate already set judge_model, that
+    value wins.
 
     Returns {'candidates_written', 'variant_written', 'contest_id',
     'winner_engine'} for the caller to log.

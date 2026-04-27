@@ -12,9 +12,9 @@ section at the bottom.
 
 | Tier          | CPU     | RAM    | Disk (data) | GPU        | Notes                                              |
 | ------------- | ------- | ------ | ----------- | ---------- | -------------------------------------------------- |
-| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Full contest path (LETHE + ANAMNESIS; APOLLO in v3.3+); Postgres 15+ on same host or nearby |
-| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full contest path; ANAMNESIS on CPU fallback is slow but functional |
-| **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | v3.1 contest path disabled via `MNEMOS_CONTEST_ENABLED=false`; v3.0 distillation worker only |
+| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Full contest path (APOLLO + ARTEMIS); Postgres 15+ on same host or nearby |
+| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full contest path; APOLLO LLM fallback uses GPU when configured |
+| **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | Contest path disabled via `MNEMOS_CONTEST_ENABLED=false`; compression queue is not drained |
 
 Embedded Pi-class is now a **lite-profile target** (SQLite + sqlite-vec
 backend) and is out of scope for the current Postgres-only branch. Pi 4 class is the intended
@@ -49,15 +49,12 @@ for production ingest.
   writes are write-heavy.
 * **GPU**:
   - **Recommended**: NVIDIA RTX 4000-class or better, 8 GB+ VRAM, CUDA 12+.
-    Observed on CERBERUS (RTX 4500 ADA): ANAMNESIS completes in ~3-8
-    seconds/memory; contest throughput ~10 memories/minute on the
-    current two-engine default (LETHE + ANAMNESIS). APOLLO's v3.3
-    schema-aware fast path is expected to bring rule-detectable
-    memories down to ~10 ms.
+    APOLLO's schema-aware fast path is CPU-cheap; GPU is only needed
+    for APOLLO's optional LLM fallback and judge-LLM scoring.
   - **Sufficient**: any CUDA-capable GPU with enough VRAM to load
     the chosen embedding/LLM model. The default models (see
     `CLAUDE.md` at the repo root) fit on 8 GB.
-* **Ancillary**: Redis/memcached NOT required in v3.1 — the contest
+* **Ancillary**: Redis/memcached NOT required — the contest
   path is single-worker per the DEPLOYMENT scaling note. Multi-worker
   coordination is v3.2.
 
@@ -65,30 +62,28 @@ for production ingest.
 
 Dev machines, solo researchers, small teams.
 
-* **CPU**: 4+ cores. CPU-only ANAMNESIS works but is slow
-  — expect ~30-60 s per memory instead of 3-8 s.
+* **CPU**: 4+ cores. ARTEMIS runs locally on CPU.
 * **RAM**: 8 GB. CPU-only inference loads the full embedding model into
   RAM; 8 GB is the comfortable floor.
 * **Disk**: 20 GB SSD for mid-scale personal corpora.
-* **GPU**: optional. A 4 GB VRAM GPU is enough to dramatically speed
-  up ANAMNESIS; APOLLO's LLM fallback on a small GPU is acceptable if
-  you accept longer ingest latency on schema-less content.
+* **GPU**: optional. A 4 GB VRAM GPU is enough for APOLLO's LLM fallback
+  if you accept longer ingest latency on schema-less content.
 
-## Edge tier — v3.1 contest disabled
+## Edge tier — contest disabled
 
 Minimal deployments: a Jetson Orin Nano or similar x86 edge node
-running the API + v3.0 distillation loop only. No multi-engine
+running the API without compression queue draining. No multi-engine
 contest, no GPU required.
 
 * **CPU**: 2 cores.
-* **RAM**: 4 GB. Postgres + Python API server + v3.0 worker fit here;
+* **RAM**: 4 GB. Postgres + Python API server + worker fit here;
   leave 1 GB headroom for the OS.
 * **Disk**: 10 GB for the corpus + rolling 7-day backup.
 * **GPU**: explicitly none. Set `MNEMOS_CONTEST_ENABLED=false` to skip
-  registering the v3.1 contest engines.
+  registering the contest engines.
 * **Features dropped**:
   - contest path (multi-engine compression)
-  - ANAMNESIS (and APOLLO's LLM fallback in v3.3+) — both GPU-leaning
+  - APOLLO's LLM fallback and judge-LLM scoring
   - scoring profiles (N/A without contest)
   - memory_compression_candidates / memory_compressed_variants tables
     migrate cleanly but stay empty
@@ -100,8 +95,7 @@ Defaults are the server-tier shape.
 
 | Env var                                | Default  | Purpose                                                             |
 | -------------------------------------- | -------- | ------------------------------------------------------------------- |
-| `MNEMOS_CONTEST_ENABLED`               | `true`   | Toggle the v3.1 contest path                                        |
-| `MNEMOS_ALETHEIA_ENABLED`              | `false`  | [DEPRECATED v3.2 tail] Opt-in gate for the retired ALETHEIA engine. Kept only for operators who had it enabled before retirement; emits a `DeprecationWarning`. v4.0 removes. |
+| `MNEMOS_CONTEST_ENABLED`               | `true`   | Toggle the contest path                                             |
 | `MNEMOS_CONTEST_MIN_CONTENT_LENGTH`    | `0`      | Skip contests for memories shorter than N chars (GPU-constrained installs) |
 | `MNEMOS_CONTEST_STALE_THRESHOLD_SECS`  | `600`    | Stale-running queue-row reclaim threshold (v3.1.1)                  |
 

@@ -38,11 +38,11 @@ psutil>=5.9.0
 # openvino-genai>=2024.4.0
 # fastembed>=0.3.0
 
-# Optional: Full LETHE sentence-mode support (higher-quality extraction)
+# Optional: ARTEMIS/Judge quality extras
 # sentence-transformers>=2.7.0
 # spacy>=3.7.0
 
-# Optional: Full LETHE token-mode support (graph-based importance scoring)
+# Optional: graph-based scoring experiments
 # networkx>=3.3
 authlib>=1.3.0
 itsdangerous>=2.2.0

@@ -100,20 +100,16 @@ Three reasons:
 The subsystem names are Greek on purpose. MNEMOS (memory itself, the
 mother of the Muses), GRAEAE (the three grey sisters who shared one
 eye — multi-LLM consensus across providers), APOLLO and ARTEMIS
-(twin deities — the two compression engines that succeeded LETHE,
-ANAMNESIS, and ALETHEIA in the v3.2 tail; APOLLO does schema-aware
-dense encoding for LLM-to-LLM wire use, ARTEMIS does CPU-only
-extractive compression with identifier preservation), CHARON (the
+(twin deities — the two active compression engines; APOLLO does
+schema-aware dense encoding for LLM-to-LLM wire use, ARTEMIS does
+CPU-only extractive compression with identifier preservation), CHARON (the
 ferryman between worlds — memory portability across schemas),
 KNOSSOS (the palace at Crete where Linear A/B tablets first
 institutionalised writing-as-memory — the MemPalace-compatible MCP
 shim), MORPHEUS (the god of dreams who shapes — the dream-state
 synthesiser). Each name maps to a function. The convention isn't
 decoration; it's how we keep the architecture's intent legible
-across releases — and the old names (LETHE, ANAMNESIS, ALETHEIA)
-stay importable behind deprecation notices through v4.0 so existing
-operator-registered configurations keep working through the
-retirement window.
+across releases.
 
 In the mythology, the gods give gifts. Prometheus brought fire.
 Demeter brought grain. Athena brought olive cultivation and weaving.

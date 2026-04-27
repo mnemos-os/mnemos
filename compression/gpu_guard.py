@@ -57,10 +57,10 @@ Circuit states:
                  (that's a v3.2 candidate).
 
 The guard is per-endpoint (keyed by URL) and lives in a process-local
-registry. Multiple engines sharing the same `GPU_PROVIDER_HOST` share
-one guard — one ANAMNESIS timeout informs APOLLO (and any other
-GPU-consuming engine) that the endpoint is unresponsive without
-each having to time out independently.
+registry. Multiple GPU-consuming paths sharing the same
+`GPU_PROVIDER_HOST` share one guard, so one timeout informs APOLLO
+(and any other GPU-consuming path) that the endpoint is unresponsive
+without each having to time out independently.
 
 For v3.2 horizontal-scaling work, the registry becomes a Redis-backed
 shared-state singleton. v3.1 is single-worker per the DEPLOYMENT.md
@@ -136,8 +136,8 @@ class GPUGuard:
 
     `probe_token` is None for CLOSED-state admissions and an opaque
     integer when the caller was admitted as a probe in HALF_OPEN.
-    Callers that don't pass the token on record_* calls keep legacy
-    behavior — the token check is an opt-in identity guard.
+    HALF_OPEN callers must pass the token on record_* calls; CLOSED-state
+    calls use ``None`` because no probe identity is active.
     """
 
     def __init__(
@@ -253,18 +253,19 @@ class GPUGuard:
         """Note a successful request. Resets failure counter; if the
         circuit was HALF_OPEN, transitions back to CLOSED.
 
-        `probe_token` opts into the v3.2 identity handshake. When
-        supplied, the call is a no-op unless the token matches the
-        guard's current generation — late completions from abandoned
-        probes carry a stale token and can't pollute the replacement
-        probe's resolution. Callers that pass None keep legacy
-        behavior (any success counts).
+        HALF_OPEN probe completions must pass the token returned by
+        is_available(). Late completions from abandoned probes carry a
+        stale token and cannot pollute the replacement probe's resolution.
         """
         async with self._lock:
-            if probe_token is not None and probe_token != self._probe_token:
+            if (
+                probe_token is not None and probe_token != self._probe_token
+            ) or (
+                self._state is CircuitState.HALF_OPEN and probe_token is None
+            ):
                 logger.debug(
                     "gpu_guard[%s]: discarding stale probe success "
-                    "(token=%d, current=%d)",
+                    "(token=%s, current=%d)",
                     self.endpoint, probe_token, self._probe_token,
                 )
                 return
@@ -288,16 +289,21 @@ class GPUGuard:
         """Note a failure. Increments the failure counter; if the counter
         crosses the threshold (or if we were HALF_OPEN), OPEN the circuit.
 
-        `probe_token` opts into the v3.2 identity handshake — see
-        record_success for details. A stale token discards the call so
-        a late failure from an abandoned probe can't re-open a circuit
-        that the replacement probe already closed.
+        HALF_OPEN probe completions must pass the token returned by
+        is_available() — see record_success for details. A stale or
+        missing token discards the call so a late failure from an
+        abandoned probe cannot re-open a circuit that the replacement
+        probe already closed.
         """
         async with self._lock:
-            if probe_token is not None and probe_token != self._probe_token:
+            if (
+                probe_token is not None and probe_token != self._probe_token
+            ) or (
+                self._state is CircuitState.HALF_OPEN and probe_token is None
+            ):
                 logger.debug(
                     "gpu_guard[%s]: discarding stale probe failure "
-                    "(token=%d, current=%d)",
+                    "(token=%s, current=%d)",
                     self.endpoint, probe_token, self._probe_token,
                 )
                 return

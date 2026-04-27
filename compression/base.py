@@ -23,11 +23,8 @@ runner uses that to route work through compression/gpu_batcher.py with
 a circuit breaker and a mandatory CPU fallback path for every
 gpu_optional engine.
 
-Built-in engines (v3.3 going-forward stack): APOLLO (gpu_optional,
-schema-aware) and ARTEMIS (cpu_only, extractive with identifier
-preservation). LETHE / ANAMNESIS / ALETHEIA were the v3.0–v3.2
-stack and were removed in the v3.3 cleanup pass — see
-EVOLUTION.md "v3.2 tail" and the 2026-04-23 CERBERUS benchmark.
+Built-in engines: APOLLO (gpu_optional, schema-aware) and ARTEMIS
+(cpu_only, extractive with identifier preservation).
 
 Operators register additional engines at startup by adding them to
 the contest engine list in distillation_worker.py.
@@ -43,7 +40,7 @@ from typing import Any, Dict, Optional
 
 # Budget-aware defaults adapted from OpenClaw CompactionProvider.
 # Individual engines may override these on a per-instance basis; the
-# CompressionManager passes the effective target_ratio via the request.
+# contest runner passes the effective target_ratio via the request.
 BASE_CHUNK_RATIO: float = 0.4              # default: keep 40% of tokens
 # MIN_CHUNK_RATIO floor: catch empty / degenerate output, NOT aggressive
 # dense encoding. APOLLO's schema path produces ~99% reduction by design
@@ -100,7 +97,7 @@ class IdentifierPolicy(str, Enum):
 class CompressionRequest:
     """Input to a CompressionEngine.compress() call.
 
-    The CompressionManager constructs one request per memory per contest
+    The contest worker constructs one request per memory per contest
     round and fans it out to every eligible engine via asyncio.gather.
     """
 
@@ -171,12 +168,12 @@ class CompressionEngine(ABC):
 
     The contest protocol:
 
-      1. CompressionManager receives a memory_compression_queue row.
+      1. The contest worker receives a memory_compression_queue row.
       2. It builds a CompressionRequest and calls `supports(request)`
          on every registered engine; ineligible engines are skipped
          with reject_reason='disabled' logged to the candidate table.
       3. The remaining engines run concurrently via asyncio.gather.
-      4. The manager collects CompressionResults, computes
+      4. The contest runner collects CompressionResults, computes
          speed_factor and composite_score per the scoring_profile,
          applies the quality floor to disqualify damaged candidates,
          and picks the highest-scoring survivor.

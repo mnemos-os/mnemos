@@ -16,7 +16,7 @@ ExecStart=/opt/mnemos/venv/bin/python3 scripts/update_graeae_config.py
 Environment=DATABASE_URL=postgresql://mnemos_user@localhost/mnemos
 Environment=MNEMOS_CONFIG=/opt/mnemos/config.toml
 Environment=MNEMOS_ELO_PATH=/opt/mnemos/graeae/elo_sync.py
-# Inherit API_KEYS_FILE from environment or rely on default ~/.api_keys_master.json
+# Inherit API_KEYS_FILE from environment or rely on ~/.config/mnemos/api_keys.json
 # Environment=API_KEYS_FILE=/etc/mnemos/api_keys.json
 
 StandardOutput=journal

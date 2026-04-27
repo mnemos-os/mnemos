@@ -66,7 +66,7 @@ _COMMON_ALLCAPS_NON_TICKERS = frozenset({
 
 # Content words that suggest this is genuinely portfolio prose, not a
 # chance regex hit. Presence of these words lifts confidence so the
-# schema doesn't lose to ANAMNESIS on clearly-portfolio content.
+# schema path wins on clearly-portfolio content.
 _PORTFOLIO_MARKERS = (
     "portfolio", "holdings", "shares", "position", "positions",
     "basis", "cost basis", "ticker", "stocks", "equities",

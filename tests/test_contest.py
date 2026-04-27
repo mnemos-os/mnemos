@@ -286,7 +286,7 @@ def test_load_custom_invalid_toml_falls_back(caplog):
         (0.005, 0.995),          # APOLLO's typical dense-encoding ratio
         (0.14, 0.86),             # previously below old floor, now rewarded
         (0.15, 0.85),             # operational sweet spot
-        (0.16, 0.84),             # just above (legacy sanity)
+        (0.16, 0.84),             # just above (boundary sanity)
     ],
 )
 def test_ratio_term(ratio, expected):
@@ -375,22 +375,21 @@ def test_speed_factor_log_space_compressed():
 
 def test_zero_composite_survivor_is_not_a_winner():
     # Regression from the CERBERUS 49-memory drain (2026-04-23):
-    # a short memory produced LETHE ratio=1.0 (no compression),
-    # ratio_term=0, composite=0. With ALETHEIA and ANAMNESIS both
-    # disqualified, LETHE was the only survivor and "won" with
-    # composite=0 — which later violated the mcc_winner_has_output
+    # a short memory produced ratio=1.0 (no compression), ratio_term=0,
+    # composite=0. The sole survivor then "won" with composite=0,
+    # which later violated the mcc_winner_has_output
     # check in the DB (persist coerces 0 to NULL; NULL on a winner
     # row is invalid). Fix: survivors with composite_score == 0
     # are not winner-eligible; they fall through to reject_reason=
     # 'inferior' and outcome.winner becomes None.
     engines = [
-        MockEngine("lethe", quality=1.0, ratio=1.0, elapsed_ms=1),   # ratio_term=0 -> composite=0
+        MockEngine("artemis", quality=1.0, ratio=1.0, elapsed_ms=1),   # ratio_term=0 -> composite=0
         MockEngine("low_q", quality=0.50, ratio=0.3, elapsed_ms=50), # below quality_floor
     ]
     outcome = asyncio.run(run_contest(engines, _request()))
     assert outcome.winner is None
     reasons = {c.result.engine_id: c.reject_reason for c in outcome.candidates}
-    assert reasons["lethe"] == "inferior"
+    assert reasons["artemis"] == "inferior"
     assert reasons["low_q"] == "quality_floor"
 
 

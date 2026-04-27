@@ -11,8 +11,8 @@ Design notes
 - Initial attempt runs inline as a background task (asyncio.create_task via
   _schedule_background). On failure, a new delivery row is scheduled at the
   next backoff interval; the failed attempt is marked `abandoned` with
-  `superseded=TRUE` so old workers skip it while audit queries can distinguish
-  retry-chain advancement from final-attempt failure. Workers claim due rows
+  `superseded=TRUE` so audit queries can distinguish retry-chain advancement
+  from final-attempt failure. Workers claim due rows
   by writing a short-lived lease, release the database connection, and only
   then perform DNS validation and the outbound POST. The lease is the
   authoritative delivery budget: DNS validation and HTTP response headers run
@@ -63,7 +63,6 @@ WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS = float(
     os.getenv("WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS", "5.0")
 )
 WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
-WEBHOOK_LEGACY_GRACE_SECONDS = int(os.getenv("WEBHOOK_LEGACY_GRACE_SECONDS", "300"))
 NEW_CODE_WRITER_REVISION = 1
 NON_IDENTITY_RESPONSE_BODY_PREVIEW_BYTES = 256
 MIN_SEND_WINDOW_SECONDS = 1.0
@@ -99,8 +98,6 @@ if WEBHOOK_RESPONSE_BODY_MAX_BYTES <= 0:
     raise ValueError("WEBHOOK_RESPONSE_BODY_MAX_BYTES must be positive")
 if WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS <= 0:
     raise ValueError("WEBHOOK_POST_HEADER_CLEANUP_TIMEOUT_SECONDS must be positive")
-if WEBHOOK_LEGACY_GRACE_SECONDS < 0:
-    raise ValueError("WEBHOOK_LEGACY_GRACE_SECONDS must be non-negative")
 
 # Keep the lease as the only operator-facing ownership budget. This derived
 # value validates startup configuration; actual sends use the DB-returned claim
@@ -343,11 +340,7 @@ async def _claim_recoverable_deliveries(
             AND NOT d.superseded
             AND d.status IN ('pending', 'retrying')
             AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
-            AND (
-              d.lease_token IS NOT NULL
-              OR d.writer_revision = $6
-              OR d.status_updated_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now
-            )
+            AND d.writer_revision = $5
             AND NOT EXISTS (
               SELECT 1
               FROM webhook_deliveries peer
@@ -391,7 +384,6 @@ async def _claim_recoverable_deliveries(
         lease_token,
         limit,
         lease_seconds,
-        WEBHOOK_LEGACY_GRACE_SECONDS,
         NEW_CODE_WRITER_REVISION,
     )
     return [
@@ -419,11 +411,7 @@ async def _recoverable_delivery_ids(
           AND NOT d.superseded
           AND d.status IN ('pending', 'retrying')
           AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
-          AND (
-            d.lease_token IS NOT NULL
-            OR d.writer_revision = $4
-            OR d.status_updated_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()
-          )
+          AND d.writer_revision = $3
           AND NOT EXISTS (
             SELECT 1
             FROM webhook_deliveries peer
@@ -449,7 +437,7 @@ async def _recoverable_delivery_ids(
         ORDER BY d.scheduled_at
         LIMIT $2
         """,
-        MAX_ATTEMPTS, limit, WEBHOOK_LEGACY_GRACE_SECONDS, NEW_CODE_WRITER_REVISION,
+        MAX_ATTEMPTS, limit, NEW_CODE_WRITER_REVISION,
     )
 
 
@@ -573,11 +561,7 @@ async def _claim_delivery(
                   AND NOT d.superseded
                   AND d.status IN ('pending', 'retrying')
                   AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
-                  AND (
-                    d.lease_token IS NOT NULL
-                    OR d.writer_revision = $6
-                    OR d.status_updated_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now
-                  )
+                  AND d.writer_revision = $5
                   AND (
                     d.status = 'pending'
                     OR (
@@ -601,7 +585,6 @@ async def _claim_delivery(
                 lease_token,
                 lease_seconds,
                 MAX_ATTEMPTS,
-                WEBHOOK_LEGACY_GRACE_SECONDS,
                 NEW_CODE_WRITER_REVISION,
             )
             if claimed is None:

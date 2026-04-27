@@ -185,9 +185,7 @@ def install_log_correlation(
     replace the root handler's formatter with one that prints
     request_id. Call once at startup, before any handlers fire.
 
-    `fmt` overrides the default format string. Default matches the
-    pre-v3.2 MNEMOS format plus a [req:<id>] segment so existing log
-    parsers stay compatible.
+    `fmt` overrides the default format string.
     """
     if fmt is None:
         fmt = (
@@ -519,7 +517,7 @@ def install_structured_logging(
     )
 
     # Pipe standard-logging records through structlog's formatter so
-    # legacy `logger.info(...)` call sites also render as JSON.
+    # ordinary `logger.info(...)` call sites also render as JSON.
     formatter = structlog.stdlib.ProcessorFormatter(
         foreign_pre_chain=shared_processors,
         processors=[

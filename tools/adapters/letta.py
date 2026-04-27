@@ -302,7 +302,7 @@ def _normalize_block(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_message(row: Dict[str, Any]) -> Dict[str, Any]:
     """Recall message → MPF event (session_turn). Letta stores either
-    text (legacy) or content=[{type, text}, ...]; flatten for content."""
+    plain text or content=[{type, text}, ...]; flatten for content."""
     content_parts = _coerce_json(row.get("content"))
     text = row.get("text")
     if not text and isinstance(content_parts, list):

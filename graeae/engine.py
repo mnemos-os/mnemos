@@ -9,8 +9,8 @@ Provider registry
 -----------------
 Providers are declared in config.toml under [graeae.providers.<name>] — no
 code changes needed to add or modify a provider. Keys are resolved from
-~/.api_keys_master.json (or $MNEMOS_KEYS_PATH). Built-in defaults are used
-as a fallback when config.toml has no [graeae.providers] section.
+~/.config/mnemos/api_keys.json (or $MNEMOS_KEYS_PATH). Built-in defaults
+are used as a fallback when config.toml has no [graeae.providers] section.
 
 API adapter styles (the "api" field in config.toml):
   "openai"    — OpenAI-compatible chat completions (Perplexity, Groq, xAI, OpenAI)
@@ -471,7 +471,7 @@ class GraeaeEngine:
                 "[GRAEAE] route(%s) failed: missing api_key (key_name=%s) — "
                 "set the %s environment variable or add the key to the "
                 "Provider Registry File (MNEMOS_KEYS_PATH / "
-                "~/.config/mnemos/api_keys.json / ~/.api_keys_master.json)",
+                "~/.config/mnemos/api_keys.json)",
                 provider,
                 provider_config["key_name"],
                 _env_var_hint(provider_config["key_name"]),
