@@ -109,7 +109,10 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   rejects non-identity response encodings before decompression, and adds
   `db/migrations_v3_5_webhook_writer_revision.sql` so lease-less legacy or
   unknown `pending` and `retrying` rows wait for legacy grace while current
-  writer rows remain immediately recoverable.
+  writer rows remain immediately recoverable. Round 7 adds
+  `db/migrations_v3_5_webhook_status_updated_at.sql`, a trigger-maintained
+  status-transition timestamp, and anchors legacy grace to it so old-writer
+  `retrying` transitions cannot bypass grace with an old `scheduled_at`.
 
 ### Conflicts and operator handling
 

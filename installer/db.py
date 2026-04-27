@@ -256,6 +256,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_5_webhook_retry_terminal_state.sql",
         repo_path / "db" / "migrations_v3_5_webhook_attempt_lease.sql",
         repo_path / "db" / "migrations_v3_5_webhook_writer_revision.sql",
+        repo_path / "db" / "migrations_v3_5_webhook_status_updated_at.sql",
     ]
 
     print("[db] Running migrations...")

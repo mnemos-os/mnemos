@@ -171,6 +171,7 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_5_webhook_retry_terminal_state.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_webhook_attempt_lease.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_webhook_writer_revision.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_webhook_status_updated_at.sql"),
     ]
 
     print("=" * 60)

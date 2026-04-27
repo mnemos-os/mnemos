@@ -255,7 +255,7 @@ async def _recoverable_delivery_ids(
           AND (
             d.lease_token IS NOT NULL
             OR d.writer_revision = $4
-            OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()
+            OR d.status_updated_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()
           )
           AND (
             d.status = 'pending'
@@ -382,7 +382,7 @@ async def _claim_delivery(
                   AND (
                     d.lease_token IS NOT NULL
                     OR d.writer_revision = $6
-                    OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now
+                    OR d.status_updated_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now
                   )
                   AND (
                     d.status = 'pending'

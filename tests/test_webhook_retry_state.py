@@ -187,7 +187,7 @@ class _FakeWebhookConn:
             row["lease_token"] = str(args[1])
             row["lease_expires_at"] = claim_db_now + timedelta(seconds=int(args[2]))
             if row["status"] == "pending":
-                row["status"] = "retrying"
+                self._set_status(row, "retrying", changed_at=claim_db_now)
             delivery = self._with_subscription(row)
             delivery["claim_db_now"] = claim_db_now
             return delivery
@@ -196,7 +196,7 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
-            row["status"] = "succeeded"
+            self._set_status(row, "succeeded")
             row["response_status"] = args[2]
             row["response_body"] = args[3]
             row["error"] = None
@@ -208,7 +208,7 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
-            row["status"] = "abandoned"
+            self._set_status(row, "abandoned")
             if "subscription revoked" in compact:
                 row["error"] = "subscription revoked"
             else:
@@ -223,7 +223,7 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
-            row["status"] = args[2]
+            self._set_status(row, args[2])
             row["response_status"] = args[3]
             row["response_body"] = args[4]
             row["error"] = args[5]
@@ -246,7 +246,7 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or row["status"] != "pending":
                 return None
-            row["status"] = "retrying"
+            self._set_status(row, "retrying")
             return row["id"]
         if compact.startswith("SELECT status FROM webhook_deliveries"):
             row = self._row(args[0])
@@ -266,7 +266,7 @@ class _FakeWebhookConn:
             updated = 0
             for row in self.rows:
                 if row["status"] == "retrying" and self._has_successor(row):
-                    row["status"] = "retry_scheduled"
+                    self._set_status(row, "retry_scheduled")
                     self._clear_lease(row)
                     updated += 1
             return f"UPDATE {updated}"
@@ -274,14 +274,14 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             if row is None or row["status"] != "retrying":
                 return "UPDATE 0"
-            row["status"] = args[1]
+            self._set_status(row, args[1])
             self._clear_lease(row)
             return "UPDATE 1"
         if compact.startswith("UPDATE webhook_deliveries SET status='retrying'"):
             row = self._row(args[0])
             if row is None or row["status"] != "pending":
                 return "UPDATE 0"
-            row["status"] = "retrying"
+            self._set_status(row, "retrying")
             return "UPDATE 1"
         if compact.startswith("INSERT INTO webhook_deliveries"):
             self.rows.append({
@@ -293,6 +293,7 @@ class _FakeWebhookConn:
                 "attempt_num": args[4],
                 "status": "pending",
                 "scheduled_at": args[5],
+                "status_updated_at": datetime.now(timezone.utc),
                 "response_status": None,
                 "response_body": None,
                 "error": None,
@@ -328,6 +329,17 @@ class _FakeWebhookConn:
         row["lease_token"] = None
         row["lease_expires_at"] = None
 
+    def _set_status(
+        self,
+        row: dict[str, Any],
+        status: str,
+        *,
+        changed_at: datetime | None = None,
+    ) -> None:
+        if row.get("status") != status:
+            row["status_updated_at"] = changed_at or datetime.now(timezone.utc)
+        row["status"] = status
+
     def _due_live_and_leaseable(self, row: dict[str, Any], max_attempts: int) -> bool:
         return (
             row["scheduled_at"] <= datetime.now(timezone.utc)
@@ -343,10 +355,11 @@ class _FakeWebhookConn:
         grace_seconds: int,
         current_revision: int,
     ) -> bool:
+        status_updated_at = row.get("status_updated_at", row["scheduled_at"])
         return (
             row.get("lease_token") is not None
             or row.get("writer_revision") == current_revision
-            or row["scheduled_at"] + timedelta(seconds=grace_seconds) <= now
+            or status_updated_at + timedelta(seconds=grace_seconds) <= now
         )
 
     def _with_subscription(self, row: dict[str, Any]) -> dict[str, Any]:
@@ -499,6 +512,7 @@ class _FakeHTTPClient:
 
 def _attempt(attempt_num: int = 1) -> dict[str, Any]:
     payload = '{"data":{"memory_id":"mem_test"},"event":"memory.created"}'
+    scheduled_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     return {
         "id": str(uuid.uuid4()),
         "subscription_id": str(uuid.uuid4()),
@@ -507,7 +521,8 @@ def _attempt(attempt_num: int = 1) -> dict[str, Any]:
         "payload_hash": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
         "attempt_num": attempt_num,
         "status": "pending",
-        "scheduled_at": datetime.now(timezone.utc) - timedelta(seconds=1),
+        "scheduled_at": scheduled_at,
+        "status_updated_at": scheduled_at,
         "response_status": None,
         "response_body": None,
         "error": None,
@@ -649,36 +664,41 @@ def test_recoverable_predicate_requires_legacy_grace_for_lease_less_old_writer_r
 
     assert "WEBHOOK_LEGACY_GRACE_SECONDS" in source
     assert "NEW_CODE_WRITER_REVISION = 1" in source
+    assert "status_updated_at" in source
     assert (
         "d.lease_token IS NOT NULL "
         "OR d.writer_revision = $4 "
-        "OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()"
+        "OR d.status_updated_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()"
     ) in compact
     assert (
         "d.lease_token IS NOT NULL "
         "OR d.writer_revision = $6 "
-        "OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now"
+        "OR d.status_updated_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now"
     ) in compact
+    assert "OR d.scheduled_at + ($3::int * INTERVAL '1 second')" not in compact
+    assert "OR d.scheduled_at + ($5::int * INTERVAL '1 second')" not in compact
     assert "lease_expires_at=claim_clock.claim_now + ($3::int * INTERVAL '1 second')" in compact
     assert "claim_clock.claim_now AS claim_db_now" in compact
     assert "NOW() AS claim_db_now" not in compact
 
 
-def test_lease_less_legacy_retrying_waits_for_grace_before_recovery(monkeypatch):
+def test_lease_less_legacy_retrying_grace_uses_status_transition_time(monkeypatch):
     async def run():
-        parent = _attempt()
-        parent["status"] = "retrying"
-        parent["writer_revision"] = None
-        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
-        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+        for writer_revision in (None, 0):
+            parent = _attempt()
+            parent["status"] = "retrying"
+            parent["writer_revision"] = writer_revision
+            dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+            monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
 
-        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=10)
-        before_grace = await dispatcher._recoverable_delivery_ids(conn)
-        assert before_grace == []
+            parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(minutes=10)
+            parent["status_updated_at"] = datetime.now(timezone.utc)
+            before_grace = await dispatcher._recoverable_delivery_ids(conn)
+            assert before_grace == []
 
-        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
-        after_grace = await dispatcher._recoverable_delivery_ids(conn)
-        assert [row["id"] for row in after_grace] == [parent["id"]]
+            parent["status_updated_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
+            after_grace = await dispatcher._recoverable_delivery_ids(conn)
+            assert [row["id"] for row in after_grace] == [parent["id"]]
 
     asyncio.run(run())
 
@@ -691,26 +711,50 @@ def test_lease_less_legacy_pending_waits_for_grace_before_recovery(monkeypatch):
         monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
 
         parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=10)
+        parent["status_updated_at"] = parent["scheduled_at"]
+        assert parent["status_updated_at"] == parent["scheduled_at"]
         before_grace = await dispatcher._recoverable_delivery_ids(conn)
         assert before_grace == []
 
         parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
+        parent["status_updated_at"] = parent["scheduled_at"]
         after_grace = await dispatcher._recoverable_delivery_ids(conn)
         assert [row["id"] for row in after_grace] == [parent["id"]]
 
     asyncio.run(run())
 
 
-def test_lease_less_new_writer_pending_recovers_immediately(monkeypatch):
+def test_lease_less_new_writer_pending_and_retrying_recover_immediately(monkeypatch):
+    async def run():
+        for status in ("pending", "retrying"):
+            parent = _attempt()
+            parent["status"] = status
+            dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+            parent["writer_revision"] = dispatcher.NEW_CODE_WRITER_REVISION
+            monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+
+            parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+            parent["status_updated_at"] = datetime.now(timezone.utc)
+            recoverable = await dispatcher._recoverable_delivery_ids(conn)
+            assert [row["id"] for row in recoverable] == [parent["id"]]
+
+    asyncio.run(run())
+
+
+def test_status_updated_at_trigger_model_advances_on_status_change(monkeypatch):
     async def run():
         parent = _attempt()
-        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
-        parent["writer_revision"] = dispatcher.NEW_CODE_WRITER_REVISION
-        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+        _dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
 
-        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
-        recoverable = await dispatcher._recoverable_delivery_ids(conn)
-        assert [row["id"] for row in recoverable] == [parent["id"]]
+        before = parent["status_updated_at"]
+        result = await conn.execute(
+            "UPDATE webhook_deliveries SET status='retrying' WHERE id=$1::uuid",
+            parent["id"],
+        )
+
+        assert result == "UPDATE 1"
+        assert parent["status"] == "retrying"
+        assert parent["status_updated_at"] > before
 
     asyncio.run(run())
 
@@ -1111,3 +1155,21 @@ def test_webhook_writer_revision_migration_adds_legacy_marker():
     assert "ADD COLUMN IF NOT EXISTS writer_revision INTEGER DEFAULT 0" in compact
     assert "0/NULL means legacy or unknown" in sql
     assert "1 means current lease-aware writer" in sql
+
+
+def test_webhook_status_updated_at_migration_adds_triggered_transition_clock():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_status_updated_at.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "ADD COLUMN IF NOT EXISTS status_updated_at TIMESTAMPTZ" in compact
+    assert "COALESCE(scheduled_at, NOW())" in compact
+    assert "ALTER COLUMN status_updated_at SET DEFAULT clock_timestamp()" in compact
+    assert "ALTER COLUMN status_updated_at SET NOT NULL" in compact
+    assert "CREATE OR REPLACE FUNCTION webhook_deliveries_set_status_updated_at()" in compact
+    assert "OLD.status IS DISTINCT FROM NEW.status" in compact
+    assert "NEW.status_updated_at = clock_timestamp()" in compact
+    assert "BEFORE UPDATE ON webhook_deliveries" in compact
+    assert "EXECUTE FUNCTION webhook_deliveries_set_status_updated_at()" in compact

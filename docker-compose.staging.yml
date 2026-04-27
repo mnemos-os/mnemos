@@ -75,6 +75,7 @@ services:
       - ./db/migrations_v3_5_webhook_retry_terminal_state.sql:/docker-entrypoint-initdb.d/26-webhook-retry-terminal-state.sql
       - ./db/migrations_v3_5_webhook_attempt_lease.sql:/docker-entrypoint-initdb.d/27-webhook-attempt-lease.sql
       - ./db/migrations_v3_5_webhook_writer_revision.sql:/docker-entrypoint-initdb.d/28-webhook-writer-revision.sql
+      - ./db/migrations_v3_5_webhook_status_updated_at.sql:/docker-entrypoint-initdb.d/29-webhook-status-updated-at.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -97,6 +98,7 @@ services:
       - ./db/migrations_v3_5_webhook_retry_terminal_state.sql:/migrations/26-webhook-retry-terminal-state.sql:ro
       - ./db/migrations_v3_5_webhook_attempt_lease.sql:/migrations/27-webhook-attempt-lease.sql:ro
       - ./db/migrations_v3_5_webhook_writer_revision.sql:/migrations/28-webhook-writer-revision.sql:ro
+      - ./db/migrations_v3_5_webhook_status_updated_at.sql:/migrations/29-webhook-status-updated-at.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -104,7 +106,8 @@ services:
       -f /migrations/25-rls-group-select-unix-bits.sql
       -f /migrations/26-webhook-retry-terminal-state.sql
       -f /migrations/27-webhook-attempt-lease.sql
-      -f /migrations/28-webhook-writer-revision.sql"
+      -f /migrations/28-webhook-writer-revision.sql
+      -f /migrations/29-webhook-status-updated-at.sql"
     restart: "no"
 
   mnemos:
