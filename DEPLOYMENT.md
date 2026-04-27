@@ -40,6 +40,25 @@ The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
 
 ---
 
+## v3.5 Federation Cursor Compatibility
+
+The v3.5 federation feed cursor is opaque and carries both `updated` and
+`id`, with feed pages ordered by that same pair. This fixes the timestamp tie
+case where a page could end in the middle of many memories sharing one
+`updated` value.
+
+No database migration is required. `federation_peers.last_sync_cursor` remains
+the existing timestamp column; the puller uses the compound cursor between
+pages during a sync and persists the timestamp portion for the next completed
+sync.
+
+New feed servers accept legacy timestamp-only `since` cursors by treating the
+missing id as a low bound. During a mixed-version rollout, pulls that involve
+an old feed implementation may still skip rows on timestamp tie boundaries
+until both ends are upgraded.
+
+---
+
 ## v3.5 Webhook Retry Migration Gate
 
 The v3.5 webhook retry migrations change delivery ownership from in-transaction

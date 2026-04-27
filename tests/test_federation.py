@@ -6,11 +6,73 @@ from __future__ import annotations
 
 import os
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+
+def _feed_row(memory_id: str, updated: datetime) -> dict:
+    return {
+        "id": memory_id,
+        "content": f"content {memory_id}",
+        "category": "facts",
+        "subcategory": None,
+        "metadata": {"source": "test"},
+        "quality_rating": 75,
+        "verbatim_content": f"content {memory_id}",
+        "owner_id": "owner-1",
+        "namespace": "default",
+        "permission_mode": 644,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+        "created": updated,
+        "updated": updated,
+    }
+
+
+class _FeedConnection:
+    def __init__(self, rows: list[dict]):
+        self.rows = sorted(rows, key=lambda r: (r["updated"], r["id"]))
+        self.queries: list[str] = []
+        self.calls: list[tuple] = []
+
+    async def fetch(self, query: str, *args):
+        self.queries.append(query)
+        self.calls.append(args)
+        limit = args[-1]
+        rows = self.rows
+        if "m.updated > $1" in query:
+            since_updated, since_id = args[0], args[1]
+            rows = [
+                r for r in rows
+                if r["updated"] > since_updated
+                or (r["updated"] == since_updated and r["id"] > since_id)
+            ]
+        return rows[:limit]
+
+
+class _FeedAcquire:
+    def __init__(self, conn: _FeedConnection):
+        self.conn = conn
+
+    async def __aenter__(self):
+        return self.conn
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FeedPool:
+    def __init__(self, rows: list[dict]):
+        self.conn = _FeedConnection(rows)
+
+    def acquire(self):
+        return _FeedAcquire(self.conn)
 
 
 # ── Module wiring ────────────────────────────────────────────────────────────
@@ -71,6 +133,138 @@ class TestFederationIdConvention:
         remote_id = "mem_abc123"
         local = f"{FEDERATION_ID_PREFIX}{peer}:{remote_id}"
         assert local == "fed:alpha:mem_abc123"
+
+
+# ── Feed cursor stability ───────────────────────────────────────────────────
+
+
+class TestFederationFeedCursor:
+    @pytest.mark.asyncio
+    async def test_same_timestamp_tie_pages_without_losing_rows(self, monkeypatch):
+        from api import federation as fed
+        import api.lifecycle as lc
+        from api.handlers import federation as handler
+
+        updated = datetime(2026, 4, 27, 12, 0, 0)
+        rows = [
+            _feed_row("00000000-0000-0000-0000-000000000001", updated),
+            _feed_row("00000000-0000-0000-0000-000000000002", updated),
+            _feed_row("00000000-0000-0000-0000-000000000003", updated),
+        ]
+        pool = _FeedPool(rows)
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        first = await handler.federation_feed(
+            None, None, since=None, namespace=None, category=None, limit=2
+        )
+        assert [m.id for m in first.memories] == [rows[0]["id"], rows[1]["id"]]
+        assert first.has_more is True
+        first_cursor = fed._decode_feed_cursor(first.next_cursor)
+        assert first_cursor.updated == updated.replace(tzinfo=timezone.utc)
+        assert first_cursor.memory_id == rows[1]["id"]
+
+        second = await handler.federation_feed(
+            None, None, since=first.next_cursor, namespace=None, category=None, limit=2
+        )
+        assert [m.id for m in second.memories] == [rows[2]["id"]]
+        assert second.has_more is False
+
+    @pytest.mark.asyncio
+    async def test_cross_timestamp_paging_advances_with_compound_cursor(self, monkeypatch):
+        import api.lifecycle as lc
+        from api.handlers import federation as handler
+
+        t0 = datetime(2026, 4, 27, 12, 0, 0)
+        t1 = t0 + timedelta(seconds=1)
+        rows = [
+            _feed_row("00000000-0000-0000-0000-000000000001", t0),
+            _feed_row("00000000-0000-0000-0000-000000000002", t1),
+            _feed_row("00000000-0000-0000-0000-000000000003", t1),
+        ]
+        pool = _FeedPool(rows)
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        first = await handler.federation_feed(
+            None, None, since=None, namespace=None, category=None, limit=2
+        )
+        second = await handler.federation_feed(
+            None, None, since=first.next_cursor, namespace=None, category=None, limit=2
+        )
+
+        assert [m.id for m in first.memories + second.memories] == [r["id"] for r in rows]
+        assert second.has_more is False
+
+    @pytest.mark.asyncio
+    async def test_empty_feed_keeps_cursor_unchanged(self, monkeypatch):
+        from api import federation as fed
+        import api.lifecycle as lc
+        from api.handlers import federation as handler
+
+        updated = datetime(2026, 4, 27, 12, 0, 0)
+        cursor = fed._encode_feed_cursor(
+            updated,
+            "00000000-0000-0000-0000-000000000009",
+        )
+        pool = _FeedPool([
+            _feed_row("00000000-0000-0000-0000-000000000001", updated),
+        ])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        response = await handler.federation_feed(
+            None, None, since=cursor, namespace=None, category=None, limit=10
+        )
+
+        assert response.memories == []
+        assert response.next_cursor == cursor
+        assert response.has_more is False
+
+    @pytest.mark.asyncio
+    async def test_legacy_string_cursor_uses_low_id_bound(self, monkeypatch):
+        from api import federation as fed
+        import api.lifecycle as lc
+        from api.handlers import federation as handler
+
+        updated = datetime(2026, 4, 27, 12, 0, 0)
+        rows = [
+            _feed_row("00000000-0000-0000-0000-000000000001", updated),
+            _feed_row("00000000-0000-0000-0000-000000000002", updated + timedelta(seconds=1)),
+        ]
+        pool = _FeedPool(rows)
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        response = await handler.federation_feed(
+            None,
+            None,
+            since="2026-04-27T12:00:00Z",
+            namespace=None,
+            category=None,
+            limit=10,
+        )
+
+        assert [m.id for m in response.memories] == [r["id"] for r in rows]
+        assert pool.conn.calls[-1][0] == updated
+        assert pool.conn.calls[-1][1] == fed.FEDERATION_CURSOR_LOWER_ID
+
+    @pytest.mark.asyncio
+    async def test_feed_sql_uses_updated_id_tie_breaker(self, monkeypatch):
+        import api.lifecycle as lc
+        from api.handlers import federation as handler
+
+        pool = _FeedPool([])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        await handler.federation_feed(
+            None,
+            None,
+            since="2026-04-27T12:00:00Z",
+            namespace=None,
+            category=None,
+            limit=10,
+        )
+
+        sql = " ".join(pool.conn.queries[-1].split())
+        assert "(m.updated > $1 OR (m.updated = $1 AND m.id > $2))" in sql
+        assert "ORDER BY m.updated ASC, m.id ASC" in sql
 
 
 # ── Peer name validation (format checked at DB layer) ────────────────────────

@@ -5,9 +5,9 @@ All notable changes to MNEMOS are documented here.
 ## [3.5-dev] — in flight on `v3.5-dev` (unreleased)
 
 v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
-as a release tag. The first two slices are merged: `a62a099` for
-audit-quick-wins and `d42c475` for memory-read tenancy + DAG integrity;
-task #25 is closed in v3.5-dev by the RLS group-select migration.
+as a release tag. Merged slices cover audit quick wins, memory-read tenancy
++ DAG integrity, webhook retry hardening, RLS group-select parity, and the
+federation compound-cursor tie-breaker.
 
 ### Added
 
@@ -78,6 +78,14 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 
 ### Fixed
 
+- **Federation feed cursor tie-breaker** — `/v1/federation/feed` now
+  paginates with an opaque cursor carrying both `updated` and `id`, filters
+  with `(m.updated > cursor_updated OR (m.updated = cursor_updated AND
+  m.id > cursor_id))`, and orders by `m.updated ASC, m.id ASC`. The puller
+  decodes the cursor for the next page while persisting the existing
+  timestamp cursor column, so no schema migration is required. Legacy
+  timestamp-only cursors are accepted with a low id bound for mixed-version
+  compatibility.
 - **Webhook retry replay state machine** — `api/webhook_dispatcher.py:121-146`
   now recovers due `pending` rows plus `retrying` rows only when no
   successor attempt exists. Superseded attempts use old-worker-compatible
@@ -207,7 +215,6 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
 
 ### Still open on the v3.5 backlog
 
-- #21 federation per-peer ACL + stable cursor.
 - #22 audit endpoint scoping + lifespan teardown.
 - #23 entity namespace conflict-key migration.
 - #19 bulk webhook parity.

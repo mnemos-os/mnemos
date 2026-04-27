@@ -32,7 +32,7 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in. The v3.5-dev read path uses the shared `read_visibility_predicate` in `api/visibility.py:40-96` across memory list/get/search/rehydrate/gateway surfaces.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-The latest tagged release is **v3.4.1**: CHARON federation schema-compat preflight plus the dev↔prod MPF restore drill. The current development branch is **v3.5-dev** and is not tagged yet. Two v3.5 slices have landed there: `a62a099` (session-history ordering + `mnemos-os` project URLs) and `d42c475` (memory-read tenancy and DAG-integrity hardening). The going-forward compression stack is **APOLLO + ARTEMIS**; **ALETHEIA**, **LETHE**, and **ANAMNESIS** remain in the tree as evolutionary history or opt-in compatibility paths.
+The latest tagged release is **v3.4.1**: CHARON federation schema-compat preflight plus the dev↔prod MPF restore drill. The current development branch is **v3.5-dev** and is not tagged yet. v3.5 slices have landed there for session-history ordering, memory-read tenancy + DAG-integrity hardening, webhook retry hardening, and the federation compound-cursor tie-breaker. The going-forward compression stack is **APOLLO + ARTEMIS**; **ALETHEIA**, **LETHE**, and **ANAMNESIS** remain in the tree as evolutionary history or opt-in compatibility paths.
 
 ## Works with
 
@@ -75,7 +75,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.4.1 is the latest tagged release**, and **v3.5-dev** currently carries the first two unreleased hardening slices. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history and the in-flight v3.5-dev section.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.4.1 is the latest tagged release**, and **v3.5-dev** carries the current unreleased hardening slices. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history and the in-flight v3.5-dev section.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -363,6 +363,8 @@ Pull-based one-way federation between MNEMOS instances. Remote peer exposes `/v1
 **Trust model:** mutual — each side registers the other. Side A issues Side B a Bearer token by creating a MNEMOS user with `role='federation'` and minting an API key via the admin API. Side B stores that token in its own `federation_peers.auth_token`. Side A's feed endpoint validates the token and `role IN ('federation', 'root')`.
 
 **Dedup:** re-pulls are safe. Local id `fed:{peer}:{remote_id}` is stable; only rows with a newer `federation_remote_updated` overwrite existing ones.
+
+**Cursoring:** `/v1/federation/feed` uses an opaque compound cursor over `(updated, id)` and orders by the same pair, so pagination cannot skip memories when many rows share one `updated` timestamp.
 
 **Filters:** `namespace_filter` and `category_filter` (both arrays) restrict what gets pulled from a peer; NULL = pull everything the peer will serve.
 

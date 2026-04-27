@@ -12,8 +12,11 @@ intervals.
 """
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -25,11 +28,80 @@ logger = logging.getLogger(__name__)
 FEDERATION_HTTP_TIMEOUT = 30.0
 FEDERATION_BATCH_LIMIT = 100
 FEDERATION_ID_PREFIX = "fed:"
+FEDERATION_CURSOR_LOWER_ID = "00000000-0000-0000-0000-000000000000"
 # Per-field size caps for incoming peer payloads. Hostile peers can otherwise
 # fill disk by pushing 50MB blobs; these caps bound a single memory to ~1.5MB.
 FEDERATION_MAX_CONTENT = 1_000_000  # 1 MB per content body
 FEDERATION_MAX_METADATA = 64 * 1024  # 64 KB metadata json
 FEDERATION_MAX_NAME = 256            # category/subcategory/namespace length
+
+
+@dataclass(frozen=True)
+class FederationFeedCursor:
+    updated: datetime
+    memory_id: str
+    raw: str
+
+
+def _cursor_timestamp_for_wire(updated: datetime) -> str:
+    if updated.tzinfo is None:
+        updated = updated.replace(tzinfo=timezone.utc)
+    else:
+        updated = updated.astimezone(timezone.utc)
+    return updated.isoformat().replace("+00:00", "Z")
+
+
+def _cursor_timestamp_for_db(updated: datetime) -> datetime:
+    if updated.tzinfo is not None:
+        updated = updated.astimezone(timezone.utc)
+    return updated.replace(tzinfo=None)
+
+
+def _parse_cursor_timestamp(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _encode_feed_cursor(updated: datetime, memory_id: str) -> str:
+    payload = {
+        "updated": _cursor_timestamp_for_wire(updated),
+        "id": memory_id,
+    }
+    raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _decode_feed_cursor(raw: str) -> FederationFeedCursor:
+    """Decode a v3.5 compound cursor, accepting legacy ISO timestamp cursors."""
+    try:
+        padded = raw + "=" * (-len(raw) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("cursor payload must be an object")
+        updated_raw = payload.get("updated")
+        if not isinstance(updated_raw, str):
+            raise ValueError("cursor payload missing updated")
+        memory_id = payload.get("id")
+        if not isinstance(memory_id, str) or not memory_id:
+            memory_id = FEDERATION_CURSOR_LOWER_ID
+        return FederationFeedCursor(
+            updated=_parse_cursor_timestamp(updated_raw),
+            memory_id=memory_id,
+            raw=raw,
+        )
+    except (binascii.Error, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        updated = _parse_cursor_timestamp(raw)
+        return FederationFeedCursor(
+            updated=updated,
+            memory_id=FEDERATION_CURSOR_LOWER_ID,
+            raw=raw,
+        )
+
+
+def _legacy_cursor_param(updated: datetime) -> str:
+    return _cursor_timestamp_for_wire(updated)
 
 
 def _cap(value, limit: int):
@@ -456,13 +528,14 @@ async def sync_peer(
     total_pulled = 0
     total_new = 0
     total_updated = 0
-    cursor = cursor_before
+    cursor_request: Optional[datetime | FederationFeedCursor] = cursor_before
+    cursor_persisted = cursor_before
     err: Optional[str] = None
 
     try:
         while True:
             batch, next_cursor, has_more = await _pull_batch(
-                peer["base_url"], peer["auth_token"], cursor,
+                peer["base_url"], peer["auth_token"], cursor_request,
                 peer["namespace_filter"], peer["category_filter"],
             )
             if not batch:
@@ -472,7 +545,9 @@ async def sync_peer(
             total_pulled += len(batch)
             total_new += new_n
             total_updated += upd_n
-            cursor = next_cursor
+            if next_cursor is not None:
+                cursor_request = next_cursor
+                cursor_persisted = next_cursor.updated
             if not has_more:
                 break
     except Exception as e:
@@ -491,7 +566,7 @@ async def sync_peer(
                 cursor_after = $6
             WHERE id = $1::uuid
             """,
-            log_id, total_pulled, total_new, total_updated, err, cursor,
+            log_id, total_pulled, total_new, total_updated, err, cursor_persisted,
         )
         if err:
             await conn.execute(
@@ -513,12 +588,12 @@ async def sync_peer(
                     total_pulled = total_pulled + $3
                 WHERE id = $1::uuid
                 """,
-                peer_id, cursor, total_pulled,
+                peer_id, cursor_persisted, total_pulled,
             )
 
     logger.info(
         "federation: peer=%s pulled=%d new=%d updated=%d cursor=%s",
-        peer["name"], total_pulled, total_new, total_updated, cursor,
+        peer["name"], total_pulled, total_new, total_updated, cursor_persisted,
     )
     return total_pulled, total_new, total_updated
 
@@ -526,15 +601,18 @@ async def sync_peer(
 async def _pull_batch(
     base_url: str,
     auth_token: str,
-    since: Optional[datetime],
+    since: Optional[datetime | FederationFeedCursor],
     namespace_filter: Optional[List[str]],
     category_filter: Optional[List[str]],
-) -> Tuple[List[Dict[str, Any]], Optional[datetime], bool]:
+) -> Tuple[List[Dict[str, Any]], Optional[FederationFeedCursor], bool]:
     """HTTP GET one batch. Returns (memories, next_cursor, has_more)."""
     url = base_url.rstrip("/") + "/v1/federation/feed"
     params: Dict[str, Any] = {"limit": FEDERATION_BATCH_LIMIT}
     if since is not None:
-        params["since"] = since.astimezone(timezone.utc).isoformat()
+        if isinstance(since, FederationFeedCursor):
+            params["since"] = since.raw
+        else:
+            params["since"] = _legacy_cursor_param(since)
     if namespace_filter:
         params["namespace"] = ",".join(namespace_filter)
     if category_filter:
@@ -553,10 +631,7 @@ async def _pull_batch(
 
     memories = body.get("memories", []) or []
     next_cursor_raw = body.get("next_cursor")
-    next_cursor = (
-        datetime.fromisoformat(next_cursor_raw.replace("Z", "+00:00"))
-        if next_cursor_raw else None
-    )
+    next_cursor = _decode_feed_cursor(next_cursor_raw) if next_cursor_raw else None
     has_more = bool(body.get("has_more"))
     return memories, next_cursor, has_more
 
