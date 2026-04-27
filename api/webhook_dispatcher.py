@@ -55,6 +55,8 @@ WEBHOOK_FINALIZE_BUFFER_SECONDS = float(os.getenv("WEBHOOK_FINALIZE_BUFFER_SECON
 WEBHOOK_RESPONSE_BODY_MAX_BYTES = int(os.getenv("WEBHOOK_RESPONSE_BODY_MAX_BYTES", "2048"))
 WEBHOOK_MAX_CONCURRENT_SENDS = int(os.getenv("WEBHOOK_MAX_CONCURRENT_SENDS", "64"))
 WEBHOOK_LEGACY_GRACE_SECONDS = int(os.getenv("WEBHOOK_LEGACY_GRACE_SECONDS", "300"))
+NEW_CODE_WRITER_REVISION = 1
+NON_IDENTITY_RESPONSE_BODY_PREVIEW_BYTES = 256
 MIN_SEND_WINDOW_SECONDS = 1.0
 RECOVERY_POLL_INTERVAL = 30.0          # seconds between recovery-worker passes
 REPAIR_BURST_SECONDS = float(os.getenv("WEBHOOK_REPAIR_BURST_SECONDS", "60.0"))
@@ -156,11 +158,11 @@ async def dispatch(
         delivery_id = await conn.fetchval(
             """
             INSERT INTO webhook_deliveries
-              (subscription_id, event_type, payload, payload_hash, status)
-            VALUES ($1, $2, $3, $4, 'pending')
+              (subscription_id, event_type, payload, payload_hash, status, writer_revision)
+            VALUES ($1, $2, $3, $4, 'pending', $5)
             RETURNING id
             """,
-            sub["id"], event_type, body, body_hash,
+            sub["id"], event_type, body, body_hash, NEW_CODE_WRITER_REVISION,
         )
         # Schedule the send via the lifecycle-tracked background registry
         # so pending tasks are awaited at shutdown. Import lazily to avoid
@@ -246,10 +248,15 @@ async def _recoverable_delivery_ids(
     return await conn.fetch(
         """
         SELECT d.id FROM webhook_deliveries d
-        WHERE d.scheduled_at <= NOW()
+        WHERE d.scheduled_at <= clock_timestamp()
           AND d.attempt_num <= $1
           AND d.status IN ('pending', 'retrying')
-          AND (d.lease_token IS NULL OR d.lease_expires_at < NOW())
+          AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
+          AND (
+            d.lease_token IS NOT NULL
+            OR d.writer_revision = $4
+            OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()
+          )
           AND (
             d.status = 'pending'
             OR (
@@ -262,17 +269,13 @@ async def _recoverable_delivery_ids(
                   AND newer.payload_hash = d.payload_hash
                   AND newer.attempt_num > d.attempt_num
               )
-              AND (
-                d.lease_token IS NOT NULL
-                OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= NOW()
-              )
             )
           )
         ORDER BY d.scheduled_at
         LIMIT $2
         FOR UPDATE SKIP LOCKED
         """,
-        MAX_ATTEMPTS, limit, WEBHOOK_LEGACY_GRACE_SECONDS,
+        MAX_ATTEMPTS, limit, WEBHOOK_LEGACY_GRACE_SECONDS, NEW_CODE_WRITER_REVISION,
     )
 
 
@@ -366,15 +369,21 @@ async def _claim_delivery(
                 """
                 UPDATE webhook_deliveries d
                 SET lease_token=$2::uuid,
-                    lease_expires_at=NOW() + ($3::int * INTERVAL '1 second'),
+                    lease_expires_at=claim_clock.claim_now + ($3::int * INTERVAL '1 second'),
                     status=CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
-                FROM webhook_subscriptions s
+                FROM webhook_subscriptions s,
+                     (SELECT clock_timestamp() AS claim_now) claim_clock
                 WHERE s.id = d.subscription_id
                   AND d.id=$1::uuid
-                  AND d.scheduled_at <= NOW()
+                  AND d.scheduled_at <= claim_clock.claim_now
                   AND d.attempt_num <= $4
                   AND d.status IN ('pending', 'retrying')
-                  AND (d.lease_token IS NULL OR d.lease_expires_at < NOW())
+                  AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
+                  AND (
+                    d.lease_token IS NOT NULL
+                    OR d.writer_revision = $6
+                    OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now
+                  )
                   AND (
                     d.status = 'pending'
                     OR (
@@ -387,15 +396,11 @@ async def _claim_delivery(
                           AND newer.payload_hash = d.payload_hash
                           AND newer.attempt_num > d.attempt_num
                       )
-                      AND (
-                        d.lease_token IS NOT NULL
-                        OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= NOW()
-                      )
                     )
                   )
                 RETURNING d.id, d.subscription_id, d.event_type, d.payload,
                           d.payload_hash, d.attempt_num, d.status,
-                          d.lease_expires_at, NOW() AS claim_db_now,
+                          d.lease_expires_at, claim_clock.claim_now AS claim_db_now,
                           s.url, s.secret, s.revoked
                 """,
                 delivery_id,
@@ -403,6 +408,7 @@ async def _claim_delivery(
                 lease_seconds,
                 MAX_ATTEMPTS,
                 WEBHOOK_LEGACY_GRACE_SECONDS,
+                NEW_CODE_WRITER_REVISION,
             )
 
 
@@ -498,17 +504,51 @@ async def _send_claimed_delivery_within_deadline(delivery: asyncpg.Record) -> _D
 
 
 async def _read_capped_response_body(response: httpx.Response) -> str:
-    """Read at most WEBHOOK_RESPONSE_BODY_MAX_BYTES from a streamed response."""
-    remaining = WEBHOOK_RESPONSE_BODY_MAX_BYTES
+    """Read bounded raw response bytes; never transparently decompress."""
+    headers = getattr(response, "headers", {})
+    content_encoding = str(headers.get("content-encoding", "identity") or "identity").strip().lower()
+    if content_encoding not in ("", "identity"):
+        # Receivers may ignore Accept-Encoding: identity; retain only raw bytes
+        # so a compressed response cannot inflate before the audit cap applies.
+        raw = await _read_capped_raw_response_body(
+            response,
+            max_bytes=min(WEBHOOK_RESPONSE_BODY_MAX_BYTES, NON_IDENTITY_RESPONSE_BODY_PREVIEW_BYTES),
+        )
+        return _decode_capped_response_body(raw, WEBHOOK_RESPONSE_BODY_MAX_BYTES)
+
+    raw = await _read_capped_raw_response_body(response, max_bytes=WEBHOOK_RESPONSE_BODY_MAX_BYTES)
+    return _decode_capped_response_body(raw, WEBHOOK_RESPONSE_BODY_MAX_BYTES)
+
+
+async def _read_capped_raw_response_body(response: httpx.Response, *, max_bytes: int) -> bytes:
+    """Read at most max_bytes raw bytes from a streamed response."""
+    remaining = max_bytes
     body = bytearray()
-    async for chunk in response.aiter_bytes():
+    async for chunk in response.aiter_raw():
         if not chunk:
             continue
         body.extend(chunk[:remaining])
         remaining -= min(len(chunk), remaining)
         if remaining <= 0:
             break
-    return bytes(body).decode("utf-8", errors="replace")
+    return bytes(body)
+
+
+def _decode_capped_response_body(raw: bytes, max_bytes: int) -> str:
+    """Decode for TEXT storage while preserving the configured UTF-8 byte cap."""
+    text = raw.decode("utf-8", errors="replace")
+    if len(text.encode("utf-8")) <= max_bytes:
+        return text
+
+    used = 0
+    out: list[str] = []
+    for char in text:
+        char_size = len(char.encode("utf-8"))
+        if used + char_size > max_bytes:
+            break
+        out.append(char)
+        used += char_size
+    return "".join(out)
 
 
 def _claim_remaining_send_window_seconds(
@@ -549,12 +589,12 @@ async def _finalize_delivery(
                     UPDATE webhook_deliveries
                     SET status='abandoned',
                         error='subscription revoked',
-                        delivered_at=NOW(),
+                        delivered_at=clock_timestamp(),
                         lease_token=NULL,
                         lease_expires_at=NULL
                     WHERE id=$1::uuid
                       AND lease_token=$2::uuid
-                      AND lease_expires_at >= NOW()
+                      AND lease_expires_at >= clock_timestamp()
                     RETURNING id
                     """,
                     delivery_id, lease_token,
@@ -569,12 +609,12 @@ async def _finalize_delivery(
                         response_status=$3,
                         response_body=$4,
                         error=NULL,
-                        delivered_at=NOW(),
+                        delivered_at=clock_timestamp(),
                         lease_token=NULL,
                         lease_expires_at=NULL
                     WHERE id=$1::uuid
                       AND lease_token=$2::uuid
-                      AND lease_expires_at >= NOW()
+                      AND lease_expires_at >= clock_timestamp()
                     RETURNING id
                     """,
                     delivery_id, lease_token, result.response_status, result.response_body,
@@ -590,12 +630,12 @@ async def _finalize_delivery(
                         response_status=$3,
                         response_body=$4,
                         error=$5,
-                        delivered_at=NOW(),
+                        delivered_at=clock_timestamp(),
                         lease_token=NULL,
                         lease_expires_at=NULL
                     WHERE id=$1::uuid
                       AND lease_token=$2::uuid
-                      AND lease_expires_at >= NOW()
+                      AND lease_expires_at >= clock_timestamp()
                     RETURNING id
                     """,
                     delivery_id, lease_token, result.response_status, result.response_body, result.error,
@@ -615,7 +655,7 @@ async def _finalize_delivery(
                     lease_expires_at=NULL
                 WHERE id=$1::uuid
                   AND lease_token=$2::uuid
-                  AND lease_expires_at >= NOW()
+                  AND lease_expires_at >= clock_timestamp()
                 RETURNING id
                 """,
                 delivery_id,
@@ -636,8 +676,8 @@ async def _finalize_delivery(
                 """
                 INSERT INTO webhook_deliveries
                   (subscription_id, event_type, payload, payload_hash,
-                   attempt_num, status, scheduled_at)
-                VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+                   attempt_num, status, scheduled_at, writer_revision)
+                VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
                 """,
                 delivery["subscription_id"],
                 delivery["event_type"],
@@ -645,6 +685,7 @@ async def _finalize_delivery(
                 delivery["payload_hash"],
                 next_attempt,
                 scheduled_at,
+                NEW_CODE_WRITER_REVISION,
             )
             logger.info(
                 "webhook delivery %s attempt %d failed (status=%s error=%s), retry in %ds",
@@ -663,10 +704,10 @@ async def _load_delivery_for_claim(conn: asyncpg.Connection, delivery_id: str) -
         FROM webhook_deliveries d
         JOIN webhook_subscriptions s ON s.id = d.subscription_id
         WHERE d.id = $1::uuid
-          AND d.scheduled_at <= NOW()
+          AND d.scheduled_at <= clock_timestamp()
           AND d.attempt_num <= $2
           AND d.status IN ('pending', 'retrying')
-          AND (d.lease_token IS NULL OR d.lease_expires_at < NOW())
+          AND (d.lease_token IS NULL OR d.lease_expires_at < clock_timestamp())
         """,
         delivery_id, MAX_ATTEMPTS,
     )

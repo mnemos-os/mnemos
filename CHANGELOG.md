@@ -102,8 +102,14 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   `WEBHOOK_LEGACY_GRACE_SECONDS` so lease-less legacy `retrying` rows are
   not recoverable during old-writer successor-insert gaps, anchors each send
   timeout to the DB-returned claim timestamps instead of a fresh static
-  budget, and sends `Accept-Encoding: identity` on webhook POSTs so automatic
-  response decompression cannot bypass the retained body cap.
+  budget, and sends `Accept-Encoding: identity` on webhook POSTs as the first
+  response-compression defense. Round 6 switches
+  webhook lease/expiry SQL from transaction-snapshot `NOW()` to
+  `clock_timestamp()`, reads audited response bodies through `aiter_raw()` and
+  rejects non-identity response encodings before decompression, and adds
+  `db/migrations_v3_5_webhook_writer_revision.sql` so lease-less legacy or
+  unknown `pending` and `retrying` rows wait for legacy grace while current
+  writer rows remain immediately recoverable.
 
 ### Conflicts and operator handling
 

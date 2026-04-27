@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hashlib
 import sys
 import uuid
@@ -133,6 +134,7 @@ class _FakeWebhookConn:
         max_attempts = args[0]
         limit = args[1] if len(args) > 1 else 50
         legacy_grace_seconds = args[2] if len(args) > 2 else 0
+        current_revision = args[3] if len(args) > 3 else 1
         now = datetime.now(timezone.utc)
         recoverable = []
         for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
@@ -141,12 +143,14 @@ class _FakeWebhookConn:
             if not self._lease_available(row):
                 continue
             if row["status"] == "pending":
-                if self._try_lock(row["id"]):
+                if self._legacy_lease_less_settled(
+                    row, now, legacy_grace_seconds, current_revision,
+                ) and self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
             elif (
                 row["status"] == "retrying"
                 and not self._has_successor(row)
-                and self._legacy_retrying_settled(row, now, legacy_grace_seconds)
+                and self._legacy_lease_less_settled(row, now, legacy_grace_seconds, current_revision)
             ):
                 if self._try_lock(row["id"]):
                     recoverable.append({"id": row["id"]})
@@ -167,14 +171,17 @@ class _FakeWebhookConn:
             row = self._row(args[0])
             max_attempts = args[3]
             legacy_grace_seconds = args[4] if len(args) > 4 else 0
+            current_revision = args[5] if len(args) > 5 else 1
             if row is None or not self._due_live_and_leaseable(row, max_attempts):
                 return None
             if row["status"] == "retrying" and self._has_successor(row):
                 return None
             claim_db_now = datetime.now(timezone.utc)
             if (
-                row["status"] == "retrying"
-                and not self._legacy_retrying_settled(row, claim_db_now, legacy_grace_seconds)
+                row["status"] in {"pending", "retrying"}
+                and not self._legacy_lease_less_settled(
+                    row, claim_db_now, legacy_grace_seconds, current_revision,
+                )
             ):
                 return None
             row["lease_token"] = str(args[1])
@@ -292,6 +299,7 @@ class _FakeWebhookConn:
                 "delivered_at": None,
                 "lease_token": None,
                 "lease_expires_at": None,
+                "writer_revision": args[6] if len(args) > 6 else 1,
             })
             return "INSERT 0 1"
         raise AssertionError(f"unexpected execute SQL: {sql}")
@@ -328,14 +336,16 @@ class _FakeWebhookConn:
             and self._lease_available(row)
         )
 
-    def _legacy_retrying_settled(
+    def _legacy_lease_less_settled(
         self,
         row: dict[str, Any],
         now: datetime,
         grace_seconds: int,
+        current_revision: int,
     ) -> bool:
         return (
             row.get("lease_token") is not None
+            or row.get("writer_revision") == current_revision
             or row["scheduled_at"] + timedelta(seconds=grace_seconds) <= now
         )
 
@@ -368,14 +378,20 @@ class _FakeResponse:
         chunk_delay: float,
         never_complete: bool,
         factory: "_HTTPClientFactory",
+        headers: dict[str, str] | None = None,
     ):
         self.status_code = status_code
         self.chunks = chunks
         self.chunk_delay = chunk_delay
         self.never_complete = never_complete
         self.factory = factory
+        self.headers = headers or {}
 
     async def aiter_bytes(self):
+        async for chunk in self.aiter_raw():
+            yield chunk
+
+    async def aiter_raw(self):
         try:
             for chunk in self.chunks:
                 if self.chunk_delay:
@@ -406,6 +422,7 @@ class _HTTPClientFactory:
         self.chunks_yielded = 0
         self.cancelled = False
         self.request_headers: list[dict[str, str]] = []
+        self.response_headers: list[dict[str, str]] = []
 
     def __call__(self, *args, **kwargs):
         return _FakeHTTPClient(self)
@@ -427,6 +444,7 @@ class _FakeHTTPStream:
             if self.factory.response_chunks
             else [f"status={status_code}".encode("utf-8")]
         )
+        response_headers = self.factory.response_headers.pop(0) if self.factory.response_headers else {}
         self.factory.delivery_ids.append(self.headers["X-MNEMOS-Delivery-ID"])
         self.factory.request_headers.append(dict(self.headers))
         self.factory.started.set()
@@ -436,6 +454,7 @@ class _FakeHTTPStream:
             chunk_delay=self.factory.chunk_delay,
             never_complete=self.factory.never_complete,
             factory=self.factory,
+            headers=response_headers,
         )
 
     async def __aexit__(self, exc_type, exc, tb):
@@ -472,6 +491,7 @@ class _FakeHTTPClient:
                 chunk_delay=0.0,
                 never_complete=False,
                 factory=self.factory,
+                headers={},
             )
         finally:
             self.factory.active -= 1
@@ -494,6 +514,7 @@ def _attempt(attempt_num: int = 1) -> dict[str, Any]:
         "delivered_at": None,
         "lease_token": None,
         "lease_expires_at": None,
+        "writer_revision": 1,
     }
 
 
@@ -621,26 +642,33 @@ def test_recovery_dequeue_uses_skip_locked_claim():
     assert "_attempt_delivery_locked" not in compact
 
 
-def test_recoverable_retrying_predicate_requires_legacy_grace_for_lease_less_rows():
+def test_recoverable_predicate_requires_legacy_grace_for_lease_less_old_writer_rows():
     repo_root = Path(__file__).resolve().parents[1]
     source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact = " ".join(source.split())
 
     assert "WEBHOOK_LEGACY_GRACE_SECONDS" in source
+    assert "NEW_CODE_WRITER_REVISION = 1" in source
     assert (
         "d.lease_token IS NOT NULL "
-        "OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= NOW()"
+        "OR d.writer_revision = $4 "
+        "OR d.scheduled_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()"
     ) in compact
     assert (
         "d.lease_token IS NOT NULL "
-        "OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= NOW()"
+        "OR d.writer_revision = $6 "
+        "OR d.scheduled_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now"
     ) in compact
+    assert "lease_expires_at=claim_clock.claim_now + ($3::int * INTERVAL '1 second')" in compact
+    assert "claim_clock.claim_now AS claim_db_now" in compact
+    assert "NOW() AS claim_db_now" not in compact
 
 
 def test_lease_less_legacy_retrying_waits_for_grace_before_recovery(monkeypatch):
     async def run():
         parent = _attempt()
         parent["status"] = "retrying"
+        parent["writer_revision"] = None
         dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
         monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
 
@@ -651,6 +679,38 @@ def test_lease_less_legacy_retrying_waits_for_grace_before_recovery(monkeypatch)
         parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
         after_grace = await dispatcher._recoverable_delivery_ids(conn)
         assert [row["id"] for row in after_grace] == [parent["id"]]
+
+    asyncio.run(run())
+
+
+def test_lease_less_legacy_pending_waits_for_grace_before_recovery(monkeypatch):
+    async def run():
+        parent = _attempt()
+        parent["writer_revision"] = None
+        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=10)
+        before_grace = await dispatcher._recoverable_delivery_ids(conn)
+        assert before_grace == []
+
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=61)
+        after_grace = await dispatcher._recoverable_delivery_ids(conn)
+        assert [row["id"] for row in after_grace] == [parent["id"]]
+
+    asyncio.run(run())
+
+
+def test_lease_less_new_writer_pending_recovers_immediately(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, _http = await _install(monkeypatch, [parent], [])
+        parent["writer_revision"] = dispatcher.NEW_CODE_WRITER_REVISION
+        monkeypatch.setattr(dispatcher, "WEBHOOK_LEGACY_GRACE_SECONDS", 60)
+
+        parent["scheduled_at"] = datetime.now(timezone.utc) - timedelta(seconds=1)
+        recoverable = await dispatcher._recoverable_delivery_ids(conn)
+        assert [row["id"] for row in recoverable] == [parent["id"]]
 
     asyncio.run(run())
 
@@ -843,21 +903,33 @@ def test_webhook_response_body_is_streamed_and_capped(monkeypatch):
     asyncio.run(run())
 
 
-def test_webhook_response_body_cap_bounds_decoded_gzip_body(monkeypatch):
+def test_webhook_response_body_cap_bounds_ignored_gzip_body(monkeypatch):
     async def run():
         from api import webhook_dispatcher as dispatcher
 
-        class _DecodedGzipResponse:
+        class _GzipResponse:
             headers = {"content-encoding": "gzip"}
 
+            def __init__(self):
+                self.raw = gzip.compress(b"x" * (5 * 1024 * 1024))
+                self.chunks_yielded = 0
+
+            async def aiter_raw(self):
+                for i in range(0, len(self.raw), 7):
+                    self.chunks_yielded += 1
+                    yield self.raw[i:i + 7]
+
             async def aiter_bytes(self):
-                yield b"x" * 1000
+                raise AssertionError("transparent decompression path must not be used")
 
         monkeypatch.setattr(dispatcher, "WEBHOOK_RESPONSE_BODY_MAX_BYTES", 10)
 
-        body = await dispatcher._read_capped_response_body(_DecodedGzipResponse())
+        response = _GzipResponse()
+        body = await dispatcher._read_capped_response_body(response)
 
-        assert body == "x" * 10
+        assert body != "x" * 10
+        assert len(body.encode("utf-8")) <= 10
+        assert response.chunks_yielded == 2
 
     asyncio.run(run())
 
@@ -1027,3 +1099,15 @@ def test_webhook_attempt_lease_migration_adds_claim_columns():
     assert "ADD COLUMN IF NOT EXISTS lease_expires_at TIMESTAMPTZ NULL" in compact
     assert "idx_webhook_deliveries_lease_expires_at" in sql
     assert "ON webhook_deliveries(lease_expires_at)" in compact
+
+
+def test_webhook_writer_revision_migration_adds_legacy_marker():
+    repo_root = Path(__file__).resolve().parents[1]
+    sql = (
+        repo_root / "db" / "migrations_v3_5_webhook_writer_revision.sql"
+    ).read_text()
+    compact = " ".join(sql.split())
+
+    assert "ADD COLUMN IF NOT EXISTS writer_revision INTEGER DEFAULT 0" in compact
+    assert "0/NULL means legacy or unknown" in sql
+    assert "1 means current lease-aware writer" in sql
