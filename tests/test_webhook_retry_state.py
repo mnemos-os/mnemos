@@ -1169,6 +1169,54 @@ def test_active_successor_failure_after_predecessor_success_closes_chain(monkeyp
     asyncio.run(run())
 
 
+def test_active_successor_success_after_predecessor_success_closes_chain(monkeypatch):
+    async def run():
+        parent = _attempt()
+        dispatcher, conn, http = await _install(monkeypatch, [parent], [204])
+        real_send = dispatcher._send_claimed_delivery
+
+        async def _send_then_active_successor(delivery, *, pre_claim_monotonic):
+            result = await real_send(
+                delivery,
+                pre_claim_monotonic=pre_claim_monotonic,
+            )
+            successor = _successor_for(parent)
+            successor["status"] = "retrying"
+            successor["lease_token"] = "00000000-0000-0000-0000-000000000099"
+            successor["lease_expires_at"] = datetime.now(timezone.utc) + timedelta(seconds=60)
+            conn.rows.append(successor)
+            return result
+
+        monkeypatch.setattr(dispatcher, "_send_claimed_delivery", _send_then_active_successor)
+
+        parent_finalized = await dispatcher._attempt_delivery(parent["id"])
+        successor = conn.rows[1]
+        successor_finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            conn._with_subscription(successor),
+            successor["lease_token"],
+            dispatcher._DeliveryResult(
+                succeeded=True,
+                response_status=204,
+                response_body="successor acknowledged",
+                error=None,
+            ),
+        )
+
+        assert parent_finalized
+        assert successor_finalized
+        assert http.delivery_ids == [parent["id"]]
+        assert parent["status"] == "succeeded"
+        assert successor["status"] == "abandoned"
+        assert successor["superseded"] is True
+        assert successor["response_status"] == 204
+        assert successor["response_body"] == "successor acknowledged"
+        assert successor["lease_token"] is None
+        assert sum(row["status"] == "succeeded" for row in conn.rows) == 1
+
+    asyncio.run(run())
+
+
 def test_expired_successor_after_predecessor_success_is_repaired(monkeypatch):
     async def run():
         parent = _attempt()

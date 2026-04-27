@@ -711,6 +711,15 @@ async def _finalize_delivery(
                 )
                 return finalized is not None
 
+            if await _has_succeeded_predecessor_attempt(conn, delivery):
+                finalized = await _abandon_owned_attempt_after_succeeded_predecessor(
+                    conn,
+                    delivery_id,
+                    lease_token,
+                    result,
+                )
+                return finalized is not None
+
             if result.succeeded:
                 finalized = await conn.fetchrow(
                     """
@@ -740,15 +749,6 @@ async def _finalize_delivery(
                 if successor is not None:
                     await _abandon_live_successor_attempt(conn, str(successor["id"]))
                 return True
-
-            if await _has_succeeded_predecessor_attempt(conn, delivery):
-                finalized = await _abandon_owned_attempt_after_succeeded_predecessor(
-                    conn,
-                    delivery_id,
-                    lease_token,
-                    result,
-                )
-                return finalized is not None
 
             next_attempt = delivery["attempt_num"] + 1
             if next_attempt > MAX_ATTEMPTS:

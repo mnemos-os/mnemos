@@ -134,6 +134,9 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   guards to claim, failure-finalize, and repair paths so active successors
   converge after canonical success, and treats response headers as the delivery
   acknowledgement while response-body capture becomes best-effort audit data.
+  Round 13 extends the succeeded-predecessor guard into success finalization,
+  so an active successor that also receives 2xx is abandoned/superseded with
+  its response audit metadata instead of creating a second succeeded row.
 
 ### Conflicts and operator handling
 
