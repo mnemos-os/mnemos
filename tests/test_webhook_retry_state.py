@@ -182,6 +182,49 @@ class _FakeWebhookConn:
                 lock.release()
 
     async def fetch(self, sql: str, *args):
+        compact = " ".join(sql.split())
+        if compact.startswith("WITH claim_clock AS") and "UPDATE webhook_deliveries d SET lease_token=$2::uuid" in compact:
+            max_attempts = args[0]
+            lease_token = str(args[1])
+            limit = args[2]
+            lease_seconds = int(args[3])
+            legacy_grace_seconds = args[4]
+            current_revision = args[5]
+            claim_db_now = datetime.now(timezone.utc)
+            claimed = []
+            for row in sorted(self.rows, key=lambda item: item["scheduled_at"]):
+                if row["scheduled_at"] > claim_db_now or row["attempt_num"] > max_attempts:
+                    continue
+                if row.get("superseded", False):
+                    continue
+                if not self._lease_available(row):
+                    continue
+                if not self._legacy_lease_less_settled(
+                    row, claim_db_now, legacy_grace_seconds, current_revision,
+                ):
+                    continue
+                if self._has_succeeded_chain_peer(row):
+                    continue
+                if row["status"] == "pending":
+                    if not self._try_lock(row["id"]):
+                        continue
+                elif row["status"] == "retrying" and not self._has_successor(row):
+                    if not self._try_lock(row["id"]):
+                        continue
+                else:
+                    continue
+                row["lease_token"] = lease_token
+                row["lease_expires_at"] = claim_db_now + timedelta(seconds=lease_seconds)
+                if row["status"] == "pending":
+                    self._set_status(row, "retrying", changed_at=claim_db_now)
+                delivery = self._with_subscription(row)
+                delivery["claim_db_now"] = claim_db_now
+                delivery["lease_token"] = lease_token
+                claimed.append(delivery)
+                if len(claimed) >= limit:
+                    break
+            return claimed
+
         if "SELECT d.id FROM webhook_deliveries d" not in sql:
             raise AssertionError(f"unexpected fetch SQL: {sql}")
         max_attempts = args[0]
@@ -196,6 +239,8 @@ class _FakeWebhookConn:
             if row.get("superseded", False):
                 continue
             if not self._lease_available(row):
+                continue
+            if self._has_succeeded_chain_peer(row):
                 continue
             if row["status"] == "pending":
                 if self._legacy_lease_less_settled(
@@ -259,11 +304,26 @@ class _FakeWebhookConn:
             successor = self.store.live_unleased_successor(probe)
             return None if successor is None else {"id": successor["id"]}
 
+        if compact.startswith("UPDATE webhook_deliveries SET lease_token=NULL"):
+            row = self._row(args[0])
+            if row is None or row.get("lease_token") != str(args[1]):
+                return None
+            self._clear_lease(row)
+            return {"id": row["id"], "status": row["status"], "superseded": row["superseded"]}
+
         if "SET status='succeeded'" in compact:
             row = self._row(args[0])
             if row is None or not self._owns_live_lease(row, args[1]):
                 return None
             self.store.succeeded_update_attempts += 1
+            if (
+                "AND status IN ('pending', 'retrying')" in compact
+                and (
+                    row["status"] not in {"pending", "retrying"}
+                    or row.get("superseded", False)
+                )
+            ):
+                return None
             if self.store.enforce_succeeded_unique and self.store.has_succeeded_chain_peer(row):
                 raise self.store.unique_violation_cls()
             self._set_status(row, "succeeded")
@@ -899,8 +959,12 @@ def test_recovery_dequeue_uses_skip_locked_claim():
     source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
     compact = " ".join(source.split())
 
+    assert "async def _claim_recoverable_deliveries" in source
+    assert "WITH claim_clock AS" in compact
     assert "FOR UPDATE SKIP LOCKED" in compact
-    assert "SET lease_token=$2::uuid" in compact
+    assert "UPDATE webhook_deliveries d SET lease_token=$2::uuid" in compact
+    assert "_attempt_delivery(str(claimed.delivery[\"id\"]), pool=pool, claimed=claimed)" in compact
+    assert "min(50, limit, _recovery_available_send_capacity(limit))" in compact
     assert "pre_claim_monotonic = time.monotonic()" in compact
     assert "pre_claim_monotonic=claimed.pre_claim_monotonic" in compact
     assert "claim_observed_monotonic = time.monotonic()" not in compact
@@ -1039,6 +1103,43 @@ def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
     asyncio.run(run())
 
 
+def test_recovery_preclaims_rows_before_send_semaphore_backpressure(monkeypatch):
+    async def run():
+        from api import lifecycle
+
+        rows = [_attempt() for _ in range(5)]
+        dispatcher, conn, http = await _install(monkeypatch, rows, [204] * len(rows))
+        http.delay = 0.05
+        monkeypatch.setattr(dispatcher, "_send_semaphore", asyncio.Semaphore(1))
+        monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
+        scheduled_tasks = []
+        real_schedule = lifecycle._schedule_delivery_attempt
+
+        def _record_schedule(coro):
+            task = real_schedule(coro)
+            scheduled_tasks.append(task)
+            return task
+
+        monkeypatch.setattr(lifecycle, "_schedule_delivery_attempt", _record_schedule)
+
+        recovered = [
+            await dispatcher._recover_due_deliveries(conn.pool, limit=5),
+            await dispatcher._recover_due_deliveries(conn.pool, limit=5),
+            await dispatcher._recover_due_deliveries(conn.pool, limit=5),
+        ]
+        await asyncio.wait_for(asyncio.gather(*scheduled_tasks), timeout=2.0)
+
+        assert recovered == [5, 0, 0]
+        assert len(scheduled_tasks) == 5
+        assert http.max_active == 1
+        assert sorted(http.delivery_ids) == sorted(row["id"] for row in rows)
+        assert len(http.delivery_ids) == len(set(http.delivery_ids)) == 5
+        assert [row["status"] for row in rows] == ["succeeded"] * 5
+        assert all(row["lease_token"] is None for row in rows)
+
+    asyncio.run(run())
+
+
 def test_expired_delivery_lease_can_be_reclaimed(monkeypatch):
     async def run():
         row = _attempt()
@@ -1087,7 +1188,8 @@ def test_finalize_with_stale_lease_token_is_noop(monkeypatch):
         assert not finalized
         assert row["status"] == "retrying"
         assert row["response_status"] is None
-        assert row["lease_token"] == "00000000-0000-0000-0000-000000000001"
+        assert row["lease_token"] is None
+        assert row["lease_expires_at"] is None
 
     asyncio.run(run())
 
@@ -1108,6 +1210,8 @@ def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
         # Old workers did not know about leases, so a rolling-upgrade race can
         # leave the new worker's lease columns on a row already marked succeeded.
         row["status"] = "succeeded"
+        row["response_status"] = 202
+        row["response_body"] = "legacy metadata"
         row["delivered_at"] = datetime.now(timezone.utc)
         assert row["lease_token"] == lease_token
 
@@ -1123,12 +1227,57 @@ def test_success_finalize_does_not_abandon_same_row_legacy_success(monkeypatch):
             ),
         )
 
-        assert finalized
+        assert not finalized
         assert conn.store.succeeded_update_attempts == 1
         assert row["status"] == "succeeded"
         assert row["superseded"] is False
-        assert row["response_status"] == 204
-        assert row["response_body"] == "legacy acknowledged"
+        assert row["response_status"] == 202
+        assert row["response_body"] == "legacy metadata"
+        assert row["lease_token"] is None
+
+    asyncio.run(run())
+
+
+def test_success_finalize_does_not_resurrect_same_row_legacy_abandon(monkeypatch):
+    async def run():
+        row = _attempt()
+        lease_token = "00000000-0000-0000-0000-000000000018"
+        dispatcher, conn, _http = await _install(monkeypatch, [row], [])
+
+        claimed = await dispatcher._claim_delivery(
+            conn.pool,
+            row["id"],
+            lease_token=lease_token,
+        )
+        assert claimed is not None
+
+        row["status"] = "abandoned"
+        row["superseded"] = False
+        row["response_status"] = 410
+        row["response_body"] = "legacy gone"
+        row["error"] = "legacy abandoned"
+        row["delivered_at"] = datetime.now(timezone.utc)
+        assert row["lease_token"] == lease_token
+
+        finalized = await dispatcher._finalize_delivery(
+            conn.pool,
+            claimed.delivery,
+            lease_token,
+            dispatcher._DeliveryResult(
+                succeeded=True,
+                response_status=204,
+                response_body="new worker acknowledged",
+                error=None,
+            ),
+        )
+
+        assert not finalized
+        assert conn.store.succeeded_update_attempts == 1
+        assert row["status"] == "abandoned"
+        assert row["superseded"] is False
+        assert row["response_status"] == 410
+        assert row["response_body"] == "legacy gone"
+        assert row["error"] == "legacy abandoned"
         assert row["lease_token"] is None
 
     asyncio.run(run())
@@ -2074,6 +2223,9 @@ def test_success_finalize_source_shape_is_chain_aware():
     assert "status='abandoned', superseded=TRUE, status_updated_at=clock_timestamp()" in compact
     assert "except asyncpg.exceptions.UniqueViolationError" in source
     assert "canonical external delivery" in source
+    assert "async def _clear_stale_owned_lease_after_terminal_finalize" in source
+    assert "SET lease_token=NULL, lease_expires_at=NULL WHERE id=$1::uuid AND lease_token=$2::uuid" in compact
+    assert "webhook delivery %s was already terminal at success finalize time; stale lease cleared" in source
 
 
 def test_succeeded_chain_guard_source_shape_is_chain_aware():
@@ -2105,7 +2257,7 @@ def test_failure_finalize_source_shape_requires_live_owned_attempt():
         "AND lease_expires_at >= clock_timestamp() "
         "AND status IN ('pending', 'retrying') "
         "AND NOT superseded RETURNING id"
-    ) == 3
+    ) == 4
 
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():

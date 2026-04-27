@@ -144,6 +144,7 @@ class _DeliveryResult:
 @dataclass(frozen=True)
 class _ClaimedDelivery:
     delivery: asyncpg.Record
+    lease_token: str
     pre_claim_monotonic: float
 
 
@@ -270,17 +271,116 @@ async def repair_superseded_retrying_deliveries(pool: asyncpg.Pool) -> str:
 
 async def _recover_due_deliveries(pool: asyncpg.Pool, *, limit: int = 50) -> int:
     """Recover due deliveries by scheduling lifecycle-tracked send attempts."""
-    recovered = 0
+    claim_limit = min(50, limit, _recovery_available_send_capacity(limit))
+    if claim_limit <= 0:
+        return 0
+
     async with pool.acquire() as conn:
         async with conn.transaction():
-            rows = await _recoverable_delivery_ids(conn, limit=limit)
+            claimed_deliveries = await _claim_recoverable_deliveries(conn, limit=claim_limit)
     from api.lifecycle import _schedule_delivery_attempt  # noqa: WPS433
-    for row in rows:
-        _schedule_delivery_attempt(_attempt_delivery(str(row["id"]), pool=pool))
-        recovered += 1
+    for claimed in claimed_deliveries:
+        _schedule_delivery_attempt(
+            _attempt_delivery(str(claimed.delivery["id"]), pool=pool, claimed=claimed)
+        )
+    recovered = len(claimed_deliveries)
     if recovered:
         await asyncio.sleep(0)
     return recovered
+
+
+def _recovery_available_send_capacity(limit: int) -> int:
+    """Return whether recovery should claim a batch for the send semaphore."""
+    semaphore = _get_send_semaphore()
+    return 0 if semaphore.locked() else limit
+
+
+async def _claim_recoverable_deliveries(
+    conn: asyncpg.Connection,
+    *,
+    limit: int = 50,
+    lease_seconds: int | None = None,
+) -> list[_ClaimedDelivery]:
+    """Claim due recovery rows before scheduling send tasks."""
+    if limit <= 0:
+        return []
+    if lease_seconds is None:
+        lease_seconds = WEBHOOK_LEASE_SECONDS
+    lease_token = str(uuid.uuid4())
+    pre_claim_monotonic = time.monotonic()
+    rows = await conn.fetch(
+        """
+        WITH claim_clock AS (
+          SELECT clock_timestamp() AS claim_now
+        ),
+        recoverable AS (
+          SELECT d.id
+          FROM webhook_deliveries d, claim_clock
+          WHERE d.scheduled_at <= claim_clock.claim_now
+            AND d.attempt_num <= $1
+            AND d.status NOT IN ('succeeded', 'abandoned')
+            AND NOT d.superseded
+            AND d.status IN ('pending', 'retrying')
+            AND (d.lease_token IS NULL OR d.lease_expires_at < claim_clock.claim_now)
+            AND (
+              d.lease_token IS NOT NULL
+              OR d.writer_revision = $6
+              OR d.status_updated_at + ($5::int * INTERVAL '1 second') <= claim_clock.claim_now
+            )
+            AND NOT EXISTS (
+              SELECT 1
+              FROM webhook_deliveries peer
+              WHERE peer.subscription_id = d.subscription_id
+                AND peer.event_type = d.event_type
+                AND peer.payload_hash = d.payload_hash
+                AND peer.status = 'succeeded'
+            )
+            AND (
+              d.status = 'pending'
+              OR (
+                d.status = 'retrying'
+                AND NOT EXISTS (
+                  SELECT 1
+                  FROM webhook_deliveries newer
+                  WHERE newer.subscription_id = d.subscription_id
+                    AND newer.event_type = d.event_type
+                    AND newer.payload_hash = d.payload_hash
+                    AND newer.attempt_num > d.attempt_num
+                )
+              )
+            )
+          ORDER BY d.scheduled_at
+          LIMIT $3
+          FOR UPDATE SKIP LOCKED
+        )
+        UPDATE webhook_deliveries d
+        SET lease_token=$2::uuid,
+            lease_expires_at=claim_clock.claim_now + ($4::int * INTERVAL '1 second'),
+            status=CASE WHEN d.status = 'pending' THEN 'retrying' ELSE d.status END
+        FROM recoverable, webhook_subscriptions s, claim_clock
+        WHERE d.id = recoverable.id
+          AND s.id = d.subscription_id
+        RETURNING d.id, d.subscription_id, d.event_type, d.payload,
+                  d.payload_hash, d.attempt_num, d.status,
+                  d.lease_expires_at, claim_clock.claim_now AS claim_db_now,
+                  $2::uuid AS lease_token,
+                  s.url, s.secret, s.revoked
+        """,
+        MAX_ATTEMPTS,
+        lease_token,
+        limit,
+        lease_seconds,
+        WEBHOOK_LEGACY_GRACE_SECONDS,
+        NEW_CODE_WRITER_REVISION,
+    )
+    return [
+        _ClaimedDelivery(
+            delivery=row,
+            lease_token=lease_token,
+            pre_claim_monotonic=pre_claim_monotonic,
+        )
+        for row in rows
+    ]
 
 
 async def _recoverable_delivery_ids(
@@ -288,7 +388,7 @@ async def _recoverable_delivery_ids(
     *,
     limit: int = 50,
 ) -> Iterable[asyncpg.Record]:
-    """Return due delivery rows that are safe for recovery to schedule."""
+    """Return due delivery rows without claiming them, for diagnostics and tests."""
     return await conn.fetch(
         """
         SELECT d.id FROM webhook_deliveries d
@@ -302,6 +402,14 @@ async def _recoverable_delivery_ids(
             d.lease_token IS NOT NULL
             OR d.writer_revision = $4
             OR d.status_updated_at + ($3::int * INTERVAL '1 second') <= clock_timestamp()
+          )
+          AND NOT EXISTS (
+            SELECT 1
+            FROM webhook_deliveries peer
+            WHERE peer.subscription_id = d.subscription_id
+              AND peer.event_type = d.event_type
+              AND peer.payload_hash = d.payload_hash
+              AND peer.status = 'succeeded'
           )
           AND (
             d.status = 'pending'
@@ -319,7 +427,6 @@ async def _recoverable_delivery_ids(
           )
         ORDER BY d.scheduled_at
         LIMIT $2
-        FOR UPDATE SKIP LOCKED
         """,
         MAX_ATTEMPTS, limit, WEBHOOK_LEGACY_GRACE_SECONDS, NEW_CODE_WRITER_REVISION,
     )
@@ -359,7 +466,12 @@ def _get_send_semaphore() -> asyncio.Semaphore:
     return _send_semaphore
 
 
-async def _attempt_delivery(delivery_id: str, *, pool: Optional[asyncpg.Pool] = None) -> bool:
+async def _attempt_delivery(
+    delivery_id: str,
+    *,
+    pool: Optional[asyncpg.Pool] = None,
+    claimed: Optional[_ClaimedDelivery] = None,
+) -> bool:
     """Claim, send, and finalize one delivery without holding DB during I/O."""
     if pool is None:
         from api.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
@@ -369,8 +481,11 @@ async def _attempt_delivery(delivery_id: str, *, pool: Optional[asyncpg.Pool] = 
         return False
 
     async with _get_send_semaphore():
-        lease_token = str(uuid.uuid4())
-        claimed = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
+        if claimed is None:
+            lease_token = str(uuid.uuid4())
+            claimed = await _claim_delivery(pool, delivery_id, lease_token=lease_token)
+        else:
+            lease_token = claimed.lease_token
         if not claimed:
             return False
         result = await _send_claimed_delivery(
@@ -466,6 +581,7 @@ async def _claim_delivery(
                 return None
             return _ClaimedDelivery(
                 delivery=claimed,
+                lease_token=lease_token,
                 pre_claim_monotonic=pre_claim_monotonic,
             )
 
@@ -773,6 +889,8 @@ async def _finalize_delivery(
                             WHERE id=$1::uuid
                               AND lease_token=$2::uuid
                               AND lease_expires_at >= clock_timestamp()
+                              AND status IN ('pending', 'retrying')
+                              AND NOT superseded
                             RETURNING id
                             """,
                             delivery_id,
@@ -789,6 +907,11 @@ async def _finalize_delivery(
                     )
                     return finalized is not None
                 if finalized is None:
+                    await _clear_stale_owned_lease_after_terminal_finalize(
+                        conn,
+                        delivery_id,
+                        lease_token,
+                    )
                     return False
 
                 # A live successor after our lease-valid 2xx is a mixed-version
@@ -872,6 +995,42 @@ async def _finalize_delivery(
                 delivery_id, delivery["attempt_num"], result.response_status, result.error, backoff,
             )
             return True
+
+
+async def _clear_stale_owned_lease_after_terminal_finalize(
+    conn: asyncpg.Connection,
+    delivery_id: str,
+    lease_token: str,
+) -> None:
+    """Release our lease when another writer terminalized the same row first."""
+    cleared = await conn.fetchrow(
+        """
+        UPDATE webhook_deliveries
+        SET lease_token=NULL,
+            lease_expires_at=NULL
+        WHERE id=$1::uuid
+          AND lease_token=$2::uuid
+        RETURNING id, status, superseded
+        """,
+        delivery_id,
+        lease_token,
+    )
+    if cleared is None:
+        logger.warning(
+            "webhook delivery %s success finalize found no live owned row; stale lease was already gone",
+            delivery_id,
+        )
+        return
+    if cleared["status"] not in LIVE_DELIVERY_STATUSES or cleared["superseded"]:
+        logger.warning(
+            "webhook delivery %s was already terminal at success finalize time; stale lease cleared",
+            delivery_id,
+        )
+        return
+    logger.warning(
+        "webhook delivery %s success finalize found no live owned row; stale lease cleared",
+        delivery_id,
+    )
 
 
 async def _load_delivery_for_claim(conn: asyncpg.Connection, delivery_id: str) -> Optional[asyncpg.Record]:

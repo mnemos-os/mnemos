@@ -149,7 +149,12 @@ task #25 is closed in v3.5-dev by the RLS group-select migration.
   Round 16 makes revocation, final-failure, and retry-failure terminal UPDATEs
   require the leased row to still be live (`pending`/`retrying` and not
   superseded), so failure finalization cannot overwrite same-row legacy
-  succeeded or abandoned terminal writes during rolling upgrades.
+  succeeded or abandoned terminal writes during rolling upgrades. Round 17
+  applies the same live-row guard to the success finalize UPDATE, clearing only
+  stale lease columns when a same-row legacy terminal write has already won, and
+  moves recovery to claim due rows with a lease in the dequeue CTE before
+  scheduling send tasks so repeated recovery polls do not enqueue duplicates
+  behind the send semaphore.
 
 ### Conflicts and operator handling
 
