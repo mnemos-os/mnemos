@@ -494,13 +494,22 @@ async def list_audit_log(
             )
         else:
             rows = await conn.fetch(
-                "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, "
-                "al.response_hash, al.chain_hash, al.prev_id, al.task_type, "
-                "al.provider, al.quality_score, al.created_at "
+                "WITH visible AS ("
+                "SELECT al.id, al.sequence_num AS global_sequence_num, "
+                "al.consultation_id, al.prompt_hash, al.response_hash, "
+                "al.chain_hash, al.task_type, al.provider, al.quality_score, "
+                "al.created_at, "
+                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
                 "FROM graeae_audit_log al "
                 "JOIN graeae_consultations c ON c.id = al.consultation_id "
                 "WHERE c.owner_id = $1 "
-                "ORDER BY al.sequence_num DESC LIMIT $2 OFFSET $3",
+                ") "
+                "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, "
+                "prompt_hash, response_hash, chain_hash, scoped_prev_id AS prev_id, "
+                "task_type, provider, quality_score, created_at "
+                "FROM visible "
+                "ORDER BY global_sequence_num DESC LIMIT $2 OFFSET $3",
                 user.user_id, limit, offset,
             )
     return [
@@ -530,10 +539,10 @@ async def verify_audit_chain(
     """Verify the integrity of the hash chain in the GRAEAE audit log.
 
     Root walks the entire chain from genesis, verifying each link. Non-root
-    callers verify only rows attached to their own consultations, using the
-    row's recorded previous-chain hash so hidden cross-tenant rows are not
-    exposed. Rate-limited because the cost grows linearly with audit-log size.
-    Returns details of any broken sequences.
+    callers verify only rows attached to their own consultations while deriving
+    each predecessor from the immediate previous global sequence row, not from
+    the row's tamperable prev_id. Rate-limited because the cost grows linearly
+    with audit-log size. Returns details of any broken sequences.
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
@@ -547,10 +556,16 @@ async def verify_audit_chain(
             rows = await conn.fetch(
                 "SELECT al.sequence_num, al.prompt_hash, al.response_hash, "
                 "al.chain_hash, al.prev_id, al.prev_chain_hash, "
-                "prev.chain_hash AS actual_prev_chain_hash "
+                "prev.chain_hash AS expected_prev_hash "
                 "FROM graeae_audit_log al "
                 "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                "LEFT JOIN graeae_audit_log prev ON prev.id = al.prev_id "
+                "LEFT JOIN LATERAL ("
+                "SELECT chain_hash "
+                "FROM graeae_audit_log "
+                "WHERE sequence_num < al.sequence_num "
+                "ORDER BY sequence_num DESC "
+                "LIMIT 1"
+                ") prev ON TRUE "
                 "WHERE c.owner_id = $1 "
                 "ORDER BY al.sequence_num ASC",
                 user.user_id,
@@ -569,19 +584,32 @@ async def verify_audit_chain(
 
     if _is_root(user):
         prev_chain = _GENESIS_HASH
+        failures: dict[int, str] = {}
         for row in rows:
             expected = hashlib.sha256(
                 (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
             ).hexdigest()
             if expected != row["chain_hash"]:
-                return AuditVerifyResponse(
-                    valid=False,
-                    entries_checked=row["sequence_num"],
-                    first_broken_sequence=row["sequence_num"],
-                    message=f"Chain broken at sequence {row['sequence_num']}: "
-                            f"expected {expected[:16]}…, stored {row['chain_hash'][:16]}…",
+                failures.setdefault(
+                    row["sequence_num"],
+                    f"Chain broken at sequence {row['sequence_num']}: "
+                    f"expected {expected[:16]}…, stored {row['chain_hash'][:16]}…",
                 )
             prev_chain = row["chain_hash"]
+
+        if failures:
+            entries_failed = sorted(failures)
+            first_broken_sequence = entries_failed[0]
+            message = failures[first_broken_sequence]
+            if len(entries_failed) > 1:
+                message = f"{message}; {len(entries_failed)} entries failed verification"
+            return AuditVerifyResponse(
+                valid=False,
+                entries_checked=len(rows),
+                first_broken_sequence=first_broken_sequence,
+                entries_failed=entries_failed,
+                message=message,
+            )
 
         return AuditVerifyResponse(
             valid=True,
@@ -589,48 +617,39 @@ async def verify_audit_chain(
             message=f"All {len(rows)} entries verified — chain intact",
         )
 
-    for checked, row in enumerate(rows, start=1):
+    failures: dict[int, str] = {}
+    for row in rows:
         stored_prev_chain = row["prev_chain_hash"]
-        actual_prev_chain = row["actual_prev_chain_hash"]
-        if row["prev_id"] is None:
-            prev_chain = stored_prev_chain or _GENESIS_HASH
-            if stored_prev_chain and stored_prev_chain != _GENESIS_HASH:
-                return AuditVerifyResponse(
-                    valid=False,
-                    entries_checked=checked,
-                    first_broken_sequence=row["sequence_num"],
-                    message=f"Scoped chain broken at sequence {row['sequence_num']}: "
-                            "stored previous hash does not match genesis",
-                )
-        else:
-            prev_chain = actual_prev_chain or stored_prev_chain
-            if not prev_chain:
-                return AuditVerifyResponse(
-                    valid=False,
-                    entries_checked=checked,
-                    first_broken_sequence=row["sequence_num"],
-                    message=f"Scoped chain broken at sequence {row['sequence_num']}: "
-                            "missing previous chain hash",
-                )
-            if stored_prev_chain and actual_prev_chain and stored_prev_chain != actual_prev_chain:
-                return AuditVerifyResponse(
-                    valid=False,
-                    entries_checked=checked,
-                    first_broken_sequence=row["sequence_num"],
-                    message=f"Scoped chain broken at sequence {row['sequence_num']}: "
-                            "stored previous hash does not match previous row",
-                )
+        prev_chain = row["expected_prev_hash"] or _GENESIS_HASH
+        if stored_prev_chain and stored_prev_chain != prev_chain:
+            failures.setdefault(
+                row["sequence_num"],
+                f"Scoped chain broken at sequence {row['sequence_num']}: "
+                "stored previous hash does not match actual previous row",
+            )
         expected = hashlib.sha256(
             (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
         ).hexdigest()
         if expected != row["chain_hash"]:
-            return AuditVerifyResponse(
-                valid=False,
-                entries_checked=checked,
-                first_broken_sequence=row["sequence_num"],
-                message=f"Scoped chain broken at sequence {row['sequence_num']}: "
-                        f"expected {expected[:16]}..., stored {row['chain_hash'][:16]}...",
+            failures.setdefault(
+                row["sequence_num"],
+                f"Scoped chain broken at sequence {row['sequence_num']}: "
+                f"expected {expected[:16]}..., stored {row['chain_hash'][:16]}...",
             )
+
+    if failures:
+        entries_failed = sorted(failures)
+        first_broken_sequence = entries_failed[0]
+        message = failures[first_broken_sequence]
+        if len(entries_failed) > 1:
+            message = f"{message}; {len(entries_failed)} scoped entries failed verification"
+        return AuditVerifyResponse(
+            valid=False,
+            entries_checked=len(rows),
+            first_broken_sequence=first_broken_sequence,
+            entries_failed=entries_failed,
+            message=message,
+        )
 
     return AuditVerifyResponse(
         valid=True,

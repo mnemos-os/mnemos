@@ -374,6 +374,7 @@ class AuditVerifyResponse(BaseModel):
     valid: bool
     entries_checked: int
     first_broken_sequence: Optional[int] = None
+    entries_failed: List[int] = Field(default_factory=list)
     message: str
 
 

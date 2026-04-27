@@ -240,18 +240,45 @@ class FakeConnection:
 
         if "FROM graeae_audit_log" in compact and "ORDER BY" in compact:
             rows = list(self.state["audit_log"])
-            if "actual_prev_chain_hash" in compact:
-                chain_by_id = {row["id"]: row["chain_hash"] for row in rows}
+            if "expected_prev_hash" in compact:
+                prev_hash_by_id = {}
+                prev_chain_hash = None
+                for row in sorted(rows, key=lambda item: item["sequence_num"]):
+                    prev_hash_by_id[row["id"]] = prev_chain_hash
+                    prev_chain_hash = row["chain_hash"]
                 rows = [
                     {
                         **row,
-                        "actual_prev_chain_hash": (
-                            chain_by_id.get(row["prev_id"]) if row["prev_id"] else None
-                        ),
+                        "expected_prev_hash": prev_hash_by_id[row["id"]],
                     }
                     for row in rows
                 ]
-            if "c.owner_id = $1" in compact:
+            if "scoped_sequence_num" in compact:
+                owner_id = args[0]
+                visible_rows = [
+                    row for row in rows
+                    if (
+                        self.state["consultations"]
+                        .get(row["consultation_id"], {})
+                        .get("owner_id") == owner_id
+                    )
+                ]
+                rows = []
+                scoped_prev_id = None
+                for scoped_sequence_num, row in enumerate(
+                    sorted(visible_rows, key=lambda item: item["sequence_num"]),
+                    start=1,
+                ):
+                    rows.append(
+                        {
+                            **row,
+                            "global_sequence_num": row["sequence_num"],
+                            "sequence_num": scoped_sequence_num,
+                            "prev_id": scoped_prev_id,
+                        }
+                    )
+                    scoped_prev_id = row["id"]
+            elif "c.owner_id = $1" in compact:
                 owner_id = args[0]
                 rows = [
                     row for row in rows
@@ -261,7 +288,11 @@ class FakeConnection:
                         .get("owner_id") == owner_id
                     )
                 ]
-            if "DESC" in compact:
+            if (
+                "ORDER BY global_sequence_num DESC" in compact
+                or "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT" in compact
+                or "ORDER BY al.sequence_num DESC" in compact
+            ):
                 rows = list(reversed(rows))
             return rows
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+
 import pytest
 from httpx import AsyncClient
 
@@ -91,12 +93,27 @@ async def test_list_audit_log_scopes_to_caller(
     assert alice_resp.status_code == 200
     alice_rows = alice_resp.json()
     assert {row["consultation_id"] for row in alice_rows} == set(ids["alice"])
+    assert [row["sequence_num"] for row in alice_rows] == [3, 2, 1]
+    alice_rows_by_sequence = {row["sequence_num"]: row for row in alice_rows}
+    assert alice_rows_by_sequence[1]["prev_id"] is None
+    assert alice_rows_by_sequence[2]["prev_id"] == alice_rows_by_sequence[1]["id"]
+    assert alice_rows_by_sequence[3]["prev_id"] == alice_rows_by_sequence[2]["id"]
+    assert {
+        row["prev_id"] for row in alice_rows if row["prev_id"] is not None
+    } <= {row["id"] for row in alice_rows}
 
     current_user_override["user"] = _user("bob")
     bob_resp = await client.get("/v1/consultations/audit", headers=auth_headers)
     assert bob_resp.status_code == 200
     bob_rows = bob_resp.json()
     assert {row["consultation_id"] for row in bob_rows} == set(ids["bob"])
+    assert [row["sequence_num"] for row in bob_rows] == [2, 1]
+    bob_rows_by_sequence = {row["sequence_num"]: row for row in bob_rows}
+    assert bob_rows_by_sequence[1]["prev_id"] is None
+    assert bob_rows_by_sequence[2]["prev_id"] == bob_rows_by_sequence[1]["id"]
+    assert {
+        row["prev_id"] for row in bob_rows if row["prev_id"] is not None
+    } <= {row["id"] for row in bob_rows}
 
 
 async def test_list_audit_log_root_sees_all(
@@ -113,6 +130,13 @@ async def test_list_audit_log_root_sees_all(
     assert resp.status_code == 200
     rows = resp.json()
     assert {row["consultation_id"] for row in rows} == set(ids["alice"] + ids["bob"])
+    assert [row["sequence_num"] for row in rows] == [5, 4, 3, 2, 1]
+    rows_by_sequence = {row["sequence_num"]: row for row in rows}
+    assert rows_by_sequence[1]["prev_id"] is None
+    for sequence_num in range(2, 6):
+        assert rows_by_sequence[sequence_num]["prev_id"] == rows_by_sequence[
+            sequence_num - 1
+        ]["id"]
 
 
 async def test_verify_audit_chain_scopes_to_caller(
@@ -154,6 +178,46 @@ async def test_verify_audit_chain_root_global(
     data = resp.json()
     assert data["valid"] is True
     assert data["entries_checked"] == 5
+
+
+async def test_verify_audit_chain_uses_actual_global_predecessor(
+    client: AsyncClient,
+    auth_headers: dict,
+    current_user_override: dict,
+    db_pool,
+):
+    await _create_consultation(
+        client, auth_headers, current_user_override, "alice", "alice audit row 1",
+    )
+    await _create_consultation(
+        client, auth_headers, current_user_override, "bob", "bob hidden audit row",
+    )
+    await _create_consultation(
+        client, auth_headers, current_user_override, "alice", "alice audit row 2",
+    )
+
+    rows = db_pool.state["audit_log"]
+    alice_first = rows[0]
+    alice_second = rows[2]
+    alice_second["prev_id"] = alice_first["id"]
+    alice_second["prev_chain_hash"] = alice_first["chain_hash"]
+    alice_second["chain_hash"] = hashlib.sha256(
+        (
+            alice_first["chain_hash"]
+            + alice_second["prompt_hash"]
+            + alice_second["response_hash"]
+        ).encode()
+    ).hexdigest()
+
+    current_user_override["user"] = _user("alice")
+    resp = await client.get("/v1/consultations/audit/verify", headers=auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["valid"] is False
+    assert data["entries_checked"] == 2
+    assert data["entries_failed"] == [3]
+    assert data["first_broken_sequence"] == 3
+    assert "actual previous row" in data["message"]
 
 
 async def test_get_consultation_owner_scope(
