@@ -119,6 +119,85 @@ class _HiddenStartConn:
         raise AssertionError(f"unexpected fetch SQL: {sql}")
 
 
+class _RecordingTxn:
+    def __init__(self, conn):
+        self.conn = conn
+
+    async def __aenter__(self):
+        self.conn.events.append("begin")
+        self.conn.in_transaction = True
+        return None
+
+    async def __aexit__(self, exc_type, *_args):
+        self.conn.events.append("rollback" if exc_type else "commit")
+        self.conn.in_transaction = False
+        return False
+
+
+class _BranchCreateRaceConn:
+    """HTTP create_branch sees preflight ownership, then a locked-row result."""
+
+    def __init__(self, *, locked_owner_matches: bool, duplicate: bool = False):
+        self.now = datetime(2026, 1, 1, 12, 0, 0)
+        self.locked_owner_matches = locked_owner_matches
+        self.duplicate = duplicate
+        self.events: list[str] = []
+        self.in_transaction = False
+        self.insert_attempts = 0
+        self.insert_sql: str | None = None
+        self.start_sql: str | None = None
+        self.fetchrow_calls: list[tuple[str, tuple]] = []
+
+    def transaction(self):
+        return _RecordingTxn(self)
+
+    async def fetchrow(self, sql: str, *args):
+        self.fetchrow_calls.append((sql, args))
+        compact = " ".join(sql.split())
+
+        if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
+            assert self.in_transaction
+            self.events.append("preflight")
+            return {"owner_id": "alice", "namespace": "alice-ns"}
+
+        if (
+            compact.startswith("SELECT 1 FROM memories WHERE id = $1")
+            and "FOR SHARE" in compact
+        ):
+            assert self.in_transaction
+            self.events.append("lock")
+            if self.locked_owner_matches:
+                return {"ok": 1}
+            return None
+
+        if "FROM memory_versions mv" in compact and "mb.name = 'main'" in compact:
+            assert self.in_transaction
+            self.events.append("start")
+            self.start_sql = sql
+            return {
+                "id": "main-version-id",
+                "commit_hash": "main-hash",
+                "created_at": self.now,
+            }
+
+        if compact.startswith("SELECT id FROM memory_branches WHERE memory_id = $1 AND name = $2"):
+            raise AssertionError("create_branch must not use stale duplicate pre-check")
+
+        if compact.startswith("INSERT INTO memory_branches"):
+            assert self.in_transaction
+            self.events.append("insert")
+            self.insert_attempts += 1
+            self.insert_sql = sql
+            if self.duplicate:
+                return None
+            return {"id": "branch-id"}
+
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+    async def fetchval(self, sql: str, *args):
+        raise AssertionError(f"unexpected fetchval SQL: {sql}")
+
+
 class _MergeHiddenTargetConn:
     """Alice owns the live memory, but target branch HEAD is Bob-private."""
 
@@ -264,6 +343,71 @@ def test_create_branch_rejects_hidden_start_commit_http(monkeypatch, from_commit
     assert conn.start_sql is not None
     assert "permission_mode % 10" in conn.start_sql
     assert "namespace = $" in conn.start_sql
+
+
+def test_create_branch_rechecks_locked_memory_before_insert_http(monkeypatch):
+    conn = _BranchCreateRaceConn(locked_owner_matches=False)
+    _install(monkeypatch, conn)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            dag_handler.create_branch(
+                "mem-1",
+                dag_handler.BranchCreateRequest(name="feature"),
+                user=_alice(),
+            )
+        )
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "Memory not found"
+    assert conn.insert_attempts == 0
+    assert conn.start_sql is None
+    assert conn.events == ["begin", "preflight", "lock", "rollback"]
+
+
+def test_create_branch_inserts_after_locked_recheck_http(monkeypatch):
+    conn = _BranchCreateRaceConn(locked_owner_matches=True)
+    _install(monkeypatch, conn)
+
+    branch = asyncio.run(
+        dag_handler.create_branch(
+            "mem-1",
+            dag_handler.BranchCreateRequest(name="feature"),
+            user=_alice(),
+        )
+    )
+
+    assert branch == dag_handler.BranchInfo(
+        name="feature",
+        head_commit_hash="main-hash",
+        created_at=conn.now.isoformat(),
+        created_by="alice",
+    )
+    assert conn.events == ["begin", "preflight", "lock", "start", "insert", "commit"]
+    assert conn.insert_attempts == 1
+    assert conn.insert_sql is not None
+    assert "ON CONFLICT (memory_id, name) DO NOTHING" in " ".join(conn.insert_sql.split())
+
+
+def test_create_branch_duplicate_uses_atomic_insert_path_http(monkeypatch):
+    conn = _BranchCreateRaceConn(locked_owner_matches=True, duplicate=True)
+    _install(monkeypatch, conn)
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(
+            dag_handler.create_branch(
+                "mem-1",
+                dag_handler.BranchCreateRequest(name="feature"),
+                user=_alice(),
+            )
+        )
+
+    assert exc.value.status_code == 409
+    assert exc.value.detail == "Branch 'feature' already exists"
+    assert conn.events == ["begin", "preflight", "lock", "start", "insert", "rollback"]
+    assert conn.insert_attempts == 1
+    assert conn.insert_sql is not None
+    assert "ON CONFLICT (memory_id, name) DO NOTHING" in " ".join(conn.insert_sql.split())
 
 
 @pytest.mark.parametrize(

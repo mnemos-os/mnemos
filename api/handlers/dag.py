@@ -349,87 +349,105 @@ async def create_branch(
 
     try:
         async with pool.acquire() as conn:
-            await _assert_memory_access(conn, memory_id, user)
-            # Resolve starting point (HEAD or specific commit)
-            if request.from_commit:
+            async with conn.transaction():
+                await _assert_memory_access(conn, memory_id, user)
+                # The preflight check above is not authoritative for the
+                # write: lock and re-check the live memory row in the same
+                # transaction that resolves the start commit and inserts the
+                # branch. This closes the HTTP/MCP TOCTOU asymmetry where a
+                # memory owner or namespace can change between auth and write.
                 if user.role == "root":
-                    start_version = await conn.fetchrow(
-                        "SELECT id, commit_hash, created_at FROM memory_versions "
-                        "WHERE memory_id = $1 AND commit_hash = $2",
-                        memory_id,
-                        request.from_commit,
-                    )
-                else:
-                    from api.visibility import version_visibility_predicate
-
-                    vis_clause, vis_params = version_visibility_predicate(
-                        user.user_id, start_param_idx=3,
-                    )
-                    ns_ph = f"${len(vis_params) + 3}"
-                    start_version = await conn.fetchrow(
-                        "SELECT id, commit_hash, created_at FROM memory_versions "
-                        "WHERE memory_id = $1 AND commit_hash = $2 "
-                        f"AND {vis_clause} AND namespace = {ns_ph}",
-                        memory_id, request.from_commit, *vis_params, user.namespace,
-                    )
-                if not start_version:
-                    raise HTTPException(status_code=404, detail="Commit hash not found")
-            else:
-                # Default: use current main branch HEAD
-                if user.role == "root":
-                    start_version = await conn.fetchrow(
-                        """
-                        SELECT mv.id, mv.commit_hash, mv.created_at
-                        FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                        WHERE mv.memory_id = $1 AND mb.name = 'main'
-                        """,
+                    live = await conn.fetchrow(
+                        "SELECT 1 FROM memories WHERE id = $1 FOR SHARE",
                         memory_id,
                     )
                 else:
-                    from api.visibility import version_visibility_predicate
-
-                    vis_clause, vis_params = version_visibility_predicate(
-                        user.user_id, start_param_idx=2, table_alias="mv",
+                    live = await conn.fetchrow(
+                        "SELECT 1 FROM memories WHERE id = $1 "
+                        "AND owner_id = $2 AND namespace = $3 FOR SHARE",
+                        memory_id,
+                        user.user_id,
+                        user.namespace,
                     )
-                    ns_ph = f"${len(vis_params) + 2}"
-                    start_version = await conn.fetchrow(
-                        f"""
-                        SELECT mv.id, mv.commit_hash, mv.created_at
-                        FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                        WHERE mv.memory_id = $1 AND mb.name = 'main'
-                          AND {vis_clause} AND mv.namespace = {ns_ph}
-                        """,
-                        memory_id, *vis_params, user.namespace,
-                    )
-                if not start_version:
-                    raise HTTPException(status_code=404, detail="main branch HEAD not found")
+                if not live:
+                    raise HTTPException(status_code=404, detail="Memory not found")
 
-            # Refuse to silently overwrite an existing branch — previous
-            # behaviour (ON CONFLICT DO UPDATE) let any caller hijack a named
-            # branch. Callers that want to move a branch head should merge
-            # instead.
-            existing = await conn.fetchrow(
-                "SELECT id FROM memory_branches WHERE memory_id = $1 AND name = $2",
-                memory_id, request.name,
-            )
-            if existing:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"Branch '{request.name}' already exists",
+                # Resolve starting point (HEAD or specific commit) only after
+                # the locked ownership/namespace re-check succeeds.
+                if request.from_commit:
+                    if user.role == "root":
+                        start_version = await conn.fetchrow(
+                            "SELECT id, commit_hash, created_at FROM memory_versions "
+                            "WHERE memory_id = $1 AND commit_hash = $2",
+                            memory_id,
+                            request.from_commit,
+                        )
+                    else:
+                        from api.visibility import version_visibility_predicate
+
+                        vis_clause, vis_params = version_visibility_predicate(
+                            user.user_id, start_param_idx=3,
+                        )
+                        ns_ph = f"${len(vis_params) + 3}"
+                        start_version = await conn.fetchrow(
+                            "SELECT id, commit_hash, created_at FROM memory_versions "
+                            "WHERE memory_id = $1 AND commit_hash = $2 "
+                            f"AND {vis_clause} AND namespace = {ns_ph}",
+                            memory_id, request.from_commit, *vis_params, user.namespace,
+                        )
+                    if not start_version:
+                        raise HTTPException(status_code=404, detail="Commit hash not found")
+                else:
+                    # Default: use current main branch HEAD
+                    if user.role == "root":
+                        start_version = await conn.fetchrow(
+                            """
+                            SELECT mv.id, mv.commit_hash, mv.created_at
+                            FROM memory_versions mv
+                            INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                            WHERE mv.memory_id = $1 AND mb.name = 'main'
+                            """,
+                            memory_id,
+                        )
+                    else:
+                        from api.visibility import version_visibility_predicate
+
+                        vis_clause, vis_params = version_visibility_predicate(
+                            user.user_id, start_param_idx=2, table_alias="mv",
+                        )
+                        ns_ph = f"${len(vis_params) + 2}"
+                        start_version = await conn.fetchrow(
+                            f"""
+                            SELECT mv.id, mv.commit_hash, mv.created_at
+                            FROM memory_versions mv
+                            INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                            WHERE mv.memory_id = $1 AND mb.name = 'main'
+                              AND {vis_clause} AND mv.namespace = {ns_ph}
+                            """,
+                            memory_id, *vis_params, user.namespace,
+                        )
+                    if not start_version:
+                        raise HTTPException(status_code=404, detail="main branch HEAD not found")
+
+                # Race-safe insert: a concurrent creator for the same branch
+                # yields no RETURNING row and is reported as a duplicate.
+                inserted = await conn.fetchrow(
+                    """
+                    INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (memory_id, name) DO NOTHING
+                    RETURNING id
+                    """,
+                    memory_id,
+                    request.name,
+                    start_version["id"],
+                    user.user_id,
                 )
-            await conn.fetchval(
-                """
-                INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
-                VALUES ($1, $2, $3, $4)
-                RETURNING id
-                """,
-                memory_id,
-                request.name,
-                start_version["id"],
-                user.user_id,
-            )
+                if inserted is None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=f"Branch '{request.name}' already exists",
+                    )
 
             logger.info(f"[DAG] Branch '{request.name}' created for {memory_id}")
 
