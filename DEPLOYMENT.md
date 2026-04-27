@@ -1,6 +1,6 @@
-# MNEMOS v3.1.0: Deployment & Configuration Guide
+# MNEMOS Deployment & Configuration Guide
 
-**Status**: Production Ready | **Version**: 3.1.0
+**Status**: v3.4.1 latest tag; v3.5-dev in flight on branch
 
 ---
 
@@ -28,11 +28,8 @@ nano .env
 # Install dependencies (with uv)
 uv pip install -r requirements.txt
 
-# Apply database migrations
-psql $PG_DATABASE < db/migrations.sql
-psql $PG_DATABASE < db/migrations_v2_versioning.sql
-psql $PG_DATABASE < db/migrations_v2_sessions.sql
-psql $PG_DATABASE < db/migrations_v3_dag.sql
+# Apply database migrations in canonical order
+python install.py
 
 # Start MNEMOS server
 export $(cat .env | grep -v '#' | xargs)
@@ -148,14 +145,32 @@ python -m uvicorn api_server:app
 docker build -t mnemos:latest .
 
 # Run with Docker Compose
-docker-compose up -d
+docker compose up -d
 ```
 
-See `docker-compose.yml` for services (PostgreSQL, Redis, MNEMOS).
+See `docker-compose.yml` for services (PostgreSQL, `postgres-upgrade`,
+Ollama, MNEMOS). `postgres-upgrade` is a one-shot migration runner for
+existing volumes.
+
+### Docker existing-volume upgrade note
+
+Postgres image init scripts under `/docker-entrypoint-initdb.d` only run
+when the data directory is first initialized. They do not re-run when an
+existing `postgres_data` volume starts with newer migration files mounted.
+For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
+therefore include `postgres-upgrade`, which waits for Postgres health and
+then applies `db/migrations_v3_5_trigger_same_memory_parent.sql` before
+the MNEMOS service starts.
+
+Fresh volumes still receive the migration from the initdb mount:
+`/docker-entrypoint-initdb.d/24-trigger-same-memory-parent.sql`.
+Existing volumes receive the same SQL through
+`/migrations/24-trigger-same-memory-parent.sql` in the one-shot service. Keep the compose mount
+and `installer/db.py` / `install.py` migration order in sync.
 
 ---
 
-## Core API Endpoints (v3.1.0)
+## Core API Endpoints
 
 ### Consultations (GRAEAE Reasoning)
 ```bash
@@ -283,11 +298,12 @@ curl -X DELETE http://localhost:5002/v1/sessions/{id} \
 sudo -u postgres createdb mnemos
 sudo -u postgres createuser -P mnemos  # Enter password interactively
 
-# Run migrations (in order)
-psql -U mnemos -d mnemos < db/migrations.sql
-psql -U mnemos -d mnemos < db/migrations_v2_versioning.sql
-psql -U mnemos -d mnemos < db/migrations_v2_sessions.sql
-psql -U mnemos -d mnemos < db/migrations_v3_dag.sql
+# Run migrations in canonical order
+python install.py
+
+# Existing DBs on v3.4.1 that only need the v3.5 trigger replacement:
+psql -U mnemos -d mnemos -v ON_ERROR_STOP=1 \
+  -f db/migrations_v3_5_trigger_same_memory_parent.sql
 
 # Verify
 psql -U mnemos -d mnemos -c "SELECT version();"
@@ -414,6 +430,24 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 - Reduce `GRAEAE_CONSENSUS_QUORUM_SIZE` (default: 3 providers)
 - Enable response caching: `GRAEAE_CACHE_ENABLED=true`
 - Check network connectivity to LLM providers
+
+### 409: Memory branch state is inconsistent
+
+v3.5-dev maps trigger SQLSTATE `MN001` to HTTP 409 when
+`memory_branches` is missing, has `NULL head_version_id`, or points at a
+`memory_versions` row from another memory. Inspect and reconcile the
+branch rows before retrying:
+
+```sql
+SELECT mb.memory_id, mb.name, mb.head_version_id, mv.memory_id AS head_memory_id
+FROM memory_branches mb
+LEFT JOIN memory_versions mv ON mv.id = mb.head_version_id
+WHERE mb.memory_id = '<memory_id>';
+```
+
+The correct branch head must be a `memory_versions.id` with the same
+`memory_id` as the branch row. Do not repair by pointing at another
+memory's version; the v3.5 trigger will reject the next write.
 
 ---
 

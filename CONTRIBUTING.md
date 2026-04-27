@@ -82,6 +82,16 @@ PRs without DCO sign-off on every commit will be asked to amend
 pytest -q
 ```
 
+- Run lint before handoff:
+
+```bash
+ruff check . --extend-exclude .venv-ci
+```
+
+- For changes touching tenancy, DAG history, triggers, import/export, or
+  auth, include focused regression tests and document the expected
+  operator behavior for 404 vs 409 vs 403 outcomes.
+
 ## Guidelines
 
 - Prefer small, reviewable commits.

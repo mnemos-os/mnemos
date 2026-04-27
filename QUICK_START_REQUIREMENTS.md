@@ -1,6 +1,7 @@
-# MNEMOS v3.1.0 Quick Start Requirements
+# MNEMOS Quick Start Requirements
 
-**TL;DR**: Python 3.11+, PostgreSQL 16, 8GB RAM, 50GB disk  
+**Applies to**: latest tag v3.4.1 and current v3.5-dev branch
+**TL;DR**: Python 3.11+, PostgreSQL 16, 8GB RAM, 50GB disk
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
 
 ---
@@ -26,12 +27,12 @@ python3.11 -m venv venv
 source venv/bin/activate
 pip install -e .
 
-# 5. Database setup (1 minute)
+# 5. Database setup and migrations (1 minute)
 psql -U postgres -d postgres -c "CREATE USER mnemos_user WITH PASSWORD 'mnemos_local';"
 psql -U postgres -d postgres -c "CREATE DATABASE mnemos OWNER mnemos_user;"
-psql -U mnemos_user -d mnemos -f db/migrations.sql
+python install.py
 
-# 6. Configure (1 minute)
+# 6. Configure (if install.py did not already write config)
 cp .env.example .env
 # Edit .env with your settings
 
@@ -39,7 +40,7 @@ cp .env.example .env
 python api_server.py
 ```
 
-**Total Time**: ~15 minutes  
+**Total Time**: ~15 minutes
 **Cost**: Free (if self-hosted)
 
 ---
@@ -67,8 +68,13 @@ docker compose logs mnemos
 curl http://localhost:5002/health
 ```
 
-**Total Time**: ~15 minutes  
+**Total Time**: ~15 minutes
 **Cost**: Free (if self-hosted)
+
+For existing Docker volumes, `docker compose up -d` also runs the
+one-shot `postgres-upgrade` service before MNEMOS starts. This applies
+the v3.5 trigger migration because Postgres initdb scripts do not rerun
+on already-initialized volumes.
 
 ---
 
@@ -81,7 +87,7 @@ curl http://localhost:5002/health
 | Disk | 10 GB | Schema (50MB) + data + buffer |
 | OS | Linux/macOS/Windows | Python 3.11+ support |
 
-**Viable**: Raspberry Pi 4 (4GB), ASUS NUC, old laptop  
+**Viable**: Raspberry Pi 4 (4GB), ASUS NUC, old laptop
 **Recommended**: ASUS NUC i5 or better for production
 
 ---
@@ -180,7 +186,7 @@ curl https://api.groq.com 2>/dev/null | grep -q "html" && echo "✓ Groq reachab
 
 # 4. Check MNEMOS
 curl http://localhost:5002/health | jq '.version'
-# Expected: "3.1.0"
+# Expected: matches the checked-out tag or branch build
 ```
 
 ---
@@ -306,6 +312,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: 3.1.0  
-**Updated**: 2026-04-19  
+**Version**: v3.5-dev branch; latest tag v3.4.1
+**Updated**: 2026-04-26
 **Accuracy**: Production-verified

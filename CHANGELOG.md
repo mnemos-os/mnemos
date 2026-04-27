@@ -2,6 +2,92 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [3.5-dev] — in flight on `v3.5-dev` (unreleased)
+
+v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
+as a release tag. The first two slices are merged: `a62a099` for
+audit-quick-wins and `d42c475` for memory-read tenancy + DAG integrity.
+
+### Added
+
+- **Shared read-visibility helper** — `api/visibility.py` now owns
+  `read_visibility_predicate` (`api/visibility.py:40-96`),
+  `version_visibility_predicate` (`api/visibility.py:99-137`),
+  `_assert_target_head_visible` (`api/visibility.py:140-168`),
+  and `handle_trigger_pgerror` (`api/visibility.py:24-37`).
+- **Trigger replacement migration** —
+  `db/migrations_v3_5_trigger_same_memory_parent.sql` replaces
+  `mnemos_version_snapshot()` so UPDATE/DELETE resolve branch HEADs
+  under lock, fail closed on missing/NULL/foreign heads with SQLSTATE
+  `MN001`, and keep the DELETE tombstone path live.
+- **Docker existing-volume upgrade path** — `docker-compose.yml` and
+  `docker-compose.staging.yml` now include a one-shot
+  `postgres-upgrade` service that applies the v3.5 trigger migration
+  after Postgres is healthy. This is required because
+  `/docker-entrypoint-initdb.d` only runs when a volume is first
+  initialized.
+- **Regression coverage** — new slice-2 tests cover branch visibility,
+  cross-memory DAG guards, visibility gaps in logs, trigger concurrency
+  locking, `MN001` update/delete conflict mapping, version tenancy, and
+  migration-list sync. The merged branch reports 768 passing tests.
+
+### Changed
+
+- **Memory read surfaces use one predicate.** `list_memories`,
+  `get_memory`, search, rehydrate, and gateway context now share the
+  owner/federated/world/group-readable predicate. The Redis search
+  cache key serializes raw inputs with `json.dumps(..., separators=...)`
+  and includes group IDs so `None`, empty string, and group variation
+  cannot collide.
+- **History reads are per-snapshot.** `list_versions`, `get_version`,
+  `diff_versions`, HTTP DAG log/get-commit/merge paths, and MCP
+  log/checkout/diff paths gate each `memory_versions` row by the
+  snapshot's own `owner_id`, `namespace`, and `permission_mode`.
+  `memory_versions` lacks `group_id` and `federation_source`, so the
+  version predicate intentionally fails closed for those historical
+  cases.
+- **DAG writers serialize on branch identity.** `merge_branch` and
+  feature-branch `revert_memory` share `_branch_advisory_lock_key`
+  (`api/handlers/dag.py:21-40`) and use advisory-lock-before-row-lock
+  discipline. Main-branch revert still updates the live memory row
+  through the trigger under the main GUC; feature-branch revert is a
+  pure DAG insert.
+- **Branch creation is race-safe.** HTTP and MCP branch creation lock
+  the parent memory row with `FOR SHARE`, resolve the starting snapshot
+  after the lock, and insert with `ON CONFLICT DO NOTHING RETURNING`.
+  MCP implicit-HEAD retries are idempotent; explicit `from_commit`
+  retries must match the existing head.
+- **Merge writes target tenancy.** Merge commits copy content and
+  provenance from the source snapshot but owner/namespace/permission
+  from the target branch head; drift guards compare all versioned
+  fields including tenancy before mutating live main.
+- **Branch logs do not bridge hidden history.** Recursive log walks are
+  same-memory only, and `parent_hash` is emitted only when the actual
+  immediate parent is also visible.
+- **Session history order fixed.** Slice 1 returns the most recent
+  history messages instead of the oldest, with deterministic system-row
+  pinning.
+- **Project URLs moved.** `pyproject.toml` metadata points at
+  `mnemos-os/mnemos`.
+
+### Conflicts and operator handling
+
+- Trigger-raised `MN001` maps to HTTP 409 with reconciliation guidance:
+  the branch row is missing, has `NULL head_version_id`, or points to a
+  version from another memory. Operators should reconcile
+  `memory_branches` against `memory_versions` for that memory before
+  retrying the write.
+
+### Still open on the v3.5 backlog
+
+- #20 webhook retry state machine.
+- #21 federation per-peer ACL + stable cursor.
+- #22 audit endpoint scoping + lifespan teardown.
+- #23 entity namespace conflict-key migration.
+- #25 RLS Unix-bit fix for `mnemos_group_select`.
+- #19 bulk webhook parity.
+- #15 deletion-log refactor.
+
 ## [3.4.1] — 2026-04-26
 
 Federation schema-compat preflight + dev↔prod MPF restore drill.

@@ -1,7 +1,7 @@
-# MNEMOS v3.1.0 System Requirements
+# MNEMOS System Requirements
 
-**Version**: 3.1.0  
-**Updated**: 2026-04-19  
+**Applies to**: latest tag v3.4.1 and current v3.5-dev branch
+**Updated**: 2026-04-26
 **Applies To**: Bare Metal, Docker, and Cloud Deployments
 
 ---
@@ -37,8 +37,8 @@
 
 ### Python Runtime
 
-**Minimum**: Python 3.11  
-**Recommended**: Python 3.12  
+**Minimum**: Python 3.11
+**Recommended**: Python 3.12
 **Maximum**: No upper limit (test with latest)
 
 **Check Current Version**:
@@ -61,8 +61,8 @@ brew install python@3.11
 
 ### PostgreSQL Database
 
-**Minimum**: PostgreSQL 13  
-**Recommended**: PostgreSQL 16 (with pgvector)  
+**Minimum**: PostgreSQL 13
+**Recommended**: PostgreSQL 16 (with pgvector)
 **Required Extensions**: pgvector, pgcrypto, uuid-ossp
 
 **Check Current Version**:
@@ -92,6 +92,12 @@ psql -U postgres -d mnemos -c "CREATE EXTENSION IF NOT EXISTS pgvector;"
 psql -U postgres -d mnemos -c "CREATE EXTENSION IF NOT EXISTS pgcrypto;"
 psql -U postgres -d mnemos -c "CREATE EXTENSION IF NOT EXISTS uuid-ossp;"
 ```
+
+**Migration note for Docker volumes**: fresh volumes run all mounted
+`/docker-entrypoint-initdb.d` SQL. Existing volumes do not. The v3.5-dev
+compose files therefore include a one-shot `postgres-upgrade` service
+that applies `db/migrations_v3_5_trigger_same_memory_parent.sql` before
+MNEMOS starts.
 
 **Storage Requirements**:
 - Initial database: ~50 MB (empty schema)
@@ -195,7 +201,7 @@ openvino-genai           # For local inference (optional)
 
 ### Docker Engine
 
-**Minimum**: Docker 20.10  
+**Minimum**: Docker 20.10
 **Recommended**: Docker 24+ (latest stable)
 
 **Check Version**:
@@ -216,7 +222,7 @@ brew install docker
 
 ### Docker Compose
 
-**Minimum**: Docker Compose 2.0  
+**Minimum**: Docker Compose 2.0
 **Recommended**: Docker Compose 2.20+
 
 **Check Version**:
@@ -297,7 +303,7 @@ Total:         725 MB
   - api.openai.com:443 (OpenAI, if used)
   - api.anthropic.com:443 (Anthropic, if used)
   - api.perplexityai.com:443 (Perplexity, if used)
-  
+
 Bandwidth: 1-10 Mbps (depends on query volume)
 Latency: <500ms to provider (standard internet acceptable)
 ```
@@ -372,7 +378,7 @@ Perplexity:    PERPLEXITY_API_KEY
 
 ### Redis (Caching)
 
-**Optional**: Yes (fully functional without)  
+**Optional**: Yes (fully functional without)
 **Use Case**: Reduce API calls for repeated queries
 
 **Minimum**:
@@ -396,7 +402,7 @@ docker run -d -p 6379:6379 redis:7-alpine
 
 ### Ollama (Local Embeddings)
 
-**Optional**: Yes (uses remote provider by default)  
+**Optional**: Yes (uses remote provider by default)
 **Use Case**: Private deployment, offline operation
 
 **Requirements**:
@@ -416,7 +422,7 @@ all-minilm-l6-v2 (50 MB) - lightweight
 
 ### vLLM (Local LLM Inference)
 
-**Optional**: Yes (uses remote provider by default)  
+**Optional**: Yes (uses remote provider by default)
 **Use Case**: Private LLM inference, custom models
 
 **Requirements**:
@@ -676,6 +682,6 @@ Solution: Check disk usage: df -h
 
 ---
 
-**Last Updated**: 2026-04-19  
-**Version**: 3.1.0  
-**Status**: Production-Ready
+**Last Updated**: 2026-04-26
+**Version**: v3.5-dev branch; latest tag v3.4.1
+**Status**: Production-ready for tagged releases; v3.5-dev remains unreleased

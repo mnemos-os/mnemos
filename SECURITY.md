@@ -2,7 +2,33 @@
 
 ## Supported versions
 
-The most recently maintained branch is the supported branch.
+The most recently maintained release branch is supported. The current
+development branch is `v3.5-dev`; it is not a release tag.
+
+## Current security invariants
+
+As of v3.5-dev slice 2 (`d42c475`):
+
+- Memory read visibility is symmetric across list/get/search/rehydrate,
+  OpenAI-compatible gateway context, version history, DAG history, and MCP
+  version tools. The live-memory predicate is centralized in
+  `read_visibility_predicate` (`api/visibility.py:40-96`).
+- Version history is gated per snapshot by `version_visibility_predicate`
+  (`api/visibility.py:99-137`), so a later-public memory does not expose
+  an earlier private snapshot.
+- DAG logs stay within one memory and do not bridge across invisible
+  snapshots. `parent_hash` is emitted only when the immediate parent is
+  visible to the caller.
+- Branch creation is race-safe: HTTP and MCP paths lock the parent memory
+  row, resolve the start snapshot inside the transaction, and insert with
+  `ON CONFLICT DO NOTHING RETURNING`.
+- `db/migrations_v3_5_trigger_same_memory_parent.sql` rejects missing,
+  NULL, or cross-memory branch heads with SQLSTATE `MN001`; the API maps
+  that condition to HTTP 409 with branch reconciliation guidance.
+
+Known open item: the original `mnemos_group_select` RLS policy still uses
+`permission_mode >= 640`. The application predicate is stricter and uses
+the Unix group bit; task #25 tracks the matching RLS migration.
 
 ## Reporting a vulnerability
 

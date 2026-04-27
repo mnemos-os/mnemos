@@ -71,7 +71,7 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 - 🔵 DAG wiring for derivations: still planned. Each compression candidate as a `memory_versions` child row with `parent_version_id → root`, branch='distilled'; narrated as branch='narrated'. Content-addressed, tamper-evident.
 - 🔵 Read-path routing on `Accept` headers: `text/plain` → narrated; `application/x-apollo-dense` → raw dense.
 - ✅ **MORPHEUS dream-state subsystem (slice 1: foundation).** v3.3.0-alpha.1 ships `morpheus_runs` table + per-row `morpheus_run_id` tagging + admin/observability API + rollback contract. Synthesis logic stubbed; slice 2 fills it in. Architecture per GRAEAE consensus 2026-04-25: append-only synthesis first, mutation paths (CONSOLIDATE / EXTRACT / ARCHIVE) deferred to v3.6+.
-- 🔵 **MORPHEUS slice 2** in flight: real cluster + synthesise phases, cron timer at 03:17 UTC, recall-frequency tracking columns (absorbed from OpenClaw dreaming patterns), per-cluster introspection artifact, per-namespace dream scoping. Drops the `-alpha` when it lands.
+- ✅ **MORPHEUS slice 2** — real cluster + synthesise phases, cron timer at 03:17 UTC, recall-frequency tracking columns (absorbed from OpenClaw dreaming patterns), per-cluster introspection artifact, per-namespace dream scoping. Landed before the v3.3 stable cut.
 
 ### v3.4 — S-IVB (third stage: trans-lunar injection) — **READY TO TAG 2026-04-26**
 
@@ -100,12 +100,28 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 
 **See:** `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md`, `docs/OPERATIONS.md` for locked scopes downstream of this tag.
 
-### v3.5 — MemPalace RFC re-engagement + compression hot-paths
+### v3.5-dev — branch build-up after v3.4.1 (not tagged)
 
-- 🔵 **RFC-002**: re-open the MemPalace bridge conversation with v3.4 evidence in hand (compression contest, MORPHEUS dreams, GPU budget, KNOSSOS phase 2). Frame as positive-sum: their local-first ethos + our production-scale capacity, KNOSSOS as the interop point. Address the "scare" honestly — different problems, composable answers.
-- 🔵 Compression hot-path expansion: more read paths consume `memory_compressed_variants` instead of raw `memories.content` when a winner exists. Specific surfaces: federation feed (peers receive compressed, save bandwidth), session message replay, MCP `get_memory`.
-- 🔵 Search response `compression_applied` / `compression_metadata` fields decision (Codex audit deferred): either wire a real summary path for large-result-set compression, or formally document as reserved.
-- 🔵 Design paper draft: git-like DAG + LLM-synthesized distillation + LLM-synthesized narration + judge-verified fidelity (carried from v3.4 charter).
+v3.5 is in flight on `v3.5-dev`. Closed items below are merged into the branch; open items remain candidates for later v3.5 slices or explicit deferral.
+
+- ✅ **Slice 1: audit quick wins** (`a62a099`). Session history now returns the most recent rows first, pins/caps system rows deterministically, and project metadata points at `mnemos-os/mnemos`.
+- ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`). Shared `read_visibility_predicate` gates memory list/get/search/rehydrate/gateway context; `version_visibility_predicate` gates version/log/commit/diff paths per snapshot; DAG writers use same-memory parent checks, target-head visibility gates, advisory-lock-before-row-lock ordering, race-safe branch creation, and `MN001` to HTTP 409 reconciliation.
+- ✅ **Docker existing-volume migration path** (`86f1532`, `19229d7`). `docker-compose.yml` and `docker-compose.staging.yml` run `postgres-upgrade` after Postgres is healthy so `db/migrations_v3_5_trigger_same_memory_parent.sql` applies to existing volumes, not only fresh initdb volumes.
+- 🔵 **#20 webhook retry state machine.** Durable state transitions for pending/retrying/terminal rows; still open.
+- 🔵 **#21 federation per-peer ACL + stable cursor.** Peer-specific scope plus cursor stability; still open.
+- 🔵 **#22 audit endpoint scoping + lifespan teardown.** Audit route scoping and cleanup behavior; still open.
+- 🔵 **#23 entity namespace conflict-key migration.** Namespace-aware conflict key for entity rows; still open.
+- 🔵 **#25 RLS Unix-bit fix.** `api/visibility.py:76-82` is stricter than `mnemos_group_select`; follow-up migration must replace `permission_mode >= 640` with the Unix group-bit expression.
+- 🔵 **#19 bulk webhook parity.** Bulk-create webhook behavior still differs from single-create.
+- 🔵 **#15 deletion-log refactor.** Parked; restore-drill cleanup still uses explicit `memory_branches` / `memory_versions` deletes.
+
+Remaining v3.5 charter work:
+
+- 🔵 **PANTHEON + IRIS.** Next-bound feature set: unified LLM facade and MCP model discovery layer.
+- 🔵 **RFC-002 / MemPalace re-engagement.** Re-open with v3.4 CHARON evidence and KNOSSOS interop framing.
+- 🔵 **Compression hot-path expansion.** More read paths consume `memory_compressed_variants` instead of raw `memories.content`; still needs per-surface audit.
+- 🔵 **Search response `compression_applied` / `compression_metadata` decision.** Either wire a real summary path for large-result-set compression or document the fields as reserved.
+- 🔵 **Design paper draft.** Git-like DAG + LLM-synthesized distillation/narration + judge-verified fidelity, carried from the v3.4 charter.
 
 ### v3.6 — PERSEPHONE + MORPHEUS mutation paths
 
@@ -179,6 +195,22 @@ Deliverables:
 
 Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles, with status. Maintained release-by-release; new findings append. ✅ = remediated, 🔵 = planned, ⏳ = deferred.
 
+### v3.5-dev slice 1 — audit quick wins
+
+- ✅ Session history returned the oldest 10 messages instead of the most recent 10 — fixed in `f9ea8d9`; deterministic system-row pinning refined through `e3c884c`.
+- ✅ Repository metadata still pointed at `perlowja/mnemos` after the org move — swept to `mnemos-os/mnemos` in `c3092c6`.
+
+### v3.5-dev slice 2 — memory-read tenancy + DAG integrity
+
+- ✅ `list_memories` / `get_memory` used narrower owner+namespace checks than the intended read contract — closed by shared `read_visibility_predicate` (`api/visibility.py:40-96`) and handler adoption in `api/handlers/memories.py`.
+- ✅ Search/rehydrate cache keys could collide across `None`, empty string, and caller group variation — closed with JSON serialization and group IDs in the key.
+- ✅ Version and DAG read paths could expose historical private snapshots through a later-public live memory — closed by `version_visibility_predicate` (`api/visibility.py:99-137`) on version/log/commit/diff/checkout paths.
+- ✅ Recursive DAG logs and parent-hash subqueries could cross memory boundaries or bridge hidden snapshots — closed with same-memory joins and immediate-parent visibility checks (`api/handlers/dag.py:117-245`).
+- ✅ Merge/revert writers could race branch HEAD movement or copy stale tenancy — closed with shared branch advisory locks, row-lock ordering, target-head visibility gates, drift guards covering tenancy, and target-derived tenancy on new commits.
+- ✅ HTTP/MCP branch creation had TOCTOU and duplicate-race windows — closed with `FOR SHARE` parent locks plus `INSERT ... ON CONFLICT DO NOTHING RETURNING` (`api/handlers/dag.py:341-450`, `api/mcp_tools.py:183-383`).
+- ✅ `mnemos_version_snapshot()` could write a parent edge to another memory if `memory_branches.head_version_id` was corrupt — closed by `db/migrations_v3_5_trigger_same_memory_parent.sql`, which raises `MN001` and lets `handle_trigger_pgerror` map it to HTTP 409.
+- 🔵 `mnemos_group_select` still uses `permission_mode >= 640` in `db/migrations_v1_multiuser.sql`; task #25 remains the RLS-side migration.
+
 ### Codex round 1 — 9-commit deep probe (early v3.2.x cycle)
 
 5 bugs found across the session's commit set 71b40e0..58011a9; all fixed in commit `1c56488` (compression scoring math, Artemis assembly, Apollo schema FP guards).
@@ -215,9 +247,9 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 
 ### Codex round-2 portability + APOLLO audit (after v3.2.3)
 
-- ⏳ MPF import is memory-only; rich envelopes (kg_triples, documents, facts, events, compression_manifest, memory_versions) silently dropped — deferred to v3.4 CHARON v0.2.
+- ✅ MPF import/export rich envelopes (kg_triples, documents, facts, events, compression_manifest, memory_versions) — shipped in v3.4 CHARON v0.2.
 - ✅ Legacy `/memories` POST path returned 404 against current API (`/v1/memories`) — fixed (v3.2.4).
-- ⏳ Adapter `payload_version` conflict (Graphiti / Cognee mislabel `kind=event/fact/document` as `mnemos-3.1` instead of `mpf-0.1`) — deferred to v3.4 CHARON v0.2.
+- ✅ Adapter `payload_version` conflict handling for richer MPF sidecars — shipped in v3.4 CHARON v0.2.
 - ✅ `_post_mpf` envelope missing `exported_at` (failed own validator) — added (v3.2.4).
 - ✅ `tools/memory_export.py text` import error (`export_memories_text` → `export_memories_plaintext`) — fixed (v3.2.4).
 - ✅ ChatGPT `--category` override ignored — now honored when set; auto-classify only when unset (v3.2.4).
@@ -227,9 +259,9 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 
 Pattern absorption opportunities surfaced by reading OpenClaw issues #70072, #65630, #67413, #70402, #64756.
 
-- 🔵 Recall-frequency tracking columns (`recall_count`, `last_recalled_at`, `unique_queries`) — planned v3.3 slice 2.
-- 🔵 Per-cluster introspection artifact (`morpheus_clusters` table + `/v1/morpheus/runs/{id}/clusters`) — planned v3.3 slice 2.
-- 🔵 Per-namespace dream scoping (`morpheus_runs.namespace` filter) — planned v3.3 slice 2.
+- ✅ Recall-frequency tracking columns (`recall_count`, `last_recalled_at`, `unique_queries`) — shipped in v3.3.
+- ✅ Per-cluster introspection artifact (`morpheus_clusters` table + `/v1/morpheus/runs/{id}/clusters`) — shipped in v3.3.
+- ✅ Per-namespace dream scoping (`morpheus_runs.namespace` filter) — shipped in v3.3.
 - ❌ Flat-file storage (`MEMORY.md` promotion target) — explicitly skipped; Postgres is canonical.
 - ❌ Promotion-gate-as-primary-mechanism — explicitly skipped; MORPHEUS is synthesizer, not triage. PERSEPHONE (v3.6) covers archival decisions.
 

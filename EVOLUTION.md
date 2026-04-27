@@ -2,7 +2,7 @@
 
 The version numbers on releases are tidy. The actual path was not. This
 document is the honest version — decisions, refactors, mistakes, and the
-reasoning that got us from the original prototype to v3.0.0-beta. If you
+reasoning that got us from the original prototype to the current v3.5-dev branch. If you
 are considering MNEMOS for your own stack, you should know where it came
 from; if you are contributing, you should know which doors have been closed
 and why.
@@ -34,6 +34,10 @@ codebase took along the way.
 | 2026-04-23 | Federation → fault-tolerance pivot. The cross-instance feed model from v3.0.0-beta turns out to be the wrong primitive for a single operator running multiple boxes; what was actually needed was HA. Move to `pg_auto_failover` (TYPHON monitor, PYTHIA primary, CERBERUS standby). ARGONAS reconciled against public master via 156-commit Codex triage (6 KEEP / 137 SKIP / 13 DROP). |
 | 2026-04-24 | **v3.2.x bug-fix tail** — APOLLO LLM-fallback emits a startup warning when GPU isn't reachable; flag flipped off in PYTHIA prod after the 49-mem run showed 4.4% win-rate didn't justify the GPU cost. Apollo schema false-positive guards across five schemas (commit / code / decision / event / person). Artemis labeled-block assembly + sentence-span tracking rewrite. Scoring math fix in the contest (multiplicative profile-weight constants → exponentiated weights, so winner ordering actually depends on profile). 654/654 tests pass on CERBERUS. |
 | 2026-04-24 | **v3.3.0-alpha** — MORPHEUS dream-state subsystem slice 1 lands (begin / finish / rollback runs, replay phase real, cluster + synthesise as stubs). MCP HTTP/SSE bridge (`mcp_http_server.py`) for ChatGPT Pro Developer Mode + any remote MCP client that needs an HTTPS URL. KNOSSOS / CHARON positioning as *gifts to other memory systems* (MemPalace, Mem0, Letta, Graphiti, Cognee) with concrete upstream-PR commitments. The compression stack settles to two engines (APOLLO + ARTEMIS); LETHE / ANAMNESIS / ALETHEIA become evolutionary history. `EVOLUTION.md`, `ROADMAP.md`, and `docs/connectors/` written for the first public release. |
+| 2026-04-26 | **v3.3.0 / v3.4.0** — MORPHEUS slice 2 fills in real cluster + synthesise, recall tracking, cluster introspection, and namespace scoping. CHARON v0.2 turns MPF into a sidecar-capable portability surface for KG triples, documents, facts, events, compression manifests, and memory-version DAGs. The v3.4 audit work spends forty-four Codex rounds on sidecar attachment and restore correctness. |
+| 2026-04-26 | **v3.4.1** — federation schema-compat preflight lands before peers sync. Strict peers refuse schema mismatch with HTTP 409 unless an operator opts into `compat_mode=permissive`. The dev↔prod MPF restore drill is written and validated on PYTHIA → PROTEUS data. |
+| 2026-04-26 | **v3.5-dev slice 1** — audit quick wins: session history returns the newest rows instead of the oldest, system rows are pinned/capped deterministically, and project URLs move to `mnemos-os/mnemos` (`a62a099`). |
+| 2026-04-26 | **v3.5-dev slice 2** — memory-read tenancy and DAG-integrity hardening (`d42c475`). Shared read visibility moves into `api/visibility.py`; version history becomes per-snapshot visible; merge/revert/branch writers serialize around branch heads; the v3.5 trigger raises `MN001` rather than accepting missing, NULL, or cross-memory branch heads. |
 
 Roughly five months. One developer with three reviewers (Codex, GRAEAE
 multi-LLM consensus, occasional Sonnet / Opus passes for design). Several
@@ -430,6 +434,68 @@ When MORPHEUS (v3.3+) and PERSEPHONE (v3.6+) land, the same
 naming convention extends: each subsystem is a Greek name that
 maps to its function. Engines that turn out to be wrong don't get
 renamed; they get retired and the history gets recorded here.
+
+---
+
+## v3.4.1 and v3.5-dev — April 2026 — "the branch learns to distrust its own history"
+
+v3.4.1 was the federation-safety release. CHARON v0.2 already made
+memory portable across systems, but portability created a new problem:
+two peers can both speak MPF and still be on different schema shapes.
+So v3.4.1 added schema fingerprints before sync. Strict peers now
+compare `mnemos_version`, `schema_signature`, and the migrations
+fingerprint before opening a pull. A mismatch returns 409 unless an
+operator deliberately flips the peer to permissive mode.
+
+That same release wrote down the restore drill instead of trusting the
+happy path. The drill matters because `memory_versions` and
+`memory_branches` intentionally preserve history across memory deletion;
+cleanup still needs explicit branch/version deletes. `docs/RESTORE-DRILL.md`
+is the runbook for doing that without polluting a target node after a
+test import.
+
+The first v3.5 branch slice was small and worth doing early. Session
+history had a classic ordering bug: "give me 10 history rows" returned
+the oldest rows, then later code tried to reason as if it had the recent
+context. The fix (`f9ea8d9` through `e3c884c`, merged as `a62a099`)
+made the order descending, pinned system rows deterministically, and
+kept the repo metadata aligned to `mnemos-os/mnemos`.
+
+The second slice was larger because the bugs were about trust
+boundaries, not syntax. The important lesson was that a memory's live
+row and its historical snapshots are different authorization objects.
+If a memory was private at version 1 and public at version 2, a reader
+allowed to see version 2 is not automatically allowed to see version 1.
+That became `version_visibility_predicate` in `api/visibility.py:99-137`.
+The live-memory read contract moved next to it as
+`read_visibility_predicate` in `api/visibility.py:40-96`, with owner,
+federation, world-readable, and Unix group-readable branches spelled
+out in one place.
+
+The same pass tightened the DAG. Logs no longer invent a clean path
+through hidden snapshots; `parent_hash` is emitted only when the actual
+immediate parent is visible. Recursive walks and parent-hash joins are
+scoped by `memory_id`, so a corrupt `parent_version_id` cannot pull a
+different memory's version into the graph. Branch creation now locks
+the parent memory row, resolves the start commit after that lock, and
+uses `INSERT ... ON CONFLICT DO NOTHING RETURNING` for duplicate-race
+handling. Merge and feature-branch revert share the same advisory lock
+key (`api/handlers/dag.py:21-40`) and the same lock order.
+
+The database had to participate. The schema's FK can prove that
+`memory_branches.head_version_id` points at an existing version; it
+cannot prove that the version belongs to the same memory. The v3.5
+trigger replacement (`db/migrations_v3_5_trigger_same_memory_parent.sql`)
+does that check under `FOR UPDATE OF mb`, fails closed on missing or
+NULL branch heads, raises SQLSTATE `MN001` for foreign heads, and lets
+`handle_trigger_pgerror` translate the condition to HTTP 409 with an
+operator reconciliation message.
+
+There is still one intentionally documented mismatch: the original
+`mnemos_group_select` RLS policy uses `permission_mode >= 640`, which
+is not a Unix group-bit test. The application predicate is stricter
+and fails closed (`api/visibility.py:76-82`); task #25 is the follow-up
+migration to make RLS match.
 
 ---
 

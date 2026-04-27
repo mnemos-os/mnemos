@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: 3.2.3
+**Version**: v3.5-dev branch (unreleased; latest tag v3.4.1)
 **Format**: JSON
 
 ---
@@ -85,6 +85,13 @@ curl -H "Authorization: Bearer $MNEMOS_API_KEY" \
 
 All memory routes are under `/v1/memories`.
 
+Read behavior is symmetric across REST, gateway context, and MCP:
+non-root callers can read a memory when they are the owner, when the
+row is federated, when the Unix world-read bit is set, or when the
+Unix group-read bit is set for one of their groups. The shared helper
+is `read_visibility_predicate` (`api/visibility.py:40-96`). Writes
+remain owner+namespace scoped.
+
 ### POST /v1/memories
 
 Create a memory. Distillation is triggered asynchronously.
@@ -101,7 +108,24 @@ Create a memory. Distillation is triggered asynchronously.
 
 ### GET /v1/memories/{memory_id}
 
-Retrieve a single memory.
+Retrieve a single memory. Non-root callers get `404` when the memory
+does not pass the shared read predicate; the API does not reveal
+cross-tenant existence.
+
+### PATCH /v1/memories/{memory_id}
+
+Update content, category, subcategory, metadata, or verbatim content.
+The update is owner+namespace scoped. If the version trigger detects a
+missing, NULL, or cross-memory branch HEAD, the API returns `409` with
+manual reconciliation guidance (`handle_trigger_pgerror` in
+`api/visibility.py:24-37`).
+
+### DELETE /v1/memories/{memory_id}
+
+Delete a memory under the same owner+namespace write scope. The v3.5
+trigger migration keeps DELETE snapshot handling live for deployments
+that still attach `trg_memory_version_delete`; broken branch state maps
+to `409`.
 
 ### POST /v1/memories/search
 
@@ -113,12 +137,15 @@ Semantic + keyword search.
 
 ### DAG versioning (git-like)
 
-- `GET /v1/memories/{id}/log` — commit history
-- `GET /v1/memories/{id}/commits/{commit}` — one commit
-- `POST /v1/memories/{id}/branch` — create a branch
-- `POST /v1/memories/{id}/merge` — merge two branches
-- `POST /v1/memories/{id}/revert/{n}` — revert to version n
-- `GET /v1/memories/{id}/diff` — diff between versions
+- `GET /v1/memories/{id}/versions` — version summaries on a branch, filtered per snapshot by `version_visibility_predicate` (`api/visibility.py:99-137`).
+- `GET /v1/memories/{id}/versions/{n}` — one version on a branch, filtered by that snapshot's own owner/namespace/permission mode.
+- `GET /v1/memories/{id}/diff` — diff between visible snapshots.
+- `POST /v1/memories/{id}/revert/{n}` — revert to version n. Main-branch revert updates the live row under the trigger after a live-row/main-HEAD drift guard; feature-branch revert inserts a new DAG row and leaves `memories` tracking main.
+- `GET /v1/memories/{id}/log` — commit history from branch HEAD. Recursive walks stay within one memory, and `parent_hash` is returned only when the actual immediate parent is visible.
+- `GET /v1/memories/{id}/commits/{commit}` — one visible commit by hash.
+- `GET /v1/memories/{id}/branches` — branch list. Non-root callers do not see branches whose head snapshot is invisible; corrupt heads are omitted and logged.
+- `POST /v1/memories/{id}/branch` — create a branch from main HEAD or a specified commit. The handler locks the parent memory row with `FOR SHARE` and uses `ON CONFLICT DO NOTHING RETURNING`; duplicate branch names return `409`.
+- `POST /v1/memories/{id}/merge` — merge source branch into target branch. Latest-wins is implemented; manual strategy returns not-implemented. Merge commits copy content/provenance from source and tenancy from target, and branch writers serialize on `_branch_advisory_lock_key` (`api/handlers/dag.py:21-40`).
 
 See `ANTI_MEMORY_POISONING.md` for the rationale and drift-detection
 workflow.
@@ -268,6 +295,7 @@ Common codes:
 - `401` — missing or invalid auth
 - `403` — role check failed
 - `404` — entity not found
+- `409` — conflict requiring operator action, including incompatible federation schema and v3.5 `MN001` branch-state reconciliation
 - `413` — request body exceeds `MAX_BODY_BYTES` (default 5 MB)
 - `429` — rate-limited (when `RATE_LIMIT_ENABLED=true`)
 - `503` — database pool unavailable

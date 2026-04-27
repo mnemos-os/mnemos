@@ -106,11 +106,12 @@ the imported records to avoid bidirectional pollution (e.g. the target
 later acts as a federation source for another node and re-emits the
 test data as native).
 
-**⚠️ Schema gotcha**: `memory_versions` and `memory_branches` lack
-a FK cascade to `memories` (tracked as a v3.5 charter item, see
-[mnemos-os/mnemos#1](https://github.com/mnemos-os/mnemos/issues/1)).
-Until that's fixed, the cleanup needs three explicit DELETEs in
-dependency order, plus an orphan sweep:
+**⚠️ Schema gotcha**: `memory_versions` and `memory_branches` still
+lack a FK cascade to `memories`. v3.5 slice 2 added same-memory branch
+HEAD guards, but it did not change restore cleanup semantics; the
+deletion-log refactor is parked as task #15. Until that changes, the
+cleanup needs three explicit DELETEs in dependency order, plus an
+orphan sweep:
 
 ```sql
 BEGIN;

@@ -27,12 +27,12 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - A FastAPI service (port 5002), PostgreSQL + pgvector backed. Python 3.11+. Apache-2.0.
 - A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
 - A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
-- Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots.
+- Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots. On the v3.5-dev branch, history reads are filtered per snapshot and branch writers refuse cross-memory parent edges.
 - Tiered compression pipeline (LETHE CPU / ANAMNESIS archival / APOLLO schema-aware in v3.3+) with a written quality manifest on every transformation. Runs in the background distillation worker. v3.1 introduced the plugin `CompressionEngine` ABC, competitive per-memory selection, and a persisted audit log of winners and losers; v3.2 wired hot-path invocation (rehydrate / gateway inject / session context read the winning variant). ALETHEIA shipped with v3.1 but was retired in the v3.2 tail — see [`ROADMAP.md`](./ROADMAP.md).
-- Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in.
+- Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in. The v3.5-dev read path uses the shared `read_visibility_predicate` in `api/visibility.py:40-96` across memory list/get/search/rehydrate/gateway surfaces.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-The [v3.2 release](./ROADMAP.md) builds on v3.1's compression platform: per-user namespace tenancy end-to-end, full observability stack (request-ID correlation / Prometheus metrics / OpenTelemetry traces / opt-in structured JSON logs), registry-backed OpenAI-compatible gateway with no default-to-Groq, MPF v0.1 export/import, Custom Query mode on `/v1/consultations`, self-healing contest queue with stale-running sweep, and probe-identity handshake on the GPUGuard circuit breaker. The going-forward compression stack is **LETHE + ANAMNESIS + APOLLO** (APOLLO in v3.3+). **ALETHEIA** shipped as the v3.1 third engine but was retired in the v3.2 tail after zero contest wins in the 2026-04-23 CERBERUS benchmark — its index-list scoring prompt doesn't survive instruction-tuned generalist LLMs; kept importable via `MNEMOS_ALETHEIA_ENABLED=true` for operators who had it opted in, scheduled for v4.0 removal. **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use — is staged across v3.3–v3.4 (the "Apollo Program").
+The latest tagged release is **v3.4.1**: CHARON federation schema-compat preflight plus the dev↔prod MPF restore drill. The current development branch is **v3.5-dev** and is not tagged yet. Two v3.5 slices have landed there: `a62a099` (session-history ordering + `mnemos-os` project URLs) and `d42c475` (memory-read tenancy and DAG-integrity hardening). The going-forward compression stack is **APOLLO + ARTEMIS**; **ALETHEIA**, **LETHE**, and **ANAMNESIS** remain in the tree as evolutionary history or opt-in compatibility paths.
 
 ## Works with
 
@@ -75,9 +75,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.2.3 is the current shipping version**, carrying the v3.1 compression platform (plugin `CompressionEngine` ABC, per-memory contest, persisted audit log) plus the v3.2 namespace tenancy + observability work and the v3.2.x stability bundle (registry-driven GRAEAE muse manifest with live-probe rotation, federation timezone + cursor fixes, per-version trigger correctness, gateway provider/model normalization). See [`CHANGELOG.md`](./CHANGELOG.md) for the full v3.0.x / v3.1 / v3.2 release history.
-
-For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.4.1 is the latest tagged release**, and **v3.5-dev** currently carries the first two unreleased hardening slices. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history and the in-flight v3.5-dev section.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -184,7 +182,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of v3.2.3 — the v3.1 compression platform plus the v3.2 namespace-tenancy + observability rollups and the v3.2.x stability bundle. Features described here are implemented and running in production. Forward-looking scope (continued Apollo Program, MPF v0.2 sidecars, federation hardening) is in [`ROADMAP.md`](./ROADMAP.md).
+This is the current state of the repo on v3.5-dev. The latest release tag remains v3.4.1; v3.5 is still being built as a sequence of slices on the branch. Features described here are implemented in the branch unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -209,6 +207,8 @@ The API surface is namespaced under `/v1/*`.
 | `GET /health` | Health check (not namespaced) |
 | `GET /stats` | Memory counts by category, compression statistics |
 
+Read access for `GET /v1/memories`, `GET /v1/memories/{id}`, search, rehydrate, and gateway context now flows through the same application predicate: owner, federated, world-readable, or Unix group-readable (`api/visibility.py:40-96`). Writes remain owner-scoped; being able to read a world/group/federated row does not grant update or delete rights.
+
 ### Multi-user and provenance (v1, shipped)
 
 Each memory carries full ownership and LLM provenance:
@@ -222,7 +222,7 @@ Each memory carries full ownership and LLM provenance:
 - `source_session` — session ID at time of creation
 - `source_agent` — agent name or identifier
 
-**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer, not application middleware.
+**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer. The application layer mirrors the RLS read contract so personal-mode and RLS-backed installs behave consistently. One loose end remains: `db/migrations_v1_multiuser.sql` still defines `mnemos_group_select` with the old `permission_mode >= 640` threshold; `api/visibility.py:76-82` is intentionally stricter and task #25 tracks the RLS migration.
 
 **Deployment profiles** — selected at install time via `python install.py`:
 
@@ -403,7 +403,8 @@ A lot of the v3.x surface is held up by background work that doesn't show up in 
 - **OAuth session garbage collector** — hourly sweep of expired and long-revoked sessions. Bounds the `oauth_sessions` table so a long-running install doesn't accumulate dead rows forever.
 - **Federation sync worker** — iterates enabled peers on their individual sync intervals, pulls batches, reconciles local + remote timestamps before overwriting, logs per-sync results to `federation_sync_log`.
 - **Advisory-lock-serialized audit chain writer** — the hash chain writer takes `pg_advisory_xact_lock` before reading the chain tip, so concurrent consultations cannot compute against the same stale previous hash. Closes a TOCTOU window in tamper-evident logging that most implementations leave open.
-- **Advisory-lock-serialized DAG merges** — merges take a per-`(memory_id, target_branch)` advisory lock, so concurrent merges on the same branch cannot produce orphan commits or duplicate version numbers.
+- **Advisory-lock-serialized DAG writers** — merges and feature-branch reverts share `_branch_advisory_lock_key` in `api/handlers/dag.py:21-40`, then take row locks in the same order. Concurrent writers on the same `(memory_id, branch)` serialize instead of orphaning branch heads.
+- **Trigger-level DAG parent guard** — `db/migrations_v3_5_trigger_same_memory_parent.sql` replaces `mnemos_version_snapshot()` so UPDATE/DELETE resolve branch HEADs under lock, reject missing/NULL/foreign heads with SQLSTATE `MN001`, and keep delete snapshots live for deployments that still attach the delete trigger.
 - **ASGI body-size middleware** — native ASGI (not `BaseHTTPMiddleware`), so it rejects chunked uploads whose running byte count exceeds `MAX_BODY_BYTES` *as they arrive*, before the full body lands in memory. Content-Length–declared uploads are rejected before the app is even invoked.
 - **SSRF-hardened webhook dispatch** — URLs are re-validated at send time (not just at subscription time); DNS resolves asynchronously so a slow resolver can't freeze the event loop; cloud metadata hostnames (AWS IMDS, Google `metadata.google.internal`, Tencent, Alibaba, IPv6 variants) are on a deny list alongside the RFC1918 / loopback / link-local filter.
 - **Rate limiter with X-Forwarded-For trust** — default keys on direct socket peer (safe behind no proxy); set `RATE_LIMIT_TRUST_PROXY=true` only when you run behind a proxy you control. Prevents clients from blowing out the global limit via spoofed headers.
@@ -438,6 +439,8 @@ Two patterns, picked per edge:
 - `consultation_memory_refs.memory_id → memories(id)` — a consultation's cited memory may be deleted; the *record of the citation* is an audit artifact and must not vanish.
 - `oauth_sessions.identity_id → oauth_identities(id)` — rotating an identity doesn't invalidate a session row that was already in flight.
 
+The FK graph prevents accidental loss. The application and trigger layer add the same-memory checks the FK alone cannot express: branch HEAD JOINs are scoped by `memory_id`, recursive logs only walk same-memory parents, and the v3.5 trigger raises `MN001` instead of writing a cross-memory parent edge.
+
 This is the part most projects that call themselves "memory" skip, because if the whole point is "store a blob, retrieve a blob", the relationships *between* blobs are out of scope. MNEMOS's design asserts the opposite: memories relate to consultations relate to audit entries relate to sessions relate to users, and the system has strong opinions about which of those relationships is load-bearing and which is historical.
 
 The constraints are enforced at the database level. Application bugs cannot violate them. Migration bugs cannot silently create orphan rows. The constraint travels with the row.
@@ -467,8 +470,8 @@ Tiered compression pipeline, each tier named after a Greek figure of memory.
 ### Versioning and audit
 
 - Memory version history (`memory_versions` table) — every mutation auto-snapshots previous state
-- Diff and revert API: `GET /v1/memories/{id}/versions`, `GET /v1/memories/{id}/versions/{n}`, `GET /v1/memories/{id}/diff`, `POST /v1/memories/{id}/revert/{n}`
-- DAG (git-like) versioning: `GET /v1/memories/{id}/log`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge`, `GET /v1/memories/{id}/commits/{commit}`
+- Diff and revert API: `GET /v1/memories/{id}/versions`, `GET /v1/memories/{id}/versions/{n}`, `GET /v1/memories/{id}/diff`, `POST /v1/memories/{id}/revert/{n}`. Non-root callers see only snapshots whose own `owner_id` / `namespace` / `permission_mode` pass `version_visibility_predicate` (`api/visibility.py:99-137`).
+- DAG (git-like) versioning: `GET /v1/memories/{id}/log`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge`, `GET /v1/memories/{id}/commits/{commit}`. Logs do not bridge across invisible snapshots; a visible child whose immediate parent is hidden reports `parent_hash=null`.
 - SHA-256 hash-chained audit log for consultations: `GET /v1/consultations/audit`, `GET /v1/consultations/audit/verify`
 
 ---
@@ -493,7 +496,17 @@ Landed with the v3.0 release line:
 - ✅ **Optional too-short content gate** — `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` skips memories below a threshold before spending GPU time on content that can't be meaningfully compressed.
 - ✅ **v2 versioning trigger bytea fix** — the `mnemos_version_snapshot()` trigger no longer crashes on memories containing backslash sequences (common in code, paths, regex, logs).
 
-### Beyond v3.1
+### Shipped in v3.4.1
+
+- ✅ **CHARON federation schema preflight** — peers exchange schema signatures before sync and return 409 on incompatible strict-mode pairings.
+- ✅ **Dev↔prod MPF restore drill** — `docs/RESTORE-DRILL.md` is validated on the PYTHIA → PROTEUS path.
+
+### Landed on v3.5-dev (not tagged)
+
+- ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
+- ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
+
+### Beyond v3.5-dev
 
 Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists committed v3.1 scope, the v3.2–v3.4 Apollo Program staged rollout, and items explicitly deferred with rationale.
 
@@ -560,13 +573,10 @@ python install.py
 ```bash
 psql -U postgres -c "CREATE USER mnemos WITH PASSWORD 'yourpassword';"
 psql -U postgres -c "CREATE DATABASE mnemos OWNER mnemos;"
-psql -U mnemos -d mnemos -f db/migrations.sql
-psql -U mnemos -d mnemos -f db/migrations_v1_multiuser.sql
-psql -U mnemos -d mnemos -f db/migrations_v3_graeae_unified.sql
-psql -U mnemos -d mnemos -f db/migrations_v3_webhooks.sql
-psql -U mnemos -d mnemos -f db/migrations_v3_oauth.sql
-psql -U mnemos -d mnemos -f db/migrations_v3_federation.sql
+python install.py
 ```
+
+`install.py` and `installer/db.py` are the canonical migration order. For Docker installs with an existing `postgres_data` volume, `docker-compose.yml` and `docker-compose.staging.yml` also run a one-shot `postgres-upgrade` service because `/docker-entrypoint-initdb.d` files only execute on fresh database initialization.
 
 ### Start
 

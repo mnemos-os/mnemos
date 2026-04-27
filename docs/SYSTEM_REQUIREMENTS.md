@@ -1,13 +1,12 @@
 # System Requirements
 
 Reference for operators planning a MNEMOS deployment. Covers the
-resource floor for each of the operating modes that v3.1.x supports
+resource floor for each of the operating modes that the v3.x line supports
 today, plus what drops off at each tier.
 
-Profiles are **descriptive** in v3.1.x — the `MNEMOS_INSTALL_PROFILE`
-env-flag plumbing lands in v3.2. For now, the feature set is controlled
-by the individual env vars in the "Environment knobs" section at the
-bottom, and this document maps those knobs to deployment shapes.
+Profiles are descriptive sizing tiers. The feature set is controlled by
+the install profile plus individual env vars in the "Environment knobs"
+section at the bottom.
 
 ## Tiers at a glance
 
@@ -17,8 +16,8 @@ bottom, and this document maps those knobs to deployment shapes.
 | **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full contest path; ANAMNESIS on CPU fallback is slow but functional |
 | **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | v3.1 contest path disabled via `MNEMOS_CONTEST_ENABLED=false`; v3.0 distillation worker only |
 
-Embedded Pi-class is explicitly a **v3.3 target** (SQLite + sqlite-vec
-backend) and is out of scope for v3.1.x. Pi 4 class is the intended
+Embedded Pi-class is now a **lite-profile target** (SQLite + sqlite-vec
+backend) and is out of scope for the current Postgres-only branch. Pi 4 class is the intended
 floor for the embedded tier when it lands.
 
 ## Baseline requirements (all tiers)
@@ -94,11 +93,10 @@ contest, no GPU required.
   - memory_compression_candidates / memory_compressed_variants tables
     migrate cleanly but stay empty
 
-## Environment knobs (v3.1.x)
+## Environment knobs (v3.x)
 
-Until v3.2 profile plumbing lands, these env vars control which
-features a running worker will exercise. Defaults are the server-tier
-shape.
+These env vars control which features a running worker will exercise.
+Defaults are the server-tier shape.
 
 | Env var                                | Default  | Purpose                                                             |
 | -------------------------------------- | -------- | ------------------------------------------------------------------- |
@@ -121,15 +119,13 @@ From real deployments as of 2026-04-23:
 These are operational rather than prescriptive — real workloads will
 differ. Use these as a sanity check when sizing a new host.
 
-## v3.2 roadmap note
+## v3.5-dev deployment note
 
-`MNEMOS_INSTALL_PROFILE=server|workstation|edge` will group the env
-knobs above under a single profile name, with runtime detection that
-picks a sensible default (GPU present → server; else workstation;
-`MNEMOS_CONTEST_ENABLED=false` → edge). The tier names above are
-the proposed names — final choice lands in v3.2.0 alongside the
-plumbing work.
+Docker fresh volumes run all mounted initdb migrations. Existing volumes
+do not. For v3.5-dev, the compose files include a one-shot
+`postgres-upgrade` service so the trigger replacement migration applies
+to existing data directories before MNEMOS starts.
 
 ---
 
-*Last updated: 2026-04-23 (v3.1.1)*
+*Last updated: 2026-04-26 (v3.5-dev docs sweep)*

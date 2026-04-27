@@ -41,8 +41,8 @@ What this doc does NOT cover:
                      /         \
                     /           \
               PYTHIA (.67)    CERBERUS (.96)
-              v3.3-alpha.1    v3.2.0 (prod)
-              pg17 primary    + v3.1.0 (dev, retiring)
+              v3.4.1 prod     dark prod / GPU host
+              pg17 primary    standby + inference
               11,756 memories + Apollo Gemma 4 (ports 8080/8081)
               5,045 compressions
               pgha-primary
@@ -54,9 +54,9 @@ What this doc does NOT cover:
 
 
               PROTEUS (.25)
-              (staging — NOT YET LIVE)
+              staging / restore-drill target
               Intel i7-6700, 60GB RAM
-              Will run next stable cut
+              Runs latest cut during release drills
               GPU calls proxy to CERBERUS
 ```
 
@@ -64,9 +64,9 @@ What this doc does NOT cover:
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v3.3-alpha.1 | ✅ Operational |
-| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary (prod) + Apollo GPU inference | v3.2.0 (prod) + v3.1.0 (dev) | ✅ Operational |
-| **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging (next stable) | planned v3.4 | ⏳ Not yet deployed |
+| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v3.4.1 tag | ✅ Operational |
+| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v3.4.x family | ✅ Operational |
+| **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / v3.5-dev during branch work | ✅ Used for drills |
 | **ARGONAS** | 192.168.207.101 | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
 ### 2.3 Network & authentication
@@ -88,8 +88,8 @@ Production MNEMOS runs on a **canary + ratchet** model: new features bake in sta
 
 | Tier | Host(s) | Version target | Stability | Deployment source |
 |---|---|---|---|---|
-| **Prod** | PYTHIA + CERBERUS | *latest stable* (v3.2.0 today) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
-| **Staging** | PROTEUS (planned) | *latest cut* (v3.4 planned) | alpha/rc, real federation | master branch, merged + tagged |
+| **Prod** | PYTHIA + CERBERUS | *latest stable* (v3.4.1 tag) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
+| **Staging** | PROTEUS | *latest cut* (`v3.5-dev` while in flight) | alpha/rc, real federation | release branch, merged + tagged |
 | **Test** | docker-compose + mnemos-test-pg on CERBERUS | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
 
 **Promotion path:**
@@ -244,10 +244,11 @@ Migrations run **privileged** (postgres superuser), never as the MNEMOS app role
 python -m mnemos.installer migrate --db-name=mnemos --db-user=postgres
 
 # Manually (if needed)
-sudo -u postgres psql -d mnemos -f db/migrations_v3_4_example.sql
+sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
+  -f db/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
-See `installer/db.py:51-63` (`_psql_superuser`) and `installer/db.py:230-253` (migration sequence) for canonical order.
+See `installer/db.py:51-63` (`_psql_superuser`) and `installer/db.py:230-254` (migration sequence) for canonical order. `install.py:150-169` carries the legacy installer list and must stay in the same order.
 
 ### 5.3 Pre-migration backup (mandatory)
 
@@ -274,6 +275,90 @@ Consequence: After upgrading PYTHIA to a new version with a new migration:
 4. When you promote CERBERUS, it already has the schema
 
 Do not attempt to run a migration directly on the standby.
+
+### 5.5 v3.5 trigger replacement migration
+
+`db/migrations_v3_5_trigger_same_memory_parent.sql` replaces
+`mnemos_version_snapshot()` with the same-memory branch HEAD guard.
+The migration is `CREATE OR REPLACE FUNCTION`, so it is safe to re-run.
+
+Fresh Docker volumes receive it from:
+
+```text
+/docker-entrypoint-initdb.d/24-trigger-same-memory-parent.sql
+```
+
+Existing Docker volumes do not re-run initdb scripts. For that case,
+`docker-compose.yml` and `docker-compose.staging.yml` include a one-shot
+`postgres-upgrade` service that waits for Postgres to be healthy and then
+runs:
+
+```bash
+psql -h postgres -U mnemos_user -d mnemos \
+  -v ON_ERROR_STOP=1 \
+  -f /migrations/24-trigger-same-memory-parent.sql
+```
+
+Manual equivalent for bare-metal or systemd deployments:
+
+```bash
+sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
+  -f db/migrations_v3_5_trigger_same_memory_parent.sql
+```
+
+Post-apply smoke check:
+
+```sql
+SELECT proname
+FROM pg_proc
+WHERE proname = 'mnemos_version_snapshot';
+```
+
+### 5.6 `MN001` / HTTP 409 branch reconciliation
+
+`MN001` means the trigger found broken branch state while resolving the
+parent for an UPDATE or DELETE. The API maps it to HTTP 409 through
+`handle_trigger_pgerror` (`api/visibility.py:24-37`).
+
+Causes:
+
+- `memory_branches` row is missing for the memory + branch.
+- `memory_branches.head_version_id` is `NULL`.
+- `head_version_id` points at a `memory_versions.id` from another memory.
+- The branch row disappeared before the trigger could advance HEAD.
+
+Inspection query:
+
+```sql
+SELECT
+  mb.memory_id,
+  mb.name,
+  mb.head_version_id,
+  mv.memory_id AS head_memory_id,
+  mv.version_num,
+  mv.commit_hash
+FROM memory_branches mb
+LEFT JOIN memory_versions mv ON mv.id = mb.head_version_id
+WHERE mb.memory_id = '<memory_id>'
+ORDER BY mb.name;
+```
+
+Reconciliation procedure:
+
+1. Confirm the intended branch and memory ID from the failing request or logs.
+2. If the branch row is missing, reconstruct it only from a
+   `memory_versions` row with the same `memory_id`.
+3. If `head_version_id` is `NULL`, set it to the highest intended
+   visible version for that branch and memory.
+4. If `head_memory_id != memory_id`, do not keep the foreign pointer.
+   Choose a same-memory version row or quarantine the branch until the
+   restore/import that created the pointer is understood.
+5. Retry the original write after the branch row resolves to a
+   same-memory version.
+
+Do not repair by reusing another memory's version ID. Slice 2 made that
+failure explicit so corrupt ancestry cannot be hidden by the next normal
+write.
 
 ---
 
@@ -302,9 +387,10 @@ pg_dump -U postgres mnemos | gzip > \
   /mnt/argonas/backups/mnemos/<version>-pre-<datestamp>.sql.gz
 ```
 
-### 6.3 Restore procedure (quarterly drill — NOT YET PERFORMED)
+### 6.3 Restore procedure (quarterly drill)
 
-**Status:** This procedure is untested. Required as v3.5 follow-up.
+**Status:** Dev↔prod MPF restore drill documented and run for v3.4.1.
+Repeat quarterly and before high-risk schema work.
 
 To restore from backup to PROTEUS (test/staging host):
 
@@ -375,7 +461,7 @@ Response (JSON):
 ```json
 {
   "status": "healthy",
-  "version": "v3.2.0",
+  "version": "v3.4.1",
   "uptime_seconds": 345600,
   "database": "connected",
   "replication_lag_seconds": 0.5,
@@ -391,9 +477,9 @@ Response (JSON):
 Simple dashboard (Grafana or custom HTML) that queries each node's `/health` and shows:
 
 ```
-PYTHIA:   v3.3-alpha.1  (uptime: 45d 3h)
-CERBERUS: v3.2.0        (uptime: 30d 22h) — version lag: 1 week
-PROTEUS:  (not deployed)
+PYTHIA:   v3.4.1        (uptime: 45d 3h)
+CERBERUS: v3.4.x        (dark prod / GPU host)
+PROTEUS:  v3.5-dev      (staging cut)
 ```
 
 Update frequency: 5 minutes (sufficient for drift detection).
@@ -503,9 +589,9 @@ Implement `scripts/ops/version_check.sh` (to be written, v3.5 target):
 #!/bin/bash
 # Check each node's version vs. declared target
 
-PYTHIA_DECLARED="v3.2.0"
-CERBERUS_DECLARED="v3.2.0"
-PROTEUS_DECLARED="v3.4-alpha"
+PYTHIA_DECLARED="v3.4.1"
+CERBERUS_DECLARED="v3.4.1"
+PROTEUS_DECLARED="v3.5-dev"
 
 PYTHIA_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
   http://192.168.207.67:5002/health | jq -r .version)
@@ -569,14 +655,14 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 ## 11. Federation health
 
-### 11.1 Architecture (v3.3 current)
+### 11.1 Architecture (v3.5-dev current)
 
 Federation (peer-to-peer memory sync) is specified in `api/handlers/federation.py:280-390`. Key points:
 
 - Each MNEMOS node maintains a `federation_peers` table (schema in `db/migrations_v3_federation.sql`)
 - Sync is **pull-based:** node A asks node B for updates since the last sync point
 - Cursor-based pagination (not full-dump on every sync)
-- **Status as of 2026-04-26:** Manual testing done; no real multi-node federation live yet (PROTEUS not deployed)
+- **Status as of 2026-04-26:** Schema-compat preflight and restore drills validated against PROTEUS; peer heartbeat and per-peer ACL/stable cursor remain open v3.5 items.
 
 ### 11.2 What happens when a peer is unreachable
 
@@ -638,7 +724,14 @@ Use this checklist before **any** deployment, upgrade, or migration on PYTHIA or
 - [ ] **Rollback path documented:** Write down exact git sha/tag to revert to
   ```bash
   # Save for rollback:
-  ROLLBACK_TAG=v3.2.0
+  ROLLBACK_TAG=v3.4.1
+  ```
+
+- [ ] **Migration path selected:** For Docker existing volumes, confirm
+  `postgres-upgrade` completed successfully; for bare metal, run the
+  migration manually with `ON_ERROR_STOP=1`.
+  ```bash
+  docker compose ps postgres-upgrade
   ```
 
 - [ ] **LB has healthy peer:** Verify the OTHER prod node is healthy and receiving traffic
@@ -728,10 +821,10 @@ The following three shell scripts codify operational patterns and reduce manual 
 | ARGONAS nginx config location | TBD (permission rate-limit) | Can't read LB config or verify drain setup | ops | Next cycle |
 | Health-check probe interval/timeout | TBD | Don't know if nginx can auto-detect backend failure | ops | Next cycle |
 | CERBERUS port 5002 v3.1.0 cleanup | ⏳ Planned | Stale container running, wastes VRAM | ops | v3.5 quarterly pass |
-| Restore drill never executed | ⏳ Never run | Backup viability uncertified | ops | v3.5 follow-up |
+| Restore drill | ✅ Dev↔prod drill documented and run | Repeat quarterly, not a one-time substitute for backup monitoring | ops | quarterly |
 | Slack/Signal alerting | ⏳ Not wired | On-call relies on manual checking | ops | v3.5 |
 | Federation peer heartbeat | ⏳ No detection | Silent failure if peer unreachable >1h | dev | v3.5 |
-| PROTEUS deployment | ⏳ Not yet live | Staging tier not yet functional | ops+dev | v3.4 |
+| PROTEUS deployment | ✅ Used for v3.4.1 restore/schema drills | Keep as staging proving ground | ops+dev | ongoing |
 | Version check script | ⏳ Not written | Drift detection manual-only | ops | v3.5 |
 | Migration wrapper script | ⏳ Not written | No safe migration automation | ops | v3.5 |
 | Blue-green deploy script | ⏳ Not written | Prod upgrades manual-only | ops | v3.5 |
@@ -791,7 +884,8 @@ ssh jasonperlow@192.168.207.101 "ls -lh /mnt/argonas/backups/mnemos/"
 gunzip < backup.sql.gz | psql -U postgres -d mnemos
 
 # Run a migration
-sudo -u postgres psql -d mnemos -f db/migrations_v3_4_example.sql
+sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
+  -f db/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
 ### Load balancer (ARGONAS)
@@ -826,4 +920,3 @@ sudo journalctl -u mnemos -f
 **Last updated:** 2026-04-26  
 **Maintained by:** Operations team  
 **Status:** Active, gaps identified for v3.5 work
-

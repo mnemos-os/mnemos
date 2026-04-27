@@ -1,8 +1,30 @@
 # MNEMOS v3.5 Charter — PANTHEON v0.1 + IRIS Discovery Layer + Memory Operations Expansion
 
-**Status:** Specification (target: ships after v3.4 GA)
+**Status:** In flight on `v3.5-dev`; not tagged. Slice 1 merged as `a62a099`; slice 2 merged as `d42c475`.
 **Position in roadmap:** Follows APOLLO S-IVB phases 1–2 (v3.2–v3.4); precedes full GPU stack (v4.0).
 **Theme:** *Unified LLM provider facade with MCP discovery + foundational memory operations hardening.*
+
+---
+
+## 0. Current branch status
+
+Closed on `v3.5-dev`:
+
+- **DONE in slice 1 (`a62a099`)** — session history order and pinning fixes; repository URL sweep to `mnemos-os/mnemos`.
+- **DONE in slice 2 (`d42c475`)** — memory read visibility symmetry, per-snapshot version visibility, same-memory DAG parent guards, race-safe branch creation, merge/revert branch-writer serialization, target-tenancy merge semantics, `MN001` → HTTP 409 reconciliation, and Docker `postgres-upgrade` for existing volumes.
+
+Open backlog still in scope or awaiting explicit deferral:
+
+- **#20** webhook retry state machine.
+- **#21** federation per-peer ACL + stable cursor.
+- **#22** audit endpoint scoping + lifespan teardown.
+- **#23** entity namespace conflict-key migration.
+- **#25** RLS Unix-bit fix for `mnemos_group_select`.
+- **#19** bulk webhook parity.
+- **#15** deletion-log refactor (parked).
+
+PANTHEON + IRIS remain the next-bound v3.5 feature set; they are not
+shipped by slices 1 or 2.
 
 ---
 
@@ -131,6 +153,14 @@ Before any public release of the MCP-MD v0.1 specification, the draft will be ci
 ### 2.2 Operational hardening
 
 All items required for v3.5 to be production-ready at scale:
+
+0. **DONE in slice 2: memory-read tenancy + DAG integrity.**
+   - Shared live read predicate: `api/visibility.py:40-96`.
+   - Per-snapshot history predicate: `api/visibility.py:99-137`.
+   - Trigger replacement: `db/migrations_v3_5_trigger_same_memory_parent.sql`.
+   - Branch-writer lock helper: `api/handlers/dag.py:21-40`.
+   - Existing-volume upgrade path: `postgres-upgrade` in both compose files.
+   - Remaining follow-up: RLS Unix-bit migration (#25).
 
 1. **HTTP body-size cap** (FastAPI Body limit).
    - `POST /v1/import` and streaming request bodies must have hard cap.
@@ -360,20 +390,24 @@ With IRIS in place, other MCP-aware frameworks (Hermes, Continue, AutoGPT, CrewA
 
 ## 6. Success criteria
 
-- ✅ PANTHEON v0.1 running on PYTHIA, accessible at `http://pythia:5002/v1/chat/completions` with extended catalog.
-- ✅ **IRIS MCP server operational:** `iris://models` resource returns full catalog; `find_model()` tool ranks models by capability constraints; `get_model_health()` reflects PANTHEON health.
-- ✅ zeroclaw + OpenClaw both using IRIS for model discovery (MCP connection working; runtime model selection via `iris://models/recommendations/coding`).
-- ✅ Audit log table populated on memory create/update/delete + federation pulls.
-- ✅ Body-size cap + per-tenant rate limit enforced, 413/429 responses working as documented.
-- ✅ APOLLO EXTRACT mining at least 10% of eligible prose memories on PYTHIA production.
-- ✅ PANTHEON routing log feedback loop proves adaptive policy (provider latency improvements over 24h).
-- ✅ zeroclaw + OpenClaw IRIS adoptions merged upstream or documented as PRs for operator merge.
+- [x] Slice 1 audit quick wins merged to `v3.5-dev` (`a62a099`).
+- [x] Slice 2 memory-read tenancy + DAG integrity merged to `v3.5-dev` (`d42c475`).
+- [x] v3.5 trigger replacement wired into `install.py`, `installer/db.py`, `docker-compose.yml`, and `docker-compose.staging.yml`.
+- [ ] PANTHEON v0.1 running on PYTHIA, accessible at `http://pythia:5002/v1/chat/completions` with extended catalog.
+- [ ] **IRIS MCP server operational:** `iris://models` resource returns full catalog; `find_model()` tool ranks models by capability constraints; `get_model_health()` reflects PANTHEON health.
+- [ ] zeroclaw + OpenClaw both using IRIS for model discovery (MCP connection working; runtime model selection via `iris://models/recommendations/coding`).
+- [ ] Audit log table populated on memory create/update/delete + federation pulls.
+- [ ] Body-size cap + per-tenant rate limit enforced, 413/429 responses working as documented.
+- [ ] APOLLO EXTRACT mining at least 10% of eligible prose memories on PYTHIA production.
+- [ ] PANTHEON routing log feedback loop proves adaptive policy (provider latency improvements over 24h).
+- [ ] zeroclaw + OpenClaw IRIS adoptions merged upstream or documented as PRs for operator merge.
 
 ---
 
 ## 7. Shipping readiness
 
 v3.5 GA gate:
+- [x] Slice 2 tenancy/DAG regression suite merged; 768 tests passing in branch context.
 - [ ] PANTHEON integration tests (vLLM, Together, Groq, OpenAI backends; happy path + fallback).
 - [ ] **IRIS MCP server:** tests for `find_model()` tool with various capability constraints; health aggregation logic validated.
 - [ ] CHARON v0.2 export/import round-trip (carried from v3.4 gate; required for federation audit).
@@ -390,6 +424,8 @@ v3.5 GA gate:
 - **PANTHEON detailed design:** `docs/PANTHEON.md` (complete, decision-ready).
 - **APOLLO S-IVB phases 1–2:** Shipped v3.2–v3.4 (see `ROADMAP.md`).
 - **CHARON v0.2:** Shipped v3.4 (portability sidecar system).
+- **v3.5-dev slice 1:** `a62a099` audit quick wins.
+- **v3.5-dev slice 2:** `d42c475` memory-read tenancy + DAG integrity.
 - **v3.4 artifacts:** Compression benchmark, APOLLO S-IVB slice 2, KNOSSOS phase 2.
 - **v3.6 followup:** PERSEPHONE archival, APOLLO S-IVB phases 3–4, Hermes/Continue/AutoGPT donations.
 
@@ -402,11 +438,11 @@ v3.5 GA gate:
 | Subsystem | Greek | Role | v3.5 status |
 |---|---|---|---|
 | MNEMOS | titaness of memory | core memory store | ✅ core |
-| APOLLO | sun god / oracle | convergent compression (S-IC, S-II, S-IVB) | ✅ phases 1–4 |
+| APOLLO | sun god / oracle | convergent compression (S-IC, S-II, S-IVB) | ✅ current compression stack; mutation paths continue in v3.6 |
 | CHARON | ferryman | cross-system portability | ✅ v0.2 |
 | GRAEAE | gray sisters | multi-LLM consensus | ✅ core |
-| PANTHEON | temple of all gods | unified LLM gateway | ✅ v0.1 ships |
-| **IRIS** | **messenger of the gods** | **MCP discovery layer over PANTHEON's catalog** | **✅ v0.1 ships** |
+| PANTHEON | temple of all gods | unified LLM gateway | 🔵 next-bound v3.5 feature |
+| **IRIS** | **messenger of the gods** | **MCP discovery layer over PANTHEON's catalog** | **🔵 next-bound v3.5 feature** |
 | PERSEPHONE | queen of the underworld | archival subsystem | 🔵 v3.6 |
 
-*Charter locked 2026-04-25. Changes via memo + MNEMOS memory update.*
+*Charter opened 2026-04-25. Current branch status updated 2026-04-26 after slice 2 merge.*
