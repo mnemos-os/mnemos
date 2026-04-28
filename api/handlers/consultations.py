@@ -12,6 +12,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 from api.rate_limit import limiter
+from api.security import is_root, scope_namespace
 from graeae.engine import _REGISTRY_MAP
 from api.models import (
     ConsultationRequest,
@@ -25,25 +26,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["consultations"])
 
 _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
-
-
-def _is_root(user: UserContext) -> bool:
-    """Root callers may inspect cross-tenant consultation audit state."""
-    return user.role == "root"
-
-
-def _scope_namespace(
-    user: UserContext, override: Optional[str] = None
-) -> str:
-    if override and override != user.namespace:
-        if user.role != "root":
-            raise HTTPException(
-                status_code=403,
-                detail="cross-namespace access requires root",
-            )
-        return override
-    return user.namespace
-
 
 # ── Custom Query selection (v3.2) ─────────────────────────────────────────────
 
@@ -504,17 +486,17 @@ async def list_audit_log(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
     async with _lc._pool.acquire() as conn:
-        is_root = _is_root(user)
-        if is_root and namespace is None:
+        root = is_root(user)
+        if root and namespace is None:
             rows = await conn.fetch(
                 "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
                 "chain_hash, prev_id, task_type, provider, quality_score, created_at "
                 "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
                 limit, offset,
             )
-        elif is_root:
+        elif root:
             rows = await conn.fetch(
                 "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, "
                 "al.chain_hash, al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
@@ -552,7 +534,7 @@ async def list_audit_log(
             consultation_id=str(r["consultation_id"]) if r["consultation_id"] else None,
             prompt_hash=r["prompt_hash"],
             response_hash=r["response_hash"],
-            chain_hash=r["chain_hash"] if is_root else None,
+            chain_hash=r["chain_hash"] if root else None,
             prev_id=str(r["prev_id"]) if r["prev_id"] else None,
             task_type=r.get("task_type"),
             provider=r.get("provider"),
@@ -580,15 +562,15 @@ async def verify_audit_chain(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_ns = _scope_namespace(user, namespace)
-    verify_global_chain = _is_root(user) and namespace is None
+    target_ns = scope_namespace(user, namespace)
+    verify_global_chain = is_root(user) and namespace is None
     async with _lc._pool.acquire() as conn:
         if verify_global_chain:
             rows = await conn.fetch(
                 "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
                 "FROM graeae_audit_log ORDER BY sequence_num ASC"
             )
-        elif _is_root(user):
+        elif is_root(user):
             rows = await conn.fetch(
                 "SELECT al.sequence_num, "
                 "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
@@ -790,17 +772,17 @@ async def get_consultation(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
 
     async with _lc._pool.acquire() as conn:
-        if _is_root(user) and namespace is None:
+        if is_root(user) and namespace is None:
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
                 "FROM graeae_consultations WHERE id = $1",
                 consultation_id,
             )
-        elif _is_root(user):
+        elif is_root(user):
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
@@ -841,16 +823,16 @@ async def get_consultation_artifacts(
     """Retrieve structured outputs and citations from a consultation."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
 
     async with _lc._pool.acquire() as conn:
         # Get consultation — scoped to caller unless root.
-        if _is_root(user) and namespace is None:
+        if is_root(user) and namespace is None:
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations WHERE id = $1",
                 consultation_id,
             )
-        elif _is_root(user):
+        elif is_root(user):
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations "
                 "WHERE id = $1 AND namespace = $2",

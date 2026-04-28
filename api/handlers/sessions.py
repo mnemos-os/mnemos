@@ -13,6 +13,7 @@ from fastapi import APIRouter, HTTPException, Depends, Query
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
+from api.security import scope_namespace
 from api.models import (
     SessionRequest, SessionResponse, SessionMessage, SessionMessageResponse,
     SessionHistoryResponse, ChatMessage, SessionContext
@@ -29,18 +30,6 @@ def _require_pool():
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     return _lc._pool
-
-
-def _scope_namespace(user: UserContext, override: Optional[str] = None) -> str:
-    if override and override != user.namespace:
-        if user.role != "root":
-            raise HTTPException(
-                status_code=403,
-                detail="cross-namespace access requires root",
-            )
-        return override
-    return user.namespace
-
 
 @router.post("", response_model=SessionResponse)
 async def create_session(
@@ -104,7 +93,7 @@ async def get_session(
 ):
     """Get session context and metadata."""
     pool = _require_pool()
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
 
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
@@ -160,7 +149,7 @@ async def add_session_message(
     6. Updates session metrics
     """
     pool = _require_pool()
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
     async with pool.acquire() as conn:
@@ -388,7 +377,7 @@ async def get_session_history(
 ):
     """Get conversation history for session."""
     pool = _require_pool()
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
     async with pool.acquire() as conn:
@@ -446,7 +435,7 @@ async def delete_session(
 ):
     """Close and delete session."""
     pool = _require_pool()
-    target_ns = _scope_namespace(user, namespace)
+    target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
     async with pool.acquire() as conn:

@@ -23,6 +23,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 from api.models import KGTriple, KGTripleCreate, KGTripleListResponse, KGTripleUpdate
+from api.security import is_root
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/kg", tags=["knowledge-graph"])
@@ -42,13 +43,6 @@ def _row_to_triple(row) -> KGTriple:
         confidence=row['confidence'],
         created=row['created'].isoformat() if row['created'] else '',
     )
-
-
-def _is_root(user: UserContext) -> bool:
-    """Root callers see all triples regardless of owner_id — they're
-    the operational tier that runs migrations, audits, backups, etc.
-    Everyone else is scoped to their own rows."""
-    return user.role == "root"
 
 
 @router.post("/triples", response_model=KGTriple, status_code=201)
@@ -83,7 +77,7 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
             )
             if mem_row is None:
                 raise HTTPException(status_code=404, detail=f"memory_id {req.memory_id} not found")
-            if not _is_root(user) and (
+            if not is_root(user) and (
                 mem_row["owner_id"] != user.user_id
                 or mem_row["namespace"] != user.namespace
             ):
@@ -125,7 +119,7 @@ async def list_triples(
     # Tenancy filter: non-root callers are scoped to both their
     # owner_id AND their namespace — the same two-dimensional gate as
     # the memories handlers now apply.
-    if not _is_root(user):
+    if not is_root(user):
         conditions.append(f"owner_id=${idx}")
         filter_params.append(user.user_id)
         idx += 1
@@ -164,7 +158,7 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        if _is_root(user):
+        if is_root(user):
             rows = await conn.fetch(
                 "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 ORDER BY valid_from ASC LIMIT $2",
                 subject, limit,
@@ -203,7 +197,7 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
         )
         if row is None:
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        if not _is_root(user) and (
+        if not is_root(user) and (
             row["owner_id"] != user.user_id
             or row["namespace"] != user.namespace
         ):
@@ -228,7 +222,7 @@ async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_
         )
         if row is None:
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        if not _is_root(user) and (
+        if not is_root(user) and (
             row["owner_id"] != user.user_id
             or row["namespace"] != user.namespace
         ):

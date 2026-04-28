@@ -10,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
 from api.models import MemoryItem
+from api.security import is_root
 from api.visibility import handle_trigger_pgerror
 
 logger = logging.getLogger(__name__)
@@ -99,11 +100,6 @@ async def _assert_memory_exists(conn, memory_id: str) -> None:
     if not row:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
 
-
-def _is_root(user: UserContext) -> bool:
-    return user.role == "root"
-
-
 async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> None:
     """Tenancy gate for version-history reads.
 
@@ -119,7 +115,7 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
     read_visibility_predicate that gates list/get/search/rehydrate
     PLUS the namespace pin.
     """
-    if _is_root(user):
+    if is_root(user):
         # Root still needs the existence check so we 404 cleanly.
         await _assert_memory_exists(conn, memory_id)
         return
@@ -161,7 +157,7 @@ async def list_versions(
         # A memory that was private at v1 and made public at v2 must
         # NOT expose v1 to readers who only became authorized after
         # the permission flip.
-        if _is_root(user):
+        if is_root(user):
             rows = await conn.fetch(
                 "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
                 "FROM memory_versions WHERE memory_id = $1 AND branch = $2 ORDER BY version_num ASC",
@@ -206,7 +202,7 @@ async def get_version(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
-        if _is_root(user):
+        if is_root(user):
             row = await conn.fetchrow(
                 "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
                 "verbatim_content, owner_id, namespace, permission_mode, "
@@ -255,7 +251,7 @@ async def diff_versions(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
-        if _is_root(user):
+        if is_root(user):
             rows = await conn.fetch(
                 "SELECT version_num, content FROM memory_versions "
                 "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3",
@@ -317,7 +313,7 @@ async def revert_memory(
         # Per-snapshot tenancy on the source version too: prevents
         # reverting TO a private historical snapshot that the caller
         # wouldn't be allowed to read directly via get_version.
-        if _is_root(user):
+        if is_root(user):
             ver_row = await conn.fetchrow(
                 "SELECT id, memory_id, version_num, content, category, subcategory, metadata, "
                 "verbatim_content, owner_id, namespace, permission_mode, "
@@ -378,7 +374,7 @@ async def revert_memory(
             # Authorize against the live row — atomic with the write
             # below. Lock acquired AFTER the advisory lock per the
             # ordering above.
-            if _is_root(user):
+            if is_root(user):
                 live = await conn.fetchrow(
                     f"SELECT {_lc._MEMORY_COLS} FROM memories "
                     "WHERE id=$1 FOR UPDATE",
