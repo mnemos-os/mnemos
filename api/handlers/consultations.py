@@ -627,6 +627,15 @@ async def verify_audit_chain(
         stored_prev_chain = row["prev_chain_hash"]
         prev_chain = row["expected_prev_hash"] or _GENESIS_HASH
         if stored_prev_chain and stored_prev_chain != prev_chain:
+            logger.warning(
+                "Scoped audit predecessor mismatch for user=%s scoped_row=%s "
+                "global_sequence=%s expected_prev_hash=%s stored_prev_hash=%s",
+                user.user_id,
+                scoped_sequence_num,
+                row["sequence_num"],
+                prev_chain,
+                stored_prev_chain,
+            )
             failures.setdefault(
                 scoped_sequence_num,
                 f"Scoped chain broken at row {scoped_sequence_num}: "
@@ -636,10 +645,18 @@ async def verify_audit_chain(
             (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
         ).hexdigest()
         if expected != row["chain_hash"]:
+            logger.warning(
+                "Scoped audit hash mismatch for user=%s scoped_row=%s "
+                "global_sequence=%s expected_hash=%s stored_hash=%s",
+                user.user_id,
+                scoped_sequence_num,
+                row["sequence_num"],
+                expected,
+                row["chain_hash"],
+            )
             failures.setdefault(
                 scoped_sequence_num,
-                f"Scoped chain broken at row {scoped_sequence_num}: "
-                f"expected {expected[:16]}..., stored {row['chain_hash'][:16]}...",
+                f"Hash mismatch at row {scoped_sequence_num}",
             )
 
     if failures:

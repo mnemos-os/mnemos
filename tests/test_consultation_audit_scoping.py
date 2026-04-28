@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 
 import pytest
 from httpx import AsyncClient
@@ -10,6 +11,8 @@ from httpx import AsyncClient
 from api.auth import UserContext, get_current_user
 
 pytestmark = pytest.mark.asyncio
+
+HASH_PREFIX_RE = re.compile(r"\b[0-9a-fA-F]{16}\b")
 
 
 def _user(user_id: str, role: str = "user") -> UserContext:
@@ -239,6 +242,49 @@ async def test_verify_audit_chain_uses_actual_global_predecessor(
     assert root_data["entries_checked"] == 3
     assert root_data["entries_failed"] == [3]
     assert root_data["first_broken_sequence"] == 3
+
+
+async def test_scoped_verify_redacts_hash_prefixes_for_hidden_predecessor_failure(
+    client: AsyncClient,
+    auth_headers: dict,
+    current_user_override: dict,
+    db_pool,
+):
+    await _create_consultation(
+        client, auth_headers, current_user_override, "alice", "alice audit row 1",
+    )
+    await _create_consultation(
+        client, auth_headers, current_user_override, "bob", "bob hidden audit row",
+    )
+    await _create_consultation(
+        client, auth_headers, current_user_override, "alice", "alice audit row 2",
+    )
+
+    rows = db_pool.state["audit_log"]
+    rows[2]["chain_hash"] = "0" * 64
+
+    current_user_override["user"] = _user("alice")
+    resp = await client.get("/v1/consultations/audit/verify", headers=auth_headers)
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["valid"] is False
+    assert data["entries_checked"] == 2
+    assert data["entries_failed"] == [2]
+    assert data["first_broken_sequence"] == 2
+    assert data["message"] == "Hash mismatch at row 2"
+    assert HASH_PREFIX_RE.search(data["message"]) is None
+    for key in ("expected_hash_prefix", "stored_hash_prefix"):
+        if key in data:
+            assert data[key] is None
+
+    current_user_override["user"] = _user("root", role="root")
+    root_resp = await client.get("/v1/consultations/audit/verify", headers=auth_headers)
+    assert root_resp.status_code == 200
+    root_data = root_resp.json()
+    assert root_data["valid"] is False
+    assert root_data["entries_failed"] == [3]
+    assert root_data["first_broken_sequence"] == 3
+    assert HASH_PREFIX_RE.search(root_data["message"]) is not None
 
 
 async def test_get_consultation_owner_scope(
