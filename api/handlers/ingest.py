@@ -1,5 +1,4 @@
 """Session ingestion endpoint."""
-import json
 import logging
 import uuid
 
@@ -8,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
+from api.handlers.memories import _insert_memory_with_created_webhook, _rls_context
 from api.models import SessionIngestRequest, SessionIngestResponse
 
 logger = logging.getLogger(__name__)
@@ -45,59 +45,50 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
     try:
         data = request.raw_data
         async with _lc._pool.acquire() as conn:
-            if data.get("messages") or data.get("prompts"):
-                items = data.get("messages", []) or data.get("prompts", [])
-                if items:
-                    content = f"Session {request.session_id} — {len(items)} messages\n{_extract_readable(items)}"
-                    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-                    meta = json.dumps({
-                        "source": request.source, "session_id": request.session_id,
-                        "machine_id": request.machine_id, "agent_id": request.agent_id,
-                        "git_commit": request.git_commit, "item_count": len(items),
-                        "item_type": "messages",
-                    })
-                    await conn.execute(
-                        "INSERT INTO memories (id, content, category, metadata, quality_rating) "
-                        "VALUES ($1, $2, $3, $4::jsonb, 75)",
-                        mem_id, content, "session_activity", meta,
-                    )
-                    stored_ids.append(mem_id)
+            async with _rls_context(conn, user):
+                async with conn.transaction():
+                    for key, fallback_key, item_type, label, category in (
+                        ("messages", "prompts", "messages", "messages", "session_activity"),
+                        ("code_blocks", None, "code", "code blocks", "session_code"),
+                        ("tool_operations", "tools", "tools", "tool operations", "session_tools"),
+                    ):
+                        items = data.get(key, [])
+                        if not items and fallback_key:
+                            items = data.get(fallback_key, [])
+                        if not items:
+                            continue
 
-            if data.get("code_blocks"):
-                items = data.get("code_blocks", [])
-                if items:
-                    content = f"Session {request.session_id} — {len(items)} code blocks\n{_extract_readable(items)}"
-                    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-                    meta = json.dumps({
-                        "source": request.source, "session_id": request.session_id,
-                        "machine_id": request.machine_id, "agent_id": request.agent_id,
-                        "git_commit": request.git_commit, "item_count": len(items),
-                        "item_type": "code",
-                    })
-                    await conn.execute(
-                        "INSERT INTO memories (id, content, category, metadata, quality_rating) "
-                        "VALUES ($1, $2, $3, $4::jsonb, 75)",
-                        mem_id, content, "session_code", meta,
-                    )
-                    stored_ids.append(mem_id)
-
-            if data.get("tool_operations") or data.get("tools"):
-                items = data.get("tool_operations", []) or data.get("tools", [])
-                if items:
-                    content = f"Session {request.session_id} — {len(items)} tool operations\n{_extract_readable(items)}"
-                    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
-                    meta = json.dumps({
-                        "source": request.source, "session_id": request.session_id,
-                        "machine_id": request.machine_id, "agent_id": request.agent_id,
-                        "git_commit": request.git_commit, "item_count": len(items),
-                        "item_type": "tools",
-                    })
-                    await conn.execute(
-                        "INSERT INTO memories (id, content, category, metadata, quality_rating) "
-                        "VALUES ($1, $2, $3, $4::jsonb, 75)",
-                        mem_id, content, "session_tools", meta,
-                    )
-                    stored_ids.append(mem_id)
+                        content = (
+                            f"Session {request.session_id} — {len(items)} {label}\n"
+                            f"{_extract_readable(items)}"
+                        )
+                        mem_id = f"mem_{uuid.uuid4().hex[:12]}"
+                        metadata = {
+                            "source": request.source,
+                            "session_id": request.session_id,
+                            "machine_id": request.machine_id,
+                            "agent_id": request.agent_id,
+                            "git_commit": request.git_commit,
+                            "item_count": len(items),
+                            "item_type": item_type,
+                        }
+                        await _insert_memory_with_created_webhook(
+                            conn=conn,
+                            mem_id=mem_id,
+                            content=content,
+                            category=category,
+                            subcategory=None,
+                            metadata=metadata,
+                            owner_id=user.user_id,
+                            namespace=user.namespace,
+                            permission_mode=600,
+                            verbatim_content=content,
+                            source_model=None,
+                            source_provider=request.source,
+                            source_session=request.session_id,
+                            source_agent=request.agent_id,
+                        )
+                        stored_ids.append(mem_id)
 
         if _lc._cache:
             try:

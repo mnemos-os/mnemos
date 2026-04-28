@@ -22,7 +22,7 @@ from typing import Optional, List, Dict, Any, Literal, Union
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Header
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import api.lifecycle as _lc
@@ -819,6 +819,21 @@ def _model_not_found_error(model: str) -> dict[str, dict[str, str]]:
     }
 
 
+def _is_openai_error_detail(detail: Any) -> bool:
+    if not isinstance(detail, dict):
+        return False
+    error = detail.get("error")
+    return (
+        isinstance(error, dict)
+        and isinstance(error.get("type"), str)
+        and isinstance(error.get("code"), str)
+    )
+
+
+def _openai_error_response(exc: HTTPException) -> JSONResponse:
+    return JSONResponse(status_code=exc.status_code, content=exc.detail)
+
+
 async def _resolve_provider_for_model(model: str) -> Optional[str]:
     """Look up `model` in model_registry and return its provider.
 
@@ -1270,7 +1285,9 @@ async def chat_completions(
             first_delta = await anext(provider_stream)
         except StopAsyncIteration:
             first_delta = None
-        except HTTPException:
+        except HTTPException as exc:
+            if _is_openai_error_detail(exc.detail):
+                return _openai_error_response(exc)
             raise
         except Exception as e:
             logger.error(f"[MNEMOS] Streaming request failed before response start: {e}")
@@ -1323,7 +1340,9 @@ async def chat_completions(
             request_params=request_params,
             user=user,
         )
-    except HTTPException:
+    except HTTPException as exc:
+        if _is_openai_error_detail(exc.detail):
+            return _openai_error_response(exc)
         raise
     except Exception as e:
         logger.error(f"[MNEMOS] Request failed: {e}")

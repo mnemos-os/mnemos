@@ -4,7 +4,7 @@
 # Automated deployment with verification
 #
 
-set -e  # Exit on error
+set -euo pipefail  # Exit on error
 
 # Required: set DEPLOY_HOST to the target server hostname or IP
 if [ -z "${DEPLOY_HOST:-}" ]; then
@@ -170,8 +170,8 @@ SQL
     echo "Database created"
 
     # Run migrations in canonical order. Keep install.py::main()
-    # migration_files (see install.py:169-178) as the canonical source.
-    cd $DEPLOY_DIR
+    # migration_files as the canonical source.
+    cd "$DEPLOY_DIR"
     source venv/bin/activate
     python - <<'PY' | while IFS= read -r migration_file; do
 import ast
@@ -213,14 +213,15 @@ log_info "Database setup complete"
 # Step 7: Run tests
 log_info "Running test suite..."
 ssh "$DEPLOY_USER@$DEPLOY_HOST" bash << TESTEOF
+    set -euo pipefail
     cd "$DEPLOY_DIR"
     source venv/bin/activate
 
     echo "Running unit tests..."
-    python -m pytest tests/test_hooks.py -v --tb=short 2>&1 | head -100 || true
+    python -m pytest tests/test_unit.py -v --tb=short
 
     echo "Running E2E tests..."
-    python -m pytest tests/test_e2e.py -v --tb=short 2>&1 | head -100 || true
+    python -m pytest tests/test_e2e.py -v --tb=short
 
     echo "Test run completed"
 TESTEOF
@@ -230,16 +231,15 @@ log_info "Test suite executed"
 # Step 8: Verify deployment
 log_info "Verifying deployment..."
 ssh "$DEPLOY_USER@$DEPLOY_HOST" bash << VERIFYEOF
+    set -euo pipefail
     cd "$DEPLOY_DIR"
 
     # Check if API server starts
     source venv/bin/activate
-    timeout 5 python -c "from api_server import app; print('API server imports OK')" || true
+    timeout 5 python -c "from api_server import app; print('API server imports OK')"
 
     # Check if modules import
-    timeout 5 python -c "from modules.compression import distill; print('Compression module OK')" || true
-    timeout 5 python -c "from modules.hooks import HookRegistry; print('Hooks module OK')" || true
-    timeout 5 python -c "from modules.bundles import BundleRouter; print('Bundles module OK')" || true
+    timeout 5 python -c "from modules.hooks import HookRegistry; print('Hooks module OK')"
 
     echo "Module imports verified"
 VERIFYEOF

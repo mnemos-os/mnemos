@@ -7,8 +7,9 @@ and context routing.
 
 import logging
 from datetime import datetime, timezone
+from typing import Optional
 
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
@@ -30,6 +31,17 @@ def _require_pool():
     return _lc._pool
 
 
+def _scope_namespace(user: UserContext, override: Optional[str] = None) -> str:
+    if override and override != user.namespace:
+        if user.role != "root":
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace access requires root",
+            )
+        return override
+    return user.namespace
+
+
 @router.post("", response_model=SessionResponse)
 async def create_session(
     request: SessionRequest,
@@ -43,11 +55,12 @@ async def create_session(
         async with pool.acquire() as conn:
             session_id = await conn.fetchval(
                 """
-                INSERT INTO sessions (user_id, model)
-                VALUES ($1, $2)
+                INSERT INTO sessions (user_id, namespace, model)
+                VALUES ($1, $2, $3)
                 RETURNING id
                 """,
                 user.user_id,
+                user.namespace,
                 request.model or "gpt-4o",
             )
 
@@ -67,8 +80,9 @@ async def create_session(
         # Return session metadata
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT id, created_at, model FROM sessions WHERE id = $1",
-                session_id,
+                "SELECT id, created_at, model FROM sessions "
+                "WHERE id = $1 AND user_id = $2 AND namespace = $3",
+                session_id, user.user_id, user.namespace,
             )
 
         return SessionResponse(
@@ -85,16 +99,19 @@ async def create_session(
 @router.get("/{session_id}", response_model=SessionContext)
 async def get_session(
     session_id: str,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Get session context and metadata."""
     pool = _require_pool()
+    target_ns = _scope_namespace(user, namespace)
 
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2",
+            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
             session_id,
             user.user_id,
+            target_ns,
         )
 
     if not session:
@@ -129,6 +146,7 @@ async def get_session(
 async def add_session_message(
     session_id: str,
     request: SessionMessage,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Add message to session, search memory, inject context, call provider, return response.
@@ -142,13 +160,15 @@ async def add_session_message(
     6. Updates session metrics
     """
     pool = _require_pool()
+    target_ns = _scope_namespace(user, namespace)
 
     # Verify session ownership
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2",
+            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
             session_id,
             user.user_id,
+            target_ns,
         )
 
     if not session:
@@ -333,10 +353,12 @@ async def add_session_message(
             SET message_count = message_count + 2,
                 total_tokens = total_tokens + $2,
                 last_activity = NOW()
-            WHERE id = $1
+            WHERE id = $1 AND user_id = $3 AND namespace = $4
             """,
             session_id,
             tokens_used,
+            user.user_id,
+            target_ns,
         )
 
     logger.info(
@@ -361,17 +383,20 @@ async def get_session_history(
     session_id: str,
     limit: int = 50,
     offset: int = 0,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Get conversation history for session."""
     pool = _require_pool()
+    target_ns = _scope_namespace(user, namespace)
 
     # Verify session ownership
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2",
+            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
             session_id,
             user.user_id,
+            target_ns,
         )
 
     if not session:
@@ -416,17 +441,20 @@ async def get_session_history(
 @router.delete("/{session_id}")
 async def delete_session(
     session_id: str,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Close and delete session."""
     pool = _require_pool()
+    target_ns = _scope_namespace(user, namespace)
 
     # Verify session ownership
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2",
+            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
             session_id,
             user.user_id,
+            target_ns,
         )
 
     if not session:
@@ -434,7 +462,10 @@ async def delete_session(
 
     # Delete session (cascade deletes messages and injections)
     async with pool.acquire() as conn:
-        await conn.execute("DELETE FROM sessions WHERE id = $1", session_id)
+        await conn.execute(
+            "DELETE FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
+            session_id, user.user_id, target_ns,
+        )
 
     logger.info(f"[SESSIONS] Deleted session {session_id}")
 

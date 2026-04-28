@@ -7,9 +7,10 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from api.auth import UserContext
+from api.auth import UserContext, get_current_user
 from api.handlers import openai_compat
 
 
@@ -1033,22 +1034,34 @@ def test_unknown_model_returns_404(monkeypatch):
     assert exc.value.detail == "model not found"
 
 
-def test_chat_completion_unknown_model_returns_model_not_found(monkeypatch):
+def test_chat_completion_unknown_model_returns_model_not_found_on_wire(monkeypatch):
     async def _unknown_model(model: str):
         return None
 
     monkeypatch.setattr(openai_compat, "_search_mnemos_context", _no_context)
     monkeypatch.setattr(openai_compat, "_resolve_provider_for_model", _unknown_model)
-    req = openai_compat.ChatCompletionRequest(
-        model="nonexistent-model",
-        messages=[openai_compat.ChatMessage(role="user", content="hello")],
-    )
 
-    with pytest.raises(HTTPException) as exc:
-        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+    from api_server import app
 
-    assert exc.value.status_code == 404
-    assert exc.value.detail == {
+    async def _override_user():
+        return _user()
+
+    app.dependency_overrides[get_current_user] = _override_user
+    try:
+        client = TestClient(app, raise_server_exceptions=False)
+        response = client.post(
+            "/v1/chat/completions",
+            json={
+                "model": "nonexistent-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+        )
+        client.close()
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+
+    assert response.status_code == 404
+    assert response.json() == {
         "error": {
             "message": "The model `nonexistent-model` does not exist or you do not have access to it.",
             "type": "invalid_request_error",

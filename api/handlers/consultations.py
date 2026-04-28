@@ -32,6 +32,19 @@ def _is_root(user: UserContext) -> bool:
     return user.role == "root"
 
 
+def _scope_namespace(
+    user: UserContext, override: Optional[str] = None
+) -> str:
+    if override and override != user.namespace:
+        if user.role != "root":
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace access requires root",
+            )
+        return override
+    return user.namespace
+
+
 # ── Custom Query selection (v3.2) ─────────────────────────────────────────────
 
 _VALID_TIERS = {"frontier", "premium", "budget"}
@@ -393,8 +406,8 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         row = await conn.fetchrow(
                             """INSERT INTO graeae_consultations
                                 (prompt, task_type, consensus_response, consensus_score,
-                                 winning_muse, cost, latency_ms, mode, owner_id)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                                 winning_muse, cost, latency_ms, mode, owner_id, namespace)
+                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
                                RETURNING id""",
                             body.prompt,
                             body.task_type,
@@ -405,6 +418,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                             engine_latency_ms,
                             body.mode or "auto",
                             user.user_id,
+                            user.namespace,
                         )
                         consultation_id = row["id"] if row else None
 
@@ -442,8 +456,10 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                         "winning_muse": result.get("winning_muse"),
                         "consensus_score": result.get("consensus_score"),
                         "owner_id": user.user_id,
+                        "namespace": user.namespace,
                     },
                     owner_id=user.user_id,
+                    namespace=user.namespace,
                 )
         except Exception:
             logger.warning("webhook dispatch failed for consultation.completed %s", consultation_id, exc_info=True)
@@ -478,6 +494,7 @@ async def list_audit_log(
     request: Request,
     limit: int = Query(20, le=100),
     offset: int = 0,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """List GRAEAE audit log entries (newest first).
@@ -487,14 +504,25 @@ async def list_audit_log(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_ns = _scope_namespace(user, namespace)
     async with _lc._pool.acquire() as conn:
         is_root = _is_root(user)
-        if is_root:
+        if is_root and namespace is None:
             rows = await conn.fetch(
                 "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
                 "chain_hash, prev_id, task_type, provider, quality_score, created_at "
                 "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
                 limit, offset,
+            )
+        elif is_root:
+            rows = await conn.fetch(
+                "SELECT al.id, al.sequence_num, al.consultation_id, al.prompt_hash, al.response_hash, "
+                "al.chain_hash, al.prev_id, al.task_type, al.provider, al.quality_score, al.created_at "
+                "FROM graeae_audit_log al "
+                "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                "WHERE c.namespace = $1 "
+                "ORDER BY al.sequence_num DESC LIMIT $2 OFFSET $3",
+                target_ns, limit, offset,
             )
         else:
             rows = await conn.fetch(
@@ -507,15 +535,15 @@ async def list_audit_log(
                 "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
                 "FROM graeae_audit_log al "
                 "JOIN graeae_consultations c ON c.id = al.consultation_id "
-                "WHERE c.owner_id = $1 "
+                "WHERE c.owner_id = $1 AND c.namespace = $2 "
                 ") "
                 "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, "
                 "prompt_hash, response_hash, NULL::text AS chain_hash, "
                 "scoped_prev_id AS prev_id, "
                 "task_type, provider, quality_score, created_at "
                 "FROM visible "
-                "ORDER BY global_sequence_num DESC LIMIT $2 OFFSET $3",
-                user.user_id, limit, offset,
+                "ORDER BY global_sequence_num DESC LIMIT $3 OFFSET $4",
+                user.user_id, target_ns, limit, offset,
             )
     return [
         AuditLogEntry(
@@ -539,6 +567,7 @@ async def list_audit_log(
 @limiter.limit("5/minute")
 async def verify_audit_chain(
     request: Request,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Verify the integrity of the hash chain in the GRAEAE audit log.
@@ -551,11 +580,33 @@ async def verify_audit_chain(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_ns = _scope_namespace(user, namespace)
+    verify_global_chain = _is_root(user) and namespace is None
     async with _lc._pool.acquire() as conn:
-        if _is_root(user):
+        if verify_global_chain:
             rows = await conn.fetch(
                 "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
                 "FROM graeae_audit_log ORDER BY sequence_num ASC"
+            )
+        elif _is_root(user):
+            rows = await conn.fetch(
+                "SELECT al.sequence_num, "
+                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "al.prompt_hash, al.response_hash, "
+                "al.chain_hash, al.prev_id, al.prev_chain_hash, "
+                "prev.chain_hash AS expected_prev_hash "
+                "FROM graeae_audit_log al "
+                "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                "LEFT JOIN LATERAL ("
+                "SELECT chain_hash "
+                "FROM graeae_audit_log "
+                "WHERE sequence_num < al.sequence_num "
+                "ORDER BY sequence_num DESC "
+                "LIMIT 1"
+                ") prev ON TRUE "
+                "WHERE c.namespace = $1 "
+                "ORDER BY al.sequence_num ASC",
+                target_ns,
             )
         else:
             rows = await conn.fetch(
@@ -573,9 +624,9 @@ async def verify_audit_chain(
                 "ORDER BY sequence_num DESC "
                 "LIMIT 1"
                 ") prev ON TRUE "
-                "WHERE c.owner_id = $1 "
+                "WHERE c.owner_id = $1 AND c.namespace = $2 "
                 "ORDER BY al.sequence_num ASC",
-                user.user_id,
+                user.user_id, target_ns,
             )
 
     if not rows:
@@ -584,12 +635,12 @@ async def verify_audit_chain(
             entries_checked=0,
             message=(
                 "Audit log is empty"
-                if _is_root(user)
+                if verify_global_chain
                 else "No audit entries visible for caller"
             ),
         )
 
-    if _is_root(user):
+    if verify_global_chain:
         prev_chain = _GENESIS_HASH
         failures: dict[int, str] = {}
         for row in rows:
@@ -728,6 +779,7 @@ async def list_modes(_: UserContext = Depends(get_current_user)):
 @router.get("/consultations/{consultation_id}")
 async def get_consultation(
     consultation_id: str,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Retrieve a consultation by ID.
@@ -738,21 +790,29 @@ async def get_consultation(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_ns = _scope_namespace(user, namespace)
 
     async with _lc._pool.acquire() as conn:
-        if _is_root(user):
+        if _is_root(user) and namespace is None:
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
                 "FROM graeae_consultations WHERE id = $1",
                 consultation_id,
             )
+        elif _is_root(user):
+            row = await conn.fetchrow(
+                "SELECT id, prompt, task_type, consensus_response, consensus_score, "
+                "winning_muse, cost, latency_ms, mode, created "
+                "FROM graeae_consultations WHERE id = $1 AND namespace = $2",
+                consultation_id, target_ns,
+            )
         else:
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1 AND owner_id = $2",
-                consultation_id, user.user_id,
+                "FROM graeae_consultations WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                consultation_id, user.user_id, target_ns,
             )
 
     if not row:
@@ -775,24 +835,32 @@ async def get_consultation(
 @router.get("/consultations/{consultation_id}/artifacts")
 async def get_consultation_artifacts(
     consultation_id: str,
+    namespace: Optional[str] = Query(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Retrieve structured outputs and citations from a consultation."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_ns = _scope_namespace(user, namespace)
 
     async with _lc._pool.acquire() as conn:
         # Get consultation — scoped to caller unless root.
-        if _is_root(user):
+        if _is_root(user) and namespace is None:
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations WHERE id = $1",
                 consultation_id,
             )
+        elif _is_root(user):
+            consultation = await conn.fetchrow(
+                "SELECT id, created FROM graeae_consultations "
+                "WHERE id = $1 AND namespace = $2",
+                consultation_id, target_ns,
+            )
         else:
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations "
-                "WHERE id = $1 AND owner_id = $2",
-                consultation_id, user.user_id,
+                "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                consultation_id, user.user_id, target_ns,
             )
         if not consultation:
             raise HTTPException(status_code=404, detail="Consultation not found")
