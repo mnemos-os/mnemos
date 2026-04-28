@@ -28,8 +28,9 @@ is yours alone; it becomes a wall when a team needs:
   tooling
 - **Federation** — pull memories across MNEMOS instances with
   provenance intact
-- **Audit + compliance** — signed audit chain on every memory
-  mutation
+- **Audit + compliance** — version DAG snapshots for memory changes,
+  hash-chained GRAEAE consultation audit rows, and webhook/compression
+  audit records where those subsystems participate
 
 MNEMOS has all of these in its core. KNOSSOS is the glue that lets a
 team adopt them without changing how their agents talk to memory.
@@ -73,18 +74,18 @@ the MemPalace tool-response shape.
 
 ## What you gain by moving
 
-| Capability | MemPalace 3.3.x | MNEMOS 3.2.x via KNOSSOS |
+| Capability | MemPalace 3.3.x | MNEMOS v3.5.x via KNOSSOS |
 |---|---|---|
 | Multi-user memory | ❌ | ✅ — `owner_id`, `group_id`, `permission_mode` |
 | HTTP API | ❌ | ✅ — `/v1/memories/*`, `/v1/kg/*`, `/v1/export`, `/v1/import` |
 | Bulk ingest speed | ~2 memories/sec (local, one-at-a-time) | ~200 memories/sec via `/v1/import` (MPF envelope, batched) |
 | Cross-instance portability | ❌ (no native export) | ✅ — Memory Portability Format (MPF) round-trip |
 | Version DAG (diff/revert/branch) | ❌ | ✅ — memory_versions table + commit_hash |
-| Audit chain | ❌ | ✅ — every mutation hashed, verifiable |
+| Version/audit trail | ❌ | ✅ — memory DAG snapshots, consultation hash chain, webhook/compression audit rows |
 | Compression (APOLLO/ARTEMIS contest) | AAAK only (~30× on a subset) | Full contest — APOLLO schema + ARTEMIS extractive, judge-scored |
 | Federation across instances | ❌ | ✅ — `/v1/federation/*`, pull-based |
 | Knowledge graph (temporal) | ✅ — SQLite-backed | ✅ — Postgres-backed, same temporal semantics |
-| MCP surface | 29 native tools | 29 via KNOSSOS + MNEMOS-native MCP tools |
+| MCP surface | 29 native tools | 16 MemPalace-compatible phase-1 tools via KNOSSOS, plus the native 18-tool MNEMOS MCP surface |
 | Retrieval benchmark R@5 (LongMemEval) | 96.6% raw / 98.4% hybrid | (see `benchmarks/compression_corpus_v3_3.jsonl`) |
 
 MemPalace is not wrong for its use case. KNOSSOS exists for the
@@ -98,7 +99,7 @@ moment your use case grew out of it.
 
 Point MNEMOS at your team's datastore (Postgres + optional phi-server
 for embeddings). Canonical quickstart: `docker-compose up` against
-the MNEMOS repo root. Full deployment notes in [DEPLOYMENT_GUIDE.md](./DEPLOYMENT_GUIDE.md).
+the MNEMOS repo root. Full deployment notes are in [DEPLOYMENT.md](../DEPLOYMENT.md).
 
 ### 2. Point KNOSSOS at it
 
@@ -106,7 +107,6 @@ the MNEMOS repo root. Full deployment notes in [DEPLOYMENT_GUIDE.md](./DEPLOYMEN
 export MNEMOS_BASE=http://mnemos.internal:5002
 export MNEMOS_API_KEY=$TEAM_API_KEY           # bearer token, issued per user
 export KNOSSOS_WING_AXIS=namespace             # default; 'owner_id' is also accepted
-                                               # (MNEMOS /v1/memories/search only scopes by namespace today)
 
 python -m tools.knossos_mcp                   # stdio MCP server
 ```
@@ -139,7 +139,7 @@ drawer IDs and metadata are kept.
 
 ## Tool coverage (v0.1)
 
-Implemented:
+Implemented in the current phase-1 shim:
 
 - `mempalace_status`
 - `mempalace_list_wings`
@@ -158,7 +158,7 @@ Implemented:
 - `mempalace_kg_timeline`
 - `mempalace_kg_stats`
 
-Phase 2 (issue-tracked):
+Deferred phase-2 surface:
 
 - `mempalace_create_tunnel` / `mempalace_list_tunnels` /
   `mempalace_delete_tunnel` / `mempalace_find_tunnels` /
@@ -197,7 +197,7 @@ Phase 2 (issue-tracked):
 KNOSSOS is one spoke; CHARON is the hub. KNOSSOS translates the
 MemPalace MCP tool surface. CHARON handles bulk import/export via
 MPF envelopes (`tools/memory_import.py`, `tools/memory_export.py`,
-`docs/mpf_v0.1.json`). A full MemPalace → MNEMOS migration uses both:
+`docs/MEMORY_EXPORT_FORMAT.md`). A full MemPalace → MNEMOS migration uses both:
 
 1. CHARON one-time bulk import of the existing palace (via
    `tools.knossos_mcp migrate --from-palace`).

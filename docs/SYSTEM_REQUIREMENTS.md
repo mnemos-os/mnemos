@@ -113,13 +113,13 @@ From real deployments as of 2026-04-23:
 These are operational rather than prescriptive — real workloads will
 differ. Use these as a sanity check when sizing a new host.
 
-## v3.5-dev deployment note
+## v3.5.x deployment note
 
 Docker fresh volumes run all mounted initdb migrations. Existing volumes
-do not. For v3.5-dev, the compose files include a one-shot
+do not. For v3.5.x, the compose files include a one-shot
 `postgres-upgrade` service so the trigger replacement migration applies
 to existing data directories before MNEMOS starts.
 
 ---
 
-*Last updated: 2026-04-26 (v3.5-dev docs sweep)*
+*Last updated: 2026-04-28 (v3.5.1 doc triage)*

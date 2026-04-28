@@ -120,7 +120,7 @@ know about. This is deliberate forward/backward compatibility.
 {
   "mpf_version": "0.1.0",
   "source_system": "mnemos",
-  "source_version": "3.1.0",
+  "source_version": "3.5.1",
   "source_instance": "pythia.internal",         // optional diagnostic
   "source_commit": "1838507",                   // optional diagnostic
   "exported_at": "2026-04-23T15:00:00Z",
@@ -221,7 +221,7 @@ know about. This is deliberate forward/backward compatibility.
   "compression_manifest": [                      // record-ID-keyed
     {
       "record_id": "mem_01JAB2",
-      "engine_id": "anamnesis",
+      "engine_id": "apollo",
       "compressed_content": "<condensed form>",
       "compression_ratio": 0.28,
       "composite_score": 0.61,

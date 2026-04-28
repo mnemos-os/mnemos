@@ -1,7 +1,7 @@
 # MNEMOS v4.0 Plan — ETLANTIS Universe Consolidation + GPU Stack
 
 **Status:** Architecture specification (target: ships after v3.6 GA)
-**Position in roadmap:** Closes APOLLO program; opens horizontal scaling + GPU integration.
+**Position in roadmap:** Forward-looking v4 architecture plan after the v3.5.x hardening release and planned v3.6 work; opens horizontal scaling + GPU integration.
 **Theme:** *Structural refactoring + GPU-backed AI infrastructure + unified ETLANTIS Universe.*
 
 ---
@@ -160,7 +160,7 @@ contracts = [
 
 ## 3. Track 7: MCP-MD v1.0 stabilization + Linux Foundation AI & Data proposal track
 
-**Strategic context:** v3.5–v3.6 established MCP-MD (MCP Model Discovery) as a draft open specification with IRIS as the reference implementation. By v4.0, the specification has accumulated 6–9 months of multi-implementer feedback and is ready to graduate from draft v0.1.x to stable v1.0.
+**Strategic context:** This assumes MCP-MD (MCP Model Discovery) and IRIS have shipped before v4.0. They did not ship in v3.5.0 or v3.5.1; treat this section as conditional forward-looking scope.
 
 **v4.0 deliverables:**
 
@@ -191,7 +191,7 @@ The proposal follows LF's standard Sandbox project intake — no expedited track
 
 ## 3. Track 3: IRIS expansion to full ETLANTIS operations discovery
 
-**Strategic context:** v3.5 ships IRIS for model discovery (capability-based selection of PANTHEON models). v4.0 generalizes IRIS to expose **all ETLANTIS operations** — not just models, but also compression engines, dream-state generators, time-series forecasters, etc. Agents query IRIS for "show me anomaly detectors with <3s latency" or "which clustering algorithm is most memory-efficient?" instead of hardcoding operation names.
+**Strategic context:** Once IRIS exists for model discovery (capability-based selection of PANTHEON models), v4.0 generalizes IRIS to expose **all ETLANTIS operations** — not just models, but also compression engines, dream-state generators, time-series forecasters, etc. Agents query IRIS for "show me anomaly detectors with <3s latency" or "which clustering algorithm is most memory-efficient?" instead of hardcoding operation names.
 
 ### 3.1 Extend IRIS tools + resources beyond models
 
@@ -285,7 +285,7 @@ db/
 │       └── ...
 ```
 
-**Automation:** `tools/migrate_schema.py --dialect=sqlite --version=3.5.0` generates SQLite migrations from canonical Postgres.
+**Planned automation:** `tools/migrate_schema.py --dialect=sqlite --source-version=3.5.x` generates SQLite migrations from canonical Postgres once that future tool exists.
 
 **Effort:** 2–3 days (migrate 20 files, validate equivalence).
 
@@ -307,10 +307,13 @@ pyinstaller --onefile mnemos-cli.spec
 ### 4.1 MCP consolidation (unified tool source + IRIS integration)
 
 **Current state:**
-- `mcp_server.py` — stdio MCP server (13 tools, ~500 LOC).
-- `api/mcp_tools.py` — REST endpoints that correspond to MCP tools.
-- `api/iris/server.py` — separate MCP server for IRIS (model + operations discovery).
-- Drift risk: multiple MCP servers, separate tool implementations.
+- `mcp_server.py` and `mcp_http_server.py` — MNEMOS stdio and HTTP/SSE MCP
+  transports sharing the same 18-tool registry.
+- `api/mcp_tools.py` — current canonical MNEMOS MCP tool registry.
+- `api/iris/server.py` — planned separate MCP server for IRIS once IRIS exists
+  (model + operations discovery).
+- Drift risk: future IRIS work could reintroduce multiple MCP servers and
+  separate tool implementations if it is not consolidated deliberately.
 
 **Strategic decision:** Instead of two separate MCP servers (MNEMOS + IRIS), consolidate into **one canonical MCP server** with two tool families.
 
@@ -435,7 +438,7 @@ pyinstaller --onefile mnemos-cli.spec
 ### 5.2 MNEMOS audit log → KRONOS feed (with IRIS integration)
 
 **Pattern:**
-- Every memory operation (create, update, retrieval) records to `audit_log` (v3.5).
+- Every memory operation (create, update, retrieval) records to the planned v4 operational audit log. v3.5.x already has GRAEAE hash-chain audit, webhook delivery audit rows, compression contest audit, and version DAG snapshots, but not one generic `audit_log` table for every memory operation.
 - Every APOLLO/APOLLO S-IVB dream/archival operation records to `etlantis_operations_log` (v4.0, see §3.2).
 - KRONOS worker subscribes to both via NATS JetStream (or polls periodically; cheaper).
 - Per-tenant windows: `memory_creates_per_minute`, `memory_retrievals_per_minute`, `embedding_quality_score`, `compression_ratio_mean`, `dream_generation_cost_usd`, etc.
@@ -560,7 +563,7 @@ pyinstaller --onefile mnemos-cli.spec
 | Tool | Risk | Mitigation |
 |---|---|---|
 | `memories_search` | Info disclosure (peer tenant data) | Enforce owner_id filter; return 403 on cross-tenant. |
-| `memories_create` | Quota DOS | Rate-limit per tenant (already in v3.5 audit log). |
+| `memories_create` | Quota DOS | Rate-limit per tenant and record decisions in the planned v4 operational audit log. |
 | `memories_retrieve` | Info disclosure | Enforce owner_id; 404 on other tenant's memory. |
 | `memories_delete` | Data loss | Require confirmation token; soft-delete only. |
 | `kg_search` | Info disclosure | Enforce owner_id filter. |
@@ -769,8 +772,8 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 | APOLLO | sun god / oracle | convergent compression (S-IC, S-II, S-IVB) | ✅ complete + hot-paths |
 | CHARON | ferryman | cross-system portability | ✅ v0.2 |
 | GRAEAE | gray sisters | multi-LLM consensus | ✅ core |
-| PANTHEON | temple of all gods | unified LLM gateway | ✅ v0.1 |
-| IRIS | messenger of the gods | MCP discovery + capability-based selection (models + all ETLANTIS ops) | ✅ expanded operations discovery |
+| PANTHEON | temple of all gods | unified LLM gateway | 🔵 prerequisite / planned |
+| IRIS | messenger of the gods | MCP discovery + capability-based selection (models + all ETLANTIS ops) | 🔵 planned expansion |
 | KRONOS | titan of time | time-series anomaly + forecasting | ✅ Tesseract integrated |
 | PERSEPHONE | queen of the underworld | archival subsystem | ✅ v3.6 |
 
@@ -778,7 +781,7 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 
 ## 15. Cross-references
 
-- **v3.5 charter:** PANTHEON v0.1 + IRIS v0.1, operational hardening, APOLLO EXTRACT phase 4.
+- **v3.5 shipped reality:** audit hardening, uniform tenancy, webhook retry/outbox discipline, MCP registry parity, faithful OpenAI compatibility, streaming-replication doctrine, compression cleanup, and documentation triage in v3.5.1. PANTHEON/IRIS and APOLLO EXTRACT did not ship in v3.5.x.
 - **v3.6 charter:** CONSOLIDATE, PERSEPHONE, APOLLO S-IVB phases 3–4, IRIS second-wave adoption.
 - **v4.0 plan:** API consolidation, IRIS operations discovery expansion, unified MCP server, KRONOS integration.
 - **ROADMAP.md:** Full history + audit log.

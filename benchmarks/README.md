@@ -1,8 +1,8 @@
 # Compression benchmarks
 
-Real-inference benchmarks of the v3.3 S-II compression stack
-(LETHE + ANAMNESIS + APOLLO, with optional judge-LLM and cross-
-encoder scorer). Purpose: answer the empirical question "is
+Real-inference benchmarks of the current compression stack
+(ARTEMIS + APOLLO, with optional judge-LLM and cross-encoder
+scorer). Purpose: answer the empirical question "is
 APOLLO effective, and under what conditions?" with enough data
 to be more than directional.
 
@@ -18,7 +18,7 @@ seven categories:
 | person | 8 | APOLLO PersonSchema (labeled + loose forms) |
 | event | 8 | APOLLO EventSchema (date + type) |
 | technical | 10 | APOLLO LLM fallback (prose) |
-| fact | 6 | APOLLO LLM fallback vs ANAMNESIS fact extraction |
+| fact | 6 | APOLLO LLM fallback vs ARTEMIS extractive compression |
 | short | 4 | min-content-length gate behavior |
 
 Hand-curated to give each engine's default-case a fair sample.
@@ -59,11 +59,11 @@ Report sections:
 - **Win distribution by category** — per-category winners so you
   can see "APOLLO wins portfolio but loses decision" patterns.
 - **Judge fidelity distribution** — per-engine mean/median/p5/p95.
-  A judge that's harsh on LETHE (p5 < 0.70 quality floor) is
+  A judge that's harsh on ARTEMIS (p5 < 0.70 quality floor) is
   what lets APOLLO's LLM-fallback wins materialize.
 - **Per-engine latency** — for Gemma-class models the floor is
-  ~3s for ANAMNESIS and ~1s for APOLLO fallback; LETHE schema-
-  path is microseconds.
+  roughly microseconds to milliseconds for ARTEMIS and APOLLO schema paths,
+  and ~1s+ for APOLLO fallback when it calls the GPU endpoint.
 - **APOLLO execution-path breakdown** — schema-matches by schema,
   fallback invocations, parse errors.
 - **Cross-judge correlation** (ensemble mode only) — Spearman +
@@ -81,7 +81,7 @@ Report sections:
   that its dense form is better for LLM-to-LLM wire use than
   prose. The benchmark measures whether the judge likes APOLLO's
   output; it does NOT measure whether a downstream LLM actually
-  performs better when fed APOLLO's dense form vs LETHE's extract.
+  performs better when fed APOLLO's dense form vs ARTEMIS's extract.
   That requires a separate task-based evaluation (retrieval QA,
   agent tool-use accuracy, etc.).
 - Real-corpus distribution. 50 hand-curated memories is enough to

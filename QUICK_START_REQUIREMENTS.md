@@ -1,6 +1,6 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: latest tag v3.4.1 and current v3.5-dev branch
+**Applies to**: current v3.5.x release line
 **TL;DR**: Python 3.11+, PostgreSQL 16, 8GB RAM, 50GB disk
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
 
@@ -73,8 +73,8 @@ curl http://localhost:5002/health
 
 For existing Docker volumes, `docker compose up -d` also runs the
 one-shot `postgres-upgrade` service before MNEMOS starts. This applies
-the v3.5 trigger migration because Postgres initdb scripts do not rerun
-on already-initialized volumes.
+the v3.5.x migration tail because Postgres initdb scripts do not rerun on
+already-initialized volumes.
 
 ---
 
@@ -312,6 +312,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: v3.5-dev branch; latest tag v3.4.1
-**Updated**: 2026-04-26
+**Version**: v3.5.x; v3.5.1 documentation-triage patch
+**Updated**: 2026-04-28
 **Accuracy**: Production-verified

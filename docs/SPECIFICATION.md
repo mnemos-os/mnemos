@@ -1,7 +1,7 @@
 # MNEMOS Specification
 
-**Version**: v3.5-dev branch (unreleased; latest tag v3.4.1)
-**Status**: Authoritative for the checked-out branch. Behavior not
+**Version**: v3.5.x current; v3.5.0 shipped 2026-04-28, v3.5.1 is the 2026-04-28 documentation-triage patch
+**Status**: Authoritative for the checked-out v3.5.x tree. Behavior not
 described here is either undefined (report as a bug) or scoped to a
 future release via `ROADMAP.md`.
 **Purpose**: supply enough structural detail that a scoping tool
@@ -40,7 +40,7 @@ been externalized.
 
 ## 2. System Scope
 
-### 2.1 In scope at v3.5-dev
+### 2.1 In scope at v3.5.x
 
 - **Memory**: CRUD, search (FTS + pgvector), DAG versioning with
   branch/merge, knowledge-graph triples, categories + namespaces,
@@ -54,33 +54,43 @@ been externalized.
   compressed memory context injection, propagated generation controls,
   SSE streaming, and explicit pass-or-400 handling for provider-specific
   tool/format/multimodal support.
-- **Sessions**: multi-turn conversation state with per-tier memory
-  injection.
+- **Sessions**: multi-turn conversation state with memory injection at turn
+  boundaries. Legacy session compression columns were removed in v3.5.
 - **Tenancy**: per-user `owner_id` + `namespace` two-axis gate; root
   role bypasses both. Live memory reads use owner/federation/world/group
   visibility; version and DAG history use per-snapshot visibility.
 - **Auth**: Bearer API keys (`/admin/users/{id}/apikeys`), OAuth /
   OIDC browser login (authlib), RLS-capable schema.
 - **Federation**: pull-based cross-instance sync with Bearer-auth
-  peers, per-memory opt-in, loop-prevention via `federation_source`.
-- **Webhooks**: SSRF-hardened outbound delivery with HMAC signing.
+  peers, schema-compat preflight, compound feed cursor, per-memory opt-in,
+  and loop-prevention via `federation_source`.
+- **Webhooks**: SSRF-hardened outbound delivery with HMAC signing, persisted
+  leases, retry-chain convergence, and terminal-success database guard.
 - **Portability**: MPF v0.1.x export + import with sidecars, Docling-based document
   ingest (optional extra).
 - **Observability**: request-ID ContextVar, Prometheus `/metrics`,
   OpenTelemetry spans (opt-in), structured JSON logs (opt-in).
-- **Two-protocol surface**: REST over HTTP (101 route declarations in
-  the current handlers) + MCP
-  stdio server (13 tools).
+- **MORPHEUS**: operator-triggered dream-state runs with REPLAY / CLUSTER /
+  SYNTHESISE / COMMIT phases, cluster introspection, namespace scoping, and
+  rollback by `morpheus_run_id`.
+- **Recall tracking**: search hits increment `recall_count` and stamp
+  `last_recalled_at` asynchronously.
+- **Two-protocol surface**: REST over HTTP (102 mounted application routes,
+  excluding FastAPI's generated docs/openapi routes) + MCP over stdio and
+  HTTP/SSE from one registry (18 tools).
 
-### 2.2 Explicitly out of scope at v3.5-dev
+### 2.2 Explicitly out of scope at v3.5.x
 
 - Horizontal scaling past `workers=1`. GRAEAE reliability primitives
   (circuit breakers, rate limiters, concurrency guards) are
   process-local singletons; shared-state refactor remains future work.
-- Webhook retry state machine (#20), bulk webhook parity (#19), audit
-  endpoint scoping/lifespan teardown (#22), federation per-peer ACL +
-  stable cursor (#21), entity namespace conflict-key migration (#23),
-  and deletion-log refactor (#15).
+- Full per-memory deletion-log / GDPR wipe subsystem. v3.5 keeps DELETE
+  tombstone snapshots live in the version DAG, but it does not add a separate
+  deletion-log table.
+- Federation per-peer ACL beyond the current peer credentials, namespace
+  filters, category filters, and feed role gate.
+- PERSEPHONE archival and MORPHEUS mutation paths (consolidate / archive /
+  extract). These remain v3.6+ work.
 - SQLite backend. Current backend is Postgres-only; SQLite +
   sqlite-vec for embedded tier is v4/lite-profile work.
 
@@ -128,7 +138,7 @@ semaphore. Reliability primitives are process-local; see §7.
 | ID | REST router | DB tables | Role |
 |----|-------------|-----------|------|
 | openai_compat | `api/handlers/openai_compat.py` | (reads `model_registry`, writes `session_messages`) | OpenAI-compatible `/v1/chat/completions` + registry-honest `/v1/models` with compression-aware memory injection, SSE streaming, and provider capability validation |
-| sessions     | `api/handlers/sessions.py`     | `sessions`, `session_messages`, `session_memory_injections` | Multi-turn conversation state, per-tier memory injection |
+| sessions     | `api/handlers/sessions.py`     | `sessions`, `session_messages`, `session_memory_injections` | Multi-turn conversation state, owner+namespace scoped, memory injection at turn boundaries |
 | health       | `api/handlers/health.py`       | (reads `memory_stats`) | Liveness + readiness + statistics |
 
 ### 3.4 Tenancy + auth (4 subsystems)
@@ -144,8 +154,8 @@ semaphore. Reliability primitives are process-local; see §7.
 
 | ID | REST router | DB tables | Role |
 |----|-------------|-----------|------|
-| federation | `api/handlers/federation.py` | `federation_peers`, `federation_sync_log` | Pull-based cross-instance memory sync; `owner_id='federation'` sentinel + `federation_source` loop guard |
-| webhooks   | `api/handlers/webhooks.py`   | `webhook_subscriptions`, `webhook_deliveries` | Outbound delivery with SSRF-hardened URL allowlist, HMAC signing, retry queue |
+| federation | `api/handlers/federation.py` | `federation_peers`, `federation_sync_log` | Pull-based cross-instance memory sync; schema preflight; compound cursor; `owner_id='federation'` sentinel + `federation_source` loop guard |
+| webhooks   | `api/handlers/webhooks.py`   | `webhook_subscriptions`, `webhook_deliveries` | Outbound delivery with SSRF-hardened URL allowlist, HMAC signing, persisted leases, repair/recovery workers, retry-chain guards |
 
 ### 3.6 Portability (3 subsystems)
 
@@ -173,7 +183,7 @@ Tracing → Prometheus → BodySizeLimit → handler.
 | ID | Module | Role |
 |----|--------|------|
 | distillation_worker | `distillation_worker.py` | Drains `memory_compression_queue` via `process_contest_queue`; runs ARTEMIS + APOLLO engines in parallel per memory; writes winner to `memory_compressed_variants` + full audit to `memory_compression_candidates`; stranded-running sweep at batch head |
-| registry_sync      | `modules/registry_sync.py` | Scheduled pull from provider APIs + Arena.ai Elo rankings into `model_registry` |
+| registry_sync      | `scripts/sync_provider_models.py` + `systemd/graeae-model-sync.timer` | Scheduled pull from provider APIs + Arena.ai/LMArena rankings into `model_registry` |
 
 ### 3.9 Compression platform (2 active engines + plugin ABC)
 
@@ -192,8 +202,8 @@ GPU circuit breaker (per-endpoint, process-local): `compression/gpu_guard.py`.
 
 | Protocol | Entry point | Tools / endpoints |
 |----------|-------------|-------------------|
-| REST over HTTP | `api_server.py` (uvicorn on port 5002) | 101 route declarations across 21 routers |
-| MCP stdio      | `mcp_server.py`                         | 13 tools (§5.2) |
+| REST over HTTP | `api_server.py` (uvicorn on port 5002) | 102 mounted application routes across 21 routers, excluding generated docs/openapi routes |
+| MCP stdio + HTTP/SSE | `mcp_server.py`, `mcp_http_server.py` | 18 tools (§5.2) from `api/mcp_tools.py::TOOL_REGISTRY` |
 
 ## 4. Data Model
 
@@ -211,7 +221,7 @@ GPU circuit breaker (per-endpoint, process-local): `compression/gpu_guard.py`.
 | 8 | `kg_triples`                     | owner_id, namespace | Subject/predicate/object with embeddings on each leg |
 | 9 | `entities`                       | owner_id, namespace | Named entity registry |
 | 10 | `state`                         | owner_id, namespace | Arbitrary k/v |
-| 11 | `journal`                       | owner_id            | Append-only operational log |
+| 11 | `journal`                       | owner_id, namespace | Append-only operational log |
 | 12 | `users`                         | —                   | Accounts (role: user / root / federation), `namespace` column |
 | 13 | `api_keys`                      | (FK user_id)        | Hashed Bearer tokens |
 | 14 | `groups`                        | —                   | Group memberships |
@@ -219,10 +229,10 @@ GPU circuit breaker (per-endpoint, process-local): `compression/gpu_guard.py`.
 | 16 | `oauth_providers`               | —                   | OIDC provider configuration |
 | 17 | `oauth_identities`              | (FK user_id)        | Linked external identities |
 | 18 | `oauth_sessions`                | (FK user_id)        | Active OIDC sessions |
-| 19 | `sessions`                      | owner_id            | Chat session metadata |
+| 19 | `sessions`                      | user_id, namespace  | Chat session metadata |
 | 20 | `session_messages`              | (FK session)        | Per-turn messages |
 | 21 | `session_memory_injections`     | (FK session)        | Which memories were injected into which turn |
-| 22 | `graeae_consultations`          | owner_id            | GRAEAE consultation rows (prompt + consensus + cost + latency) |
+| 22 | `graeae_consultations`          | owner_id, namespace | GRAEAE consultation rows (prompt + consensus + cost + latency) |
 | 23 | `graeae_audit_log`              | (FK consultation)   | Hash-chained audit (prev_hash → current_hash) |
 | 24 | `consultation_memory_refs`      | (FK consultation)   | Memories referenced by a consultation |
 | 25 | `model_registry`                | —                   | Provider × model catalog with Elo, cost, deprecated flags |
@@ -245,7 +255,7 @@ extension). Default embedding dimension is 768; configurable via
 **Content-addressed column**: `memory_versions.commit_hash` (SHA-256
 of memory_id + version_num + content + snapshot_at). Unique index.
 
-### 4.2 Migrations (24 files)
+### 4.2 Migrations (38 files)
 
 SQL migrations in `db/` are idempotent. Canonical order is the ordered
 list in `install.py` and `installer/db.py`, mirrored by
@@ -275,6 +285,20 @@ list in `install.py` and `installer/db.py`, mirrored by
 22. `migrations_charon_trigger_guard.sql` (trigger suppression guard)
 23. `migrations_v3_4_federation_compat.sql` (schema preflight fields)
 24. `migrations_v3_5_trigger_same_memory_parent.sql` (same-memory branch HEAD guard; `MN001`)
+25. `migrations_v3_5_rls_group_select_unix_bits.sql` (RLS group-read parity)
+26. `migrations_v3_5_webhook_retry_terminal_state.sql` (retry terminal-state repair)
+27. `migrations_v3_5_webhook_attempt_lease.sql` (persisted webhook leases)
+28. `migrations_v3_5_webhook_writer_revision.sql` (current-writer marker)
+29. `migrations_v3_5_webhook_status_updated_at.sql` (status transition timestamp)
+30. `migrations_v3_5_webhook_superseded_marker.sql` (superseded audit marker)
+31. `migrations_v3_5_webhook_attempt_unique.sql` (live successor uniqueness)
+32. `migrations_v3_5_webhook_succeeded_unique.sql` (single succeeded chain peer)
+33. `migrations_v3_5_webhook_succeeded_terminal_trigger.sql` (terminal success guard)
+34. `migrations_v3_5_entities_namespace_unique.sql` (entity uniqueness includes namespace)
+35. `migrations_v3_5_state_journal_namespace.sql` (state/journal namespace columns)
+36. `migrations_v3_5_session_compression_ratio_drop.sql` (drop fiction ratio columns)
+37. `migrations_v3_5_session_compression_legacy_drop.sql` (drop legacy session compression fields)
+38. `migrations_v3_5_sessions_consultations_namespace.sql` (sessions/consultations namespace)
 
 All migrations pattern: `BEGIN; <add-column>/<backfill>/<set-default>
 /<set-not-null>/<add-constraint>; COMMIT;`. Idempotent via
@@ -295,8 +319,8 @@ belongs to the same memory before ordinary UPDATE/DELETE writes.
 | I1 | Every `memory_versions` row has a `commit_hash`; the hash is deterministic (same content → same hash). |
 | I2 | `memory_versions` has FK-less memory_id (versions survive memory deletion). |
 | I3 | `memory_branches` HEAD pointer on `main` is strictly increasing in `version_num` per memory. |
-| I4 | `memory_compressed_variants` has exactly one row per memory_id per engine_id (UNIQUE on `(memory_id, engine_id)`). |
-| I5 | `memory_compression_candidates` has exactly one `is_winner=TRUE` per `(memory_id, contest_run_id)`. |
+| I4 | `memory_compressed_variants` has at most one current winning row per memory_id (primary key on `memory_id`). |
+| I5 | `memory_compression_candidates` records every attempt per contest; a completed contest selects one winner into `memory_compressed_variants`, while historical winning candidates remain in the candidate log. |
 | I6 | `graeae_audit_log` is a hash-chain: each row's `prev_hash` equals the previous row's `commit_hash` within the same consultation. |
 | I7 | Non-root live-memory reads use the shared owner/federation/world/group predicate from `api/visibility.py:40-96`; writes remain owner+namespace scoped. |
 | I8 | Non-root historical reads use the snapshot's own `owner_id`, `namespace`, and `permission_mode`; live-memory visibility does not authorize hidden old snapshots. |
@@ -305,7 +329,8 @@ belongs to the same memory before ordinary UPDATE/DELETE writes.
 | I11 | `federation_source IS NOT NULL ⇒ owner_id='federation'`. |
 | I12 | Non-root writes on tenant-scoped tables filter by `owner_id = current_user.owner_id AND namespace = current_user.namespace`. Root role bypasses both. |
 | I13 | Webhook URLs are validated at subscribe time and delivery time, including DNS resolution and metadata-host denial. |
-| I14 | API keys persisted as `sha256(token)`; tokens never stored plaintext. |
+| I14 | Webhook retry chains have at most one live successor attempt per attempt number and one terminal succeeded row per `(subscription_id, event_type, payload_hash)` chain. |
+| I15 | API keys persisted as `sha256(token)`; tokens never stored plaintext. |
 
 ## 5. Interface Contracts
 
@@ -317,21 +342,22 @@ Surface breakdown:
 |------|-----------|---------------------|
 | Memories CRUD + search | 10 | `POST /v1/memories/search`, `GET /v1/memories/{id}`, `POST /v1/memories/rehydrate` |
 | Versioning + DAG | 9 | `GET /v1/memories/{id}/versions`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge` |
-| Knowledge graph | 6 | `POST /v1/kg/triples`, `POST /v1/kg/search`, `GET /v1/kg/timeline` |
-| Entities | 5 | `POST /v1/entities`, `GET /v1/entities/{id}` |
-| State | 4 | `GET /v1/state/{key}`, `PUT /v1/state/{key}` |
-| Journal | 3 | `GET /v1/journal`, `POST /v1/journal/append` |
-| Sessions | 6 | `POST /v1/sessions`, `POST /v1/sessions/{id}/messages` |
-| Consultations (GRAEAE) | 8 | `POST /v1/consultations`, `GET /v1/consultations/audit/verify` |
-| Providers + registry | 6 | `GET /v1/providers`, `GET /v1/models`, `POST /v1/providers/{id}/health` |
-| Gateway (OpenAI-compat) | 3 | `POST /v1/chat/completions`, `GET /v1/models` |
-| Federation | 5 | `POST /v1/federation/peers`, `POST /v1/federation/pull` |
+| Knowledge graph | 5 | `POST /v1/kg/triples`, `GET /v1/kg/triples`, `GET /v1/kg/timeline/{subject}` |
+| Entities | 7 | `POST /entities`, `GET /entities/{id}`, `POST /entities/{id}/link` |
+| State | 4 | `GET /state/{key}`, `PUT /state/{key}` |
+| Journal | 3 | `GET /journal`, `POST /journal` |
+| Sessions | 5 | `POST /v1/sessions`, `POST /v1/sessions/{id}/messages` |
+| Consultations (GRAEAE) | 7 | `POST /v1/consultations`, `GET /v1/consultations/audit/verify` |
+| Providers + registry | 5 | `GET /v1/providers`, `GET /v1/providers/health`, `GET /v1/providers/recommend`, `GET /v1/models` |
+| Gateway (OpenAI-compat) | 1 | `POST /v1/chat/completions` |
+| Federation | 10 | `POST /v1/federation/peers`, `GET /v1/federation/feed`, `GET /v1/federation/schema` |
 | Webhooks | 5 | `POST /v1/webhooks`, `GET /v1/webhooks/{id}/deliveries` |
-| Ingest | 3 | `POST /v1/ingest/bulk`, `POST /v1/document-import` |
+| Ingest + documents | 3 | `POST /ingest/session`, `POST /v1/documents/import`, `POST /v1/documents/batch-import` |
 | Portability (MPF) | 2 | `GET /v1/export`, `POST /v1/import` |
-| Admin | 12 | `POST /admin/users`, `POST /admin/users/{id}/apikeys`, `POST /admin/compression/enqueue-all` |
-| OAuth | 4 | `GET /oauth/{provider}/authorize`, `GET /oauth/{provider}/callback` |
+| Admin | 15 | `POST /admin/users`, `POST /admin/users/{id}/apikeys`, `POST /admin/compression/enqueue-all` |
+| OAuth | 5 | `GET /auth/oauth/{provider}/login`, `GET /auth/oauth/{provider}/callback` |
 | Health + metrics | 3 | `GET /health`, `GET /stats`, `GET /metrics` |
+| MORPHEUS | 3 | `GET /v1/morpheus/runs`, `GET /v1/morpheus/runs/{id}`, `GET /v1/morpheus/runs/{id}/clusters` |
 
 All REST endpoints use Pydantic request/response models (defined in
 `api/models.py`). All non-public endpoints require Bearer auth or
@@ -343,14 +369,15 @@ Rate limiting: SlowAPI, opt-in via `RATE_LIMIT_ENABLED=true`.
 Body size: default 5 MB, `MAX_BODY_BYTES` override. Chunked-transfer
 aware streaming limiter (not just Content-Length check).
 
-### 5.2 MCP (stdio, 13 tools)
+### 5.2 MCP (stdio and HTTP/SSE, 18 tools)
 
-Entry point: `mcp_server.py`. Tool manifest:
+Entry points: `mcp_server.py` and `mcp_http_server.py`. Both use
+`api/mcp_tools.py::TOOL_REGISTRY`. Tool manifest:
 
 | Tool | Maps to REST |
 |------|--------------|
 | `create_memory`       | `POST /v1/memories` |
-| `bulk_create_memories`| `POST /v1/ingest/bulk` |
+| `bulk_create_memories`| `POST /v1/memories/bulk` |
 | `get_memory`          | `GET /v1/memories/{id}` |
 | `list_memories`       | `GET /v1/memories` |
 | `search_memories`     | `POST /v1/memories/search` |
@@ -358,10 +385,15 @@ Entry point: `mcp_server.py`. Tool manifest:
 | `delete_memory`       | `DELETE /v1/memories/{id}` |
 | `get_stats`           | `GET /stats` |
 | `kg_create_triple`    | `POST /v1/kg/triples` |
-| `kg_search`           | `POST /v1/kg/search` |
+| `kg_search`           | `GET /v1/kg/triples` |
 | `kg_timeline`         | `GET /v1/kg/timeline` |
 | `update_triple`       | `PATCH /v1/kg/triples/{id}` |
 | `delete_triple`       | `DELETE /v1/kg/triples/{id}` |
+| `log_memory`          | `GET /v1/memories/{id}/log` |
+| `branch_memory`       | `POST /v1/memories/{id}/branch` |
+| `diff_memory_commits` | DAG commit diff helper |
+| `checkout_memory`     | `GET /v1/memories/{id}/commits/{commit}` |
+| `recommend_model`     | `GET /v1/providers/recommend` |
 
 MCP contract-wire regression test: `tests/test_mcp_stdio_wire.py`.
 
@@ -663,12 +695,15 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v3.5-dev)
+### 10.4 Known gaps (as of v3.5.x)
 
-- Webhook retry state machine (#20), federation per-peer ACL/stable
-  cursor (#21), audit endpoint scoping/lifespan teardown (#22), entity
-  namespace conflict-key migration (#23), bulk webhook parity (#19), and
-  deletion-log refactor (#15).
+- Horizontal process scaling still requires externalized circuit breakers,
+  rate limiters, dispatch semaphores, and recovery-worker coordination.
+- Full deletion-log/GDPR wipe workflow is not present. DELETE tombstone
+  snapshots exist in the version DAG when the delete trigger is attached, but
+  no separate deletion-log table ships in v3.5.x.
+- Federation per-peer ACLs beyond bearer identity, role gate, namespace
+  filters, and category filters remain future work.
 - No in-process secrets encryption layer (values read from env + config
   files directly).
 
@@ -693,8 +728,8 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
 ### 11.3 Horizontal scaling
 
 **Currently pinned to `workers=1`.** GRAEAE circuit breakers, rate
-limiters, and concurrency semaphores are in-process state. Moving
-them to Redis-backed shared singletons is v3.3 work.
+limiters, dispatch semaphores, and recovery workers are in-process state.
+Moving them to shared/external coordination is v4 work.
 
 ### 11.4 Backup / restore
 
@@ -704,20 +739,20 @@ them to Redis-backed shared singletons is v3.3 work.
 
 ## 12. Complexity Indicators
 
-Raw metrics at v3.5-dev slice 2 (`d42c475`), measured from the checked-out tree unless noted.
+Raw metrics at v3.5.x (`d8a035b`), measured from the checked-out tree unless noted.
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Total Python LOC | ~57,000 | Excludes virtualenvs; simple `wc -l` over Python files |
-| Production LOC | ~36,700 | api + compression + graeae + installer + modules + scripts/tools |
-| Test LOC | ~17,800 | tests/ only |
-| Python files | 176 | Primary modules + tests |
-| Test files | 60 | Unit + integration + live-gated E2E |
-| Test count | 768 passing on merged slice 2 | Reported by the v3.5-dev slice 2 merge context |
-| REST endpoints | 101 route declarations | Across 21 routers |
-| MCP tools | 13 | Memory CRUD + KG + stats |
+| Total Python LOC | ~67,000 | Excludes virtualenvs; simple `wc -l` over Python files |
+| Production LOC | ~40,800 | api + compression + graeae + installer + modules + scripts/tools + morpheus |
+| Test LOC | ~24,900 | tests/ only |
+| Python files | 185 | Primary modules + tests |
+| Test files | 74 | Unit + integration + live-gated E2E |
+| Test count | ~900 collected definitions | `rg "def test_|async def test_" tests` count; DB-gated tests are selectively ignored in CI/doc sweeps |
+| REST endpoints | 102 mounted application routes | Across 21 routers; excludes generated FastAPI docs/openapi routes |
+| MCP tools | 18 | Memory CRUD + KG + stats + DAG + model recommendation |
 | DB tables | 32 | See §4.1 |
-| Migrations | 24 SQL files | Idempotent, ordered |
+| Migrations | 38 ordered SQL migrations | Idempotent, ordered |
 | Named concepts | ~40 | See Appendix H |
 | External service protocols | 4 | Postgres wire, HTTP (providers + peers + webhooks + GPU), OAuth/OIDC, MCP stdio |
 | Required Python deps | 18 | See §8.2 |
@@ -769,9 +804,9 @@ A scoping tool estimating cost from scratch should bucket:
 | Install / config / ops | 1.0× baseline | Not trivial (profiles, migrations, service unit, Docker) |
 
 Roughly **11-14 full-bucket subsystems** at baseline equivalence. The
-current branch is about 36k LOC of production Python plus 18k LOC of
-tests; v3.5-dev slice 2 added focused tenancy/DAG regressions rather
-than a new user-facing subsystem.
+current branch is about 41k LOC of production Python plus 25k LOC of
+tests; v3.5.0 added hardening and tenancy closure rather than a new
+standalone user-facing subsystem.
 
 ## 13. Version history (summary)
 
@@ -789,8 +824,7 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
   import, Custom Query mode on consultations, engine-consistent
   consultation persistence, middleware LIFO fix, probe-identity
   handshake on GPUGuard.
-- **v3.2 tail** — ALETHEIA retired; APOLLO S-IC + S-II landed;
-  going-forward stack is LETHE + ANAMNESIS + APOLLO.
+- **v3.2 tail** — ALETHEIA retired from default contests; APOLLO S-IC + S-II landed.
 - **v3.2.1** — registry-driven GRAEAE muse manifest with ELO-override
   + newer-version override + live-probe + n-1 fallback; non-blocking
   startup reload; gateway provider/model namespacing; gateway prefix-
@@ -822,13 +856,20 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
   checks.
 - **v3.4.1** — federation schema-compat preflight and dev↔prod MPF
   restore drill.
-- **v3.5-dev slice 1** — session history DESC fix and
+- **v3.5.0 slice 1** — session history DESC fix and
   `mnemos-os/mnemos` URL sweep (`a62a099`).
-- **v3.5-dev slice 2** — shared live-memory read visibility,
+- **v3.5.0 slice 2** — shared live-memory read visibility,
   per-snapshot version visibility, same-memory DAG guards, race-safe
   branch creation, feature-branch revert as pure DAG insert, merge
   target-tenancy semantics, `MN001` → HTTP 409, and Docker
   `postgres-upgrade` for existing volumes (`d42c475`).
+- **v3.5.0 final hardening** — webhook retry leases/outbox discipline,
+  consultation audit scoping, MCP stdio/HTTP registry parity, faithful
+  OpenAI-compatible gateway handling, PostgreSQL streaming-replication
+  doctrine, namespace-uniform state/journal/entities/sessions/consultations,
+  bulk webhook parity, compression cleanup, and audit closure passes.
+- **v3.5.1** — documentation-triage patch and version metadata correction;
+  no product behavior changes from v3.5.0.
 
 ---
 
@@ -843,9 +884,9 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
 13. admin          14. oauth          15. federation
 16. webhooks       17. ingest         18. portability
 19. document_import 20. distillation_worker 21. registry_sync
-22. MCP stdio server
+22. MCP stdio/HTTP server
 
-## B. REST endpoint inventory (101 route declarations, router-grouped)
+## B. REST endpoint inventory (102 mounted application routes, router-grouped)
 
 (see §5.1 for the count breakdown; full list in the router modules
 at `api/handlers/*.py`)
@@ -864,11 +905,11 @@ session_memory_injections, session_messages, sessions, state,
 user_groups, users, webhook_deliveries, webhook_subscriptions,
 memory_stats.
 
-## D. Migration inventory (24)
+## D. Migration inventory (38)
 
 Ordered as applied (see §4.2 for detail).
 
-## E. Test inventory (59 test files)
+## E. Test inventory (74 test files)
 
 Unit + integration + live-GPU-gated E2E:
 

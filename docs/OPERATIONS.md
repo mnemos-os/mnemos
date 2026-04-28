@@ -41,7 +41,7 @@ What this doc does NOT cover:
                      /         \
                     /           \
               PYTHIA (.67)    CERBERUS (.96)
-              v3.4.1 prod     dark prod / GPU host
+              v3.5.x prod     dark prod / GPU host
               pg17 primary    standby + inference
               11,756 memories + Apollo Gemma 4 (ports 8080/8081)
               5,045 compressions
@@ -64,14 +64,14 @@ What this doc does NOT cover:
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v3.4.1 tag | ✅ Operational |
-| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v3.4.x family | ✅ Operational |
-| **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / v3.5-dev during branch work | ✅ Used for drills |
+| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v3.5.x stable target | ✅ Operational |
+| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v3.5.x stable target | ✅ Operational |
+| **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
 | **ARGONAS** | 192.168.207.101 | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
 ### 2.3 Network & authentication
 
-> **⚠️ Current-state caveat (verified 2026-04-26):** The nginx running on ARGONAS today is the TrueNAS web UI proxy, **NOT** a MNEMOS HTTP load balancer. All `proxy_pass` entries route to `127.0.0.1:6000` (TrueNAS middleware). There is **no HTTP LB in front of MNEMOS today** — clients hit PYTHIA at `192.168.207.67:5002` directly. CERBERUS `:5003` is currently *dark prod* (running but not externally routed). Standing up a real LB on ARGONAS (or elsewhere) is a **v3.5 prerequisite** for the blue-green deploy pattern below to function. Until that's done, "drain a node" means "stop sending it traffic from clients you control" — there's no upstream pool to manipulate.
+> **Current-state caveat (verified 2026-04-26):** The nginx running on ARGONAS today is the TrueNAS web UI proxy, **NOT** a MNEMOS HTTP load balancer. All `proxy_pass` entries route to `127.0.0.1:6000` (TrueNAS middleware). There is **no HTTP LB in front of MNEMOS today** — clients hit PYTHIA at `192.168.207.67:5002` directly. CERBERUS `:5003` is currently *dark prod* (running but not externally routed). Standing up a real LB on ARGONAS (or elsewhere) is a **production rollout prerequisite** for the blue-green deploy pattern below to function. Until that's done, "drain a node" means "stop sending it traffic from clients you control" — there's no upstream pool to manipulate.
 
 - **External (planned):** ARGONAS nginx LB listens on :80 (http) and :443 (https); backends are PYTHIA + CERBERUS on private :5002 + :5003. Status: NOT YET CONFIGURED.
 - **External (today):** Clients hit PYTHIA `192.168.207.67:5002` directly. No fronting LB.
@@ -88,8 +88,8 @@ Production MNEMOS runs on a **canary + ratchet** model: new features bake in sta
 
 | Tier | Host(s) | Version target | Stability | Deployment source |
 |---|---|---|---|---|
-| **Prod** | PYTHIA + CERBERUS | *latest stable* (v3.4.1 tag) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
-| **Staging** | PROTEUS | *latest cut* (`v3.5-dev` while in flight) | alpha/rc, real federation | release branch, merged + tagged |
+| **Prod** | PYTHIA + CERBERUS | *latest stable* (v3.5.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
+| **Staging** | PROTEUS | *latest cut* / next release branch | alpha/rc, real federation | release branch, merged + tagged |
 | **Test** | docker-compose + mnemos-test-pg on CERBERUS | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
 
 **Promotion path:**
@@ -389,7 +389,7 @@ pg_dump -U postgres mnemos | gzip > \
 
 ### 6.3 Restore procedure (quarterly drill)
 
-**Status:** Dev↔prod MPF restore drill documented and run for v3.4.1.
+**Status:** Dev↔prod MPF restore drill documented and last run for v3.4.1; repeat before high-risk v3.5.x schema work.
 Repeat quarterly and before high-risk schema work.
 
 To restore from backup to PROTEUS (test/staging host):
@@ -461,12 +461,9 @@ Response (JSON):
 ```json
 {
   "status": "healthy",
-  "version": "v3.4.1",
-  "uptime_seconds": 345600,
-  "database": "connected",
-  "replication_lag_seconds": 0.5,
-  "memory_count": 11756,
-  "compression_count": 5045
+  "version": "3.5.1",
+  "database_connected": true,
+  "distillation_worker": "healthy"
 }
 ```
 
@@ -477,9 +474,9 @@ Response (JSON):
 Simple dashboard (Grafana or custom HTML) that queries each node's `/health` and shows:
 
 ```
-PYTHIA:   v3.4.1        (uptime: 45d 3h)
-CERBERUS: v3.4.x        (dark prod / GPU host)
-PROTEUS:  v3.5-dev      (staging cut)
+PYTHIA:   3.5.1         (prod target)
+CERBERUS: 3.5.1         (dark prod / GPU host)
+PROTEUS:  next cut      (staging / restore-drill target)
 ```
 
 Update frequency: 5 minutes (sufficient for drift detection).
@@ -589,9 +586,9 @@ Implement `scripts/ops/version_check.sh` (to be written, v3.5 target):
 #!/bin/bash
 # Check each node's version vs. declared target
 
-PYTHIA_DECLARED="v3.4.1"
-CERBERUS_DECLARED="v3.4.1"
-PROTEUS_DECLARED="v3.5-dev"
+PYTHIA_DECLARED="3.5.1"
+CERBERUS_DECLARED="3.5.1"
+PROTEUS_DECLARED="next-cut"
 
 PYTHIA_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
   http://192.168.207.67:5002/health | jq -r .version)
@@ -655,14 +652,14 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 ## 11. Federation health
 
-### 11.1 Architecture (v3.5-dev current)
+### 11.1 Architecture (v3.5.x current)
 
 Federation (peer-to-peer memory sync) is specified in `api/handlers/federation.py:280-390`. Key points:
 
 - Each MNEMOS node maintains a `federation_peers` table (schema in `db/migrations_v3_federation.sql`)
 - Sync is **pull-based:** node A asks node B for updates since the last sync point
-- Cursor-based pagination (not full-dump on every sync)
-- **Status as of 2026-04-26:** Schema-compat preflight and restore drills validated against PROTEUS; peer heartbeat and per-peer ACL/stable cursor remain open v3.5 items.
+- Compound-cursor pagination over `(updated, id)` (not full-dump on every sync)
+- **Status as of 2026-04-28:** Schema-compat preflight, restore drills, and the stable compound cursor are validated. Peer heartbeat and per-peer ACL remain future work.
 
 ### 11.2 What happens when a peer is unreachable
 
@@ -724,7 +721,7 @@ Use this checklist before **any** deployment, upgrade, or migration on PYTHIA or
 - [ ] **Rollback path documented:** Write down exact git sha/tag to revert to
   ```bash
   # Save for rollback:
-  ROLLBACK_TAG=v3.4.1
+  ROLLBACK_TAG=v3.5.0
   ```
 
 - [ ] **Migration path selected:** For Docker existing volumes, confirm

@@ -10,7 +10,7 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 **Headline:** plugin-interfaced compression platform with competitive per-memory engine selection, a persisted audit log on every compression decision, and a first-class GPU batcher that works across integrated graphics, discrete GPUs, and remote OpenAI-compatible endpoints.
 
-Three engines shipped under the platform in v3.1: LETHE (extractive, CPU), ALETHEIA (LLM-assisted token importance, GPU-required), and ANAMNESIS (LLM fact extraction, GPU-optional). The going-forward stack is LETHE + ANAMNESIS + APOLLO — ALETHEIA was retired from the default contest in the v3.2 tail on the back of the 2026-04-23 benchmark (0 contest wins, index-list prompt incompatible with instruction-tuned generalist LLMs) and is scheduled for v4.0 removal. The `CompressionEngine` ABC is open: operators can register additional engines, and the first-party third engine of the going-forward stack (APOLLO — schema-aware dense encoding for LLM-to-LLM consumption) is staged across v3.3–v3.4 (see "Apollo Program" below).
+Three engines shipped under the platform in v3.1: LETHE (extractive, CPU), ALETHEIA (LLM-assisted token importance, GPU-required), and ANAMNESIS (LLM fact extraction, GPU-optional). That is historical release context, not the active v3.5.x runtime. ALETHEIA was retired from the default contest in the v3.2 tail after the 2026-04-23 benchmark, ARTEMIS and APOLLO became the active built-ins, and v3.5 removed the LETHE / ANAMNESIS / ALETHEIA modules plus the old manager/compatibility shims. The `CompressionEngine` ABC remains open for operator-registered engines.
 
 ### Tier 1 — small fixes that unblock real surfaces (shipped on master)
 
@@ -73,7 +73,7 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 - ✅ **MORPHEUS dream-state subsystem (slice 1: foundation).** v3.3.0-alpha.1 ships `morpheus_runs` table + per-row `morpheus_run_id` tagging + admin/observability API + rollback contract. Synthesis logic stubbed; slice 2 fills it in. Architecture per GRAEAE consensus 2026-04-25: append-only synthesis first, mutation paths (CONSOLIDATE / EXTRACT / ARCHIVE) deferred to v3.6+.
 - ✅ **MORPHEUS slice 2** — real cluster + synthesise phases, cron timer at 03:17 UTC, recall-frequency tracking columns (absorbed from OpenClaw dreaming patterns), per-cluster introspection artifact, per-namespace dream scoping. Landed before the v3.3 stable cut.
 
-### v3.4 — S-IVB (third stage: trans-lunar injection) — **READY TO TAG 2026-04-26**
+### v3.4 — S-IVB (third stage: trans-lunar injection) — **SHIPPED 2026-04-26**
 
 **Headline: "CHARON v0.2 — agent memory now travels."** The portability surface that turns MNEMOS into something other systems can interop with.
 
@@ -92,37 +92,40 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 - ✅ Audit-remediation log responses to the 2026-04-25 GPT critical review (8 of 13 findings closed, 1 partial, 4 deferred-by-design or carried to v4.0 — see audit log section below).
 
 **Carried forward (originally bundled with v3.4):**
-- Distill-on-ingest as default write path → **v3.5** (see `docs/V3_5_CHARTER.md`).
-- ANAMNESIS deprecation path → stays importable until **v4.0**.
-- Full round-trip fidelity benchmark as GA gate → **v3.5** (paired with embedding migration plan).
-- KNOSSOS solidify (phase 2) → **v3.5**.
-- First wave of goodwill PRs to MemPalace → **v3.5** (subject to the 3-4 PRs/24h-per-upstream rate-limit constraint per `~/.claude/rules/github-behavior.md`).
+- Distill-on-ingest as default write path → deferred after v3.5.0; compression remains operator-batched.
+- Historical ANAMNESIS deprecation path → superseded by v3.5 slice 5 removal of LETHE / ANAMNESIS / ALETHEIA modules and compatibility shims.
+- Full round-trip fidelity benchmark as GA gate → deferred after v3.5.0; MPF restore drills and schema-compat preflight shipped first.
+- KNOSSOS phase 2 and MemPalace re-engagement → deferred after v3.5.0; v3.5.x keeps the phase-1 stdio shim.
+- First wave of goodwill PRs to MemPalace → deferred after v3.5.0 (subject to the 3-4 PRs/24h-per-upstream rate-limit constraint per `~/.claude/rules/github-behavior.md`).
 
 **See:** `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md`, `docs/OPERATIONS.md` for locked scopes downstream of this tag.
 
-### v3.5-dev — branch build-up after v3.4.1 (not tagged)
+### v3.5.0 — audit hardening and uniform tenancy — **SHIPPED 2026-04-28**
 
-v3.5 is in flight on `v3.5-dev`. Closed items below are merged into the branch; open items remain candidates for later v3.5 slices or explicit deferral.
+v3.5.0 shipped the audit-driven hardening branch that followed v3.4.1. It is not the PANTHEON/IRIS feature release originally sketched in `docs/V3_5_CHARTER.md`; that charter is now historical and its unshipped feature ideas move to later roadmap work.
 
 - ✅ **Slice 1: audit quick wins** (`a62a099`). Session history now returns the most recent rows first, pins/caps system rows deterministically, and project metadata points at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`). Shared `read_visibility_predicate` gates memory list/get/search/rehydrate/gateway context; `version_visibility_predicate` gates version/log/commit/diff paths per snapshot; DAG writers use same-memory parent checks, target-head visibility gates, advisory-lock-before-row-lock ordering, race-safe branch creation, and `MN001` to HTTP 409 reconciliation.
 - ✅ **Docker existing-volume migration path** (`86f1532`, `19229d7`). `docker-compose.yml` and `docker-compose.staging.yml` run `postgres-upgrade` after Postgres is healthy so `db/migrations_v3_5_trigger_same_memory_parent.sql` applies to existing volumes, not only fresh initdb volumes.
-- ✅ **#25 RLS Unix-bit fix** (`pending commit`). `db/migrations_v3_5_rls_group_select_unix_bits.sql` replaces `mnemos_group_select` so RLS and `read_visibility_predicate` both use `((permission_mode / 10) % 10) >= 4` for group-readable rows.
-- ✅ **#20 webhook retry state machine** (`pending commit`). `api/webhook_dispatcher.py` now terminalizes superseded failed attempts as `retry_scheduled`, recovery excludes retry rows that already have successors, and `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs existing superseded rows.
-- ✅ **#21 federation stable cursor tie-breaker** (`pending commit`). `/v1/federation/feed` now uses an opaque `(updated, id)` cursor and `ORDER BY updated, id` so page boundaries inside identical timestamps do not skip rows. Per-peer ACL scope remains split to a later slice.
-- ✅ **#22 audit endpoint scoping** (`pending commit`). Consultation audit list and verify routes are owner-scoped for non-root callers, with root retaining global audit visibility.
-- ✅ **#24 MCP registry split-brain** (`pending commit`). `api/mcp_tools.py` is the canonical MCP registry for stdio and HTTP/SSE; DAG log/branch/diff/checkout and `recommend_model` are exposed through the live MCP transports, and HTTP/SSE supports per-user token maps instead of one shared backend principal.
-- ✅ **OpenAI compat honesty must-fix #5/#6/#7** (`pending commit`). Generation controls propagate through `graeae.route`, SSE streaming is implemented, tools/response_format/multimodal fields are pass-or-400 by provider capability, and `/v1/models/{model_id}` returns 404 for unregistered models.
-- 🔵 **#23 entity namespace conflict-key migration.** Namespace-aware conflict key for entity rows; still open.
-- 🔵 **#19 bulk webhook parity.** Bulk-create webhook behavior still differs from single-create.
-- 🔵 **#15 deletion-log refactor.** Parked; restore-drill cleanup still uses explicit `memory_branches` / `memory_versions` deletes.
+- ✅ **#25 RLS Unix-bit fix.** `db/migrations_v3_5_rls_group_select_unix_bits.sql` replaces `mnemos_group_select` so RLS and `read_visibility_predicate` both use `((permission_mode / 10) % 10) >= 4` for group-readable rows.
+- ✅ **#20 webhook retry state machine.** Persisted attempt leases, writer revisions, repair/recovery split, terminal-state repair, one-success-per-chain guards, and terminal success trigger.
+- ✅ **#21 federation stable cursor tie-breaker.** `/v1/federation/feed` uses an opaque `(updated, id)` cursor and `ORDER BY updated, id` so page boundaries inside identical timestamps do not skip rows. Per-peer ACL scope remains later work.
+- ✅ **#22 audit endpoint scoping + lifespan teardown.** Consultation audit list and verify routes are owner-scoped for non-root callers, root retains global audit visibility, and lifecycle shutdown drains tracked webhook send tasks.
+- ✅ **#24 MCP registry split-brain.** `api/mcp_tools.py` is the canonical MCP registry for stdio and HTTP/SSE; DAG log/branch/diff/checkout and `recommend_model` are exposed through both transports, and HTTP/SSE supports per-user token maps instead of one shared backend principal.
+- ✅ **OpenAI compat honesty must-fix #5/#6/#7.** Generation controls propagate through `graeae.route`, SSE streaming is implemented, tools/response_format/multimodal fields are pass-or-400 by provider capability, and `/v1/models/{model_id}` returns 404 for unregistered models.
+- ✅ **#23 entity namespace conflict-key migration.** Entity uniqueness includes namespace, so the same owner can use the same entity name/type in different namespaces.
+- ✅ **#19 bulk webhook parity.** `POST /v1/memories/bulk` emits the same transactional `memory.created` outbox events as single-create for successful rows.
+- ✅ **Compression cleanup.** LETHE / ANAMNESIS / ALETHEIA modules, `CompressionManager`, and the `DistillationEngine` compatibility wrapper are removed; APOLLO + ARTEMIS remain the built-in contest engines.
+- ✅ **Session compression cleanup.** Always-NULL `compression_ratio` columns and legacy `compression_tier` / `compressed` columns are dropped from session tables.
+- ✅ **Namespace-uniform tenancy.** State, journal, entities, sessions, consultations, memory reads/history, and webhook outbox writes follow owner+namespace scoping.
+- ✅ **PostgreSQL streaming-replication doctrine.** Single-site HA uses Postgres primary/standby replication; federation is reserved for remote/curated data flows.
 
-Remaining v3.5 charter work:
+Remaining after v3.5.0:
 
-- 🔵 **PANTHEON + IRIS.** Next-bound feature set: unified LLM facade and MCP model discovery layer.
+- 🔵 **Dedicated deletion-log / GDPR wipe workflow.** v3.5 keeps DELETE tombstone snapshots live in the version DAG, but no separate deletion-log table ships.
+- 🔵 **PANTHEON + IRIS.** Unified LLM facade and MCP model discovery layer, deferred from the historical v3.5 charter.
 - 🔵 **RFC-002 / MemPalace re-engagement.** Re-open with v3.4 CHARON evidence and KNOSSOS interop framing.
-- 🔵 **Compression hot-path expansion.** More read paths consume `memory_compressed_variants` instead of raw `memories.content`; still needs per-surface audit.
-- 🔵 **Search response `compression_applied` / `compression_metadata` decision.** Either wire a real summary path for large-result-set compression or document the fields as reserved.
+- 🔵 **Compression hot-path expansion.** More read paths can consume `memory_compressed_variants`; `/v1/memories/search` documents `compression_applied` / `compression_metadata` as reserved false fields in v3.5.x.
 - 🔵 **Design paper draft.** Git-like DAG + LLM-synthesized distillation/narration + judge-verified fidelity, carried from the v3.4 charter.
 
 ### v3.6 — PERSEPHONE + MORPHEUS mutation paths
@@ -197,12 +200,12 @@ Deliverables:
 
 Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles, with status. Maintained release-by-release; new findings append. ✅ = remediated, 🔵 = planned, ⏳ = deferred.
 
-### v3.5-dev slice 1 — audit quick wins
+### v3.5.0 slice 1 — audit quick wins
 
 - ✅ Session history returned the oldest 10 messages instead of the most recent 10 — fixed in `f9ea8d9`; deterministic system-row pinning refined through `e3c884c`.
 - ✅ Repository metadata still pointed at `perlowja/mnemos` after the org move — swept to `mnemos-os/mnemos` in `c3092c6`.
 
-### v3.5-dev slice 2 — memory-read tenancy + DAG integrity
+### v3.5.0 slice 2 — memory-read tenancy + DAG integrity
 
 - ✅ `list_memories` / `get_memory` used narrower owner+namespace checks than the intended read contract — closed by shared `read_visibility_predicate` (`api/visibility.py:40-96`) and handler adoption in `api/handlers/memories.py`.
 - ✅ Search/rehydrate cache keys could collide across `None`, empty string, and caller group variation — closed with JSON serialization and group IDs in the key.
@@ -246,7 +249,7 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 - ✅ `/v1/documents/import` bypass: now uses `mem_<hex12>` ids, populates `verbatim_content` / `quality_rating` / `permission_mode`, dispatches `memory.created` webhooks per chunk, invalidates search cache (v3.2.3).
 - ✅ Stale docs: README current-version paragraph rewritten to v3.2.3; SPECIFICATION endpoint count 91→96; release-history extended (v3.2.3).
 - 🔵 MPF portability partial (`kind=memory` only) — deferred to v3.4 CHARON v0.2.
-- ⏳ `/v1/memories/search` `compression_applied` / `compression_metadata` reserved-but-always-false — decision pending: implement or formally document as reserved. Carried into v3.5.
+- ✅ `/v1/memories/search` `compression_applied` / `compression_metadata` reserved-but-always-false — formally documented as reserved in v3.5.1. Real compressed reads use `/v1/memories/rehydrate` and compression manifests.
 
 ### Codex round-2 portability + APOLLO audit (after v3.2.3)
 

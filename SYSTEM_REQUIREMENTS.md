@@ -1,7 +1,7 @@
 # MNEMOS System Requirements
 
-**Applies to**: latest tag v3.4.1 and current v3.5-dev branch
-**Updated**: 2026-04-26
+**Applies to**: current v3.5.x release line
+**Updated**: 2026-04-28
 **Applies To**: Bare Metal, Docker, and Cloud Deployments
 
 ---
@@ -94,10 +94,9 @@ psql -U postgres -d mnemos -c "CREATE EXTENSION IF NOT EXISTS uuid-ossp;"
 ```
 
 **Migration note for Docker volumes**: fresh volumes run all mounted
-`/docker-entrypoint-initdb.d` SQL. Existing volumes do not. The v3.5-dev
+`/docker-entrypoint-initdb.d` SQL. Existing volumes do not. The v3.5.x
 compose files therefore include a one-shot `postgres-upgrade` service
-that applies `db/migrations_v3_5_trigger_same_memory_parent.sql` before
-MNEMOS starts.
+that applies the v3.5 migration tail before MNEMOS starts.
 
 **Storage Requirements**:
 - Initial database: ~50 MB (empty schema)
@@ -509,10 +508,10 @@ Example: DigitalOcean Performance, AWS c5.2xlarge, Linode Linode 32GB
 | Operation | Time | Notes |
 |-----------|------|-------|
 | `/health` | 10/20ms | Always fast |
-| `POST /memories` | 50/200ms | Disk I/O bound |
-| `/memories/search` | 100/500ms | Depends on index size |
-| `POST /consultations` | 2-5s/10s | LLM network latency |
-| `/consultations/audit/verify` | 500/2000ms | Hash chain length |
+| `POST /v1/memories` | 50/200ms | Disk I/O bound |
+| `/v1/memories/search` | 100/500ms | Depends on index size |
+| `POST /v1/consultations` | 2-5s/10s | LLM network latency |
+| `/v1/consultations/audit/verify` | 500/2000ms | Hash chain length |
 
 ### Memory Per Query
 
@@ -682,6 +681,6 @@ Solution: Check disk usage: df -h
 
 ---
 
-**Last Updated**: 2026-04-26
-**Version**: v3.5-dev branch; latest tag v3.4.1
-**Status**: Production-ready for tagged releases; v3.5-dev remains unreleased
+**Last Updated**: 2026-04-28
+**Version**: v3.5.x; v3.5.1 documentation-triage patch
+**Status**: Production-ready for tagged releases

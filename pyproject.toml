@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemos-os"
-version = "3.4.1"
+version = "3.5.1"
 description = "MNEMOS-OS v3: Unified memory operating system with GRAEAE reasoning, DAG versioning, compression, and cost-aware routing"
 readme = "README.md"
 requires-python = ">=3.11"

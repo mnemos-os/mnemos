@@ -1,7 +1,7 @@
 # MNEMOS v3.6 Charter — APOLLO S-IVB Evolution + IRIS Second-Wave Adoption + Mutation Paths
 
-**Status:** Specification (target: ships after v3.5 GA)
-**Position in roadmap:** Closes APOLLO S-IVB phases 1–4 (v3.2–v3.6); broadens IRIS adoption across frameworks; sets stage for v4.0 consolidation.
+**Status:** Forward-looking specification (target: ships after v3.5.x; not shipped in v3.5.0 or v3.5.1)
+**Position in roadmap:** Extends APOLLO S-IVB work after the v3.5.0 hardening release; broadens any shipped IRIS adoption across frameworks; sets stage for v4.0 consolidation.
 **Theme:** *Derivative-idea layers + memory state evolution + industry-wide IRIS adoption.*
 
 ---
@@ -43,7 +43,7 @@ MNEMOS v3.6 is the **APOLLO S-IVB maturity release**. It ships the final two pha
 
 ### 2.2 APOLLO S-IVB phase 4 completion: EXTRACT finishing touches
 
-**Status from v3.5:** Basic EXTRACT mines prose for triples via fast extractor + strong reasoner.
+**Status entering v3.6:** Basic EXTRACT did not ship in v3.5.0. This section is planned work carried forward from the historical v3.5 charter.
 
 **v3.6 refinement:**
 - **Batch optimization:** Accumulate extraction queue; send batches to fast extractor (amortizes LLM call overhead).
@@ -131,7 +131,7 @@ MNEMOS v3.6 is the **APOLLO S-IVB maturity release**. It ships the final two pha
 
 ### 2.7 Client-side IRIS adoption (second wave — configuration-driven, not code-donation)
 
-**Strategic shift from v3.5:** With IRIS proven and stable, v3.6 expands adoption across the agentic ecosystem. But the work pattern changes: instead of framework-specific code donations, adoption is now **config documentation + verification**.
+**Strategic intent:** Once IRIS exists and is stable, v3.6 expands adoption across the agentic ecosystem. The intended work pattern is **config documentation + verification** instead of framework-specific code donations.
 
 Each framework that speaks MCP (Hermes, Continue, AutoGPT, CrewAI) can start using IRIS by adding one line to their config:
 ```toml
@@ -238,11 +238,11 @@ v3.6 GA unlocks the v4.0 sprint:
 
 ## 8. Cross-references
 
-- **v3.5 PANTHEON + IRIS:** Released before v3.6; provides LLM routing foundation + model discovery MCP server.
-- **IRIS adoption strategy:** v3.5 ships IRIS + reference implementations (zeroclaw, OpenClaw); v3.6 expands to Hermes, Continue, AutoGPT, CrewAI, langchain.
+- **PANTHEON + IRIS:** Deferred from the historical v3.5 charter; must ship before the second-wave adoption work described here can be treated as executable.
+- **IRIS adoption strategy:** Reference implementations (zeroclaw, OpenClaw) precede second-wave adoption by Hermes, Continue, AutoGPT, CrewAI, and langchain.
 - **APOLLO program:** Phases 1–4 complete by end of v3.6 (shipped v3.2–v3.6).
 - **APOLLO S-IVB dream-state:** Foundation in v3.3, slice 2 in v3.3 (parallel), phases 3–4 in v3.6.
-- **PERSEPHONE archival:** Initial design + foundation in v3.5; full implementation v3.6.
+- **PERSEPHONE archival:** Planned for v3.6; no v3.5.0 archival foundation shipped beyond recall tracking already present from v3.3.
 - **Design papers:** Existing `PANTHEON.md`, new `IRIS_DISCOVERY.md`, `DREAM_STATE_DESIGN.md`, new `MEMORY_ARCHITECTURE.md` (v3.6).
 - **v4.0 next:** Modularization, GPU scaling, surface integrations, IRIS expansion to all ETLANTIS operations.
 
@@ -258,8 +258,8 @@ v3.6 GA unlocks the v4.0 sprint:
 | APOLLO | sun god / oracle | convergent compression (S-IC, S-II, S-IVB) | ✅ complete |
 | CHARON | ferryman | cross-system portability | ✅ v0.2 |
 | GRAEAE | gray sisters | multi-LLM consensus | ✅ core |
-| PANTHEON | temple of all gods | unified LLM gateway | ✅ v0.1 |
-| IRIS | messenger of the gods | MCP discovery layer + capability-based selection | ✅ v0.1 + second-wave adoption |
-| PERSEPHONE | queen of the underworld | archival subsystem | ✅ v3.6 |
+| PANTHEON | temple of all gods | unified LLM gateway | 🔵 prerequisite / planned |
+| IRIS | messenger of the gods | MCP discovery layer + capability-based selection | 🔵 prerequisite / planned |
+| PERSEPHONE | queen of the underworld | archival subsystem | 🔵 planned v3.6 |
 
 *Charter locked 2026-04-25. Changes via memo + MNEMOS memory update.*

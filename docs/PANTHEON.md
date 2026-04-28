@@ -24,8 +24,8 @@ Every existing tool keeps working — PANTHEON is OpenAI-shape. The win is the c
 
 ## CHARON v0.2 contract note (related work)
 
-The CHARON v0.2 portability subsystem (which ships with this v4
-cut) restricts the trigger-suppressed `memory_versions` sidecar
+The CHARON v0.2 portability subsystem (shipped in the v3.4 line and available
+to later PANTHEON work) restricts the trigger-suppressed `memory_versions` sidecar
 import path to the **root + preserve_owner=true** admin/migration
 path. Non-root callers can ship `kg_triples` and
 `compression_manifest` sidecars without restriction, but

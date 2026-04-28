@@ -1,6 +1,13 @@
 # MNEMOS v3.5 Charter — PANTHEON v0.1 + IRIS Discovery Layer + Memory Operations Expansion
 
-**Status:** In flight on `v3.5-dev`; not tagged. Slice 1 merged as `a62a099`; slice 2 merged as `d42c475`.
+**STATUS: SHIPPED.** v3.5.0 shipped 2026-04-28 as an audit-hardening and
+uniform-tenancy release; v3.5.1 is the 2026-04-28 documentation-triage patch.
+No product behavior changed between v3.5.0 and v3.5.1.
+
+**Document status:** Historical charter. The original PANTHEON/IRIS feature
+pitch below did not ship in v3.5.0; it is preserved as planning record and
+moved to later roadmap work. The shipped v3.5.0 scope is the slice sequence
+listed in §0.
 **Position in roadmap:** Follows APOLLO S-IVB phases 1–2 (v3.2–v3.4); precedes full GPU stack (v4.0).
 **Theme:** *Unified LLM provider facade with MCP discovery + foundational memory operations hardening.*
 
@@ -8,30 +15,28 @@
 
 ## 0. Current branch status
 
-Closed on `v3.5-dev`:
+Closed in v3.5.0:
 
 - **DONE in slice 1 (`a62a099`)** — session history order and pinning fixes; repository URL sweep to `mnemos-os/mnemos`.
 - **DONE in slice 2 (`d42c475`)** — memory read visibility symmetry, per-snapshot version visibility, same-memory DAG parent guards, race-safe branch creation, merge/revert branch-writer serialization, target-tenancy merge semantics, `MN001` → HTTP 409 reconciliation, and Docker `postgres-upgrade` for existing volumes.
+- **DONE in later slices** — webhook retry leases/outbox discipline, federation compound cursor, consultation audit endpoint scoping, MCP stdio/HTTP registry parity, faithful OpenAI-compatible gateway handling, PostgreSQL streaming-replication doctrine, namespace-uniform state/journal/entities/sessions/consultations, bulk webhook parity, compression cleanup, and audit-closure passes.
 
-Open backlog still in scope or awaiting explicit deferral:
+Deferred after v3.5.0:
 
-- **#20** webhook retry state machine.
-- **#21** federation per-peer ACL + stable cursor.
-- **#22** audit endpoint scoping + lifespan teardown.
-- **#23** entity namespace conflict-key migration.
-- **#19** bulk webhook parity.
-- **#15** deletion-log refactor (parked).
-
-PANTHEON + IRIS remain the next-bound v3.5 feature set; they are not
-shipped by slices 1 or 2.
+- **PANTHEON + IRIS** — unified LLM facade and MCP model discovery layer.
+- **Dedicated deletion-log / GDPR wipe workflow** — v3.5 keeps DELETE tombstone
+  snapshots live in the version DAG, but it does not add a separate deletion-log
+  table.
+- **Federation per-peer ACL** beyond current bearer identity, role gate,
+  namespace filters, and category filters.
 
 ---
 
 ## 1. Headline Pitch
 
-MNEMOS v3.5 is the **integration & operations release**. It ships PANTHEON v0.1 — a unified LLM provider facade sitting above GRAEAE and every OpenAI-compatible backend — and IRIS, an MCP server that exposes PANTHEON's model registry so agents discover and select models by capability (not hardcoded names). Together, PANTHEON + IRIS eliminate the industry-wide problem of agents hardcoding model strings. Agents stop asking "what model should I use?" and start asking "what are my options for a tool-calling vision model?" IRIS responds with a ranked list including cost, latency, quality, and availability.
+Original pitch, not the shipped v3.5.0 outcome: MNEMOS v3.5 was drafted as the **integration & operations release**. It would ship PANTHEON v0.1 — a unified LLM provider facade sitting above GRAEAE and every OpenAI-compatible backend — and IRIS, an MCP server that exposes PANTHEON's model registry so agents discover and select models by capability (not hardcoded names). Together, PANTHEON + IRIS would eliminate the industry-wide problem of agents hardcoding model strings. Agents would stop asking "what model should I use?" and start asking "what are my options for a tool-calling vision model?" IRIS would respond with a ranked list including cost, latency, quality, and availability.
 
-Alongside, v3.5 hardens the core memory infrastructure: async distillation, embedding migration, reranking integration, and the closing out of APOLLO S-IVB phase 4 (EXTRACT latent KG triples from prose).
+What shipped instead: v3.5.0 hardened the core memory infrastructure and release docs around audit closure, uniform tenancy, webhook retry correctness, MCP registry parity, faithful OpenAI compatibility, and streaming-replication operations.
 
 The release is operationally driven: every item directly supports running MNEMOS at scale.
 
@@ -139,7 +144,7 @@ IRIS is the reference implementation of a broader capability-based model discove
 
 **Specification & standardization path:**
 
-- v3.5 ships IRIS + a draft specification at `docs/spec/MCP-MD-v0.1.md` (separate from MNEMOS feature docs to signal vendor-neutral intent).
+- Original plan: v3.5 would ship IRIS + a draft specification at `docs/spec/MCP-MD-v0.1.md` (separate from MNEMOS feature docs to signal vendor-neutral intent). This did not ship in v3.5.0.
 - The specification is explicitly draft-stage; breaking changes are possible through v3.6 and into v4.0 pending implementer feedback.
 - Over v3.5–v4.0, the goal is to build adoption signals from multiple implementers (MNEMOS as reference, zeroclaw, OpenClaw, ideally external partners). Once multi-implementer adoption demonstrates merit, the specification will be **proposed to the Linux Foundation AI & Data working group** as a Sandbox project for neutral standardization.
 - MNEMOS remains the reference implementation throughout; the specification itself may eventually graduate to LF-hosted neutral infrastructure once v1.0 stabilization is achieved and the proposal is accepted.
@@ -244,7 +249,7 @@ All items required for v3.5 to be production-ready at scale:
 - **Option A: augment-then-replace** — keep old embeddings until all new queries prefer new embeddings, then drop old columns.
 - **Option B: alter-and-backfill** — alter column type, backfill new embeddings (batch job, ~2 hours on PYTHIA), drop old immediately.
 
-**v3.5 ships:** NIM deployment Helm values + docs for CERBERUS. Reembedding logic stubbed; actual migration left to operator.
+**Original v3.5 plan:** NIM deployment Helm values + docs for CERBERUS. Reembedding logic stubbed; actual migration left to operator. This did not ship in v3.5.0.
 
 **Affected files:** `api/pantheon/workers/embedding_worker.py` (NIM endpoint), `api/models.py` (embedding config), `docs/EMBEDDING_MIGRATION.md` (to be created in v3.5).
 
@@ -295,7 +300,7 @@ All items required for v3.5 to be production-ready at scale:
 
 **The strategic shift:** v3.4 framed the problem as "seven frameworks, seven separate PRs to add PANTHEON support." v3.5 solves it by shipping IRIS, collapsing the problem to **one MCP server that all MCP-aware frameworks already know how to consume**. Frameworks don't need patches; they just need a config line.
 
-**v3.5 ships IRIS plus first-wave reference implementations:**
+**Original plan, deferred after v3.5.0: IRIS plus first-wave reference implementations:**
 
 ### 3.1 zeroclaw IRIS adoption (reference implementation — own repo, full control)
 
@@ -326,7 +331,7 @@ env = {PANTHEON_API_KEY = "pantheon-<tenant-token>"}
 
 **Agent behavior:** On startup, connect to IRIS via MCP. Call `find_model(capabilities=[tool_calling], max_cost_per_mtok=0.001)`. IRIS returns ranked models with metadata. User can see options, IRIS defaults to top-ranked. Runtime `/model query vision` dynamically re-queries and switches.
 
-**Effort:** ~2 hours (integrate IRIS MCP client + dynamic model selection logic). Ships as PR against `perlowja/zeroclaw:main`, merged before v3.5 GA.
+**Historical estimate:** ~2 hours (integrate IRIS MCP client + dynamic model selection logic). Did not ship in v3.5.0; carried forward with the deferred PANTHEON/IRIS scope.
 
 ### 3.2 OpenClaw IRIS adoption (medium difficulty — NVIDIA contributor, not owner)
 
@@ -334,7 +339,7 @@ env = {PANTHEON_API_KEY = "pantheon-<tenant-token>"}
 
 **Change shape:** Same as zeroclaw's IRIS config, applied to `~/.openclaw/config.toml`. Contributor-level PR to `zeroclaw-labs/openclaw`.
 
-**Effort:** ~3 hours including upstream coordination. Target: merged before v3.5 GA (stretch; may land v3.5.1 patch).
+**Historical estimate:** ~3 hours including upstream coordination. Did not ship in v3.5.0 or the v3.5.1 doc-triage patch.
 
 ### 3.2a Rate-limiting upstream PR donations
 
@@ -389,11 +394,11 @@ With IRIS in place, other MCP-aware frameworks (Hermes, Continue, AutoGPT, CrewA
 
 ## 6. Success criteria
 
-- [x] Slice 1 audit quick wins merged to `v3.5-dev` (`a62a099`).
-- [x] Slice 2 memory-read tenancy + DAG integrity merged to `v3.5-dev` (`d42c475`).
+- [x] Slice 1 audit quick wins shipped in v3.5.0 (`a62a099`).
+- [x] Slice 2 memory-read tenancy + DAG integrity shipped in v3.5.0 (`d42c475`).
 - [x] v3.5 trigger replacement wired into `install.py`, `installer/db.py`, `docker-compose.yml`, and `docker-compose.staging.yml`.
-- [ ] PANTHEON v0.1 running on PYTHIA, accessible at `http://pythia:5002/v1/chat/completions` with extended catalog.
-- [ ] **IRIS MCP server operational:** `iris://models` resource returns full catalog; `find_model()` tool ranks models by capability constraints; `get_model_health()` reflects PANTHEON health.
+- [ ] PANTHEON v0.1 running on PYTHIA, accessible at `http://pythia:5002/v1/chat/completions` with extended catalog. **Deferred after v3.5.0.**
+- [ ] **IRIS MCP server operational:** `iris://models` resource returns full catalog; `find_model()` tool ranks models by capability constraints; `get_model_health()` reflects PANTHEON health. **Deferred after v3.5.0.**
 - [ ] zeroclaw + OpenClaw both using IRIS for model discovery (MCP connection working; runtime model selection via `iris://models/recommendations/coding`).
 - [ ] Audit log table populated on memory create/update/delete + federation pulls.
 - [ ] Body-size cap + per-tenant rate limit enforced, 413/429 responses working as documented.
@@ -423,8 +428,8 @@ v3.5 GA gate:
 - **PANTHEON detailed design:** `docs/PANTHEON.md` (complete, decision-ready).
 - **APOLLO S-IVB phases 1–2:** Shipped v3.2–v3.4 (see `ROADMAP.md`).
 - **CHARON v0.2:** Shipped v3.4 (portability sidecar system).
-- **v3.5-dev slice 1:** `a62a099` audit quick wins.
-- **v3.5-dev slice 2:** `d42c475` memory-read tenancy + DAG integrity.
+- **v3.5.0 slice 1:** `a62a099` audit quick wins.
+- **v3.5.0 slice 2:** `d42c475` memory-read tenancy + DAG integrity.
 - **v3.4 artifacts:** Compression benchmark, APOLLO S-IVB slice 2, KNOSSOS phase 2.
 - **v3.6 followup:** PERSEPHONE archival, APOLLO S-IVB phases 3–4, Hermes/Continue/AutoGPT donations.
 
@@ -434,14 +439,14 @@ v3.5 GA gate:
 
 ## Appendix: Greek pantheon + IRIS subsystem naming
 
-| Subsystem | Greek | Role | v3.5 status |
+| Subsystem | Greek | Role | v3.5.0 status |
 |---|---|---|---|
 | MNEMOS | titaness of memory | core memory store | ✅ core |
 | APOLLO | sun god / oracle | convergent compression (S-IC, S-II, S-IVB) | ✅ current compression stack; mutation paths continue in v3.6 |
 | CHARON | ferryman | cross-system portability | ✅ v0.2 |
 | GRAEAE | gray sisters | multi-LLM consensus | ✅ core |
-| PANTHEON | temple of all gods | unified LLM gateway | 🔵 next-bound v3.5 feature |
-| **IRIS** | **messenger of the gods** | **MCP discovery layer over PANTHEON's catalog** | **🔵 next-bound v3.5 feature** |
+| PANTHEON | temple of all gods | unified LLM gateway | 🔵 deferred after v3.5.0 |
+| **IRIS** | **messenger of the gods** | **MCP discovery layer over PANTHEON's catalog** | **🔵 deferred after v3.5.0** |
 | PERSEPHONE | queen of the underworld | archival subsystem | 🔵 v3.6 |
 
-*Charter opened 2026-04-25. Current branch status updated 2026-04-26 after slice 2 merge.*
+*Charter opened 2026-04-25. Status reconciled 2026-04-28 after v3.5.0 GA and the v3.5.1 documentation patch.*

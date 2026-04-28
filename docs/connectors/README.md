@@ -5,7 +5,9 @@
 > tooling (Claude Desktop, Claude Code, ChatGPT Pro Developer Mode, Cursor,
 > Codex CLI). Defaults are off; configuration is opt-in; surface area is
 > intentionally narrow. APIs may change between minor releases without a
-> deprecation cycle until the surface is promoted to `stable` in v3.5+.
+> deprecation cycle until the surface is promoted to `stable` in a later
+> release. v3.5.0 shipped stdio/HTTP registry parity, but remote connector
+> packaging remains experimental.
 
 ## Audience
 
@@ -117,9 +119,10 @@ Each was specific, each was useful, each strengthened the mortal
 world rather than diminishing the giver. KNOSSOS and CHARON sit in
 that lineage:
 
-- **KNOSSOS** is a portal into MNEMOS's storage substrate that
+- **KNOSSOS** is a phase-1 portal into MNEMOS's storage substrate that
   speaks MemPalace's tool vocabulary (wings, rooms, drawers,
-  tunnels, diaries) byte-for-byte. Existing MemPalace-targeting
+  and KG basics today; tunnels and diaries remain deferred) byte-for-byte
+  where implemented. Existing MemPalace-targeting
   agents — every Claude Code prompt, every harness — keep working
   when their owner's workload outgrows what file-backed local-first
   storage can handle. No migration, no code changes in the agent.
@@ -150,9 +153,9 @@ open to them. Public evidence:
   side; PRs scoped where the runtime intersects MNEMOS's MCP surface.
 - **MemPalace, Mem0, Letta, Graphiti, Cognee**: bug reports and
   goodwill PRs as we encounter issues testing the CHARON adapters
-  against real instances. v3.4 charter commits to a first wave of
-  2–3 upstream MemPalace contributions before re-engaging on the
-  KNOSSOS bridge RFC there. See `ROADMAP.md` Track 3.
+  against real instances. The first wave of upstream MemPalace
+  contributions and KNOSSOS bridge RFC re-engagement is deferred after
+  v3.5.0. See `ROADMAP.md`.
 
 We'll grow this list as PRs land. The principle is simple: when
 KNOSSOS or CHARON adapters surface bugs in upstream memory systems,
@@ -166,11 +169,10 @@ While `experimental`:
 - Endpoints under `/admin/tunnels/*` may be renamed, restructured, or
   withdrawn in any minor release.
 - Default ports (5004 for the MCP HTTP/SSE bridge) may change.
-- Bearer-auth model is the v1 baseline; OAuth + per-user tokens come
-  in a later iteration without backwards compatibility for the v1
-  shared-token mode.
+- Bearer auth is the current baseline. Per-user token mapping exists on the
+  HTTP/SSE bridge; OAuth on the MCP edge remains later work.
 - The `mnemos-tunnel-setup` script's argument shape and config-file
   location (`~/.mnemos/tunnel.toml`) may change.
 
-When the connector subsystem promotes to `stable` (target: v3.5),
+When the connector subsystem promotes to `stable` in a later release,
 those guarantees flip — semver applies, deprecation cycles apply.

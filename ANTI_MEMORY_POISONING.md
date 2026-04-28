@@ -59,8 +59,7 @@ memory_versions:
   - metadata: {distillation_attempts, source_model, source_provider, ...}
 session_memory_injections:
   - which memory was used in which session
-  - relevance_score, compression_ratio
-  - exact timestamp
+  - relevance_score and injection timestamp
 ```
 
 ### Protection Against Common Scenarios
@@ -71,21 +70,23 @@ session_memory_injections:
 - Create new memory entry with updated endpoint
 - Old memory remains in history (readable via git log)
 - Agents must explicitly query current version
-- Diff shows when/what changed: `GET /memories/{id}/diff?from=1&to=2`
+- Diff shows when/what changed: `GET /v1/memories/{id}/diff?from=1&to=2`
 
 #### Scenario 2: Model Rename
 **Problem:** Memory references model that no longer exists.
 **Solution:**
 - Memory is immutable; old versions preserved
 - New versions created with corrected model name
-- Version log shows exact transition point: `GET /memories/{id}/log`
+- Version log shows exact transition point: `GET /v1/memories/{id}/log`
 - Agents can query timestamp-specific versions
 
 #### Scenario 3: Configuration Drift
 **Problem:** Infrastructure changed; memory contradicts current state.
 **Solution:**
 - Session memory injections are logged (session_memory_injections table)
-- Each injection records: memory_id, relevance_score, compression_ratio, timestamp
+- Each injection records memory_id, relevance_score, and timestamp; v3.5 removed
+  the legacy session compression-ratio columns because they were not the real
+  compression store
 - Audit trail shows which memories were used and when
 - Can trace decision back to specific memory version via commit_hash
 - Revert to known-good configuration by checking out stable commit
@@ -119,35 +120,35 @@ create_memory(
 #### When Infrastructure Changes
 ```bash
 # 1. Create new memory with updated information
-curl -X POST http://localhost:5002/memories \
+curl -X POST http://localhost:5002/v1/memories \
   -d '{"content": "NEW: API endpoint is https://api.example.com/v3/auth", ...}'
 
 # 2. Review history to understand drift
-curl http://localhost:5002/memories/{id}/log?branch=main
+curl http://localhost:5002/v1/memories/{id}/log?branch=main
 
 # 3. If memory is actively used, create bugfix branch
-curl -X POST http://localhost:5002/memories/{id}/branch \
+curl -X POST http://localhost:5002/v1/memories/{id}/branch \
   -d '{"name": "bugfix-api-v2-to-v3", "from_commit": "<hash>"}'
 
 # 4. Make correction on bugfix branch
-curl -X POST http://localhost:5002/memories/{id}/versions/123/revert \
+curl -X POST http://localhost:5002/v1/memories/{id}/revert/123 \
   -d '{"branch": "bugfix-api-v2-to-v3"}'
 
 # 5. Merge back to main after validation
-curl -X POST http://localhost:5002/memories/{id}/merge \
+curl -X POST http://localhost:5002/v1/memories/{id}/merge \
   -d '{"source_branch": "bugfix-api-v2-to-v3", "strategy": "latest-wins"}'
 ```
 
 #### Detecting Poisoning
 ```bash
 # List all memories injected into a session
-curl http://localhost:5002/sessions/{id}/history
+curl http://localhost:5002/v1/sessions/{id}/history
 
 # Check if specific memory caused a problem
-curl http://localhost:5002/memories/{id}/log | jq '.commits[] | select(.snapshot_at > "2026-04-19T00:00:00")'
+curl http://localhost:5002/v1/memories/{id}/log | jq '.commits[] | select(.snapshot_at > "2026-04-19T00:00:00")'
 
 # Diff old vs new to spot drift
-curl 'http://localhost:5002/memories/{id}/diff?from=1&to=10'
+curl 'http://localhost:5002/v1/memories/{id}/diff?from=1&to=10'
 ```
 
 ### Best Practices

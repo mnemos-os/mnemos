@@ -2,7 +2,7 @@
 
 The version numbers on releases are tidy. The actual path was not. This
 document is the honest version — decisions, refactors, mistakes, and the
-reasoning that got us from the original prototype to the current v3.5-dev branch. If you
+reasoning that got us from the original prototype to the current v3.5.x release line. If you
 are considering MNEMOS for your own stack, you should know where it came
 from; if you are contributing, you should know which doors have been closed
 and why.
@@ -28,7 +28,7 @@ codebase took along the way.
 | 2026-03 | Knowledge graph schema design — subject / predicate / object with temporal validity windows. Memory versioning trigger drafted. Cryptographic audit chain (SHA-256) prototyped. Multi-user RLS foundation via PostgreSQL session variables. The first attempt at the column-naming convention that the v2.3 release would later force a five-bug cleanup of. |
 | 2026-04-12 | **v2.3.0** — knowledge graph (`/kg/triples`, `/kg/timeline/{subject}`), journal, key-value state, entity tracking, model registry, LETHE compression (Tier 1, CPU), full audit chain, multi-user RLS, memory versioning with diff/revert. The painful release — five `created_at` column bugs, missing `kg_triples` migration on fresh installs, FK type mismatch (`UUID` vs `TEXT`) caught at first insert, port 5000 → 5002 move. |
 | 2026-04-19 | **v2.4.0** (consolidation, not public) — OpenAI-compatible gateway (`/v1/chat/completions`, `/v1/models`) with optional memory injection. Stateful session management (`/sessions/*`). DAG versioning — git-like branch / merge / revert on memory history. MOIRAI compression triad (LETHE / ALETHEIA / ANAMNESIS) with quality manifests on every transformation. The shape of v3 is locked. |
-| 2026-04-22 | **v3.0.0-beta** — MNEMOS + GRAEAE unify on port 5002. Webhooks (HMAC-SHA256, SSRF defense, durable retry log). OAuth / OIDC (Google / GitHub / Azure AD / generic) with `email_verified` cross-provider linking guard. Cross-instance federation with `permission_mode` per-memory opt-in and `federation_source` loop prevention. Self-maintaining model registry (`provider_sync` daily, Arena.ai Elo quarterly). Per-owner multi-tenant scoping on memories / consultations / state / journal / entities. Atomic consultation persistence under `pg_advisory_xact_lock`. Twenty-two FK edges with explicit `ON DELETE`. Two-pass release-gate audit (self + Codex re-audit) catches five P0 issues including a hardcoded production bearer in the Docling export tool. |
+| 2026-04-22 | **v3.0.0-beta** — MNEMOS + GRAEAE unify on port 5002. Webhooks (HMAC-SHA256, SSRF defense, durable retry log). OAuth / OIDC (Google / GitHub / Azure AD / generic) with `email_verified` cross-provider linking guard. Cross-instance federation with `permission_mode` per-memory opt-in and `federation_source` loop prevention. Model registry sync foundations (`provider_sync` and Arena.ai/LMArena weighting). Per-owner multi-tenant scoping on memories / consultations / state / journal / entities. Atomic consultation persistence under `pg_advisory_xact_lock`. Twenty-two FK edges with explicit `ON DELETE`. Two-pass release-gate audit (self + Codex re-audit) catches five P0 issues including a hardcoded production bearer in the Docling export tool. |
 | 2026-04-22 | OpenClaw PR #70224 merged — first upstream contribution from the MNEMOS testing surface. The "we give as well as take" principle starts being load-bearing instead of aspirational. |
 | 2026-04-23 | **v3.1.0** — Plugin `CompressionEngine` ABC + competitive contest framework + persisted audit log across three built-in engines. GPU circuit breaker. Admin enqueue endpoints. First real benchmark on 49 PYTHIA memories with `gemma-4-E4B` as judge on CERBERUS reveals ALETHEIA scored 0/49 contest wins — its index-list prompt doesn't survive instruction-tuned generalist LLMs. ALETHEIA retired from default contest the same day. Benchmark write-up: `docs/benchmarks/compression-2026-04-23.md`. |
 | 2026-04-23 | Federation → fault-tolerance pivot. The cross-instance feed model from v3.0.0-beta turns out to be the wrong primitive for a single operator running multiple boxes; what was actually needed was HA. Move to `pg_auto_failover` (TYPHON monitor, PYTHIA primary, CERBERUS standby). ARGONAS reconciled against public master via 156-commit Codex triage (6 KEEP / 137 SKIP / 13 DROP). |
@@ -36,8 +36,10 @@ codebase took along the way.
 | 2026-04-24 | **v3.3.0-alpha** — MORPHEUS dream-state subsystem slice 1 lands (begin / finish / rollback runs, replay phase real, cluster + synthesise as stubs). MCP HTTP/SSE bridge (`mcp_http_server.py`) for ChatGPT Pro Developer Mode + any remote MCP client that needs an HTTPS URL. KNOSSOS / CHARON positioning as *gifts to other memory systems* (MemPalace, Mem0, Letta, Graphiti, Cognee) with concrete upstream-PR commitments. The compression stack settles to two engines (APOLLO + ARTEMIS); LETHE / ANAMNESIS / ALETHEIA become evolutionary history. `EVOLUTION.md`, `ROADMAP.md`, and `docs/connectors/` written for the first public release. |
 | 2026-04-26 | **v3.3.0 / v3.4.0** — MORPHEUS slice 2 fills in real cluster + synthesise, recall tracking, cluster introspection, and namespace scoping. CHARON v0.2 turns MPF into a sidecar-capable portability surface for KG triples, documents, facts, events, compression manifests, and memory-version DAGs. The v3.4 audit work spends forty-four Codex rounds on sidecar attachment and restore correctness. |
 | 2026-04-26 | **v3.4.1** — federation schema-compat preflight lands before peers sync. Strict peers refuse schema mismatch with HTTP 409 unless an operator opts into `compat_mode=permissive`. The dev↔prod MPF restore drill is written and validated on PYTHIA → PROTEUS data. |
-| 2026-04-26 | **v3.5-dev slice 1** — audit quick wins: session history returns the newest rows instead of the oldest, system rows are pinned/capped deterministically, and project URLs move to `mnemos-os/mnemos` (`a62a099`). |
-| 2026-04-26 | **v3.5-dev slice 2** — memory-read tenancy and DAG-integrity hardening (`d42c475`). Shared read visibility moves into `api/visibility.py`; version history becomes per-snapshot visible; merge/revert/branch writers serialize around branch heads; the v3.5 trigger raises `MN001` rather than accepting missing, NULL, or cross-memory branch heads. |
+| 2026-04-26 | **v3.5.0 slice 1** — audit quick wins: session history returns the newest rows instead of the oldest, system rows are pinned/capped deterministically, and project URLs move to `mnemos-os/mnemos` (`a62a099`). |
+| 2026-04-26 | **v3.5.0 slice 2** — memory-read tenancy and DAG-integrity hardening (`d42c475`). Shared read visibility moves into `api/visibility.py`; version history becomes per-snapshot visible; merge/revert/branch writers serialize around branch heads; the v3.5 trigger raises `MN001` rather than accepting missing, NULL, or cross-memory branch heads. |
+| 2026-04-28 | **v3.5.0 GA** — the hardening branch ships: webhook retry leases/outbox discipline, federation compound cursor, consultation audit scoping, MCP stdio/HTTP registry parity, faithful OpenAI-compatible gateway behavior, PostgreSQL streaming-replication doctrine, namespace-uniform state/journal/entities/sessions/consultations, bulk webhook parity, compression cleanup, and audit closure. |
+| 2026-04-28 | **v3.5.1** — documentation-triage patch. Version metadata moves to 3.5.1 and docs are reconciled with the shipped v3.5.x state; no product behavior changes from v3.5.0. |
 
 Roughly five months. One developer with three reviewers (Codex, GRAEAE
 multi-LLM consensus, occasional Sonnet / Opus passes for design). Several
@@ -437,7 +439,7 @@ renamed; they get retired and the history gets recorded here.
 
 ---
 
-## v3.4.1 and v3.5-dev — April 2026 — "the branch learns to distrust its own history"
+## v3.4.1 and v3.5.x — April 2026 — "the branch learns to distrust its own history"
 
 v3.4.1 was the federation-safety release. CHARON v0.2 already made
 memory portable across systems, but portability created a new problem:
@@ -496,6 +498,16 @@ The final documented mismatch is closed by
 `mnemos_group_select` RLS policy and application predicate now both
 test the Unix group-read bit directly with
 `((permission_mode / 10) % 10) >= 4`.
+
+The later v3.5.0 passes made the same posture broader. Webhook delivery
+became lease-owned and retry-chain aware, with one terminal succeeded row
+enforced at the database layer. MCP stdio and HTTP/SSE now expose the same
+18-tool registry. The OpenAI-compatible gateway became pass-or-reject instead
+of silently dropping controls. State, journal, entities, sessions, and
+consultations picked up namespace-uniform tenancy. The old compression stack
+was cut down to the active APOLLO + ARTEMIS contest path; LETHE, ANAMNESIS,
+ALETHEIA, `CompressionManager`, the `DistillationEngine` wrapper, and the
+session compression fiction columns became history rather than live API.
 
 ---
 

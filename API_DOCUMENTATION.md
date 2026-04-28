@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v3.5-dev branch (unreleased; latest tag v3.4.1)
+**Version**: v3.5.x current; v3.5.0 shipped 2026-04-28, v3.5.1 is the 2026-04-28 documentation-triage patch
 **Format**: JSON
 
 ---
@@ -20,15 +20,18 @@ The unified `/v1/` namespace is the supported API surface.
 1. [Authentication](#authentication)
 2. [Health & Status](#health--status)
 3. [Memory Operations](#memory-operations)
-4. [Consultations (GRAEAE)](#consultations-graeae)
-5. [Providers & Models](#providers--models)
-6. [OpenAI-Compatible Gateway](#openai-compatible-gateway)
-7. [Sessions](#sessions)
-8. [Webhooks](#webhooks)
-9. [OAuth / OIDC](#oauth--oidc)
-10. [Federation](#federation)
-11. [Error Handling](#error-handling)
-12. [Examples](#examples)
+4. [Knowledge Graph](#knowledge-graph)
+5. [Consultations (GRAEAE)](#consultations-graeae)
+6. [Providers & Models](#providers--models)
+7. [OpenAI-Compatible Gateway](#openai-compatible-gateway)
+8. [Sessions](#sessions)
+9. [MORPHEUS](#morpheus)
+10. [Webhooks](#webhooks)
+11. [OAuth / OIDC](#oauth--oidc)
+12. [Federation](#federation)
+13. [Portability (MPF)](#portability-mpf)
+14. [Error Handling](#error-handling)
+15. [Examples](#examples)
 
 ---
 
@@ -60,7 +63,7 @@ Liveness + readiness check (no auth required).
   "status": "healthy",
   "timestamp": "2026-04-21T14:30:00.000Z",
   "database_connected": true,
-  "version": "3.2.3"
+  "version": "3.5.1"
 }
 ```
 
@@ -94,7 +97,11 @@ remain owner+namespace scoped.
 
 ### POST /v1/memories
 
-Create a memory. Distillation is triggered asynchronously.
+Create a memory. This writes the memory row and emits a transactional
+`memory.created` webhook event. Compression is operator-batched in v3.5.x:
+root users enqueue memories through `/admin/compression/enqueue` or
+`/admin/compression/enqueue-all`; the distillation worker then drains
+`memory_compression_queue`.
 
 **Request Body**:
 ```json
@@ -135,6 +142,21 @@ Semantic + keyword search.
 { "query": "infrastructure", "limit": 5 }
 ```
 
+Search hits update `recall_count` and `last_recalled_at` in the background.
+`compression_applied` and `compression_metadata` are reserved response fields
+on `MemoryListResponse`; v3.5.x search responses set
+`compression_applied=false`. Use `/v1/memories/rehydrate` to receive compressed
+variants when present, or `/v1/memories/{id}/compression-manifests` to inspect
+contest output.
+
+### Compression manifests and rehydration
+
+- `GET /v1/memories/{id}/compression-manifests` — current winning variant plus
+  every historical contest candidate, score, manifest, and reject reason.
+- `POST /v1/memories/rehydrate` — token-budgeted context assembly. It prefers a
+  `memory_compressed_variants` winner when one exists and reports
+  `compression_applied=true` only when a variant was actually used.
+
 ### DAG versioning (git-like)
 
 - `GET /v1/memories/{id}/versions` — version summaries on a branch, filtered per snapshot by `version_visibility_predicate` (`api/visibility.py:99-137`).
@@ -149,6 +171,22 @@ Semantic + keyword search.
 
 See `ANTI_MEMORY_POISONING.md` for the rationale and drift-detection
 workflow.
+
+---
+
+## Knowledge Graph
+
+Structured triples live beside free-text memories and use the same
+owner+namespace tenancy model.
+
+- `POST /v1/kg/triples` — create a subject/predicate/object triple
+- `GET /v1/kg/triples` — list triples with filters
+- `GET /v1/kg/timeline/{subject}` — subject timeline
+- `PATCH /v1/kg/triples/{triple_id}` — update a triple
+- `DELETE /v1/kg/triples/{triple_id}` — delete a triple
+
+KG tenancy columns were added in v3.1.x and namespace parity became the
+standard across memory and entity surfaces in v3.2-v3.5.
 
 ---
 
@@ -231,10 +269,26 @@ Memory injection can be enabled per-request via header
 
 Stateful multi-turn chat with memory injection at turn boundaries.
 
-- `POST /sessions` — create
+- `POST /v1/sessions` — create
 - `POST /v1/sessions/{id}/messages` — post a turn
 - `GET /v1/sessions/{id}` — retrieve transcript
+- `GET /v1/sessions/{id}/history` — full history
 - `DELETE /v1/sessions/{id}` — close
+
+---
+
+## MORPHEUS
+
+Dream-state generation is operator-triggered and append-only in v3.5.x.
+Generated memories are tagged with `morpheus_run_id`; rollback deletes
+generated memories for that run.
+
+- `GET /v1/morpheus/runs` — list runs
+- `GET /v1/morpheus/runs/{run_id}` — run detail
+- `GET /v1/morpheus/runs/{run_id}/clusters` — cluster membership and
+  synthesized memory IDs
+- `POST /admin/morpheus/runs` — trigger a synchronous run (root only)
+- `DELETE /admin/morpheus/runs/{run_id}` — roll back a run (root only)
 
 ---
 
@@ -291,6 +345,22 @@ are read-only by convention. Loop prevention via
 - `GET /v1/federation/feed` — outbound feed (requires `role IN ('federation','root')`)
 
 Background sync runs every 60 seconds.
+
+---
+
+## Portability (MPF)
+
+MNEMOS Portability Format (MPF) is the native import/export envelope.
+
+- `GET /v1/export` — export MPF v0.1.x envelope. `include_sidecars=true`
+  includes KG triples, memory-version DAGs, and compression manifests where
+  available.
+- `POST /v1/import` — import an MPF envelope. Root plus
+  `preserve_owner=true` is for authoritative restore/migration; non-root
+  imports are scoped to the caller's owner+namespace.
+
+CLI helpers: `tools/memory_export.py`, `tools/memory_import.py`, and
+`tools/mpf_validate.py`.
 
 ---
 

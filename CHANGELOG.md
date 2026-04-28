@@ -2,14 +2,36 @@
 
 All notable changes to MNEMOS are documented here.
 
-## [3.5-dev] — in flight on `v3.5-dev` (unreleased)
+## [3.5.1] — 2026-04-28 (doc-triage patch)
 
-v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
-as a release tag. Merged slices cover audit quick wins, memory-read tenancy
-and DAG integrity, webhook retry hardening, RLS group-select parity, the
-federation compound-cursor tie-breaker, consultation audit endpoint scoping,
-MCP transport parity, faithful OpenAI-compatible gateway controls, and the
-single-site HA replication doctrine.
+Documentation and version-state reconciliation only. No product behavior
+changes from v3.5.0.
+
+### Changed
+
+- Bump package/runtime version metadata from 3.4.1 to 3.5.1.
+- Reframe README, deployment, specification, API, roadmap, evolution, and
+  release-charter docs around the shipped v3.5.x state.
+- Preserve historical LETHE / ANAMNESIS / ALETHEIA references, but remove or
+  reframe current-state docs that still described retired compression engines,
+  `CompressionManager`, the `DistillationEngine` compatibility wrapper, or
+  vestigial session compression columns as active.
+- Surface shipped v3.2-v3.5 features in user-facing docs: two-dimensional
+  owner+namespace tenancy, MORPHEUS, recall tracking, MPF portability,
+  CHARON schema preflight, webhook retry leases/outbox hardening, MCP registry
+  parity, faithful OpenAI-compatible gateway handling, PostgreSQL streaming
+  replication doctrine, and namespace-uniform audit closure.
+
+## [3.5.0] — 2026-04-28
+
+v3.5.0 is the audit-driven hardening and uniform-tenancy release. It shipped
+the branch sequence that began after v3.4.1: session-history ordering,
+memory-read tenancy and DAG integrity, webhook retry hardening, RLS
+group-select parity, the federation compound-cursor tie-breaker, consultation
+audit endpoint scoping, MCP transport parity, faithful OpenAI-compatible
+gateway controls, namespace-uniform tenancy across remaining product surfaces,
+bulk webhook parity, and the single-site PostgreSQL streaming-replication
+doctrine.
 
 ### Added
 
@@ -101,9 +123,19 @@ single-site HA replication doctrine.
 - **Slice 12 — compression semantics** — drop session-layer always-NULL
   `compression_ratio` fiction columns from `session_messages` +
   `session_memory_injections`; document operator-batched compression doctrine in
-  `docs/COMPRESSION.md`. Real compression layer (`compression_artifacts` /
-  contests, `StatsResponse`, `RehydrationResponse`, admin batch endpoints)
-  unchanged.
+  `docs/COMPRESSION.md`. Real compression layer
+  (`memory_compression_queue`, `memory_compression_candidates`,
+  `memory_compressed_variants`, `StatsResponse`, `RehydrationResponse`, admin
+  batch endpoints) unchanged.
+- **Namespace-uniform product surfaces.** State, journal, entities, sessions,
+  and GRAEAE consultations now carry the same owner+namespace discipline as
+  memory rows. Entity uniqueness is widened to
+  `(owner_id, namespace, entity_type, name)`; state keys are scoped by
+  `(owner_id, namespace, key)`.
+- **Bulk memory create webhook parity.** `POST /v1/memories/bulk` now emits
+  `memory.created` through the same transactional outbox path as single
+  memory creation for every successful item and rolls back the batch if outbox
+  enqueue fails.
 
 ### Fixed
 
@@ -248,7 +280,7 @@ single-site HA replication doctrine.
   now roll back the ACK record and partial cleanup, leaving the lease-owned
   attempt retryable. The rare tradeoff is a bounded duplicate POST after
   lease expiry, logged for observability, instead of a committed succeeded
-  predecessor with live successors that old v3.5-dev workers could replay.
+  predecessor with live successors that old pre-GA workers could replay.
   Round 24 adds
   `db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql`, making
   `status='succeeded'` terminal at the database layer. Old id-only writers
@@ -264,11 +296,11 @@ single-site HA replication doctrine.
   `memory_branches` against `memory_versions` for that memory before
   retrying the write.
 
-### Still open on the v3.5 backlog
+### Deferred after v3.5.0
 
-- #23 entity namespace conflict-key migration.
-- #19 bulk webhook parity.
-- #15 deletion-log refactor.
+- Dedicated per-memory deletion-log table and GDPR wipe workflow remain v4
+  scope. v3.5.0 keeps the DELETE tombstone snapshot path live in the version
+  DAG, but it does not add a separate deletion-log subsystem.
 
 ## [3.4.1] — 2026-04-26
 
@@ -401,7 +433,7 @@ retiring ALETHEIA from the default contest.
   pass (LLM-mediated synthesis of cross-memory patterns into
   derived facts). Three audit-log items closed: namespace scope on
   cluster output, cluster introspection endpoint, FastAPI
-  deprecation cleanup. 31 tests in `tests/test_knossos.py` cover
+  deprecation cleanup. 31 tests in `tests/test_knossos_phase1.py` cover
   the phase-1 tool surface (0.46s).
 - **`recall_count` + `last_recalled_at` on memory search hits.**
   Every search result increments the recall counter and updates

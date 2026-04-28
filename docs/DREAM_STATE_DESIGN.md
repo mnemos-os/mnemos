@@ -1,6 +1,8 @@
 # MNEMOS Dream State — Design Scoping
 
-**Status**: Draft (v3.3 / v3.4 candidate)
+**Status**: Historical design draft. MORPHEUS shipped in v3.3/v3.5.x as an
+operator-triggered, append-only dream-state subsystem; mutation paths and the
+full dream-branch contract in this document remain forward-looking.
 **Owner**: Jason Perlow (`jperlow@gmail.com`)
 **Origin**: Dreamt up 2026-04-23, sprung from MEMORY_PSYCHOLOGY.md's Jungian framing:
 
@@ -104,7 +106,7 @@ becomes a private diary nobody reads.
 
 Therefore:
 
-- Dreams are **returned** by `POST /memories/search` and by the
+- Dreams are **returned** by `POST /v1/memories/search` and by the
   gateway's `_search_mnemos_context` inject path.
 - Dreams are **labeled** in the response envelope so the consuming
   agent can tell the register: this is speculative, generated, with
@@ -283,7 +285,7 @@ single-parent dreams this is trivially the seed's category. For
 multi-parent (octopus) dreams, the dream version row carries the
 **dominant** category (most common across seeds) in `category`, and
 the full set in `metadata.category_mix`. This keeps
-`GET /memories?category=X` working uniformly — it surfaces main-branch
+`GET /v1/memories?category=X` working uniformly — it surfaces main-branch
 facts plus any dream branches whose dream version row carries that
 category.
 
@@ -425,7 +427,7 @@ Mechanical implementation of §2 (surfaceability).
 ### 8.1 Search API
 
 ```
-POST /memories/search
+POST /v1/memories/search
 {
   "query": "...",
   "limit": 10,
@@ -495,7 +497,7 @@ The `search_memories` MCP tool gains a `dream_mode` parameter:
 ### 8.4 DAG endpoints
 
 The existing DAG endpoints (`/v1/memories/{id}/branches`,
-`/v1/memories/{id}/versions`, `/v1/versions/{id}`) gain a
+`/v1/memories/{id}/versions`, `/v1/memories/{id}/commits/{commit}`) gain a
 `kind='dream'` response field. "Show me the dream RFCs attached to
 memory M" is just `GET /v1/memories/M/branches?prefix=dream/` — no new
 endpoint.
@@ -639,7 +641,7 @@ in v3.4.
 - Dream worker + queue drain reusing `process_contest_queue` shape.
 - Seed strategies: `random`, `category_scoped`, `recent`. (No
   schema-aware `cluster_gap` yet — that needs APOLLO-typed seeds.)
-- Retrieval surfacing: `POST /memories/search` facts/dreams split.
+- Retrieval surfacing: `POST /v1/memories/search` facts/dreams split.
 - Manual promotion via merge commit (single-parent dreams only).
 - Manual trigger endpoint (`/admin/dreams/run`); no idle scheduler.
 - Prose-form seeds only *[provisional — replaced by APOLLO dense in
