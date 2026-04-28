@@ -13,9 +13,12 @@ Provides:
 # subsystem for use in Python applications that embed MNEMOS directly.
 # The REST API handlers (api/handlers/) use direct asyncpg queries for performance.
 
+import json
 import logging
-from typing import Dict, Any, Optional, List
 from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
+
+from api.auth import UserContext
 
 logger = logging.getLogger(__name__)
 
@@ -25,62 +28,86 @@ class StateManager:
 
     def __init__(self, db_pool=None):
         self.db_pool = db_pool
-        self._cache: Dict[str, Any] = {}
+        self._cache: Dict[tuple[str, str, str], Any] = {}
 
-    async def get(self, key: str) -> Optional[Any]:
+    @staticmethod
+    def _scope(user: UserContext) -> tuple[str, str]:
+        return user.user_id, user.namespace
+
+    async def get(self, key: str, *, user: UserContext) -> Optional[Any]:
         """Load value for key."""
-        if key in self._cache:
-            return self._cache[key]
+        owner_id, namespace = self._scope(user)
+        cache_key = (owner_id, namespace, key)
+        if cache_key in self._cache:
+            return self._cache[cache_key]
         if not self.db_pool:
             return None
         try:
             async with self.db_pool.acquire() as conn:
-                row = await conn.fetchrow('SELECT value FROM state WHERE key = $1', key)
+                row = await conn.fetchrow(
+                    'SELECT value FROM state '
+                    'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+                    owner_id, namespace, key,
+                )
                 if row:
                     val = row['value']
-                    self._cache[key] = val
+                    self._cache[cache_key] = val
                     return val
         except Exception as e:
             logger.error(f"Error loading state key '{key}': {e}", exc_info=True)
         return None
 
-    async def set(self, key: str, value: Any) -> None:
+    async def set(self, key: str, value: Any, *, user: UserContext) -> None:
         """Upsert key-value pair."""
-        self._cache[key] = value
+        owner_id, namespace = self._scope(user)
+        self._cache[(owner_id, namespace, key)] = value
         if not self.db_pool:
             return
         try:
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
-                    '''INSERT INTO state (key, value, updated)
-                       VALUES ($1, $2::jsonb, NOW())
-                       ON CONFLICT (key) DO UPDATE SET value = $2::jsonb, updated = NOW()''',
-                    key, value
+                    '''INSERT INTO state (owner_id, namespace, key, value, updated)
+                       VALUES ($1, $2, $3, $4::jsonb, NOW())
+                       ON CONFLICT (owner_id, namespace, key) DO UPDATE
+                       SET value = $4::jsonb,
+                           updated = NOW(),
+                           version = state.version + 1''',
+                    owner_id, namespace, key, json.dumps(value),
                 )
             logger.debug(f"Saved state key: {key}")
         except Exception as e:
             logger.error(f"Error saving state key '{key}': {e}", exc_info=True)
 
-    async def delete(self, key: str) -> bool:
+    async def delete(self, key: str, *, user: UserContext) -> bool:
         """Delete key. Returns True if it existed."""
-        self._cache.pop(key, None)
+        owner_id, namespace = self._scope(user)
+        self._cache.pop((owner_id, namespace, key), None)
         if not self.db_pool:
             return False
         try:
             async with self.db_pool.acquire() as conn:
-                result = await conn.execute('DELETE FROM state WHERE key = $1', key)
+                result = await conn.execute(
+                    'DELETE FROM state '
+                    'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+                    owner_id, namespace, key,
+                )
                 return result != 'DELETE 0'
         except Exception as e:
             logger.error(f"Error deleting state key '{key}': {e}", exc_info=True)
             return False
 
-    async def list_keys(self) -> List[Dict[str, Any]]:
+    async def list_keys(self, *, user: UserContext) -> List[Dict[str, Any]]:
         """Return all state keys."""
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return []
         try:
             async with self.db_pool.acquire() as conn:
-                rows = await conn.fetch('SELECT key, updated FROM state ORDER BY key')
+                rows = await conn.fetch(
+                    'SELECT key, updated FROM state '
+                    'WHERE owner_id = $1 AND namespace = $2 ORDER BY key',
+                    owner_id, namespace,
+                )
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error listing state keys: {e}", exc_info=True)
@@ -88,12 +115,12 @@ class StateManager:
 
     # ── Convenience accessors ────────────────────────────────────────────────
 
-    async def load_identity(self) -> Dict[str, Any]:
-        val = await self.get('identity')
+    async def load_identity(self, *, user: UserContext) -> Dict[str, Any]:
+        val = await self.get('identity', user=user)
         return val or {'id': 'unknown', 'name': 'Unknown User', 'workspace': 'default'}
 
-    async def load_today(self) -> Dict[str, Any]:
-        val = await self.get('today')
+    async def load_today(self, *, user: UserContext) -> Dict[str, Any]:
+        val = await self.get('today', user=user)
         if val:
             return val
         now = datetime.now(timezone.utc).replace(tzinfo=None)
@@ -104,8 +131,8 @@ class StateManager:
             'events': [],
         }
 
-    async def load_workspace(self) -> Dict[str, Any]:
-        val = await self.get('workspace')
+    async def load_workspace(self, *, user: UserContext) -> Dict[str, Any]:
+        val = await self.get('workspace', user=user)
         return val or {'id': 'default', 'name': 'Default Workspace', 'projects': []}
 
     def clear_cache(self) -> None:

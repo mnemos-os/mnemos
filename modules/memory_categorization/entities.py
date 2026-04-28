@@ -16,13 +16,15 @@ Provides:
 # subsystem for use in Python applications that embed MNEMOS directly.
 # The REST API handlers (api/handlers/) use direct asyncpg queries for performance.
 
+import json
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-logger = logging.getLogger(__name__)
-
+from api.auth import UserContext
 from modules.memory_categorization.constants import ENTITY_TYPES
+
+logger = logging.getLogger(__name__)
 
 
 class EntityManager:
@@ -31,22 +33,33 @@ class EntityManager:
     def __init__(self, db_pool=None):
         self.db_pool = db_pool
 
+    @staticmethod
+    def _scope(user: UserContext) -> tuple[str, str]:
+        return user.user_id, user.namespace
+
     async def create_entity(self, entity_type: str, name: str,
                             description: Optional[str] = None,
-                            metadata: Optional[Dict] = None) -> Optional[str]:
+                            metadata: Optional[Dict] = None,
+                            *,
+                            user: UserContext) -> Optional[str]:
         """Create entity. Returns entity id or None on error."""
         if entity_type not in ENTITY_TYPES:
             logger.warning(f"Unknown entity type: {entity_type}")
         entity_id = str(uuid4())
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return entity_id
         try:
             async with self.db_pool.acquire() as conn:
                 await conn.execute(
-                    '''INSERT INTO entities (id, entity_type, name, description, metadata)
-                       VALUES ($1, $2, $3, $4, $5)
-                       ON CONFLICT (entity_type, name) DO NOTHING''',
-                    entity_id, entity_type, name, description, metadata or {}
+                    '''INSERT INTO entities
+                       (id, owner_id, namespace, entity_type, name, description, metadata)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
+                       ON CONFLICT (owner_id, namespace, entity_type, name) DO UPDATE
+                       SET description = COALESCE($6, entities.description),
+                           updated = NOW()''',
+                    entity_id, owner_id, namespace, entity_type, name,
+                    description, json.dumps(metadata or {}),
                 )
             logger.debug(f"Created entity: {entity_type}/{name}")
             return entity_id
@@ -54,35 +67,58 @@ class EntityManager:
             logger.error(f"Error creating entity: {e}", exc_info=True)
             return None
 
-    async def get_entity(self, entity_id: str) -> Optional[Dict]:
+    async def get_entity(self, entity_id: str, *, user: UserContext) -> Optional[Dict]:
         """Fetch entity by id."""
-        if not self.db_pool:
-            return None
-        try:
-            async with self.db_pool.acquire() as conn:
-                row = await conn.fetchrow('SELECT * FROM entities WHERE id = $1', entity_id)
-                return dict(row) if row else None
-        except Exception as e:
-            logger.error(f"Error fetching entity: {e}", exc_info=True)
-            return None
-
-    async def get_by_name(self, entity_type: str, name: str) -> Optional[Dict]:
-        """Fetch entity by type+name."""
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return None
         try:
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    'SELECT * FROM entities WHERE entity_type = $1 AND name = $2',
-                    entity_type, name
+                    '''SELECT * FROM entities
+                       WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+                    entity_id, owner_id, namespace,
+                )
+                return dict(row) if row else None
+        except Exception as e:
+            logger.error(f"Error fetching entity: {e}", exc_info=True)
+            return None
+
+    async def get_by_name(
+        self,
+        entity_type: str,
+        name: str,
+        *,
+        user: UserContext,
+    ) -> Optional[Dict]:
+        """Fetch entity by type+name."""
+        owner_id, namespace = self._scope(user)
+        if not self.db_pool:
+            return None
+        try:
+            async with self.db_pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    '''SELECT * FROM entities
+                       WHERE owner_id = $1
+                         AND namespace = $2
+                         AND entity_type = $3
+                         AND name = $4''',
+                    owner_id, namespace, entity_type, name,
                 )
                 return dict(row) if row else None
         except Exception as e:
             logger.error(f"Error fetching entity by name: {e}", exc_info=True)
             return None
 
-    async def link_entities(self, entity_id: str, related_id: str) -> bool:
+    async def link_entities(
+        self,
+        entity_id: str,
+        related_id: str,
+        *,
+        user: UserContext,
+    ) -> bool:
         """Add related_id to entity's related_entities array (bidirectional)."""
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return False
         try:
@@ -94,8 +130,11 @@ class EntityManager:
                            $2::uuid
                        ),
                        updated = NOW()
-                       WHERE id = $1 AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
-                    entity_id, related_id
+                       WHERE id = $1::uuid
+                         AND owner_id = $3
+                         AND namespace = $4
+                         AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
+                    entity_id, related_id, owner_id, namespace,
                 )
                 # Also link in reverse
                 await conn.execute(
@@ -105,8 +144,11 @@ class EntityManager:
                            $2::uuid
                        ),
                        updated = NOW()
-                       WHERE id = $1 AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
-                    related_id, entity_id
+                       WHERE id = $1::uuid
+                         AND owner_id = $3
+                         AND namespace = $4
+                         AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
+                    related_id, entity_id, owner_id, namespace,
                 )
             logger.debug(f"Linked entities: {entity_id} <-> {related_id}")
             return True
@@ -116,50 +158,75 @@ class EntityManager:
 
     async def query_entities(self, entity_type: Optional[str] = None,
                              name_search: Optional[str] = None,
-                             limit: int = 50) -> List[Dict]:
+                             limit: int = 50,
+                             *,
+                             user: UserContext) -> List[Dict]:
         """Search entities."""
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return []
         try:
             async with self.db_pool.acquire() as conn:
                 if entity_type and name_search:
                     rows = await conn.fetch(
-                        '''SELECT * FROM entities WHERE entity_type = $1 AND name ILIKE $2
-                           ORDER BY name LIMIT $3''',
-                        entity_type, f'%{name_search}%', limit
+                        '''SELECT * FROM entities
+                           WHERE owner_id = $1
+                             AND namespace = $2
+                             AND entity_type = $3
+                             AND name ILIKE $4
+                           ORDER BY name LIMIT $5''',
+                        owner_id, namespace, entity_type, f'%{name_search}%', limit,
                     )
                 elif entity_type:
                     rows = await conn.fetch(
-                        'SELECT * FROM entities WHERE entity_type = $1 ORDER BY name LIMIT $2',
-                        entity_type, limit
+                        '''SELECT * FROM entities
+                           WHERE owner_id = $1 AND namespace = $2 AND entity_type = $3
+                           ORDER BY name LIMIT $4''',
+                        owner_id, namespace, entity_type, limit,
                     )
                 elif name_search:
                     rows = await conn.fetch(
-                        'SELECT * FROM entities WHERE name ILIKE $1 ORDER BY name LIMIT $2',
-                        f'%{name_search}%', limit
+                        '''SELECT * FROM entities
+                           WHERE owner_id = $1
+                             AND namespace = $2
+                             AND name ILIKE $3
+                           ORDER BY name LIMIT $4''',
+                        owner_id, namespace, f'%{name_search}%', limit,
                     )
                 else:
                     rows = await conn.fetch(
-                        'SELECT * FROM entities ORDER BY entity_type, name LIMIT $1', limit
+                        '''SELECT * FROM entities
+                           WHERE owner_id = $1 AND namespace = $2
+                           ORDER BY entity_type, name LIMIT $3''',
+                        owner_id, namespace, limit,
                     )
                 return [dict(row) for row in rows]
         except Exception as e:
             logger.error(f"Error querying entities: {e}", exc_info=True)
             return []
 
-    async def get_related_entities(self, entity_id: str) -> List[Dict]:
+    async def get_related_entities(
+        self,
+        entity_id: str,
+        *,
+        user: UserContext,
+    ) -> List[Dict]:
         """Get all entities linked to this one via related_entities array."""
-        entity = await self.get_entity(entity_id)
+        entity = await self.get_entity(entity_id, user=user)
         if not entity or not entity.get('related_entities'):
             return []
         related_ids = entity['related_entities']
+        owner_id, namespace = self._scope(user)
         if not related_ids or not self.db_pool:
             return []
         try:
             async with self.db_pool.acquire() as conn:
                 rows = await conn.fetch(
-                    'SELECT * FROM entities WHERE id = ANY($1::uuid[])',
-                    related_ids
+                    '''SELECT * FROM entities
+                       WHERE owner_id = $1
+                         AND namespace = $2
+                         AND id = ANY($3::uuid[])''',
+                    owner_id, namespace, related_ids,
                 )
                 return [dict(row) for row in rows]
         except Exception as e:
@@ -168,34 +235,44 @@ class EntityManager:
 
     async def update_entity(self, entity_id: str,
                             description: Optional[str] = None,
-                            metadata: Optional[Dict] = None) -> bool:
+                            metadata: Optional[Dict] = None,
+                            *,
+                            user: UserContext) -> bool:
         """Update entity description/metadata."""
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return False
         try:
             async with self.db_pool.acquire() as conn:
                 if description is not None and metadata is not None:
                     await conn.execute(
-                        'UPDATE entities SET description=$1, metadata=$2, updated=NOW() WHERE id=$3',
-                        description, metadata, entity_id
+                        '''UPDATE entities
+                           SET description = $1, metadata = $2::jsonb, updated = NOW()
+                           WHERE id = $3::uuid AND owner_id = $4 AND namespace = $5''',
+                        description, json.dumps(metadata), entity_id, owner_id, namespace,
                     )
                 elif description is not None:
                     await conn.execute(
-                        'UPDATE entities SET description=$1, updated=NOW() WHERE id=$2',
-                        description, entity_id
+                        '''UPDATE entities
+                           SET description = $1, updated = NOW()
+                           WHERE id = $2::uuid AND owner_id = $3 AND namespace = $4''',
+                        description, entity_id, owner_id, namespace,
                     )
                 elif metadata is not None:
                     await conn.execute(
-                        'UPDATE entities SET metadata=$1, updated=NOW() WHERE id=$2',
-                        metadata, entity_id
+                        '''UPDATE entities
+                           SET metadata = $1::jsonb, updated = NOW()
+                           WHERE id = $2::uuid AND owner_id = $3 AND namespace = $4''',
+                        json.dumps(metadata), entity_id, owner_id, namespace,
                     )
             return True
         except Exception as e:
             logger.error(f"Error updating entity: {e}", exc_info=True)
             return False
 
-    async def delete_entity(self, entity_id: str) -> bool:
+    async def delete_entity(self, entity_id: str, *, user: UserContext) -> bool:
         """Delete entity and remove from other entities' related_entities arrays."""
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return False
         try:
@@ -204,24 +281,38 @@ class EntityManager:
                 await conn.execute(
                     '''UPDATE entities
                        SET related_entities = array_remove(related_entities, $1::uuid)
-                       WHERE $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
-                    entity_id
+                       WHERE owner_id = $2
+                         AND namespace = $3
+                         AND $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
+                    entity_id, owner_id, namespace,
                 )
-                result = await conn.execute('DELETE FROM entities WHERE id = $1', entity_id)
+                result = await conn.execute(
+                    '''DELETE FROM entities
+                       WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+                    entity_id, owner_id, namespace,
+                )
                 return result != 'DELETE 0'
         except Exception as e:
             logger.error(f"Error deleting entity: {e}", exc_info=True)
             return False
 
-    async def get_statistics(self) -> Dict[str, Any]:
+    async def get_statistics(self, *, user: UserContext) -> Dict[str, Any]:
         stats = {'total_entities': 0, 'by_type': {}}
+        owner_id, namespace = self._scope(user)
         if not self.db_pool:
             return stats
         try:
             async with self.db_pool.acquire() as conn:
-                stats['total_entities'] = await conn.fetchval('SELECT COUNT(*) FROM entities') or 0
+                stats['total_entities'] = await conn.fetchval(
+                    '''SELECT COUNT(*) FROM entities
+                       WHERE owner_id = $1 AND namespace = $2''',
+                    owner_id, namespace,
+                ) or 0
                 type_rows = await conn.fetch(
-                    'SELECT entity_type, COUNT(*) as count FROM entities GROUP BY entity_type ORDER BY count DESC'
+                    '''SELECT entity_type, COUNT(*) as count FROM entities
+                       WHERE owner_id = $1 AND namespace = $2
+                       GROUP BY entity_type ORDER BY count DESC''',
+                    owner_id, namespace,
                 )
                 stats['by_type'] = {row['entity_type']: row['count'] for row in type_rows}
         except Exception as e:

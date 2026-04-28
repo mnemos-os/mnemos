@@ -2,7 +2,7 @@
 
 Usage from handlers:
     from api.webhook_dispatcher import dispatch
-    await dispatch(conn, "memory.created", {"memory_id": ..., "content": ...})
+    await dispatch("memory.created", {"memory_id": ..., "content": ...}, conn=conn)
 
 Design notes
 ------------
@@ -171,6 +171,60 @@ class _ClaimedDelivery:
 
 
 async def dispatch(
+    event_type: str | asyncpg.Connection,
+    payload: Dict[str, Any] | str,
+    legacy_payload: Optional[Dict[str, Any]] = None,
+    *,
+    conn: Optional[asyncpg.Connection] = None,
+    owner_id: Optional[str] = None,
+    namespace: Optional[str] = None,
+) -> None:
+    """Fan out an event to all matching subscriptions.
+
+    Records a `webhook_deliveries` row per subscription, then schedules each
+    delivery as a background task. When `conn` is provided, the delivery rows
+    are inserted on that connection and join the caller's transaction. Without
+    `conn`, the dispatcher acquires its own connection, preserving the
+    stand-alone behavior used by non-transactional callers.
+    """
+    target_conn = conn
+    resolved_event_type = event_type
+    resolved_payload = payload
+    if legacy_payload is not None:
+        if conn is not None:
+            raise TypeError("dispatch received both positional and keyword conn")
+        target_conn = event_type
+        resolved_event_type = payload
+        resolved_payload = legacy_payload
+    if not isinstance(resolved_event_type, str) or not isinstance(resolved_payload, dict):
+        raise TypeError("dispatch expects dispatch(event_type, payload, *, conn=conn)")
+
+    if target_conn is not None:
+        await _dispatch_on_conn(
+            target_conn,
+            resolved_event_type,
+            resolved_payload,
+            owner_id=owner_id,
+            namespace=namespace,
+        )
+        return
+
+    from api.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
+    if not lifecycle_pool:
+        logger.warning("webhook dispatcher: no DB pool — skipping event %s", resolved_event_type)
+        return
+
+    async with lifecycle_pool.acquire() as acquired_conn:
+        await _dispatch_on_conn(
+            acquired_conn,
+            resolved_event_type,
+            resolved_payload,
+            owner_id=owner_id,
+            namespace=namespace,
+        )
+
+
+async def _dispatch_on_conn(
     conn: asyncpg.Connection,
     event_type: str,
     payload: Dict[str, Any],
@@ -178,12 +232,7 @@ async def dispatch(
     owner_id: Optional[str] = None,
     namespace: Optional[str] = None,
 ) -> None:
-    """Fan out an event to all matching subscriptions.
-
-    Records a `webhook_deliveries` row per subscription, then schedules
-    each delivery as a background task. Safe to call from inside any
-    handler that already has a DB connection.
-    """
+    """Insert delivery intents using an already-selected connection."""
     subs = await _matching_subscriptions(conn, event_type, owner_id, namespace)
     if not subs:
         return

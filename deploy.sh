@@ -13,7 +13,6 @@ if [ -z "${DEPLOY_HOST:-}" ]; then
 fi
 
 # Configuration
-DEPLOY_HOST=""
 DEPLOY_USER="${DEPLOY_USER:-$(whoami)}"
 DEPLOY_DIR="/opt/mnemos"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -126,7 +125,6 @@ DATABASE_PASSWORD=mnemos_secure_password
 # API Server
 MNEMOS_HOST=0.0.0.0
 MNEMOS_PORT=5000
-MNEMOS_WORKERS=4
 MNEMOS_DEBUG=false
 
 # Graeae Integration
@@ -171,12 +169,41 @@ SQL
 
     echo "Database created"
 
-    # Run migrations
+    # Run migrations in canonical order. Keep install.py::main()
+    # migration_files (see install.py:169-178) as the canonical source.
     cd $DEPLOY_DIR
     source venv/bin/activate
-    # Give mnemos user a simple password for local connections
-    sudo -u postgres psql -d mnemos -f db/migrations.sql 2>/dev/null || \
-    sudo -u postgres psql -d mnemos -f db/migrations.sql
+    python - <<'PY' | while IFS= read -r migration_file; do
+import ast
+from pathlib import Path
+
+tree = ast.parse(Path("install.py").read_text())
+for node in ast.walk(tree):
+    if not isinstance(node, ast.FunctionDef) or node.name != "main":
+        continue
+    for stmt in ast.walk(node):
+        if (
+            isinstance(stmt, ast.Assign)
+            and len(stmt.targets) == 1
+            and isinstance(stmt.targets[0], ast.Name)
+            and stmt.targets[0].id == "migration_files"
+            and isinstance(stmt.value, ast.List)
+        ):
+            for item in stmt.value.elts:
+                filename = None
+                for subnode in ast.walk(item):
+                    if isinstance(subnode, ast.Constant) and isinstance(subnode.value, str):
+                        if subnode.value.endswith(".sql"):
+                            filename = subnode.value
+                if filename is not None:
+                    print(f"db/{filename}")
+            raise SystemExit(0)
+raise SystemExit("migration_files list not found in install.py")
+PY
+        [ -n "\$migration_file" ] || continue
+        echo "Applying \$migration_file"
+        sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 -f "\$migration_file"
+    done
 
     echo "Migrations completed"
 DBEOF

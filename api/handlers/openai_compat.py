@@ -809,6 +809,16 @@ def _fallback_provider_from_name(model: str) -> Optional[str]:
     return None
 
 
+def _model_not_found_error(model: str) -> dict[str, dict[str, str]]:
+    return {
+        "error": {
+            "message": f"The model `{model}` does not exist or you do not have access to it.",
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+        }
+    }
+
+
 async def _resolve_provider_for_model(model: str) -> Optional[str]:
     """Look up `model` in model_registry and return its provider.
 
@@ -906,13 +916,8 @@ async def _prepare_provider_route(
             "fallback substring match", model,
         )
         raise HTTPException(
-            status_code=400,
-            detail=(
-                f"unknown model {model!r}; not in model_registry and "
-                f"no provider heuristic matched. Add the model to the "
-                f"registry (update_model_registry.py) or use a known "
-                f"model id."
-            ),
+            status_code=404,
+            detail=_model_not_found_error(model),
         )
 
     bare_model = _strip_gateway_namespace(model, provider)

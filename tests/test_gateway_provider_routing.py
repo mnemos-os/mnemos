@@ -217,10 +217,10 @@ def test_resolve_falls_back_when_pool_missing(monkeypatch):
 # ─── _route_to_provider ─────────────────────────────────────────────────────
 
 
-def test_route_unknown_model_raises_400(monkeypatch):
-    """v3.2 contract: unknown model_id is an explicit 400, NOT a
-    silent route to groq. Operators see the failure at the edge
-    instead of getting garbage responses from the wrong provider."""
+def test_route_unknown_model_raises_404(monkeypatch):
+    """Unknown model_id is an explicit OpenAI-style 404, NOT a silent
+    route to groq. Operators see the failure at the edge instead of
+    getting garbage responses from the wrong provider."""
     from api.handlers import openai_compat
 
     conn = _Conn(row=None)
@@ -234,9 +234,8 @@ def test_route_unknown_model_raises_400(monkeypatch):
             temperature=0.7, max_tokens=100,
             user=_user(),
         ))
-    assert exc.value.status_code == 400
-    assert "unknown model" in exc.value.detail
-    assert "model_registry" in exc.value.detail
+    assert exc.value.status_code == 404
+    assert exc.value.detail["error"]["code"] == "model_not_found"
 
 
 def test_route_uses_registry_hit_over_heuristic(monkeypatch):

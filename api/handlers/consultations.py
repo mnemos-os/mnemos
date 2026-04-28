@@ -434,14 +434,17 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         try:
             from api.webhook_dispatcher import dispatch as _dispatch_webhook
             if _lc._pool and consultation_id is not None:
-                async with _lc._pool.acquire() as _wh_conn:
-                    await _dispatch_webhook(_wh_conn, "consultation.completed", {
+                await _dispatch_webhook(
+                    "consultation.completed",
+                    {
                         "consultation_id": str(consultation_id),
                         "task_type": body.task_type,
                         "winning_muse": result.get("winning_muse"),
                         "consensus_score": result.get("consensus_score"),
                         "owner_id": user.user_id,
-                    }, owner_id=user.user_id)
+                    },
+                    owner_id=user.user_id,
+                )
         except Exception:
             logger.warning("webhook dispatch failed for consultation.completed %s", consultation_id, exc_info=True)
 

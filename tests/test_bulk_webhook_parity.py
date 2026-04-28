@@ -122,7 +122,7 @@ async def test_bulk_create_emits_memory_created_for_each_success(
     _install_pool(monkeypatch, pool)
     events: list[dict[str, Any]] = []
 
-    async def fake_dispatch(conn, event_type, payload, *, owner_id, namespace):
+    async def fake_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
         events.append(
             {
                 "conn": conn,
@@ -160,8 +160,8 @@ async def test_bulk_create_emits_memory_created_for_each_success(
     assert {event["namespace"] for event in events} == {"alice-ns"}
     assert {event["payload"]["owner_id"] for event in events} == {"alice"}
     assert {event["payload"]["namespace"] for event in events} == {"alice-ns"}
-    assert len(pool.connections) == 2
-    assert {event["conn"] for event in events} == {pool.connections[1]}
+    assert len(pool.connections) == 1
+    assert {event["conn"] for event in events} == {pool.connections[0]}
     assert {insert["conn"] for insert in pool.inserts} == {pool.connections[0]}
 
 
@@ -175,7 +175,7 @@ async def test_bulk_create_dispatches_only_successful_items(
     _install_pool(monkeypatch, pool)
     events: list[dict[str, Any]] = []
 
-    async def fake_dispatch(conn, event_type, payload, *, owner_id, namespace):
+    async def fake_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
         events.append({"payload": payload, "owner_id": owner_id, "namespace": namespace})
 
     from api import webhook_dispatcher
@@ -206,7 +206,7 @@ async def test_bulk_create_dispatches_only_successful_items(
     assert {event["namespace"] for event in events} == {"alice-ns"}
 
 
-async def test_bulk_create_tolerates_webhook_dispatch_failure(
+async def test_bulk_create_fails_when_outbox_enqueue_fails(
     client,
     auth_headers: dict[str, str],
     current_user_override,
@@ -218,7 +218,7 @@ async def test_bulk_create_tolerates_webhook_dispatch_failure(
     dispatch_attempts: list[dict[str, Any]] = []
     caplog.set_level(logging.WARNING, logger="api.handlers.memories")
 
-    async def failing_dispatch(conn, event_type, payload, *, owner_id, namespace):
+    async def failing_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
         dispatch_attempts.append(payload)
         raise RuntimeError("dispatcher unavailable")
 
@@ -232,14 +232,7 @@ async def test_bulk_create_tolerates_webhook_dispatch_failure(
         headers=auth_headers,
     )
 
-    assert resp.status_code == 201, resp.text
-    data = resp.json()
-    assert data["created"] == 2
-    assert data["errors"] == []
-    assert [insert["id"] for insert in pool.inserts] == data["memory_ids"]
+    assert resp.status_code == 500, resp.text
+    assert resp.json()["detail"] == "Bulk memory creation failed"
     assert dispatch_attempts
-    assert dispatch_attempts[0]["memory_id"] == data["memory_ids"][0]
-    assert any(
-        record.message == "webhook dispatch failed for memory.created bulk"
-        for record in caplog.records
-    )
+    assert "webhook dispatch failed" not in caplog.text

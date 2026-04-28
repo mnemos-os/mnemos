@@ -267,22 +267,21 @@ async def import_memories_from_document(
                 pass
         try:
             from api.webhook_dispatcher import dispatch as _dispatch_webhook
-            async with _lc._pool.acquire() as _wh_conn:
-                for mid, chunk in zip(memory_ids, chunks):
-                    await _dispatch_webhook(
-                        _wh_conn, "memory.created",
-                        {
-                            "memory_id": mid,
-                            "category": category,
-                            "subcategory": subcategory,
-                            "content": chunk["content"],
-                            "owner_id": user.user_id,
-                            "namespace": user.namespace,
-                            "source": "document_import",
-                        },
-                        owner_id=user.user_id,
-                        namespace=user.namespace,
-                    )
+            for mid, chunk in zip(memory_ids, chunks):
+                await _dispatch_webhook(
+                    "memory.created",
+                    {
+                        "memory_id": mid,
+                        "category": category,
+                        "subcategory": subcategory,
+                        "content": chunk["content"],
+                        "owner_id": user.user_id,
+                        "namespace": user.namespace,
+                        "source": "document_import",
+                    },
+                    owner_id=user.user_id,
+                    namespace=user.namespace,
+                )
         except Exception:
             logger.warning(
                 "webhook dispatch failed for document_import (%d memories)",

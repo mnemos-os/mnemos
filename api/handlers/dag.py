@@ -957,8 +957,9 @@ async def merge_branch(
 
             try:
                 from api.webhook_dispatcher import dispatch as _dispatch_webhook
-                async with _lc._pool.acquire() as _wh_conn:
-                    await _dispatch_webhook(_wh_conn, "memory.updated", {
+                await _dispatch_webhook(
+                    "memory.updated",
+                    {
                         "memory_id": memory_id,
                         "category": source_head["category"],
                         "subcategory": source_head["subcategory"],
@@ -967,7 +968,10 @@ async def merge_branch(
                         "namespace": merge_namespace,
                         "merge_source": request.source_branch,
                         "merge_target": target_branch,
-                    }, owner_id=merge_owner_id, namespace=merge_namespace)
+                    },
+                    owner_id=merge_owner_id,
+                    namespace=merge_namespace,
+                )
             except Exception:
                 logger.warning(
                     "webhook dispatch failed for memory.updated %s",

@@ -41,6 +41,13 @@ single-site HA replication doctrine.
 
 ### Changed
 
+- **Slice 13 Phase-1 audit closure.** Internal categorization managers now
+  require caller context and scope state, journal, and entity CRUD by
+  `owner_id + namespace`; memory-created webhook delivery rows are enqueued in
+  the same transaction as the memory insert; unknown chat-completion models now
+  return OpenAI-style `404 model_not_found`; stale session compression columns
+  are dropped by a new v3.5 migration; deployment docs and templates now state
+  the v3.5 single-worker runtime contract.
 - **Memory read surfaces use one predicate.** `list_memories`,
   `get_memory`, search, rehydrate, and gateway context now share the
   owner/federated/world/group-readable predicate. The Redis search

@@ -1033,6 +1033,30 @@ def test_unknown_model_returns_404(monkeypatch):
     assert exc.value.detail == "model not found"
 
 
+def test_chat_completion_unknown_model_returns_model_not_found(monkeypatch):
+    async def _unknown_model(model: str):
+        return None
+
+    monkeypatch.setattr(openai_compat, "_search_mnemos_context", _no_context)
+    monkeypatch.setattr(openai_compat, "_resolve_provider_for_model", _unknown_model)
+    req = openai_compat.ChatCompletionRequest(
+        model="nonexistent-model",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 404
+    assert exc.value.detail == {
+        "error": {
+            "message": "The model `nonexistent-model` does not exist or you do not have access to it.",
+            "type": "invalid_request_error",
+            "code": "model_not_found",
+        }
+    }
+
+
 def test_registered_model_lookup_works(monkeypatch):
     _install_pool(monkeypatch, _Conn(row={"provider": "openai"}))
 
