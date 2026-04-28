@@ -206,8 +206,21 @@ back to the static GRAEAE provider config so new deployments aren't 404.
 
 Drop-in for OpenAI SDK consumers. Point `OPENAI_BASE_URL` at MNEMOS.
 
-- `POST /v1/chat/completions`
-- `GET /v1/models`
+- `POST /v1/chat/completions` — chat completions with memory injection,
+  propagated generation controls, and OpenAI-format SSE when `stream=true`.
+- `GET /v1/models` — registry-backed model list only.
+- `GET /v1/models/{model_id}` — registry lookup; unregistered IDs return 404.
+
+Field support is intentionally pass-or-reject:
+
+| Request field | OpenAI-style providers | Anthropic | Gemini | Other/text-only providers |
+|---------------|------------------------|-----------|--------|---------------------------|
+| `temperature`, `max_tokens`, `top_p` | Passed through (`max_tokens` maps to `max_completion_tokens` for GPT-5 models) | Mapped to Messages API fields | Mapped to `generationConfig` | Provider default unless adapter supports it |
+| `stream` | Native SSE where available | Single-shot fallback wrapped as OpenAI SSE | Single-shot fallback wrapped as OpenAI SSE | Single-shot fallback wrapped as OpenAI SSE |
+| `tools`, `tool_choice` | Passed for the OpenAI provider | Converted to Claude tool schema | 400 | 400 |
+| `response_format` | Passed through | 400 | `json_object` maps to `responseMimeType=application/json` | 400 |
+| `stop`, `n`, penalties | Passed through | `stop` maps to `stop_sequences`; unsupported penalties return 400 | Native `generationConfig` mapping | 400 when not honored |
+| content blocks / images | OpenAI vision-capable models | Claude vision | Gemini vision | 400 |
 
 Memory injection can be enabled per-request via header
 `X-MNEMOS-Inject-Memories: 1`.

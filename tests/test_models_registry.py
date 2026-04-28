@@ -1,14 +1,17 @@
 """/v1/models registry-backed (v3.1.2 Tier 3).
 
 Pins the new behavior: /v1/models queries model_registry instead of
-returning a hardcoded list, with a defensive fallback to the built-in
-list when the table is empty or the query fails.
+returning a hardcoded list. Discovery is registry-only: chat routing
+can still use heuristics, but model listing and lookup do not synthesize
+metadata for unregistered models.
 """
 
 from __future__ import annotations
 
 import asyncio
 from unittest.mock import MagicMock
+
+import pytest
 
 from api.auth import UserContext
 from api.handlers import openai_compat
@@ -82,30 +85,26 @@ def test_list_models_returns_registry_rows(monkeypatch):
     assert owners["gemini-2.5-pro"] == "Google"
 
 
-def test_list_models_empty_registry_falls_back_to_builtins(monkeypatch):
+def test_list_models_empty_registry_returns_empty(monkeypatch):
     _install(monkeypatch, _Conn(rows=[]))
 
     resp = asyncio.run(openai_compat.list_models(authorization=None, user=_user()))
-    assert len(resp.data) > 0
-    # fallback list contains the canonical built-ins
-    ids = [m.id for m in resp.data]
-    assert any(i.startswith("gpt") for i in ids)
-    assert any(i.startswith("claude") for i in ids)
+    assert resp.data == []
 
 
-def test_list_models_db_failure_falls_back_without_raising(monkeypatch):
+def test_list_models_db_failure_returns_empty_without_synthesizing(monkeypatch):
     _install(monkeypatch, _Conn(raise_on_query=True))
 
-    # Must not raise — /v1/models stays usable through transient DB blips
+    # Must not synthesize unregistered models through transient DB blips.
     resp = asyncio.run(openai_compat.list_models(authorization=None, user=_user()))
-    assert len(resp.data) > 0
+    assert resp.data == []
 
 
-def test_list_models_no_pool_falls_back_to_builtins(monkeypatch):
+def test_list_models_no_pool_returns_empty(monkeypatch):
     _install_no_pool(monkeypatch)
 
     resp = asyncio.run(openai_compat.list_models(authorization=None, user=_user()))
-    assert len(resp.data) > 0
+    assert resp.data == []
 
 
 def test_list_models_unknown_provider_capitalized(monkeypatch):
@@ -155,14 +154,16 @@ def test_get_model_alias_resolved_before_lookup(monkeypatch):
     assert captured_args[0] == (concrete,)
 
 
-def test_get_model_unknown_returns_passthrough(monkeypatch):
-    """A model not in the registry is still returned with owned_by=Unknown,
-    because operators can configure local models that aren't globally listed.
-    """
+def test_get_model_unknown_returns_404(monkeypatch):
+    """A model not in the registry returns 404. Chat routing may still
+    use provider heuristics, but discovery must not overstate availability."""
     _install(monkeypatch, _Conn(row_for_get=None))
 
-    result = asyncio.run(openai_compat.get_model(
-        "my-local-model", authorization=None, user=_user(),
-    ))
-    assert result.id == "my-local-model"
-    assert result.owned_by == "Unknown"
+    from fastapi import HTTPException
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.get_model(
+            "my-local-model", authorization=None, user=_user(),
+        ))
+    assert exc.value.status_code == 404
+    assert exc.value.detail == "model not found"

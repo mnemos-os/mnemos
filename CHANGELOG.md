@@ -6,8 +6,9 @@ All notable changes to MNEMOS are documented here.
 
 v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
 as a release tag. Merged slices cover audit quick wins, memory-read tenancy
-+ DAG integrity, webhook retry hardening, RLS group-select parity, and the
-federation compound-cursor tie-breaker, and consultation audit endpoint scoping.
+and DAG integrity, webhook retry hardening, RLS group-select parity, the
+federation compound-cursor tie-breaker, consultation audit endpoint scoping,
+MCP transport parity, and faithful OpenAI-compatible gateway controls.
 
 ### Added
 
@@ -85,6 +86,15 @@ federation compound-cursor tie-breaker, and consultation audit endpoint scoping.
 
 ### Fixed
 
+- **Slice 8 OpenAI-compatible gateway honesty (#5/#6/#7)** —
+  `/v1/chat/completions` now propagates `temperature`, `max_tokens`, and
+  `top_p` through GRAEAE into provider payloads; supports OpenAI-format
+  SSE when `stream=true`; accepts string or content-block message payloads;
+  and passes tools/tool_choice, response_format, stop/n, and penalties only
+  where the selected provider can honor them. Unsupported provider/field
+  combinations now return explicit HTTP 400s instead of being silently
+  dropped. `/v1/models/{model_id}` now returns 404 for unregistered models,
+  and model discovery no longer synthesizes `owned_by="Unknown"` entries.
 - **Slice 7 MCP split-brain (#24)** — `api/mcp_tools.py` is now the
   canonical MCP tool registry for stdio and HTTP/SSE transports. The live MCP
   surface includes CRUD, bulk create, stats, KG tools, DAG log/branch/diff/
@@ -559,11 +569,10 @@ and the full follow-up Codex re-audit.
 - **Registry-backed `/v1/models`** (`api/handlers/openai_compat.py`).
   Replaces the hardcoded six-entry list with
   `SELECT … FROM model_registry WHERE available AND NOT deprecated
-  ORDER BY graeae_weight DESC`. Fallback to a built-in list when
-  the registry is empty (fresh install) or the query fails.
-  `get_model` resolves aliases first, then registry lookup;
-  unregistered IDs still return with `owned_by="Unknown"` since
-  operators may route to locally configured models.
+  ORDER BY graeae_weight DESC`. This originally retained a built-in
+  fallback list and synthetic `owned_by="Unknown"` detail responses for
+  unregistered IDs; v3.5 Slice 8 supersedes that behavior with
+  registry-only discovery and 404 on unknown model detail lookup.
 
 ### Provider routing + audit fixes — handoff work
 

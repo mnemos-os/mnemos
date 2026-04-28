@@ -30,11 +30,13 @@ Reliability stack (innermost to outermost):
 """
 
 import asyncio
+import json
 import logging
 import re
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 
@@ -144,6 +146,150 @@ def _load_providers() -> dict[str, dict]:
 
     logger.info(f"[GRAEAE] loaded {len(providers)} providers from config.toml: {list(providers)}")
     return providers
+
+
+def _content_text(content: Any) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                parts.append(str(block.get("text", "")))
+            elif block.get("type") == "image_url":
+                image_url = block.get("image_url") or {}
+                url = image_url.get("url") if isinstance(image_url, dict) else None
+                if url:
+                    parts.append(f"[image_url: {url}]")
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _as_list(value: Any) -> list[Any]:
+    return value if isinstance(value, list) else [value]
+
+
+def _openai_messages(messages: Optional[list[dict]], prompt: str) -> list[dict]:
+    if messages:
+        normalized: list[dict] = []
+        for msg in messages:
+            item = {k: v for k, v in msg.items() if v is not None}
+            if "content" not in item and "tool_calls" not in item:
+                item["content"] = ""
+            normalized.append(item)
+        return normalized
+    return [{"role": "user", "content": prompt}]
+
+
+def _anthropic_content_parts(content: Any) -> list[dict]:
+    if isinstance(content, list):
+        parts: list[dict] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                parts.append({"type": "text", "text": block.get("text", "")})
+            elif block.get("type") == "image_url":
+                image_url = block.get("image_url") or {}
+                url = image_url.get("url") if isinstance(image_url, dict) else None
+                if url:
+                    parts.append({"type": "image", "source": {"type": "url", "url": url}})
+        return parts or [{"type": "text", "text": ""}]
+    return [{"type": "text", "text": _content_text(content)}]
+
+
+def _anthropic_messages(messages: Optional[list[dict]], prompt: str) -> tuple[Optional[str], list[dict]]:
+    if not messages:
+        return None, [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+
+    system_parts: list[str] = []
+    converted: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role == "system":
+            text = _content_text(msg.get("content"))
+            if text:
+                system_parts.append(text)
+            continue
+        if role not in {"user", "assistant"}:
+            role = "user"
+        converted.append({"role": role, "content": _anthropic_content_parts(msg.get("content"))})
+    if not converted:
+        converted.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
+    return ("\n\n".join(system_parts) if system_parts else None), converted
+
+
+def _anthropic_tools(tools: list[dict]) -> list[dict]:
+    converted: list[dict] = []
+    for tool in tools:
+        if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
+            fn = tool["function"]
+            converted.append({
+                "name": fn.get("name"),
+                "description": fn.get("description", ""),
+                "input_schema": fn.get("parameters", {"type": "object"}),
+            })
+        else:
+            converted.append(tool)
+    return converted
+
+
+def _anthropic_tool_choice(tool_choice: Any) -> Any:
+    if tool_choice is None:
+        return None
+    if tool_choice in ("auto", "any"):
+        return {"type": "auto"} if tool_choice == "auto" else {"type": "any"}
+    if tool_choice == "none":
+        return {"type": "none"}
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function") or {}
+        if tool_choice.get("type") == "function" and fn.get("name"):
+            return {"type": "tool", "name": fn["name"]}
+    return tool_choice
+
+
+def _gemini_part(content: Any) -> list[dict]:
+    if isinstance(content, list):
+        parts: list[dict] = []
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "text":
+                parts.append({"text": block.get("text", "")})
+            elif block.get("type") == "image_url":
+                image_url = block.get("image_url") or {}
+                url = image_url.get("url") if isinstance(image_url, dict) else None
+                if url:
+                    parts.append({"fileData": {"fileUri": url}})
+        return parts or [{"text": ""}]
+    return [{"text": _content_text(content)}]
+
+
+def _gemini_contents(messages: Optional[list[dict]], prompt: str) -> tuple[Optional[dict], list[dict]]:
+    if not messages:
+        return None, [{"role": "user", "parts": [{"text": prompt}]}]
+
+    system_text: list[str] = []
+    contents: list[dict] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role == "system":
+            text = _content_text(msg.get("content"))
+            if text:
+                system_text.append(text)
+            continue
+        gemini_role = "model" if role == "assistant" else "user"
+        contents.append({"role": gemini_role, "parts": _gemini_part(msg.get("content"))})
+    if not contents:
+        contents.append({"role": "user", "parts": [{"text": prompt}]})
+    system_instruction = None
+    if system_text:
+        system_instruction = {"parts": [{"text": "\n\n".join(system_text)}]}
+    return system_instruction, contents
 
 
 class GraeaeEngine:
@@ -425,7 +571,15 @@ class GraeaeEngine:
         return {"all_responses": all_responses, **consensus}
 
     async def route(
-        self, provider: str, model: str, prompt: str, task_type: str = "reasoning", timeout: int = 180
+        self,
+        provider: str,
+        model: str,
+        prompt: str,
+        task_type: str = "reasoning",
+        timeout: int = 180,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
     ) -> Dict:
         """Single-provider pass-through — consensus skipped, eligibility
         gates applied.
@@ -447,6 +601,12 @@ class GraeaeEngine:
             prompt: Query text
             task_type: Task type for logging/tracking
             timeout: Request timeout in seconds
+            generation_params: OpenAI generation controls (temperature,
+                max_tokens, top_p) to map per provider
+            request_params: OpenAI-compatible request fields already
+                validated by the gateway (tools, response_format, stop, etc.)
+            messages: Full chat messages to preserve system/history and
+                multimodal content for adapters that support it
 
         Returns:
             Dict with status, response_text, latency_ms, model_id, error
@@ -514,10 +674,14 @@ class GraeaeEngine:
                 # model="claude-opus-4-7") actually reaches dispatch
                 # instead of being silently overwritten by whatever
                 # self.providers[provider]["model"] currently holds.
-                result = await self._query_provider(
-                    provider, prompt, task_type, timeout,
-                    model_override=model,
-                )
+                query_kwargs: Dict[str, Any] = {"model_override": model}
+                if generation_params:
+                    query_kwargs["generation_params"] = generation_params
+                if request_params:
+                    query_kwargs["request_params"] = request_params
+                if messages is not None:
+                    query_kwargs["messages"] = messages
+                result = await self._query_provider(provider, prompt, task_type, timeout, **query_kwargs)
             except Exception as e:
                 # Record the failure against the breaker so repeated
                 # gateway-path failures actually trip it, and quality
@@ -541,9 +705,103 @@ class GraeaeEngine:
         finally:
             concurrency.release(provider)
 
+    async def route_stream(
+        self,
+        provider: str,
+        model: str,
+        prompt: str,
+        task_type: str = "reasoning",
+        timeout: int = 180,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Single-provider streaming route.
+
+        OpenAI-style providers use native SSE streaming. Other adapters fall
+        back to one non-streaming provider call emitted as a single delta, so
+        callers still get a faithful OpenAI SSE envelope without silently
+        ignoring stream=True.
+        """
+        if provider not in self.providers:
+            raise RuntimeError(f"provider '{provider}' not registered in this deployment")
+
+        provider_config = dict(self.providers[provider])
+        if model:
+            provider_config["model"] = model
+
+        api_key = get_key(provider_config["key_name"])
+        if not api_key:
+            raise RuntimeError(
+                f"missing api_key for provider '{provider}' "
+                f"(key_name={provider_config['key_name']})"
+            )
+
+        if not self._circuit_breakers.is_allowed(provider):
+            raise RuntimeError(f"provider '{provider}' circuit open")
+        if not self._rate_limiters.is_allowed(provider):
+            raise RuntimeError(f"provider '{provider}' rate-limited")
+        concurrency = self._get_concurrency()
+        if not await concurrency.acquire(provider):
+            raise RuntimeError(f"provider '{provider}' concurrency saturated")
+
+        try:
+            try:
+                provider_cfg = dict(self.providers[provider])
+                if model:
+                    provider_cfg["model"] = model
+                    if provider_cfg.get("api") == "gemini":
+                        provider_cfg["url"] = (
+                            f"https://generativelanguage.googleapis.com/v1beta/"
+                            f"models/{model}:generateContent"
+                        )
+
+                if provider_cfg.get("api") == "openai":
+                    async for chunk in self._stream_openai_compatible(
+                        provider_cfg,
+                        prompt,
+                        timeout,
+                        generation_params=generation_params,
+                        request_params=request_params,
+                        messages=messages,
+                    ):
+                        yield chunk
+                else:
+                    result = await self._query_provider(
+                        provider,
+                        prompt,
+                        task_type,
+                        timeout,
+                        model_override=model,
+                        generation_params=generation_params,
+                        request_params=request_params,
+                        messages=messages,
+                    )
+                    for choice in result.get("choices") or []:
+                        msg = choice.get("message") or {}
+                        content = msg.get("content")
+                        if content:
+                            yield {"index": choice.get("index", 0), "content": content}
+                        if msg.get("tool_calls"):
+                            yield {"index": choice.get("index", 0), "tool_calls": msg["tool_calls"]}
+                    if not result.get("choices"):
+                        yield {"index": 0, "content": result.get("response_text", "")}
+            except Exception:
+                self._circuit_breakers.record_failure(provider)
+                self._quality.record_failure(provider)
+                raise
+            else:
+                self._circuit_breakers.record_success(provider)
+                self._quality.record_success(provider, 0)
+        finally:
+            concurrency.release(provider)
+
     async def _query_provider(
         self, provider_name: str, prompt: str, task_type: str, timeout: int,
         model_override: Optional[str] = None,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
     ) -> Dict:
         # Snapshot the provider config so a concurrent reload_from_registry
         # mutation can't tear the dict mid-dispatch. shallow copy is enough
@@ -562,11 +820,32 @@ class GraeaeEngine:
         api = provider["api"]
 
         if api == "openai":
-            response = await self._query_openai_compatible(provider, prompt, timeout)
+            response = await self._query_openai_compatible(
+                provider,
+                prompt,
+                timeout,
+                generation_params=generation_params,
+                request_params=request_params,
+                messages=messages,
+            )
         elif api == "anthropic":
-            response = await self._query_anthropic(provider, prompt, timeout)
+            response = await self._query_anthropic(
+                provider,
+                prompt,
+                timeout,
+                generation_params=generation_params,
+                request_params=request_params,
+                messages=messages,
+            )
         elif api == "gemini":
-            response = await self._query_gemini(provider, prompt, timeout)
+            response = await self._query_gemini(
+                provider,
+                prompt,
+                timeout,
+                generation_params=generation_params,
+                request_params=request_params,
+                messages=messages,
+            )
         else:
             raise ValueError(f"Unknown api style '{api}' for provider '{provider_name}'")
 
@@ -575,71 +854,236 @@ class GraeaeEngine:
         response["final_score"] = provider["weight"]  # overridden by quality tracker in consult()
         return response
 
-    async def _query_openai_compatible(self, provider: Dict, prompt: str, timeout: int) -> Dict:
+    def _openai_payload(
+        self,
+        provider: Dict,
+        prompt: str,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+        stream: bool = False,
+    ) -> Dict[str, Any]:
+        generation_params = generation_params or {}
+        request_params = request_params or {}
+
+        is_gpt5 = provider["model"].startswith("gpt-5")
+        tokens_key = "max_completion_tokens" if is_gpt5 else "max_tokens"
+        payload: Dict[str, Any] = {
+            "model": provider["model"],
+            "messages": _openai_messages(messages, prompt),
+            tokens_key: generation_params.get("max_tokens", 4096),
+        }
+        if "temperature" in generation_params:
+            payload["temperature"] = generation_params["temperature"]
+        elif not is_gpt5:
+            payload["temperature"] = 0.7
+        if "top_p" in generation_params:
+            payload["top_p"] = generation_params["top_p"]
+        for field in (
+            "tools", "tool_choice", "response_format", "stop", "n",
+            "presence_penalty", "frequency_penalty", "user",
+        ):
+            if field in request_params:
+                payload[field] = request_params[field]
+        if stream:
+            payload["stream"] = True
+        return payload
+
+    async def _query_openai_compatible(
+        self,
+        provider: Dict,
+        prompt: str,
+        timeout: int,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ) -> Dict:
         """Query OpenAI-compatible APIs (Perplexity, Groq, xAI, OpenAI)."""
         api_key = get_key(provider["key_name"])
         headers = {
             "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         }
-        # GPT-5 series has two API quirks:
-        #   1. Uses max_completion_tokens instead of max_tokens.
-        #   2. Only accepts temperature=1 (returns 400 on any other value).
-        # Other OpenAI-compat providers take the traditional shape.
-        is_gpt5 = provider["model"].startswith("gpt-5")
-        tokens_key = "max_completion_tokens" if is_gpt5 else "max_tokens"
-        payload: Dict = {
-            "model": provider["model"],
-            "messages": [{"role": "user", "content": prompt}],
-            tokens_key: 4096,
-        }
-        if not is_gpt5:
-            payload["temperature"] = 0.7
+        payload = self._openai_payload(
+            provider,
+            prompt,
+            generation_params=generation_params,
+            request_params=request_params,
+            messages=messages,
+        )
         client = await self._get_client()
         resp = await client.post(provider["url"], json=payload, headers=headers, timeout=timeout)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            raise RuntimeError(f"No choices in response: {data}")
+        normalized_choices = []
+        for i, choice in enumerate(choices):
+            message = choice.get("message") or {}
+            normalized_choices.append({
+                "index": choice.get("index", i),
+                "message": message,
+                "finish_reason": choice.get("finish_reason") or "stop",
+            })
+        first_message = normalized_choices[0]["message"]
         return {
             "status": "success",
-            "response_text": data["choices"][0]["message"]["content"],
+            "response_text": first_message.get("content") or "",
             "latency_ms": 0,
             "model_id": provider["model"],
+            "choices": normalized_choices,
         }
 
-    async def _query_anthropic(self, provider: Dict, prompt: str, timeout: int) -> Dict:
+    async def _stream_openai_compatible(
+        self,
+        provider: Dict,
+        prompt: str,
+        timeout: int,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        api_key = get_key(provider["key_name"])
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = self._openai_payload(
+            provider,
+            prompt,
+            generation_params=generation_params,
+            request_params=request_params,
+            messages=messages,
+            stream=True,
+        )
+        client = await self._get_client()
+        async with client.stream("POST", provider["url"], json=payload, headers=headers, timeout=timeout) as resp:
+            if resp.status_code != 200:
+                body = await resp.aread()
+                raise RuntimeError(f"HTTP {resp.status_code}: {body[:200]!r}")
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                raw = line[5:].strip()
+                if not raw or raw == "[DONE]":
+                    break
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.debug("[GRAEAE] skipped non-JSON stream frame: %s", raw[:120])
+                    continue
+                for choice in data.get("choices", []):
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        yield {"index": choice.get("index", 0), "content": delta["content"]}
+                    if delta.get("tool_calls"):
+                        yield {"index": choice.get("index", 0), "tool_calls": delta["tool_calls"]}
+
+    async def _query_anthropic(
+        self,
+        provider: Dict,
+        prompt: str,
+        timeout: int,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ) -> Dict:
         """Query Anthropic Claude API."""
+        generation_params = generation_params or {}
+        request_params = request_params or {}
         api_key = get_key(provider["key_name"])
         headers = {
             "x-api-key": api_key,
             "anthropic-version": "2023-06-01",
             "content-type": "application/json",
         }
+        system, anthropic_messages = _anthropic_messages(messages, prompt)
         payload = {
             "model": provider["model"],
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": generation_params.get("max_tokens", 4096),
+            "messages": anthropic_messages,
         }
+        if system:
+            payload["system"] = system
+        if "temperature" in generation_params:
+            payload["temperature"] = generation_params["temperature"]
+        if "top_p" in generation_params:
+            payload["top_p"] = generation_params["top_p"]
+        if "stop" in request_params:
+            payload["stop_sequences"] = _as_list(request_params["stop"])
+        if "tools" in request_params:
+            payload["tools"] = _anthropic_tools(request_params["tools"])
+        if "tool_choice" in request_params:
+            payload["tool_choice"] = _anthropic_tool_choice(request_params["tool_choice"])
         client = await self._get_client()
         resp = await client.post(provider["url"], json=payload, headers=headers, timeout=timeout)
         if resp.status_code != 200:
             raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
         data = resp.json()
+        content = data.get("content", [])
+        text = "".join(block.get("text", "") for block in content if block.get("type") == "text")
+        tool_calls = []
+        for block in content:
+            if block.get("type") == "tool_use":
+                tool_calls.append({
+                    "id": block.get("id"),
+                    "type": "function",
+                    "function": {
+                        "name": block.get("name"),
+                        "arguments": json.dumps(block.get("input", {}), separators=(",", ":")),
+                    },
+                })
+        message: Dict[str, Any] = {"role": "assistant", "content": text}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return {
             "status": "success",
-            "response_text": data["content"][0]["text"],
+            "response_text": text,
             "latency_ms": 0,
             "model_id": provider["model"],
+            "choices": [{"index": 0, "message": message, "finish_reason": data.get("stop_reason") or "stop"}],
         }
 
-    async def _query_gemini(self, provider: Dict, prompt: str, timeout: int) -> Dict:
+    async def _query_gemini(
+        self,
+        provider: Dict,
+        prompt: str,
+        timeout: int,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ) -> Dict:
         """Query Google Gemini API."""
+        generation_params = generation_params or {}
+        request_params = request_params or {}
         api_key = get_key(provider["key_name"])
         headers = {"x-goog-api-key": api_key}
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"maxOutputTokens": 4096, "temperature": 0.7},
+        system_instruction, contents = _gemini_contents(messages, prompt)
+        generation_config: Dict[str, Any] = {
+            "maxOutputTokens": generation_params.get("max_tokens", 4096),
+            "temperature": generation_params.get("temperature", 0.7),
         }
+        if "top_p" in generation_params:
+            generation_config["topP"] = generation_params["top_p"]
+        if "stop" in request_params:
+            generation_config["stopSequences"] = _as_list(request_params["stop"])
+        if request_params.get("n") not in (None, 1):
+            generation_config["candidateCount"] = request_params["n"]
+        if "presence_penalty" in request_params:
+            generation_config["presencePenalty"] = request_params["presence_penalty"]
+        if "frequency_penalty" in request_params:
+            generation_config["frequencyPenalty"] = request_params["frequency_penalty"]
+        response_format = request_params.get("response_format")
+        if isinstance(response_format, dict) and response_format.get("type") == "json_object":
+            generation_config["responseMimeType"] = "application/json"
+        payload = {
+            "contents": contents,
+            "generationConfig": generation_config,
+        }
+        if system_instruction:
+            payload["systemInstruction"] = system_instruction
         client = await self._get_client()
         resp = await client.post(provider["url"], headers=headers, json=payload, timeout=timeout)
         if resp.status_code != 200:
@@ -648,8 +1092,16 @@ class GraeaeEngine:
         candidates = data.get("candidates", [])
         if not candidates:
             raise RuntimeError(f"No candidates in response: {data}")
-        parts = candidates[0].get("content", {}).get("parts", [])
-        text = parts[0].get("text", "") if parts else ""
+        choices = []
+        for i, candidate in enumerate(candidates):
+            parts = candidate.get("content", {}).get("parts", [])
+            text = "".join(part.get("text", "") for part in parts)
+            choices.append({
+                "index": i,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": candidate.get("finishReason") or "stop",
+            })
+        text = choices[0]["message"]["content"] if choices else ""
         if not text:
             raise RuntimeError(f"Empty content in candidate: {candidates[0]}")
         return {
@@ -657,6 +1109,7 @@ class GraeaeEngine:
             "response_text": text,
             "latency_ms": 0,
             "model_id": provider["model"],
+            "choices": choices,
         }
 
     def provider_status(self) -> Dict:

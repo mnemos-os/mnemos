@@ -50,8 +50,10 @@ been externalized.
   decision, Custom Query lineup selection, reliability stack
   (circuit breaker + rate limiter + concurrency guard).
 - **Gateway**: OpenAI-compatible `/v1/chat/completions` +
-  `/v1/models` with registry-backed provider resolution and
-  compressed memory context injection.
+  `/v1/models` with registry-backed provider resolution,
+  compressed memory context injection, propagated generation controls,
+  SSE streaming, and explicit pass-or-400 handling for provider-specific
+  tool/format/multimodal support.
 - **Sessions**: multi-turn conversation state with per-tier memory
   injection.
 - **Tenancy**: per-user `owner_id` + `namespace` two-axis gate; root
@@ -125,7 +127,7 @@ semaphore. Reliability primitives are process-local; see §7.
 
 | ID | REST router | DB tables | Role |
 |----|-------------|-----------|------|
-| openai_compat | `api/handlers/openai_compat.py` | (reads `model_registry`, writes `session_messages`) | OpenAI-compatible `/v1/chat/completions` + `/v1/models` with compression-aware memory injection |
+| openai_compat | `api/handlers/openai_compat.py` | (reads `model_registry`, writes `session_messages`) | OpenAI-compatible `/v1/chat/completions` + registry-honest `/v1/models` with compression-aware memory injection, SSE streaming, and provider capability validation |
 | sessions     | `api/handlers/sessions.py`     | `sessions`, `session_messages`, `session_memory_injections` | Multi-turn conversation state, per-tier memory injection |
 | health       | `api/handlers/health.py`       | (reads `memory_stats`) | Liveness + readiness + statistics |
 
@@ -368,8 +370,27 @@ MCP contract-wire regression test: `tests/test_mcp_stdio_wire.py`.
 - **Consultation ↔ Provider**: reliability stack guards every
   per-provider HTTP call (circuit breaker + rate limiter + semaphore).
 - **Gateway ↔ Registry**: `_resolve_provider_for_model` queries
-  `model_registry` first, falls back to substring heuristic, 400s on
-  complete miss (no default-to-Groq as of 337aac9).
+  `model_registry` first for chat routing, falls back to substring
+  heuristic, and 400s on complete miss. `/v1/models` discovery is
+  stricter: list/detail responses are registry-only and
+  `GET /v1/models/{model_id}` returns 404 for unregistered IDs.
+- **Gateway ↔ Provider controls**: `temperature`, `max_tokens`, and
+  `top_p` flow through `graeae.route(..., generation_params=...)`.
+  OpenAI-style adapters pass `stop`, `n`, penalties, `response_format`,
+  and supported tool calls; Anthropic/Gemini map equivalent native
+  generation fields. Unsupported tools, response formats, penalties, or
+  multimodal content blocks fail at the gateway with HTTP 400.
+
+OpenAI-compatible field support matrix:
+
+| Field | OpenAI-style | Anthropic | Gemini | Unsupported providers |
+|-------|--------------|-----------|--------|-----------------------|
+| `temperature`, `max_tokens`, `top_p` | Native (`max_completion_tokens` for GPT-5) | Native Messages fields | `generationConfig` | Provider default only if no explicit field |
+| `stream` | Native SSE | Single-shot SSE fallback | Single-shot SSE fallback | Single-shot SSE fallback |
+| `tools`, `tool_choice` | OpenAI provider passthrough | Claude tool schema mapping | 400 | 400 |
+| `response_format` | Passthrough | 400 | JSON MIME mapping for `json_object` | 400 |
+| `stop`, `n`, penalties | Passthrough | `stop` only; penalties/n rejected | Native `generationConfig` | 400 |
+| content blocks / images | OpenAI vision-capable models | Claude vision | Gemini vision | 400 |
 - **Gateway ↔ Memories**: `_search_mnemos_context` left-joins
   `memory_compressed_variants` and COALESCEs winner → raw content.
 - **Worker ↔ Queue**: `process_contest_queue` dequeues with
