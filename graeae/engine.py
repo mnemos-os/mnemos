@@ -68,6 +68,44 @@ class ProviderResponse:
     final_score: float = 0.0
 
 
+class ProviderStreamError(RuntimeError):
+    """Structured provider error decoded from an SSE data frame."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        error_type: str = "provider_error",
+        status_code: int = 400,
+        details: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__(message)
+        self.message = message
+        self.error_type = error_type
+        self.status_code = status_code
+        self.details = details or {}
+
+
+GEMINI_FINISH_REASON_MAP = {
+    "STOP": "stop",
+    "MAX_TOKENS": "length",
+    "SAFETY": "content_filter",
+    "RECITATION": "content_filter",
+    "OTHER": "stop",
+    "FINISH_REASON_UNSPECIFIED": "stop",
+}
+
+
+def _normalize_gemini_finish_reason(raw: str | None) -> str:
+    if raw is None:
+        return "stop"
+    raw_value = str(raw)
+    canonical = {"stop", "length", "content_filter", "tool_calls"}
+    if raw_value.lower() in canonical:
+        return raw_value.lower()
+    return GEMINI_FINISH_REASON_MAP.get(raw_value.upper(), "stop")
+
+
 
 # Built-in provider defaults — used when config.toml has no [graeae.providers] section.
 # Operators override these (or add new providers) via config.toml exclusively.
@@ -171,6 +209,28 @@ def _content_text(content: Any) -> str:
 
 def _as_list(value: Any) -> list[Any]:
     return value if isinstance(value, list) else [value]
+
+
+def _provider_stream_error(data: dict[str, Any]) -> ProviderStreamError:
+    raw_error = data.get("error")
+    if isinstance(raw_error, dict):
+        message = str(raw_error.get("message") or raw_error.get("detail") or "Provider stream error")
+        error_type = str(raw_error.get("type") or raw_error.get("code") or "provider_error")
+        raw_status = raw_error.get("status_code") or raw_error.get("status")
+        try:
+            status_code = int(raw_status) if raw_status is not None else 400
+        except (TypeError, ValueError):
+            status_code = 400
+        if not 400 <= status_code <= 599:
+            status_code = 400
+        return ProviderStreamError(
+            message,
+            error_type=error_type,
+            status_code=status_code,
+            details=raw_error,
+        )
+    message = str(raw_error) if raw_error is not None else "Provider stream error"
+    return ProviderStreamError(message, details={"error": raw_error})
 
 
 def _openai_messages(messages: Optional[list[dict]], prompt: str) -> list[dict]:
@@ -307,15 +367,19 @@ def _anthropic_tools(tools: list[dict]) -> list[dict]:
 def _anthropic_tool_choice(tool_choice: Any) -> Any:
     if tool_choice is None:
         return None
-    if tool_choice in ("auto", "any"):
-        return {"type": "auto"} if tool_choice == "auto" else {"type": "any"}
-    if tool_choice == "none":
-        return {"type": "none"}
+    if isinstance(tool_choice, str):
+        if tool_choice == "auto":
+            return {"type": "auto"}
+        if tool_choice in ("any", "required"):
+            return {"type": "any"}
+        if tool_choice == "none":
+            return {"type": "none"}
+        raise ValueError(f"unsupported Anthropic tool_choice {tool_choice!r}")
     if isinstance(tool_choice, dict):
         fn = tool_choice.get("function") or {}
         if tool_choice.get("type") == "function" and fn.get("name"):
             return {"type": "tool", "name": fn["name"]}
-    return tool_choice
+    raise ValueError(f"unsupported Anthropic tool_choice {tool_choice!r}")
 
 
 def _gemini_part(content: Any) -> list[dict]:
@@ -853,13 +917,19 @@ class GraeaeEngine:
                             yield {"index": index, "content": content}
                         if msg.get("tool_calls"):
                             yield {"index": index, "tool_calls": msg["tool_calls"]}
+                        finish_reason = choice.get("finish_reason") or result.get("finish_reason") or "stop"
+                        if provider_cfg.get("api") == "gemini":
+                            finish_reason = _normalize_gemini_finish_reason(finish_reason)
                         yield {
                             "index": index,
-                            "finish_reason": choice.get("finish_reason") or result.get("finish_reason") or "stop",
+                            "finish_reason": finish_reason,
                         }
                     if not result.get("choices"):
                         yield {"index": 0, "content": result.get("response_text", "")}
-                        yield {"index": 0, "finish_reason": result.get("finish_reason") or "stop"}
+                        finish_reason = result.get("finish_reason") or "stop"
+                        if provider_cfg.get("api") == "gemini":
+                            finish_reason = _normalize_gemini_finish_reason(finish_reason)
+                        yield {"index": 0, "finish_reason": finish_reason}
             except Exception:
                 self._circuit_breakers.record_failure(provider)
                 self._quality.record_failure(provider)
@@ -1048,6 +1118,11 @@ class GraeaeEngine:
                 except json.JSONDecodeError:
                     logger.debug("[GRAEAE] skipped non-JSON stream frame: %s", raw[:120])
                     continue
+                if isinstance(data, dict) and "error" in data:
+                    raise _provider_stream_error(data)
+                if not isinstance(data, dict):
+                    logger.debug("[GRAEAE] skipped non-object stream frame: %s", raw[:120])
+                    continue
                 for choice in data.get("choices", []):
                     delta = choice.get("delta") or {}
                     chunk = {"index": choice.get("index", 0)}
@@ -1180,7 +1255,7 @@ class GraeaeEngine:
             choices.append({
                 "index": i,
                 "message": {"role": "assistant", "content": text},
-                "finish_reason": candidate.get("finishReason") or "stop",
+                "finish_reason": _normalize_gemini_finish_reason(candidate.get("finishReason")),
             })
         text = choices[0]["message"]["content"] if choices else ""
         if not text:

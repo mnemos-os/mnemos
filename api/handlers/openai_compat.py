@@ -23,11 +23,11 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
-from graeae.engine import get_graeae_engine, _REGISTRY_MAP
+from graeae.engine import ProviderStreamError, get_graeae_engine, _REGISTRY_MAP
 
 # Reverse the engine's _REGISTRY_MAP so we can translate the
 # model_registry's `provider` column (e.g. "anthropic") back into the
@@ -62,6 +62,8 @@ MODEL_ALIASES = {
 
 
 class ContentBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     type: Literal["text", "image_url"]
     text: Optional[str] = None
     image_url: Optional[Dict[str, Any]] = None
@@ -78,11 +80,31 @@ class ContentBlock(BaseModel):
 ChatContent = Union[str, List[ContentBlock]]
 
 
+class ToolFunction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
+
+
+class Tool(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["function"]
+    function: ToolFunction
+
+
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str
     content: Optional[ChatContent] = None
+    name: Optional[str] = None
     tool_calls: Optional[List[Dict[str, Any]]] = None
     tool_call_id: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
 class ChatCompletionRequest(BaseModel):
@@ -94,7 +116,7 @@ class ChatCompletionRequest(BaseModel):
     max_tokens: Optional[int] = None
     top_p: Optional[float] = None
     stream: bool = False
-    tools: Optional[List[Dict[str, Any]]] = None
+    tools: Optional[List[Tool]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
     response_format: Optional[Dict[str, Any]] = None
     stop: Optional[Union[str, List[str]]] = None
@@ -352,6 +374,17 @@ def _serialize_content(content: Any) -> Any:
     return content
 
 
+def _plain_value(value: Any) -> Any:
+    """Recursively convert request model fragments into provider payload data."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, list):
+        return [_plain_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _plain_value(item) for key, item in value.items() if item is not None}
+    return value
+
+
 def _content_text(content: Any) -> str:
     """Extract searchable/flattenable text from OpenAI string or content-block payloads."""
     if content is None:
@@ -379,6 +412,8 @@ def _message_to_dict(msg: ChatMessage) -> Dict[str, Any]:
     data: Dict[str, Any] = {"role": msg.role}
     if msg.content is not None:
         data["content"] = _serialize_content(msg.content)
+    if msg.name is not None:
+        data["name"] = msg.name
     if msg.tool_calls is not None:
         data["tool_calls"] = msg.tool_calls
     if msg.tool_call_id is not None:
@@ -388,6 +423,10 @@ def _message_to_dict(msg: ChatMessage) -> Dict[str, Any]:
 
 def _has_content_blocks(messages: List[Dict[str, Any]]) -> bool:
     return any(isinstance(msg.get("content"), list) for msg in messages)
+
+
+def _has_message_names(messages: List[Dict[str, Any]]) -> bool:
+    return any(msg.get("name") is not None for msg in messages)
 
 
 def _flatten_messages_for_prompt(messages: List[Dict[str, Any]]) -> str:
@@ -432,7 +471,7 @@ def _request_params(request: ChatCompletionRequest) -> Dict[str, Any]:
     ):
         value = getattr(request, field)
         if value is not None:
-            params[field] = value
+            params[field] = _plain_value(value)
     if request.user is not None:
         params["user"] = request.user
     return params
@@ -473,6 +512,29 @@ def _provider_supports_penalties(cfg: Dict[str, Any]) -> bool:
     return cfg.get("api") in {"openai", "gemini"}
 
 
+def _validate_anthropic_tool_choice(provider: str, tool_choice: Any) -> None:
+    if tool_choice is None:
+        return
+    if isinstance(tool_choice, str):
+        if tool_choice in {"auto", "any", "none", "required"}:
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider {provider} does not support tool_choice {tool_choice!r}",
+        )
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function") or {}
+        if tool_choice.get("type") == "function" and isinstance(fn, dict) and fn.get("name"):
+            return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"provider {provider} only supports tool_choice strings "
+            "auto, none, required, any, or a function tool selector"
+        ),
+    )
+
+
 def _validate_provider_request(
     provider: str,
     provider_cfg: Dict[str, Any],
@@ -480,6 +542,8 @@ def _validate_provider_request(
     messages: List[Dict[str, Any]],
     request_params: Dict[str, Any],
 ) -> None:
+    if _has_message_names(messages) and provider_cfg.get("api") != "openai":
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support message name")
     if _has_content_blocks(messages) and not _provider_supports_multimodal(provider, provider_cfg, model):
         raise HTTPException(
             status_code=400,
@@ -489,6 +553,8 @@ def _validate_provider_request(
         provider, provider_cfg,
     ):
         raise HTTPException(status_code=400, detail=f"provider {provider} does not support tool_calls")
+    if "tool_choice" in request_params and provider_cfg.get("api") == "anthropic":
+        _validate_anthropic_tool_choice(provider, request_params["tool_choice"])
     if "response_format" in request_params and not _provider_supports_response_format(provider, provider_cfg):
         raise HTTPException(status_code=400, detail=f"provider {provider} does not support response_format")
     if (
@@ -511,14 +577,19 @@ def _validate_provider_request(
         raise HTTPException(status_code=400, detail=f"provider {provider} does not support penalties")
 
 
+def _response_message_data(message: Dict[str, Any]) -> Dict[str, Any]:
+    allowed = {"role", "content", "name", "tool_calls", "tool_call_id"}
+    return {key: value for key, value in message.items() if key in allowed}
+
+
 def _provider_choices(response: Dict[str, Any]) -> List[ChatCompletionChoice]:
     raw_choices = response.get("choices") or []
     choices: List[ChatCompletionChoice] = []
     for i, choice in enumerate(raw_choices):
-        message_data = choice.get("message") or {
+        message_data = _response_message_data(choice.get("message") or {
             "role": "assistant",
             "content": choice.get("text") or "",
-        }
+        })
         choices.append(
             ChatCompletionChoice(
                 index=choice.get("index", i),
@@ -541,6 +612,15 @@ def _completion_text_for_usage(choices: List[ChatCompletionChoice]) -> str:
     return "\n".join(_content_text(choice.message.content) for choice in choices)
 
 
+def _validate_request_messages(messages: List[ChatMessage]) -> None:
+    for msg in messages:
+        if msg.function_call is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="message.function_call is deprecated; use tool_calls and tool messages instead",
+            )
+
+
 def _stream_event(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
 
@@ -551,7 +631,7 @@ def _stream_error_event(message: str, error_type: str = "provider_stream_error")
 
 def _stream_preflight_exception(exc: Exception) -> HTTPException:
     message = str(exc)
-    status_code = 503
+    status_code = getattr(exc, "status_code", 503)
     status_prefix = message.split(":", 1)[0].split()
     if len(status_prefix) == 2 and status_prefix[0] == "HTTP":
         try:
@@ -1032,6 +1112,7 @@ async def chat_completions(
 
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages required")
+    _validate_request_messages(request.messages)
 
     # Extract last user message for context search and task detection
     last_msg = ""
@@ -1095,7 +1176,10 @@ async def chat_completions(
     for msg in request.messages:
         if msg.role == "system":
             if not system_added:
-                messages.append({"role": "system", "content": system_prompt})
+                system_message = {"role": "system", "content": system_prompt}
+                if msg.name is not None:
+                    system_message["name"] = msg.name
+                messages.append(system_message)
                 system_added = True
         else:
             messages.append(_message_to_dict(msg))
@@ -1158,7 +1242,8 @@ async def chat_completions(
                         yield event
             except Exception as e:
                 logger.error(f"[MNEMOS] Streaming response failed after response start: {e}")
-                yield _stream_error_event(str(e))
+                error_type = e.error_type if isinstance(e, ProviderStreamError) else "provider_stream_error"
+                yield _stream_error_event(str(e), error_type=error_type)
             finally:
                 try:
                     await provider_stream.aclose()

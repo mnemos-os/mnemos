@@ -137,6 +137,82 @@ def test_chat_request_rejects_unsupported_openai_fields(field, value):
     assert field in str(exc.value)
 
 
+def test_chat_message_rejects_unknown_nested_fields():
+    payload = {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "hello", "legacy": True}],
+    }
+
+    with pytest.raises(ValidationError) as exc:
+        openai_compat.ChatCompletionRequest.model_validate_json(json.dumps(payload))
+
+    assert "legacy" in str(exc.value)
+
+
+def test_content_block_and_tool_reject_unknown_nested_fields():
+    bad_content = {
+        "model": "gpt-5.4",
+        "messages": [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": "hello", "legacy": True}],
+            }
+        ],
+    }
+    with pytest.raises(ValidationError) as content_exc:
+        openai_compat.ChatCompletionRequest.model_validate_json(json.dumps(bad_content))
+    assert "legacy" in str(content_exc.value)
+
+    bad_tool = {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "hello"}],
+        "tools": [
+            {
+                "type": "function",
+                "function": {"name": "lookup", "parameters": {"type": "object"}, "legacy": True},
+            }
+        ],
+    }
+    with pytest.raises(ValidationError) as tool_exc:
+        openai_compat.ChatCompletionRequest.model_validate_json(json.dumps(bad_tool))
+    assert "legacy" in str(tool_exc.value)
+
+
+def test_chat_message_name_propagates_to_openai_provider(monkeypatch):
+    fake = _FakeGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", name="alice", content="hello")],
+    )
+
+    asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert fake.route_calls[0][1]["messages"][0]["name"] == "alice"
+
+
+def test_chat_message_function_call_rejected_with_migration_hint(monkeypatch):
+    fake = _FakeGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[
+            openai_compat.ChatMessage(
+                role="assistant",
+                content=None,
+                function_call={"name": "lookup", "arguments": "{}"},
+            ),
+            openai_compat.ChatMessage(role="user", content="hello"),
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 400
+    assert "tool_calls" in exc.value.detail
+
+
 def test_temperature_max_tokens_top_p_propagate(monkeypatch):
     fake = _FakeGraeae()
     _install_gateway(monkeypatch, fake)
@@ -227,6 +303,56 @@ def test_stream_midstream_failure_emits_error_and_done(monkeypatch):
     error_event = json.loads(events[-2])
     assert error_event["error"]["type"] == "provider_stream_error"
     assert "upstream closed early" in error_event["error"]["message"]
+
+
+def test_provider_sse_error_first_frame_returns_http_error_and_records_failure(monkeypatch):
+    _engine, _client, breaker, quality, concurrency = _stream_engine_gateway(
+        monkeypatch,
+        ['data: {"error":{"message":"foo","type":"invalid_request_error"}}'],
+    )
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        stream=True,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 400
+    assert "foo" in exc.value.detail
+    assert breaker.failures == ["openai"]
+    assert breaker.successes == []
+    assert quality.failures == ["openai"]
+    assert quality.successes == []
+    assert concurrency.released == ["openai"]
+
+
+def test_provider_sse_error_midstream_emits_error_event_done_and_records_failure(monkeypatch):
+    _engine, _client, breaker, quality, concurrency = _stream_engine_gateway(
+        monkeypatch,
+        [
+            'data: {"choices":[{"index":0,"delta":{"content":"hel"}}]}',
+            'data: {"error":{"message":"foo","type":"invalid_request_error"}}',
+        ],
+    )
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        stream=True,
+    )
+
+    _response, body = asyncio.run(_chat_stream_response_and_body(req))
+    events = _sse_events(body)
+
+    assert events[-1] == "[DONE]"
+    error_event = json.loads(events[-2])
+    assert error_event["error"] == {"message": "foo", "type": "invalid_request_error"}
+    assert breaker.failures == ["openai"]
+    assert breaker.successes == []
+    assert quality.failures == ["openai"]
+    assert quality.successes == []
+    assert concurrency.released == ["openai"]
 
 
 def test_stream_finish_reason_tool_calls_propagates(monkeypatch):
@@ -323,6 +449,79 @@ class _Client:
         return _Resp(self.data)
 
 
+class _StreamResp:
+    status_code = 200
+
+    def __init__(self, lines):
+        self.lines = lines
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def aread(self):
+        return b""
+
+    async def aiter_lines(self):
+        for line in self.lines:
+            yield line
+
+
+class _StreamClient:
+    def __init__(self, lines):
+        self.lines = lines
+        self.payloads = []
+
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        self.payloads.append(json)
+        return _StreamResp(self.lines)
+
+
+class _RecorderBreaker:
+    def __init__(self):
+        self.successes = []
+        self.failures = []
+
+    def is_allowed(self, name):
+        return True
+
+    def record_success(self, name):
+        self.successes.append(name)
+
+    def record_failure(self, name):
+        self.failures.append(name)
+
+
+class _RecorderRateLimiter:
+    def is_allowed(self, name):
+        return True
+
+
+class _RecorderQuality:
+    def __init__(self):
+        self.successes = []
+        self.failures = []
+
+    def record_success(self, name, latency):
+        self.successes.append((name, latency))
+
+    def record_failure(self, name):
+        self.failures.append(name)
+
+
+class _RecorderConcurrency:
+    def __init__(self):
+        self.released = []
+
+    async def acquire(self, name):
+        return True
+
+    def release(self, name):
+        self.released.append(name)
+
+
 def _engine_with_client(monkeypatch, data):
     from graeae import engine as engine_module
 
@@ -335,6 +534,37 @@ def _engine_with_client(monkeypatch, data):
     monkeypatch.setattr(engine_module, "get_key", lambda key_name: "sk-test")
     monkeypatch.setattr(engine, "_get_client", _client)
     return engine, client
+
+
+def _stream_engine_gateway(monkeypatch, lines):
+    from graeae import engine as engine_module
+
+    engine = engine_module.GraeaeEngine()
+    engine.providers = {
+        "openai": {
+            "api": "openai",
+            "url": "https://api.openai.com/v1/chat/completions",
+            "model": "gpt-5.4",
+            "key_name": "openai",
+            "weight": 0.9,
+        }
+    }
+    client = _StreamClient(lines)
+    breaker = _RecorderBreaker()
+    quality = _RecorderQuality()
+    concurrency = _RecorderConcurrency()
+    engine._circuit_breakers = breaker
+    engine._rate_limiters = _RecorderRateLimiter()
+    engine._quality = quality
+    engine._concurrency = concurrency
+
+    async def _client():
+        return client
+
+    monkeypatch.setattr(engine_module, "get_key", lambda key_name: "sk-test")
+    monkeypatch.setattr(engine, "_get_client", _client)
+    _install_gateway(monkeypatch, engine)
+    return engine, client, breaker, quality, concurrency
 
 
 def test_tools_passthrough_supported_provider(monkeypatch):
@@ -432,6 +662,63 @@ def test_anthropic_multiturn_tool_history_preserves_tool_identity(monkeypatch):
     }
 
 
+def test_anthropic_tool_choice_required_and_function_selector(monkeypatch):
+    engine, client = _engine_with_client(
+        monkeypatch,
+        {"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"},
+    )
+    provider = {
+        "api": "anthropic",
+        "url": "https://api.anthropic.com/v1/messages",
+        "model": "claude-opus-4-6",
+        "key_name": "claude",
+    }
+    tools = [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}]
+
+    asyncio.run(engine._query_anthropic(
+        provider,
+        "hello",
+        30,
+        request_params={"tools": tools, "tool_choice": "required"},
+    ))
+    asyncio.run(engine._query_anthropic(
+        provider,
+        "hello",
+        30,
+        request_params={"tools": tools, "tool_choice": {"type": "function", "function": {"name": "lookup"}}},
+    ))
+
+    assert client.payloads[0]["tool_choice"] == {"type": "any"}
+    assert client.payloads[1]["tool_choice"] == {"type": "tool", "name": "lookup"}
+
+
+def test_anthropic_tool_choice_unsupported_string_rejected_before_dispatch(monkeypatch):
+    fake = _FakeGraeae(
+        providers={
+            "claude": {
+                "api": "anthropic",
+                "model": "claude-opus-4-6",
+                "url": "https://api.anthropic.com/v1/messages",
+                "key_name": "claude",
+            }
+        }
+    )
+    _install_gateway(monkeypatch, fake, provider="claude")
+    req = openai_compat.ChatCompletionRequest(
+        model="claude-opus-4-6",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+        tool_choice="garbage_unsupported",
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 400
+    assert "garbage_unsupported" in exc.value.detail
+    assert fake.route_calls == []
+
+
 def test_tools_rejected_unsupported_provider(monkeypatch):
     fake = _FakeGraeae(
         providers={
@@ -474,6 +761,63 @@ def test_response_format_passthrough(monkeypatch):
     ))
 
     assert client.payloads[0]["response_format"] == {"type": "json_object"}
+
+
+@pytest.mark.parametrize(
+    ("gemini_reason", "openai_reason"),
+    [
+        ("MAX_TOKENS", "length"),
+        ("SAFETY", "content_filter"),
+        ("STOP", "stop"),
+        ("unexpected_new_reason", "stop"),
+    ],
+)
+def test_gemini_finish_reason_normalized_non_streaming(monkeypatch, gemini_reason, openai_reason):
+    engine, _client = _engine_with_client(
+        monkeypatch,
+        {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "done"}]},
+                    "finishReason": gemini_reason,
+                }
+            ]
+        },
+    )
+
+    result = asyncio.run(engine._query_gemini(
+        {
+            "api": "gemini",
+            "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent",
+            "model": "gemini-test",
+            "key_name": "gemini",
+        },
+        "hello",
+        30,
+    ))
+
+    assert result["choices"][0]["finish_reason"] == openai_reason
+
+
+def test_gemini_finish_reason_normalized_streaming_fallback(monkeypatch):
+    engine, _client = _engine_with_client(
+        monkeypatch,
+        {
+            "candidates": [
+                {
+                    "content": {"parts": [{"text": "done"}]},
+                    "finishReason": "MAX_TOKENS",
+                }
+            ]
+        },
+    )
+
+    async def _collect():
+        return [chunk async for chunk in engine.route_stream("gemini", "gemini-test", "hello")]
+
+    chunks = asyncio.run(_collect())
+
+    assert chunks[-1]["finish_reason"] == "length"
 
 
 def test_unknown_field_handling(monkeypatch):
