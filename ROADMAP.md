@@ -112,6 +112,7 @@ v3.5 is in flight on `v3.5-dev`. Closed items below are merged into the branch; 
 - ✅ **#21 federation stable cursor tie-breaker** (`pending commit`). `/v1/federation/feed` now uses an opaque `(updated, id)` cursor and `ORDER BY updated, id` so page boundaries inside identical timestamps do not skip rows. Per-peer ACL scope remains split to a later slice.
 - ✅ **#22 audit endpoint scoping** (`pending commit`). Consultation audit list and verify routes are owner-scoped for non-root callers, with root retaining global audit visibility.
 - ✅ **#24 MCP registry split-brain** (`pending commit`). `api/mcp_tools.py` is the canonical MCP registry for stdio and HTTP/SSE; DAG log/branch/diff/checkout and `recommend_model` are exposed through the live MCP transports, and HTTP/SSE supports per-user token maps instead of one shared backend principal.
+- ✅ **OpenAI compat honesty must-fix #5/#6/#7** (`pending commit`). Generation controls propagate through `graeae.route`, SSE streaming is implemented, tools/response_format/multimodal fields are pass-or-400 by provider capability, and `/v1/models/{model_id}` returns 404 for unregistered models.
 - 🔵 **#23 entity namespace conflict-key migration.** Namespace-aware conflict key for entity rows; still open.
 - 🔵 **#19 bulk webhook parity.** Bulk-create webhook behavior still differs from single-create.
 - 🔵 **#15 deletion-log refactor.** Parked; restore-drill cleanup still uses explicit `memory_branches` / `memory_versions` deletes.

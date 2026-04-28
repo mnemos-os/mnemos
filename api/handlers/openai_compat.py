@@ -16,15 +16,18 @@ Memory injection:
 """
 
 import logging
-from typing import Optional, List, Dict, Any
+import json
+from collections.abc import AsyncIterator
+from typing import Optional, List, Dict, Any, Literal, Union
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Header
-from pydantic import BaseModel
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
-from graeae.engine import get_graeae_engine, _REGISTRY_MAP
+from graeae.engine import ProviderStreamError, get_graeae_engine, _REGISTRY_MAP
 
 # Reverse the engine's _REGISTRY_MAP so we can translate the
 # model_registry's `provider` column (e.g. "anthropic") back into the
@@ -58,23 +61,92 @@ MODEL_ALIASES = {
 }
 
 
+class ContentBlock(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["text", "image_url"]
+    text: Optional[str] = None
+    image_url: Optional[Dict[str, Any]] = None
+
+    @model_validator(mode="after")
+    def validate_payload(self):
+        if self.type == "text" and self.text is None:
+            raise ValueError("text content block requires text")
+        if self.type == "image_url" and self.image_url is None:
+            raise ValueError("image_url content block requires image_url")
+        return self
+
+
+ChatContent = Union[str, List[ContentBlock]]
+
+
+class ToolFunction(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str
+    description: Optional[str] = None
+    parameters: Optional[Dict[str, Any]] = None
+    strict: Optional[bool] = None
+
+
+class Tool(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    type: Literal["function"]
+    function: ToolFunction
+
+
 class ChatMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     role: str
-    content: str
+    content: Optional[ChatContent] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = Field(default=None, exclude=True)
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: Optional[str] = "auto"
     messages: List[ChatMessage]
-    temperature: Optional[float] = 0.7
+    temperature: Optional[float] = None
     max_tokens: Optional[int] = None
-    top_p: Optional[float] = 1.0
+    top_p: Optional[float] = None
+    stream: bool = False
+    tools: Optional[List[Tool]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    response_format: Optional[Dict[str, Any]] = None
+    stop: Optional[Union[str, List[str]]] = None
+    n: Optional[int] = None
+    presence_penalty: Optional[float] = None
+    frequency_penalty: Optional[float] = None
     user: Optional[str] = None
+
+
+class ChatCompletionStreamRequest(ChatCompletionRequest):
+    stream: bool = True
+
+
+class ChatCompletionResponseMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    content: Optional[ChatContent] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = None
+    refusal: Optional[str] = None
+    audio: Optional[Dict[str, Any]] = None
+    annotations: Optional[List[Dict[str, Any]]] = None
 
 
 class ChatCompletionChoice(BaseModel):
     index: int
-    message: ChatMessage
+    message: ChatCompletionResponseMessage
     finish_reason: str
 
 
@@ -85,6 +157,26 @@ class ChatCompletionResponse(BaseModel):
     model: str
     choices: List[ChatCompletionChoice]
     usage: Dict[str, int]
+
+
+class ChatCompletionDelta(BaseModel):
+    role: Optional[str] = None
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+
+
+class ChatCompletionStreamChoice(BaseModel):
+    index: int
+    delta: ChatCompletionDelta
+    finish_reason: Optional[str] = None
+
+
+class ChatCompletionStreamResponse(BaseModel):
+    id: str
+    object: str = "chat.completion.chunk"
+    created: int
+    model: str
+    choices: List[ChatCompletionStreamChoice]
 
 
 class ModelInfo(BaseModel):
@@ -283,7 +375,75 @@ async def _get_model_recommendation(
         return None
 
 
-def _flatten_messages_for_prompt(messages: List[Dict[str, str]]) -> str:
+def _serialize_content(content: Any) -> Any:
+    """Convert Pydantic content blocks into plain dicts for provider payloads."""
+    if isinstance(content, list):
+        serialized = []
+        for block in content:
+            if isinstance(block, BaseModel):
+                serialized.append(block.model_dump(exclude_none=True))
+            else:
+                serialized.append(block)
+        return serialized
+    return content
+
+
+def _plain_value(value: Any) -> Any:
+    """Recursively convert request model fragments into provider payload data."""
+    if isinstance(value, BaseModel):
+        return value.model_dump(exclude_none=True)
+    if isinstance(value, list):
+        return [_plain_value(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _plain_value(item) for key, item in value.items() if item is not None}
+    return value
+
+
+def _content_text(content: Any) -> str:
+    """Extract searchable/flattenable text from OpenAI string or content-block payloads."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for block in content:
+            block_data = block.model_dump(exclude_none=True) if isinstance(block, BaseModel) else block
+            if not isinstance(block_data, dict):
+                continue
+            if block_data.get("type") == "text":
+                parts.append(str(block_data.get("text", "")))
+            elif block_data.get("type") == "image_url":
+                image_url = block_data.get("image_url") or {}
+                url = image_url.get("url") if isinstance(image_url, dict) else None
+                if url:
+                    parts.append(f"[image_url: {url}]")
+        return "\n".join(p for p in parts if p)
+    return str(content)
+
+
+def _message_to_dict(msg: ChatMessage) -> Dict[str, Any]:
+    data: Dict[str, Any] = {"role": msg.role}
+    if msg.content is not None:
+        data["content"] = _serialize_content(msg.content)
+    if msg.name is not None:
+        data["name"] = msg.name
+    if msg.tool_calls is not None:
+        data["tool_calls"] = msg.tool_calls
+    if msg.tool_call_id is not None:
+        data["tool_call_id"] = msg.tool_call_id
+    return data
+
+
+def _has_content_blocks(messages: List[Dict[str, Any]]) -> bool:
+    return any(isinstance(msg.get("content"), list) for msg in messages)
+
+
+def _has_message_names(messages: List[Dict[str, Any]]) -> bool:
+    return any(msg.get("name") is not None for msg in messages)
+
+
+def _flatten_messages_for_prompt(messages: List[Dict[str, Any]]) -> str:
     """Serialize a chat-completions ``messages`` array to a single prompt string.
 
     Used as a fallback when GRAEAE's single-provider route accepts only a
@@ -294,7 +454,7 @@ def _flatten_messages_for_prompt(messages: List[Dict[str, str]]) -> str:
     parts: List[str] = []
     for msg in messages:
         role = msg.get("role", "user")
-        content = msg.get("content", "") or ""
+        content = _content_text(msg.get("content"))
         if not content:
             continue
         if role == "system":
@@ -306,6 +466,319 @@ def _flatten_messages_for_prompt(messages: List[Dict[str, str]]) -> str:
         else:
             parts.append(f"[User]\n{content}")
     return "\n\n".join(parts)
+
+
+def _generation_params(request: ChatCompletionRequest) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    for field in ("temperature", "max_tokens", "top_p"):
+        value = getattr(request, field)
+        if value is not None:
+            params[field] = value
+    return params
+
+
+def _request_params(request: ChatCompletionRequest) -> Dict[str, Any]:
+    params: Dict[str, Any] = {}
+    for field in (
+        "tools", "tool_choice", "response_format", "stop", "n",
+        "presence_penalty", "frequency_penalty",
+    ):
+        value = getattr(request, field)
+        if value is not None:
+            params[field] = _plain_value(value)
+    if request.user is not None:
+        params["user"] = request.user
+    return params
+
+
+def _provider_supports_tools(provider: str, cfg: Dict[str, Any]) -> bool:
+    if "supports_tools" in cfg:
+        return bool(cfg["supports_tools"])
+    return provider == "openai" or cfg.get("api") == "anthropic"
+
+
+def _provider_supports_response_format(provider: str, cfg: Dict[str, Any]) -> bool:
+    if "supports_response_format" in cfg:
+        return bool(cfg["supports_response_format"])
+    return cfg.get("api") in {"openai", "gemini"}
+
+
+def _provider_supports_multimodal(provider: str, cfg: Dict[str, Any], model: str) -> bool:
+    if "supports_vision" in cfg:
+        return bool(cfg["supports_vision"])
+    if cfg.get("api") in {"anthropic", "gemini"}:
+        return True
+    lower_model = (model or cfg.get("model") or "").lower()
+    if provider == "openai" and any(token in lower_model for token in ("gpt-4o", "gpt-5", "vision")):
+        return True
+    return False
+
+
+def _provider_supports_stop(cfg: Dict[str, Any]) -> bool:
+    return cfg.get("api") in {"openai", "anthropic", "gemini"}
+
+
+def _provider_supports_n(cfg: Dict[str, Any]) -> bool:
+    return cfg.get("api") in {"openai", "gemini"}
+
+
+def _provider_supports_penalties(cfg: Dict[str, Any]) -> bool:
+    return cfg.get("api") in {"openai", "gemini"}
+
+
+def _validate_anthropic_tool_choice(provider: str, tool_choice: Any) -> None:
+    if tool_choice is None:
+        return
+    if isinstance(tool_choice, str):
+        if tool_choice in {"auto", "any", "none", "required"}:
+            return
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider {provider} does not support tool_choice {tool_choice!r}",
+        )
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function") or {}
+        if tool_choice.get("type") == "function" and isinstance(fn, dict) and fn.get("name"):
+            return
+    raise HTTPException(
+        status_code=400,
+        detail=(
+            f"provider {provider} only supports tool_choice strings "
+            "auto, none, required, any, or a function tool selector"
+        ),
+    )
+
+
+_ROLE_SUPPORT_BY_API = {
+    "gemini": ("system", "user", "assistant"),
+    "anthropic": ("system", "user", "assistant", "tool"),
+    # "function" is OpenAI's deprecated function-message role. We allow it
+    # through unchanged for OpenAI-compatible providers that still support it.
+    "openai": ("system", "user", "assistant", "tool", "function"),
+}
+
+
+def _validate_provider_roles(provider: str, provider_cfg: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
+    supported = _ROLE_SUPPORT_BY_API.get(provider_cfg.get("api"))
+    if supported is None:
+        return
+    supported_set = set(supported)
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role not in supported_set:
+            raise HTTPException(
+                status_code=400,
+                detail=f"provider {provider} does not support role={role}; supported: {', '.join(supported)}",
+            )
+
+
+def _validate_provider_request(
+    provider: str,
+    provider_cfg: Dict[str, Any],
+    model: str,
+    messages: List[Dict[str, Any]],
+    request_params: Dict[str, Any],
+) -> None:
+    _validate_provider_roles(provider, provider_cfg, messages)
+    if _has_message_names(messages) and provider_cfg.get("api") != "openai":
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support message name")
+    if _has_content_blocks(messages) and not _provider_supports_multimodal(provider, provider_cfg, model):
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider {provider} does not support multimodal content blocks",
+        )
+    if ("tools" in request_params or "tool_choice" in request_params) and not _provider_supports_tools(
+        provider, provider_cfg,
+    ):
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support tool_calls")
+    if "tool_choice" in request_params and provider_cfg.get("api") == "anthropic":
+        _validate_anthropic_tool_choice(provider, request_params["tool_choice"])
+    if "response_format" in request_params and not _provider_supports_response_format(provider, provider_cfg):
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support response_format")
+    if (
+        "response_format" in request_params
+        and provider_cfg.get("api") == "gemini"
+        and request_params["response_format"].get("type") != "json_object"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=f"provider {provider} only supports response_format type json_object",
+        )
+    if "stop" in request_params and not _provider_supports_stop(provider_cfg):
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support stop")
+    if "n" in request_params and not _provider_supports_n(provider_cfg):
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support n")
+    if (
+        ("presence_penalty" in request_params or "frequency_penalty" in request_params)
+        and not _provider_supports_penalties(provider_cfg)
+    ):
+        raise HTTPException(status_code=400, detail=f"provider {provider} does not support penalties")
+
+
+_RESPONSE_MESSAGE_FIELDS = {
+    "role",
+    "content",
+    "name",
+    "tool_calls",
+    "tool_call_id",
+    "function_call",
+    "refusal",
+    "audio",
+    "annotations",
+}
+
+
+def _response_message_data(message: Dict[str, Any]) -> Dict[str, Any]:
+    for key in message:
+        if key not in _RESPONSE_MESSAGE_FIELDS:
+            raise HTTPException(
+                status_code=502,
+                detail=f"provider returned unsupported response field {key}; gateway cannot faithfully represent",
+            )
+    return dict(message)
+
+
+def _provider_choices(response: Dict[str, Any]) -> List[ChatCompletionChoice]:
+    raw_choices = response.get("choices") or []
+    choices: List[ChatCompletionChoice] = []
+    for i, choice in enumerate(raw_choices):
+        message_data = _response_message_data(choice.get("message") or {
+            "role": "assistant",
+            "content": choice.get("text") or "",
+        })
+        choices.append(
+            ChatCompletionChoice(
+                index=choice.get("index", i),
+                message=ChatCompletionResponseMessage(**message_data),
+                finish_reason=choice.get("finish_reason") or "stop",
+            )
+        )
+    if choices:
+        return choices
+    return [
+        ChatCompletionChoice(
+            index=0,
+            message=ChatCompletionResponseMessage(role="assistant", content=response.get("response_text", "")),
+            finish_reason=response.get("finish_reason") or "stop",
+        )
+    ]
+
+
+def _completion_text_for_usage(choices: List[ChatCompletionChoice]) -> str:
+    return "\n".join(_content_text(choice.message.content) for choice in choices)
+
+
+def _validate_request_messages(messages: List[ChatMessage]) -> None:
+    for msg in messages:
+        if msg.function_call is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="message.function_call is deprecated; use tool_calls and tool messages instead",
+            )
+
+
+def _stream_event(data: Dict[str, Any]) -> str:
+    return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+def _stream_error_event(message: str, error_type: str = "provider_stream_error") -> str:
+    return _stream_event({"error": {"message": message, "type": error_type}})
+
+
+def _stream_preflight_exception(exc: Exception) -> HTTPException:
+    message = str(exc)
+    status_code = getattr(exc, "status_code", 503)
+    status_prefix = message.split(":", 1)[0].split()
+    if len(status_prefix) == 2 and status_prefix[0] == "HTTP":
+        try:
+            upstream_status = int(status_prefix[1])
+        except ValueError:
+            upstream_status = 0
+        if 400 <= upstream_status <= 599:
+            status_code = upstream_status
+    elif "rate-limited" in message:
+        status_code = 429
+    return HTTPException(status_code=status_code, detail=f"Streaming request failed: {message}")
+
+
+def _stream_chunk_event(
+    *,
+    stream_id: str,
+    created: int,
+    model: str,
+    index: int,
+    delta: ChatCompletionDelta,
+    finish_reason: Optional[str] = None,
+) -> str:
+    chunk = ChatCompletionStreamResponse(
+        id=stream_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionStreamChoice(
+                index=index,
+                delta=delta,
+                finish_reason=finish_reason,
+            )
+        ],
+    )
+    return _stream_event(chunk.model_dump(exclude_none=True))
+
+
+def _stream_events_for_provider_delta(
+    *,
+    delta: Dict[str, Any],
+    stream_id: str,
+    created: int,
+    model: str,
+    started_indexes: set[int],
+    finished_indexes: set[int],
+) -> List[str]:
+    index = int(delta.get("index", 0))
+    events: List[str] = []
+
+    if index not in started_indexes:
+        started_indexes.add(index)
+        events.append(
+            _stream_chunk_event(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                delta=ChatCompletionDelta(role=delta.get("role") or "assistant"),
+            )
+        )
+
+    has_delta_payload = delta.get("content") is not None or delta.get("tool_calls") is not None
+    if has_delta_payload:
+        events.append(
+            _stream_chunk_event(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                delta=ChatCompletionDelta(
+                    content=delta.get("content"),
+                    tool_calls=delta.get("tool_calls"),
+                ),
+            )
+        )
+
+    finish_reason = delta.get("finish_reason")
+    if finish_reason is not None and index not in finished_indexes:
+        finished_indexes.add(index)
+        events.append(
+            _stream_chunk_event(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                delta=ChatCompletionDelta(),
+                finish_reason=finish_reason,
+            )
+        )
+
+    return events
 
 
 # Substring-to-provider heuristics kept as a last-resort fallback when
@@ -403,29 +876,29 @@ async def _resolve_provider_for_model(model: str) -> Optional[str]:
     return _fallback_provider_from_name(model)
 
 
-async def _route_to_provider(
-    model: str,
-    messages: List[Dict[str, str]],
-    temperature: float,
-    max_tokens: Optional[int],
-    user: UserContext,
-) -> str:
-    """Route request to selected provider via GRAEAE single-provider mode.
+def _strip_gateway_namespace(model: str, provider: str) -> str:
+    candidate_prefixes = [f"{provider}/"]
+    if provider in _REGISTRY_MAP:
+        registry_name = _REGISTRY_MAP[provider]["registry_provider"]
+        if registry_name != provider:
+            candidate_prefixes.append(f"{registry_name}/")
 
-    Provider resolution: query model_registry for the exact model_id,
-    falling back to substring heuristics only when the registry has no row.
-    Unknown models are rejected with 400 instead of silently routing to a
-    default.
-    """
-    graeae = get_graeae_engine()
-    # Flatten the full messages array rather than keeping only
-    # messages[-1]. The prior behaviour silently dropped the system prompt,
-    # injected memory context, and every prior turn — multi-turn chat via
-    # /v1/chat/completions collapsed to single-shot.
+    for pfx in candidate_prefixes:
+        if model.startswith(pfx):
+            return model[len(pfx):]
+    return model
+
+
+async def _prepare_provider_route(
+    model: str,
+    messages: List[Dict[str, Any]],
+    request_params: Optional[Dict[str, Any]] = None,
+) -> tuple[Any, str, str, str]:
+    """Resolve provider, preserve model slash semantics, and validate controls."""
     if not messages:
         raise HTTPException(status_code=400, detail="messages required")
-    prompt = _flatten_messages_for_prompt(messages)
 
+    prompt = _flatten_messages_for_prompt(messages)
     provider = await _resolve_provider_for_model(model)
     if provider is None:
         logger.warning(
@@ -442,38 +915,55 @@ async def _route_to_provider(
             ),
         )
 
+    bare_model = _strip_gateway_namespace(model, provider)
+    graeae = get_graeae_engine()
+    provider_cfg = dict(graeae.providers.get(provider, {}))
+    if bare_model:
+        provider_cfg["model"] = bare_model
+    _validate_provider_request(provider, provider_cfg, bare_model, messages, request_params or {})
+
     logger.info(
         f"[MNEMOS] Route: model={model} → provider={provider} "
         f"(messages={len(messages)}, prompt_chars={len(prompt)})"
     )
+    return graeae, provider, bare_model, prompt
+
+
+async def _route_to_provider_response(
+    model: str,
+    messages: List[Dict[str, Any]],
+    generation_params: Optional[Dict[str, Any]] = None,
+    request_params: Optional[Dict[str, Any]] = None,
+    user: Optional[UserContext] = None,
+) -> Dict[str, Any]:
+    """Route request to selected provider via GRAEAE single-provider mode.
+
+    Provider resolution: query model_registry for the exact model_id,
+    falling back to substring heuristics only when the registry has no row.
+    Unknown models are rejected with 400 instead of silently routing to a
+    default.
+    """
+    graeae, provider, bare_model, prompt = await _prepare_provider_route(
+        model=model,
+        messages=messages,
+        request_params=request_params,
+    )
 
     try:
-        # Strip ONLY a leading `<provider>/` namespace that matches the
-        # resolved provider — many upstream APIs use slash-bearing model
-        # IDs natively (NVIDIA: `meta/llama-3.3-70b-instruct`, Together:
-        # `meta-llama/Llama-3.3-70B-Instruct-Turbo`, `Qwen/Qwen3-235B-…`),
-        # so a blanket "strip the first slash" rule would corrupt those.
-        # Two equivalent prefixes are recognised:
-        #   - GRAEAE name (e.g. `claude/`)
-        #   - registry name (e.g. `anthropic/`) — what /v1/models surfaces
-        # Only one is stripped; org-style prefixes the caller passes
-        # through untouched (e.g. plain `meta-llama/Llama-…` is already
-        # in the upstream API's expected shape).
-        candidate_prefixes = [f"{provider}/"]
-        if provider in _REGISTRY_MAP:
-            registry_name = _REGISTRY_MAP[provider]["registry_provider"]
-            if registry_name != provider:
-                candidate_prefixes.append(f"{registry_name}/")
-        bare_model = model
-        for pfx in candidate_prefixes:
-            if model.startswith(pfx):
-                bare_model = model[len(pfx):]
-                break
         # Use GRAEAE single-provider route (no consensus, just direct call)
-        response = await graeae.route(provider, bare_model, prompt, task_type="reasoning", timeout=30)
+        response = await graeae.route(
+            provider,
+            bare_model,
+            prompt,
+            task_type="reasoning",
+            timeout=30,
+            generation_params=generation_params,
+            request_params=request_params,
+            messages=messages,
+        )
 
         if response.get("status") == "success":
-            return response.get("response_text", "")
+            return response
         # GRAEAE returns unavailable shape with an `error` field (v3.1.2).
         # Surface the cause in both the log line and the 503 detail so
         # operators see WHY the provider failed (missing key, 401, etc.)
@@ -493,6 +983,62 @@ async def _route_to_provider(
     except Exception as e:
         logger.error(f"[MNEMOS] Routing to {provider} failed: {e}")
         raise HTTPException(status_code=503, detail=f"Routing error: {str(e)}")
+
+
+async def _route_to_provider_stream(
+    model: str,
+    messages: List[Dict[str, Any]],
+    generation_params: Optional[Dict[str, Any]] = None,
+    request_params: Optional[Dict[str, Any]] = None,
+    user: Optional[UserContext] = None,
+) -> AsyncIterator[Dict[str, Any]]:
+    graeae, provider, bare_model, prompt = await _prepare_provider_route(
+        model=model,
+        messages=messages,
+        request_params=request_params,
+    )
+    try:
+        async for chunk in graeae.route_stream(
+            provider,
+            bare_model,
+            prompt,
+            task_type="reasoning",
+            timeout=30,
+            generation_params=generation_params,
+            request_params=request_params,
+            messages=messages,
+        ):
+            yield chunk
+    except Exception as e:
+        logger.error(f"[MNEMOS] Streaming route to {provider} failed: {e}")
+        raise
+
+
+async def _route_to_provider(
+    model: str,
+    messages: List[Dict[str, Any]],
+    temperature: Optional[float],
+    max_tokens: Optional[int],
+    user: UserContext,
+    top_p: Optional[float] = None,
+    request_params: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Backward-compatible string-returning wrapper used by session routes."""
+    generation_params: Dict[str, Any] = {}
+    if temperature is not None:
+        generation_params["temperature"] = temperature
+    if max_tokens is not None:
+        generation_params["max_tokens"] = max_tokens
+    if top_p is not None:
+        generation_params["top_p"] = top_p
+    response = await _route_to_provider_response(
+        model=model,
+        messages=messages,
+        generation_params=generation_params,
+        request_params=request_params,
+        user=user,
+    )
+    return response.get("response_text", "")
 
 
 # Provider key -> display name for the `owned_by` field in OpenAI
@@ -519,22 +1065,6 @@ def _owned_by(provider: Optional[str]) -> str:
     return _PROVIDER_DISPLAY.get(provider.lower(), provider.capitalize())
 
 
-# Defensive fallback for fresh installs whose model_registry hasn't
-# been seeded yet. Matches the shape the old hardcoded list used; new
-# deployments should run `update_model_registry.py` to populate real
-# rows, but /v1/models stays usable in the meantime.
-# Refreshed 2026-04-23 (v3.1.2 Defect 3) — aligned with the GRAEAE
-# built-in provider defaults in graeae/engine.py._BUILTIN_PROVIDERS.
-_FALLBACK_MODELS: list[dict] = [
-    {"model_id": "gpt-5.2-chat-latest", "provider": "openai"},
-    {"model_id": "claude-opus-4-6", "provider": "anthropic"},
-    {"model_id": "gemini-3-pro-preview", "provider": "gemini"},
-    {"model_id": "grok-4-1-fast", "provider": "xai"},
-    {"model_id": "sonar-pro", "provider": "perplexity"},
-    {"model_id": "llama-3.3-70b-versatile", "provider": "groq"},
-]
-
-
 def _row_model_id(r) -> str:
     """Support both dict fallback rows and asyncpg Record objects."""
     return r["model_id"] if hasattr(r, "__getitem__") else r.get("model_id")
@@ -549,13 +1079,13 @@ async def list_models(
     authorization: Optional[str] = Header(None),
     user: UserContext = Depends(get_current_user),
 ):
-    """List available models from the model_registry table (v3.1.2).
+    """List available models from the model_registry table.
 
     Returns every row where available=true AND deprecated=false,
     ordered by graeae_weight DESC so higher-quality models lead the
-    response. On a fresh install where the registry is empty (or the
-    query fails), falls back to a short built-in list so the endpoint
-    stays usable until `update_model_registry.py` seeds the table.
+    response. Discovery is intentionally registry-only: fallback routing
+    can still serve explicit chat requests, but `/v1/models` does not
+    advertise synthetic models that are not registered.
     """
     rows: list = []
     if _lc._pool is not None:
@@ -572,12 +1102,9 @@ async def list_models(
         except Exception as exc:
             logger.warning(
                 "[/v1/models] model_registry query failed, "
-                "falling back to built-in list: %s", exc,
+                "returning an empty discovery list: %s", exc,
             )
             rows = []
-
-    if not rows:
-        rows = _FALLBACK_MODELS
 
     models = [
         ModelInfo(id=_row_model_id(r), owned_by=_owned_by(_row_provider(r)))
@@ -592,14 +1119,12 @@ async def get_model(
     authorization: Optional[str] = Header(None),
     user: UserContext = Depends(get_current_user),
 ):
-    """Look up a single model in the registry (v3.1.2).
+    """Look up a single model in the registry.
 
     Aliases resolve first (best-coding etc. → concrete model), then
-    the resolved id is checked against model_registry. If the model
-    isn't in the registry the handler still returns it with
-    owned_by='Unknown' — this is a passthrough API and operators
-    sometimes route to locally configured models that aren't
-    registered globally.
+    the resolved id is checked against model_registry. Unlike chat
+    routing, model discovery is registry-only: unregistered IDs return
+    404 instead of synthetic `owned_by="Unknown"` metadata.
     """
     resolved_model = MODEL_ALIASES.get(model_id, model_id)
     provider: Optional[str] = None
@@ -625,6 +1150,10 @@ async def get_model(
                 "[/v1/models/%s] registry lookup failed: %s",
                 model_id, exc,
             )
+            raise HTTPException(status_code=503, detail="model registry unavailable") from exc
+
+    if provider is None:
+        raise HTTPException(status_code=404, detail="model not found")
 
     return ModelInfo(id=resolved_model, owned_by=_owned_by(provider))
 
@@ -639,12 +1168,13 @@ async def chat_completions(
 
     if not request.messages:
         raise HTTPException(status_code=400, detail="messages required")
+    _validate_request_messages(request.messages)
 
     # Extract last user message for context search and task detection
     last_msg = ""
     for msg in reversed(request.messages):
         if msg.role == "user":
-            last_msg = msg.content
+            last_msg = _content_text(msg.content)
             break
 
     if not last_msg:
@@ -687,7 +1217,7 @@ async def chat_completions(
     system_prompt = ""
     for msg in request.messages:
         if msg.role == "system":
-            system_prompt = msg.content
+            system_prompt = _content_text(msg.content)
             break
 
     if mnemos_docs:
@@ -702,21 +1232,90 @@ async def chat_completions(
     for msg in request.messages:
         if msg.role == "system":
             if not system_added:
-                messages.append({"role": "system", "content": system_prompt})
+                system_message = {"role": "system", "content": system_prompt}
+                if msg.name is not None:
+                    system_message["name"] = msg.name
+                messages.append(system_message)
                 system_added = True
         else:
-            messages.append({"role": msg.role, "content": msg.content})
+            messages.append(_message_to_dict(msg))
 
     if not system_added and system_prompt:
         messages.insert(0, {"role": "system", "content": system_prompt})
 
-    # Route to provider via GRAEAE
-    try:
-        response_text = await _route_to_provider(
+    generation_params = _generation_params(request)
+    request_params = _request_params(request)
+    now = int(datetime.now(timezone.utc).timestamp())
+
+    if request.stream:
+        stream_id = f"chatcmpl-mnemos-{now}"
+        provider_stream = _route_to_provider_stream(
             model=model,
             messages=messages,
-            temperature=request.temperature or 0.7,
-            max_tokens=request.max_tokens,
+            generation_params=generation_params,
+            request_params=request_params,
+            user=user,
+        )
+        try:
+            # Prime the upstream stream before constructing StreamingResponse.
+            # This forces provider resolution, key/reliability checks, and the
+            # initial upstream stream open/status check to fail while FastAPI can
+            # still return a normal JSON error response instead of committing a
+            # 200 SSE response that later truncates.
+            first_delta = await anext(provider_stream)
+        except StopAsyncIteration:
+            first_delta = None
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[MNEMOS] Streaming request failed before response start: {e}")
+            raise _stream_preflight_exception(e) from e
+
+        async def event_source() -> AsyncIterator[str]:
+            started_indexes: set[int] = set()
+            finished_indexes: set[int] = set()
+            try:
+                if first_delta is not None:
+                    for event in _stream_events_for_provider_delta(
+                        delta=first_delta,
+                        stream_id=stream_id,
+                        created=now,
+                        model=model,
+                        started_indexes=started_indexes,
+                        finished_indexes=finished_indexes,
+                    ):
+                        yield event
+
+                async for delta in provider_stream:
+                    for event in _stream_events_for_provider_delta(
+                        delta=delta,
+                        stream_id=stream_id,
+                        created=now,
+                        model=model,
+                        started_indexes=started_indexes,
+                        finished_indexes=finished_indexes,
+                    ):
+                        yield event
+            except Exception as e:
+                logger.error(f"[MNEMOS] Streaming response failed after response start: {e}")
+                error_type = e.error_type if isinstance(e, ProviderStreamError) else "provider_stream_error"
+                yield _stream_error_event(str(e), error_type=error_type)
+            finally:
+                try:
+                    await provider_stream.aclose()
+                except Exception as e:
+                    logger.debug(f"[MNEMOS] Streaming response cleanup failed: {e}")
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(event_source(), media_type="text/event-stream")
+
+    # Route to provider via GRAEAE
+    try:
+        provider_response = await _route_to_provider_response(
+            model=model,
+            messages=messages,
+            generation_params=generation_params,
+            request_params=request_params,
             user=user,
         )
     except HTTPException:
@@ -726,21 +1325,15 @@ async def chat_completions(
         raise HTTPException(status_code=503, detail=f"Request failed: {str(e)}")
 
     # Format OpenAI-compatible response
-    now = int(datetime.now(timezone.utc).timestamp())
-    prompt_tokens = sum(len(m.get("content", "").split()) for m in messages)
-    completion_tokens = len(response_text.split())
+    choices = _provider_choices(provider_response)
+    prompt_tokens = sum(len(_content_text(m.get("content")).split()) for m in messages)
+    completion_tokens = len(_completion_text_for_usage(choices).split())
 
     return ChatCompletionResponse(
         id=f"chatcmpl-mnemos-{now}",
         created=now,
         model=model,
-        choices=[
-            ChatCompletionChoice(
-                index=0,
-                message=ChatMessage(role="assistant", content=response_text),
-                finish_reason="stop",
-            )
-        ],
+        choices=choices,
         usage={
             "prompt_tokens": prompt_tokens,
             "completion_tokens": completion_tokens,
