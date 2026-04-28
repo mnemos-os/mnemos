@@ -1,9 +1,9 @@
 """MCP stdio server ↔ REST route wire-contract regression tests.
 
-Regression tests for the prefix mismatch where mcp_server.py called
+Regression tests for the prefix mismatch where the MCP tool registry called
 `/memories*` but the REST router registers `/v1/memories*`. This is a
 static contract check — it imports the FastAPI app, enumerates the
-registered route paths, and asserts that every path mcp_server.py
+registered route paths, and asserts that every path the registry
 targets is actually served.
 
 No running server required. Runs in the normal pytest suite.
@@ -18,19 +18,19 @@ from typing import Iterable
 
 
 REPO_ROOT = Path(__file__).parent.parent
-MCP_SERVER = REPO_ROOT / "mcp_server.py"
+MCP_TOOLS = REPO_ROOT / "api" / "mcp_tools.py"
 
 
 def _extract_mcp_paths() -> list[str]:
-    """Pull every literal/f-string path passed to _get/_post/_delete in
-    mcp_server.py. Returns the static prefix up to the first f-string hole."""
-    src = MCP_SERVER.read_text(encoding="utf-8")
-    # Match _get("..."), _post("..."), _delete("..."), and f"..." variants.
+    """Pull every literal/f-string path passed to _rest_* in
+    api/mcp_tools.py. Returns the static prefix up to the first f-string hole."""
+    src = MCP_TOOLS.read_text(encoding="utf-8")
+    # Match _rest_get("..."), _rest_post("..."), _rest_delete("..."), and f"..." variants.
     # We capture the leading literal segment; f-strings with `{arg}` holes
     # keep only the static prefix so we compare against registered path
     # *patterns*, not rendered URIs.
     pattern = re.compile(
-        r"""_(?:get|post|delete)\(\s*f?["']([^"'{]+)(?:["']|\{)""",
+        r"""_rest_(?:get|post|delete)\(\s*f?["']([^"'{]+)(?:["']|\{)""",
         re.MULTILINE,
     )
     paths = set()
@@ -44,7 +44,7 @@ def _extract_mcp_paths() -> list[str]:
 def _registered_prefixes() -> list[str]:
     """Enumerate the static prefixes of every route registered in the
     FastAPI app. Returns prefixes suitable for startswith() matching
-    against mcp_server.py's literal path prefixes."""
+    against api/mcp_tools.py's literal path prefixes."""
     # Import lazily — the app import chain pulls in asyncpg / pgvector
     # stubs, which conftest.py sets up.
     from api_server import app  # noqa: E402
@@ -77,13 +77,13 @@ def _any_prefix_matches(mcp_path: str, registered: Iterable[str]) -> bool:
 class TestMCPWireContract:
     """Every path the stdio MCP server calls must be a route the REST
     app serves. This test would have caught the v3.0.0 regression where
-    nine memory tools returned 404 because mcp_server.py called
+    nine memory tools returned 404 because the MCP server called
     /memories while the router registered /v1/memories."""
 
     def test_every_mcp_path_is_a_real_route(self):
         mcp_paths = _extract_mcp_paths()
         registered = _registered_prefixes()
-        assert mcp_paths, "mcp_server.py exposes no paths — something is wrong with extraction"
+        assert mcp_paths, "api/mcp_tools.py exposes no paths — something is wrong with extraction"
         assert registered, "FastAPI app exposes no routes — import failed"
 
         missing: list[str] = []
@@ -92,22 +92,22 @@ class TestMCPWireContract:
                 missing.append(path)
 
         assert not missing, (
-            f"mcp_server.py calls these paths that the REST app does not serve: {missing}. "
+            f"api/mcp_tools.py calls these paths that the REST app does not serve: {missing}. "
             f"This is the #M31-01 regression — MCP stdio server returns 404 for callers. "
             f"Registered prefixes (sample): {sorted(registered)[:20]}"
         )
 
     def test_memory_paths_are_v1_prefixed(self):
-        """Explicit regression: every memory-related path in mcp_server.py
+        """Explicit regression: every memory-related path in api/mcp_tools.py
         must carry the /v1 prefix. Reverting the prefix would reintroduce
         the v3.0.0 bug."""
         mcp_paths = _extract_mcp_paths()
         memory_paths = [p for p in mcp_paths if "/memor" in p]
-        assert memory_paths, "mcp_server.py has no memory paths — extraction regex is broken"
+        assert memory_paths, "api/mcp_tools.py has no memory paths — extraction regex is broken"
 
         unprefixed = [p for p in memory_paths if not p.startswith("/v1/")]
         assert not unprefixed, (
-            f"These memory paths in mcp_server.py are missing the /v1 prefix: {unprefixed}. "
+            f"These memory paths in api/mcp_tools.py are missing the /v1 prefix: {unprefixed}. "
             f"The REST router registers memories under /v1 (api/handlers/memories.py:34); "
             f"any path without the prefix will 404."
         )
@@ -115,18 +115,18 @@ class TestMCPWireContract:
     def test_kg_paths_are_v1_prefixed(self):
         """KG routes were moved from /kg to /v1/kg as part of the v3.3
         API cleanup pass. Any
-        unversioned /kg/* path in mcp_server.py would 404 against the
+        unversioned /kg/* path in api/mcp_tools.py would 404 against the
         current API."""
         mcp_paths = _extract_mcp_paths()
         kg_paths = [p for p in mcp_paths if "/kg/" in p or p.endswith("/kg")]
-        assert kg_paths, "mcp_server.py has no KG paths — extraction regex is broken"
+        assert kg_paths, "api/mcp_tools.py has no KG paths — extraction regex is broken"
 
         unprefixed = [
             p for p in kg_paths
             if (p.startswith("/kg/") or p == "/kg") and not p.startswith("/v1/")
         ]
         assert not unprefixed, (
-            f"These KG paths in mcp_server.py are missing the /v1 prefix: "
+            f"These KG paths in api/mcp_tools.py are missing the /v1 prefix: "
             f"{unprefixed}. The REST router registers KG under /v1/kg "
             f"(api/handlers/kg.py); any path without the prefix will 404."
         )
