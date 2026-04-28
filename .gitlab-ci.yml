@@ -131,7 +131,21 @@ test:integration:
         db/migrations_v3_2_2_version_snapshot_new_values.sql \
         db/migrations_v3_3_morpheus.sql \
         db/migrations_v3_3_morpheus_namespace.sql \
-        db/migrations_v3_3_recall_tracking.sql; do
+        db/migrations_v3_3_recall_tracking.sql \
+        db/migrations_charon_trigger_guard.sql \
+        db/migrations_v3_4_federation_compat.sql \
+        db/migrations_v3_5_trigger_same_memory_parent.sql \
+        db/migrations_v3_5_rls_group_select_unix_bits.sql \
+        db/migrations_v3_5_webhook_retry_terminal_state.sql \
+        db/migrations_v3_5_webhook_attempt_lease.sql \
+        db/migrations_v3_5_webhook_writer_revision.sql \
+        db/migrations_v3_5_webhook_status_updated_at.sql \
+        db/migrations_v3_5_webhook_superseded_marker.sql \
+        db/migrations_v3_5_webhook_attempt_unique.sql \
+        db/migrations_v3_5_webhook_succeeded_unique.sql \
+        db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql \
+        db/migrations_v3_5_entities_namespace_unique.sql \
+        db/migrations_v3_5_state_journal_namespace.sql; do
         if [ -f "$f" ]; then
           echo "applying $f"
           psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"

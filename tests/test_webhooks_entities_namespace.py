@@ -174,7 +174,7 @@ def test_entities_assert_owned_root_bypasses_namespace(monkeypatch):
     conn = _Conn(row={"owner_id": "bob", "namespace": "bob-ns"})
     # Root call — should NOT raise
     result = asyncio.run(ent._assert_owned(conn, str(uuid.uuid4()), _root()))
-    assert result == "bob"
+    assert result == ("bob", "bob-ns")
 
 
 # ─── webhooks ────────────────────────────────────────────────────────────────

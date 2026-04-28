@@ -18,10 +18,7 @@ CREATE INDEX IF NOT EXISTS idx_entities_namespace
 CREATE INDEX IF NOT EXISTS idx_entities_owner_namespace
     ON entities(owner_id, namespace);
 
--- Note: the (owner_id, entity_type, name) UNIQUE constraint stays
--- as-is. Namespace segmentation WITHIN a single owner (same owner
--- having "Alice" the person in namespace A and namespace B) is not
--- supported today; tenant separation is expressed via distinct
--- owner_ids per team. Widening the unique key is a v3.3+ decision
--- that also needs migration discipline for rows created before the
--- change.
+-- Note: this migration originally deferred widening the
+-- (owner_id, entity_type, name) UNIQUE constraint. That deferral is closed in
+-- migrations_v3_5_entities_namespace_unique.sql, which replaces it with
+-- (owner_id, namespace, entity_type, name) after an exact-duplicate guard.

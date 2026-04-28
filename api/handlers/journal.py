@@ -1,7 +1,8 @@
 """Journal API: POST /journal, GET /journal, DELETE /journal/{entry_id}
 
-Per-owner journal. Each entry is scoped to the creating user's `user_id` and
-visible only to that user (root can cross-read by passing `?owner_id=...`).
+Per-owner, per-namespace journal. Each entry is scoped to the creating user's
+`user_id` and `namespace`; root can target another owner/namespace via
+`?owner_id=` and `?namespace=`.
 """
 import json
 import logging
@@ -43,13 +44,28 @@ def _scope_owner(user: UserContext, override: Optional[str]) -> str:
     return user.user_id
 
 
+def _scope_namespace(user: UserContext, override: Optional[str] = None) -> str:
+    if override and override != user.namespace:
+        if user.role != "root":
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace access requires root",
+            )
+        return override
+    return user.namespace
+
+
 @router.post("/journal", status_code=201)
 async def create_journal_entry(
     req: JournalCreateRequest,
     user: UserContext = Depends(get_current_user),
+    owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
+    namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     try:
         entry_id = str(uuid.uuid4())
         async with _lc._pool.acquire() as conn:
@@ -59,18 +75,18 @@ async def create_journal_entry(
                 except ValueError:
                     raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 row = await conn.fetchrow(
-                    '''INSERT INTO journal (id, owner_id, entry_date, topic, content, metadata)
-                       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+                    '''INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                       VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
                        RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, user.user_id, entry_date, req.topic, req.content,
+                    entry_id, target_owner, target_ns, entry_date, req.topic, req.content,
                     json.dumps(req.metadata or {}),
                 )
             else:
                 row = await conn.fetchrow(
-                    '''INSERT INTO journal (id, owner_id, entry_date, topic, content, metadata)
-                       VALUES ($1, $2, CURRENT_DATE, $3, $4, $5::jsonb)
+                    '''INSERT INTO journal (id, owner_id, namespace, entry_date, topic, content, metadata)
+                       VALUES ($1, $2, $3, CURRENT_DATE, $4, $5, $6::jsonb)
                        RETURNING id, entry_date::text, topic, content, metadata, created::text''',
-                    entry_id, user.user_id, req.topic, req.content,
+                    entry_id, target_owner, target_ns, req.topic, req.content,
                     json.dumps(req.metadata or {}),
                 )
         return dict(row)
@@ -89,10 +105,12 @@ async def list_journal_entries(
     limit: int = Query(20, ge=1, le=200),
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None),
+    namespace: Optional[str] = Query(None),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     try:
         async with _lc._pool.acquire() as conn:
             if date_str:
@@ -102,30 +120,30 @@ async def list_journal_entries(
                     raise HTTPException(status_code=422, detail="Invalid date format; expected YYYY-MM-DD")
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND entry_date = $2
-                       ORDER BY created DESC LIMIT $3''',
-                    target_owner, parsed_date, limit
+                       FROM journal WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
+                       ORDER BY created DESC LIMIT $4''',
+                    target_owner, target_ns, parsed_date, limit
                 )
             elif topic:
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND topic = $2
-                       ORDER BY created DESC LIMIT $3''',
-                    target_owner, topic, limit
+                       FROM journal WHERE owner_id = $1 AND namespace = $2 AND topic = $3
+                       ORDER BY created DESC LIMIT $4''',
+                    target_owner, target_ns, topic, limit
                 )
             elif search:
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1 AND (content ILIKE $2 OR topic ILIKE $2)
-                       ORDER BY created DESC LIMIT $3''',
-                    target_owner, f'%{search}%', limit
+                       FROM journal WHERE owner_id = $1 AND namespace = $2 AND (content ILIKE $3 OR topic ILIKE $3)
+                       ORDER BY created DESC LIMIT $4''',
+                    target_owner, target_ns, f'%{search}%', limit
                 )
             else:
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
-                       FROM journal WHERE owner_id = $1
-                       ORDER BY created DESC LIMIT $2''',
-                    target_owner, limit
+                       FROM journal WHERE owner_id = $1 AND namespace = $2
+                       ORDER BY created DESC LIMIT $3''',
+                    target_owner, target_ns, limit
                 )
         return {"entries": [dict(r) for r in rows], "count": len(rows)}
     except HTTPException:
@@ -139,18 +157,17 @@ async def list_journal_entries(
 async def delete_journal_entry(
     entry_id: str,
     user: UserContext = Depends(get_current_user),
+    owner_id: Optional[str] = Query(None),
+    namespace: Optional[str] = Query(None),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     async with _lc._pool.acquire() as conn:
-        if user.role == "root":
-            result = await conn.execute(
-                'DELETE FROM journal WHERE id = $1', entry_id,
-            )
-        else:
-            result = await conn.execute(
-                'DELETE FROM journal WHERE id = $1 AND owner_id = $2',
-                entry_id, user.user_id,
-            )
+        result = await conn.execute(
+            'DELETE FROM journal WHERE id = $1 AND owner_id = $2 AND namespace = $3',
+            entry_id, target_owner, target_ns,
+        )
     if result == 'DELETE 0':
         raise HTTPException(status_code=404, detail="Entry not found")
