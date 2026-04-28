@@ -719,6 +719,67 @@ def test_anthropic_tool_choice_unsupported_string_rejected_before_dispatch(monke
     assert fake.route_calls == []
 
 
+@pytest.mark.parametrize("role", ["tool", "developer", "random_typo"])
+def test_gemini_unsupported_roles_rejected_before_dispatch(monkeypatch, role):
+    fake = _FakeGraeae(
+        providers={
+            "gemini": {
+                "api": "gemini",
+                "model": "gemini-test",
+                "url": "https://generativelanguage.googleapis.com/v1beta/models/gemini-test:generateContent",
+                "key_name": "gemini",
+            }
+        }
+    )
+    _install_gateway(monkeypatch, fake, provider="gemini")
+    req = openai_compat.ChatCompletionRequest(
+        model="gemini-test",
+        messages=[
+            openai_compat.ChatMessage(role="user", content="hello"),
+            openai_compat.ChatMessage(role=role, content="should not be reclassified"),
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == (
+        f"provider gemini does not support role={role}; supported: system, user, assistant"
+    )
+    assert fake.route_calls == []
+
+
+def test_anthropic_developer_role_rejected_before_dispatch(monkeypatch):
+    fake = _FakeGraeae(
+        providers={
+            "claude": {
+                "api": "anthropic",
+                "model": "claude-opus-4-6",
+                "url": "https://api.anthropic.com/v1/messages",
+                "key_name": "claude",
+            }
+        }
+    )
+    _install_gateway(monkeypatch, fake, provider="claude")
+    req = openai_compat.ChatCompletionRequest(
+        model="claude-opus-4-6",
+        messages=[
+            openai_compat.ChatMessage(role="user", content="hello"),
+            openai_compat.ChatMessage(role="developer", content="not supported by anthropic"),
+        ],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == (
+        "provider claude does not support role=developer; supported: system, user, assistant, tool"
+    )
+    assert fake.route_calls == []
+
+
 def test_tools_rejected_unsupported_provider(monkeypatch):
     fake = _FakeGraeae(
         providers={
@@ -858,6 +919,72 @@ def test_unknown_field_handling(monkeypatch):
         asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
     assert exc.value.status_code == 400
     assert "does not support penalties" in exc.value.detail
+
+
+def test_provider_refusal_response_field_is_preserved(monkeypatch):
+    class _RefusalGraeae(_FakeGraeae):
+        async def route(self, *args, **kwargs):
+            self.route_calls.append((args, kwargs))
+            return {
+                "status": "success",
+                "response_text": "",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": None,
+                            "refusal": "I cannot comply with that request.",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+    fake = _RefusalGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+    )
+
+    result = asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert result.choices[0].message.refusal == "I cannot comply with that request."
+
+
+def test_provider_unknown_response_message_field_fails_closed(monkeypatch):
+    class _UnknownFieldGraeae(_FakeGraeae):
+        async def route(self, *args, **kwargs):
+            self.route_calls.append((args, kwargs))
+            return {
+                "status": "success",
+                "response_text": "ok",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "ok",
+                            "new_provider_field": {"opaque": True},
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+            }
+
+    fake = _UnknownFieldGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 502
+    assert "unsupported response field new_provider_field" in exc.value.detail
 
 
 def test_multimodal_content_blocks(monkeypatch):

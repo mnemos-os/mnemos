@@ -130,9 +130,23 @@ class ChatCompletionStreamRequest(ChatCompletionRequest):
     stream: bool = True
 
 
+class ChatCompletionResponseMessage(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    role: str
+    content: Optional[ChatContent] = None
+    name: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
+    tool_call_id: Optional[str] = None
+    function_call: Optional[Dict[str, Any]] = None
+    refusal: Optional[str] = None
+    audio: Optional[Dict[str, Any]] = None
+    annotations: Optional[List[Dict[str, Any]]] = None
+
+
 class ChatCompletionChoice(BaseModel):
     index: int
-    message: ChatMessage
+    message: ChatCompletionResponseMessage
     finish_reason: str
 
 
@@ -535,6 +549,29 @@ def _validate_anthropic_tool_choice(provider: str, tool_choice: Any) -> None:
     )
 
 
+_ROLE_SUPPORT_BY_API = {
+    "gemini": ("system", "user", "assistant"),
+    "anthropic": ("system", "user", "assistant", "tool"),
+    # "function" is OpenAI's deprecated function-message role. We allow it
+    # through unchanged for OpenAI-compatible providers that still support it.
+    "openai": ("system", "user", "assistant", "tool", "function"),
+}
+
+
+def _validate_provider_roles(provider: str, provider_cfg: Dict[str, Any], messages: List[Dict[str, Any]]) -> None:
+    supported = _ROLE_SUPPORT_BY_API.get(provider_cfg.get("api"))
+    if supported is None:
+        return
+    supported_set = set(supported)
+    for msg in messages:
+        role = msg.get("role", "user")
+        if role not in supported_set:
+            raise HTTPException(
+                status_code=400,
+                detail=f"provider {provider} does not support role={role}; supported: {', '.join(supported)}",
+            )
+
+
 def _validate_provider_request(
     provider: str,
     provider_cfg: Dict[str, Any],
@@ -542,6 +579,7 @@ def _validate_provider_request(
     messages: List[Dict[str, Any]],
     request_params: Dict[str, Any],
 ) -> None:
+    _validate_provider_roles(provider, provider_cfg, messages)
     if _has_message_names(messages) and provider_cfg.get("api") != "openai":
         raise HTTPException(status_code=400, detail=f"provider {provider} does not support message name")
     if _has_content_blocks(messages) and not _provider_supports_multimodal(provider, provider_cfg, model):
@@ -577,9 +615,27 @@ def _validate_provider_request(
         raise HTTPException(status_code=400, detail=f"provider {provider} does not support penalties")
 
 
+_RESPONSE_MESSAGE_FIELDS = {
+    "role",
+    "content",
+    "name",
+    "tool_calls",
+    "tool_call_id",
+    "function_call",
+    "refusal",
+    "audio",
+    "annotations",
+}
+
+
 def _response_message_data(message: Dict[str, Any]) -> Dict[str, Any]:
-    allowed = {"role", "content", "name", "tool_calls", "tool_call_id"}
-    return {key: value for key, value in message.items() if key in allowed}
+    for key in message:
+        if key not in _RESPONSE_MESSAGE_FIELDS:
+            raise HTTPException(
+                status_code=502,
+                detail=f"provider returned unsupported response field {key}; gateway cannot faithfully represent",
+            )
+    return dict(message)
 
 
 def _provider_choices(response: Dict[str, Any]) -> List[ChatCompletionChoice]:
@@ -593,7 +649,7 @@ def _provider_choices(response: Dict[str, Any]) -> List[ChatCompletionChoice]:
         choices.append(
             ChatCompletionChoice(
                 index=choice.get("index", i),
-                message=ChatMessage(**message_data),
+                message=ChatCompletionResponseMessage(**message_data),
                 finish_reason=choice.get("finish_reason") or "stop",
             )
         )
@@ -602,7 +658,7 @@ def _provider_choices(response: Dict[str, Any]) -> List[ChatCompletionChoice]:
     return [
         ChatCompletionChoice(
             index=0,
-            message=ChatMessage(role="assistant", content=response.get("response_text", "")),
+            message=ChatCompletionResponseMessage(role="assistant", content=response.get("response_text", "")),
             finish_reason=response.get("finish_reason") or "stop",
         )
     ]

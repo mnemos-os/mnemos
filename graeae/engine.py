@@ -412,6 +412,10 @@ def _gemini_contents(messages: Optional[list[dict]], prompt: str) -> tuple[Optio
             if text:
                 system_text.append(text)
             continue
+        if role not in {"user", "assistant"}:
+            raise ValueError(
+                f"Gemini does not support role={role}; supported: system, user, assistant"
+            )
         gemini_role = "model" if role == "assistant" else "user"
         contents.append({"role": gemini_role, "parts": _gemini_part(msg.get("content"))})
     if not contents:
