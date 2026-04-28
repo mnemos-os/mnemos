@@ -2,8 +2,8 @@
 
 Compression is opt-in and operator-batched through the admin endpoints:
 
-- `POST /v1/admin/compression/enqueue`
-- `POST /v1/admin/compression/enqueue-all`
+- `POST /admin/compression/enqueue`
+- `POST /admin/compression/enqueue-all`
 
 Memory creation does not auto-enqueue contest jobs. This is deliberate:
 compression is expensive work. It can involve LLM-judged contests and GPU

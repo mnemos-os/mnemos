@@ -47,7 +47,7 @@ service; everything stays in your MNEMOS.
 ```
 
 The MCP HTTP/SSE bridge (`mcp_http_server.py`) shares the exact same
-`Server("mnemos")` instance and 13 tool definitions as the stdio MCP
+`Server("mnemos")` instance and 18 tool definitions as the stdio MCP
 server. A memory written from Claude Desktop is queryable from
 ChatGPT and vice versa.
 
@@ -69,15 +69,17 @@ services:
     ports:
       - "5004:5004"
     environment:
-      MNEMOS_MCP_TOKEN: "${MNEMOS_MCP_TOKEN:?must be set}"
+      MNEMOS_MCP_TOKENS: "alice:${MNEMOS_MCP_TOKEN}:${MNEMOS_API_KEY}"
       MNEMOS_BASE: "http://mnemos:5002"
       MNEMOS_API_KEY: "<your existing MNEMOS bearer>"
     extra_hosts:
       - "host.docker.internal:host-gateway"
 ```
 
-Generate a bearer token (this is what ChatGPT will send on every
-request — independent from your MNEMOS API key):
+Generate a bearer token (this is what ChatGPT will send on every request).
+`MNEMOS_MCP_TOKENS` maps that edge token to a backend MNEMOS API key; the
+legacy single-user `MNEMOS_MCP_TOKEN` mode still exists but shares one backend
+principal for every client:
 
 ```bash
 export MNEMOS_MCP_TOKEN="$(openssl rand -hex 32)"
@@ -159,7 +161,8 @@ ChatGPT → Settings → Developer Mode → Connectors → Add custom
 
 Click Save. ChatGPT will hit the URL, complete the SSE handshake, and
 list the available tools (search_memories, create_memory, get_memory,
-list_memories, kg_create_triple, kg_search, etc. — all 13).
+list_memories, kg_create_triple, kg_search, DAG tools, recommend_model, etc. —
+all 18).
 
 ### 4. Use it
 
@@ -173,32 +176,29 @@ Ask things like:
 ChatGPT calls MNEMOS's MCP tools and folds the results into the
 conversation. Same memory is visible from your other agents.
 
-## Setup — assisted path (planned, v3.4)
+## Setup — assisted path (experimental helper)
 
-The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py` in
-the repo today, daemon-side endpoints land in v3.4) will collapse the
-above into:
+The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is checked
+in as an experimental contract. It calls daemon-side `/admin/tunnels/*`
+endpoints; use the manual path above unless those endpoints are enabled in
+your deployment.
 
 ```bash
 mnemos-tunnel-setup chatgpt
 ```
 
-The script walks you through ngrok signup, opens the tunnel, generates
-the token, prints the connector config, and copies URL+token to your
-clipboard. The script is checked in now as the user-facing contract;
-the daemon-side `/admin/tunnels/*` endpoints it calls will ship in
-v3.4. Until then, use the manual path above.
+The script walks you through ngrok signup, opens the tunnel, generates the
+token, prints the connector config, and copies URL+token to your clipboard.
 
 ## Operational notes
 
 - **Token rotation**: change `MNEMOS_MCP_TOKEN`, restart the
   `mnemos-mcp-http` service, update the connector in ChatGPT.
   No coordination with stdio agents needed — they don't use this token.
-- **Single shared token model**: every ChatGPT user sharing this
-  connector URL uses the same bearer token, so they all write to the
-  same MNEMOS namespace. For multi-user separation, run separate
-  tunnels per user with separate tokens, OR wait for the v3.5 OAuth
-  + per-user attribution work.
+- **Per-user token model**: prefer `MNEMOS_MCP_TOKENS` so each connector
+  bearer maps to a backend user/API key. The legacy `MNEMOS_MCP_TOKEN`
+  mode is single-user only; every client sharing it writes as the same
+  backend principal.
 - **Audit trail**: every connector-driven write goes through
   `/v1/memories` exactly like a normal API call, so the version DAG,
   webhooks, MORPHEUS run tagging, and federation all observe it.
@@ -213,8 +213,9 @@ v3.4. Until then, use the manual path above.
 - **TLS is the tunnel's responsibility**: `mcp_http_server.py` listens
   on plain HTTP. Never bind it to a public IP without the tunnel
   providing TLS termination.
-- **No OAuth yet**: bearer auth only. Anyone with the token can
-  read/write your memory. Treat the token like an SSH private key.
+- **No OAuth on the MCP edge yet**: bearer auth only. Anyone with the token can
+  read/write as the mapped backend principal. Treat the token like an SSH
+  private key.
 - **Connector tool list updates require reconnect**: if MNEMOS adds
   new tools (e.g., MORPHEUS slice 2 endpoints), ChatGPT may need the
   connector removed and re-added to pick them up.

@@ -12,27 +12,27 @@ The distinction matters. A *storage provider* gives you a place to put bytes. An
 
 MNEMOS is the second thing. It is the operating system for agent memory: a runtime composed of named subsystems that cooperate to manage the full lifecycle of memory across multiple agents, providers, and time horizons — **write, embed, compress, version, reason-over, audit, federate, archive** — each one a first-class citizen of the runtime, not a feature bolted onto a vector store.
 
-- **MNEMOS** is the memory kernel and the overall system name. Storage, versioning, tiered compression, and lifecycle sit here.
+- **MNEMOS** is the memory kernel and the overall system name. Storage, versioning, operator-batched compression, and lifecycle sit here.
 - **GRAEAE** is the reasoning bus — a multi-provider consensus layer that scores and selects across live LLM backends with a cryptographic audit chain on every decision.
 - **THE MOIRAI** is the compression subsystem. The current built-in stack is **APOLLO + ARTEMIS**, with a written receipt on every transformation.
-- A **self-maintaining model registry** keeps itself current from provider APIs and Arena.ai Elo rankings, so the kernel always knows what models exist, what they cost, and how good they currently are.
+- A **self-maintaining model registry**, when the shipped sync timer is enabled, keeps itself current from provider APIs and Arena.ai Elo rankings, so the kernel knows what models exist, what they cost, and how good they currently are.
 - **Federation**, **webhooks**, **OAuth**, **RLS**, **DAG versioning**, and the **/v1/** REST surface are services built on top of that kernel, not retrofits onto a library.
 
 This is not vocabulary borrowed from a dictionary of compelling words. Each of those names is a subsystem with an actual code path, an actual SQL table, an actual lifecycle worker, and an actual failure mode. Read the source tree; it's laid out that way.
 
-You can treat MNEMOS like a memory storage provider if you want — `POST /v1/memories`, `GET /v1/memories/{id}`, you're done. The system will happily oblige. But the reason it holds up in production is that everything underneath that surface is operating-system-shaped: write-ahead transactions on the audit chain, supervised workers for distillation, per-provider circuit breakers, hash-chained reasoning logs, named compression tiers with quality manifests, advisory-locked DAG merges, SSRF-hardened outbound webhooks, a dynamically-weighted model registry that updates itself. It is infrastructure built to operate, not a demo feature built to demo.
+You can treat MNEMOS like a memory storage provider if you want — `POST /v1/memories`, `GET /v1/memories/{id}`, you're done. The system will happily oblige. But the reason it holds up in production is that everything underneath that surface is operating-system-shaped: write-ahead transactions on the audit chain, supervised workers for distillation, per-provider circuit breakers, hash-chained reasoning logs, operator-triggered compression contests with quality manifests, advisory-locked DAG merges, SSRF-hardened outbound webhooks, and a dynamically-weighted model registry maintained by the shipped sync job. It is infrastructure built to operate, not a demo feature built to demo.
 
 **What it is, concretely:**
 
 - A FastAPI service (port 5002), PostgreSQL + pgvector backed. Python 3.11+. Apache-2.0.
 - A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
 - A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
-- Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots. On the v3.5-dev branch, history reads are filtered per snapshot and branch writers refuse cross-memory parent edges.
-- Tiered compression pipeline (APOLLO schema-aware dense encoding + ARTEMIS extractive compression) with a written quality manifest on every transformation. Runs in the background distillation worker through the plugin `CompressionEngine` ABC, competitive per-memory selection, and a persisted audit log of winners and losers.
-- Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in. The v3.5-dev read path uses the shared `read_visibility_predicate` in `api/visibility.py:40-96` across memory list/get/search/rehydrate/gateway surfaces.
+- Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots. In v3.5.x, history reads are filtered per snapshot and branch writers refuse cross-memory parent edges.
+- Operator-batched compression contest (APOLLO schema-aware dense encoding + ARTEMIS extractive compression) with a written quality manifest on every transformation. Runs in the background distillation worker through the plugin `CompressionEngine` ABC, competitive per-memory selection, and a persisted audit log of winners and losers.
+- Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in. The v3.5.x read path uses the shared `read_visibility_predicate` in `api/visibility.py:40-96` across memory list/get/search/rehydrate/gateway surfaces.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-The latest tagged release is **v3.4.1**: CHARON federation schema-compat preflight plus the dev↔prod MPF restore drill. The current development branch is **v3.5-dev** and is not tagged yet. v3.5 slices have landed there for session-history ordering, memory-read tenancy + DAG-integrity hardening, webhook retry hardening, the federation compound-cursor tie-breaker, MCP transport parity, and faithful OpenAI-compatible gateway controls. The going-forward compression stack is **APOLLO + ARTEMIS**.
+The current release line is **v3.5.x**. **v3.5.0 shipped on 2026-04-28** with audit-driven hardening, uniform owner+namespace tenancy, webhook retry and outbox repairs, the federation compound-cursor tie-breaker, MCP transport parity, faithful OpenAI-compatible gateway controls, and the PostgreSQL streaming-replication doctrine. **v3.5.1 is the 2026-04-28 documentation-triage patch**: no product behavior changes, just version metadata and documentation reconciliation. The active built-in compression stack is **APOLLO + ARTEMIS**.
 
 ## Works with
 
@@ -77,7 +77,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.4.1 is the latest tagged release**, and **v3.5-dev** carries the current unreleased hardening slices. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history and the in-flight v3.5-dev section.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape shipped here; **v3.5.0 is the current shipped GA line**, and **v3.5.1** is its documentation-triage patch. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -184,7 +184,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of the repo on v3.5-dev. The latest release tag remains v3.4.1; v3.5 is still being built as a sequence of slices on the branch. Features described here are implemented in the branch unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
+This is the current state of the v3.5.x release line. Features described here are implemented unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -199,7 +199,7 @@ The API surface is namespaced under `/v1/*`.
 | `POST /v1/memories/bulk` | Bulk create memories |
 | `PATCH /v1/memories/{id}` | Update memory content or metadata |
 | `DELETE /v1/memories/{id}` | Delete a memory |
-| `POST /v1/memories/rehydrate` | Token-budgeted context load for prompt injection (v3.2 wires the compression contest's winner variants into this path) |
+| `POST /v1/memories/rehydrate` | Token-budgeted context load for prompt injection; uses the compression contest's winning variant when present |
 | `POST /ingest/session` | Ingest a session transcript |
 | `GET /v1/memories/{id}/log` | DAG commit history for a memory |
 | `POST /v1/memories/{id}/branch` | Create a branch from a specific commit |
@@ -213,7 +213,7 @@ Read access for `GET /v1/memories`, `GET /v1/memories/{id}`, search, rehydrate, 
 
 ### Multi-user and provenance (v1, shipped)
 
-Each memory carries full ownership and LLM provenance:
+Each memory carries full ownership and LLM provenance. Since v3.2, tenancy is two-dimensional: `owner_id` names the account and `namespace` names the caller's logical workspace. Non-root writes require both to match the caller context; root can override for import, repair, and audit work.
 
 - `owner_id` — which user owns this memory
 - `group_id` — optional group for shared access
@@ -224,7 +224,7 @@ Each memory carries full ownership and LLM provenance:
 - `source_session` — session ID at time of creation
 - `source_agent` — agent name or identifier
 
-**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer. The application layer mirrors the RLS read contract so personal-mode and RLS-backed installs behave consistently. v3.5-dev closes task #25 with `db/migrations_v3_5_rls_group_select_unix_bits.sql`: `read_visibility_predicate` and the `mnemos_group_select` RLS policy now use identical Unix group-bit math, `((permission_mode / 10) % 10) >= 4`.
+**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer. The application layer mirrors the RLS read contract so personal-mode and RLS-backed installs behave consistently. v3.5.x closes task #25 with `db/migrations_v3_5_rls_group_select_unix_bits.sql`: `read_visibility_predicate` and the `mnemos_group_select` RLS policy now use identical Unix group-bit math, `((permission_mode / 10) % 10) >= 4`.
 
 **Deployment profiles** — selected at install time via `python install.py`:
 
@@ -233,6 +233,8 @@ Each memory carries full ownership and LLM provenance:
 | Personal | off | off | Single developer, localhost |
 | Team | API key | on | 2–20 users, shared PostgreSQL |
 | Enterprise | API key | on | 20+ users, full namespace isolation |
+
+Search hits update recall telemetry in the background: `recall_count` increments and `last_recalled_at` is set for the returned memory IDs. The counters are observability and future archival input, not authorization state; failures are logged and do not block the user-visible search response.
 
 ### Admin API (v1)
 
@@ -294,15 +296,27 @@ Gateway field support is pass-or-reject: OpenAI-style providers receive `tempera
 
 ### Stateful sessions (v3, shipped)
 
-Multi-turn conversation state with memory injection at turn boundaries. Sessions carry accumulated context across requests.
+Multi-turn conversation state with memory injection at turn boundaries. Sessions carry accumulated context across requests and are scoped by the same owner+namespace pair as memories. v3.5 removed the legacy per-session compression columns; session history is ordered by deterministic pinned system rows plus recent turns, and compression output comes from `memory_compressed_variants` when a read path explicitly asks for compressed memory.
 
 | Endpoint | What it does |
 |----------|-------------|
-| `POST /sessions` | Start a new session |
+| `POST /v1/sessions` | Start a new session |
 | `GET /v1/sessions/{id}` | Retrieve session state |
 | `POST /v1/sessions/{id}/messages` | Post a turn; memory injection at turn boundary |
 | `GET /v1/sessions/{id}/history` | Full message history |
 | `DELETE /v1/sessions/{id}` | End a session |
+
+### MORPHEUS — dream-state generator (v3.3, shipped)
+
+MORPHEUS is the append-only dream-state subsystem: it scans a time window of existing memories, clusters related records, synthesises per-cluster summary memories, tags every generated memory with `morpheus_run_id`, and records run state in `morpheus_runs`. It is operator-triggered, not an automatic mutation daemon; rollback deletes memories generated by a run and marks the run `rolled_back`.
+
+| Endpoint | What it does |
+|----------|-------------|
+| `GET /v1/morpheus/runs` | List runs newest-first |
+| `GET /v1/morpheus/runs/{id}` | Inspect one run |
+| `GET /v1/morpheus/runs/{id}/clusters` | Inspect cluster membership and synthesized memory IDs |
+| `POST /admin/morpheus/runs` | Trigger a run (root only, synchronous in this release) |
+| `DELETE /admin/morpheus/runs/{id}` | Roll back a run (root only) |
 
 ### Webhooks (v3, shipped)
 
@@ -361,6 +375,12 @@ application-level dedup work that PostgreSQL WAL streaming already solves below
 the app. See [`DEPLOYMENT.md`](./DEPLOYMENT.md#high-availability-and-replication)
 and [`docs/STREAMING_REPLICATION.md`](./docs/STREAMING_REPLICATION.md).
 
+### Portability — MPF import/export (v3.4, shipped)
+
+MNEMOS Portability Format (MPF) is the native envelope for moving memories between MNEMOS instances and across compatible external systems. `GET /v1/export` writes an MPF v0.1.x envelope; `POST /v1/import` reads the envelope back. Root callers may use `preserve_owner=true` for authoritative restore and migration work; non-root imports are scoped to the caller's owner+namespace.
+
+CLI helpers live in [`tools/memory_export.py`](./tools/memory_export.py), [`tools/memory_import.py`](./tools/memory_import.py), and [`tools/mpf_validate.py`](./tools/mpf_validate.py). The schema is documented in [`docs/MEMORY_EXPORT_FORMAT.md`](./docs/MEMORY_EXPORT_FORMAT.md), and v3.4.1 added CHARON schema-compat preflight so federating peers can refuse incompatible migration sets before sync.
+
 ### Federation — cross-instance memory sync (v3, shipped)
 
 Pull-based one-way federation between genuinely remote MNEMOS instances. Remote peer exposes `/v1/federation/feed`; local instance pulls on a configurable interval, storing remote memories with ids of the form `fed:{peer_name}:{remote_id}` and `federation_source = peer_name`. Federated memories are read-only by application convention.
@@ -397,22 +417,22 @@ The reasoning engine behind `/v1/consultations` provides:
 - **Rate limiter** — single-level request rate limit with graceful backoff
 - **Audit chain** — SHA-256 hash-chained prompt/response log for compliance
 
-### Model registry and dynamic provider weighting (self-maintaining)
+### Model registry and dynamic provider weighting
 
-Most multi-LLM routers hardcode a provider list. MNEMOS ships a **self-populating PostgreSQL-backed model registry** that keeps itself current.
+Most multi-LLM routers hardcode a provider list. MNEMOS ships a **self-populating PostgreSQL-backed model registry** that keeps itself current when the sync job is installed.
 
 **What's in the registry.** Every known model from every configured provider — OpenAI, Groq, xAI, Together, Nvidia, Gemini, Anthropic — with per-model metadata: provider + model_id, display name, family (grok-4, gpt-5, gemini-3, …), capabilities (`chat`, `vision`, `code`, `reasoning`, `web_search`), context window, max output tokens, input / output / cache pricing (USD per million tokens), availability, deprecation flag, **Arena.ai Elo score**, **Arena.ai rank**, and the normalized `graeae_weight` (0.50–1.00) actually used by the consensus scorer.
 
 **How it populates.**
 
-- **Daily provider sync** — `graeae.provider_sync` hits each provider's `/v1/models` endpoint (Gemini uses `/v1beta/models`; Anthropic uses a static list because Anthropic does not expose a public `/models` surface) and upserts into `model_registry`. New models appear automatically; deprecated ones get flagged. No manual curation required.
-- **Quarterly Elo sync** — `scripts/refresh_elo_weights.py` (systemd: `graeae-elo-sync.timer`) fetches the Arena.ai leaderboard, maps ranks back to providers + models, and writes `arena_score`, `arena_rank`, and `graeae_weight` into the registry.
+- **Daily provider sync** — `scripts/sync_provider_models.py` (systemd: `graeae-model-sync.timer`) calls `graeae.provider_sync`, hits each provider's model-list endpoint where one exists (Gemini uses `/v1beta/models`; Anthropic uses a static list because Anthropic does not expose a public `/models` surface), and upserts into `model_registry`. New models appear automatically when the timer is installed and provider keys are configured; deprecated ones get flagged.
+- **Arena.ai ranking sync** — the same sync script refreshes Arena.ai/LMArena ranking data unless run with `--skip-arena`, maps ranks back to providers + models, and writes `arena_score`, `arena_rank`, and `graeae_weight` into the registry. `scripts/refresh_elo_weights.py` remains available for an Elo-cache-only refresh.
 - **Online quality signals** — the GRAEAE engine tracks per-provider success / failure / latency in memory; those signals combine with the registry's Elo-derived `graeae_weight` to pick the winning response on each consultation.
 
 **What it's used for.**
 
 - **`/v1/providers/recommend?task_type=...&budget=...`** — returns the cheapest available model that meets the task's capability + quality floor. Uses `graeae_weight` as the quality signal and `input_cost_per_mtok + output_cost_per_mtok` as the cost signal.
-- **GRAEAE consensus scoring** — provider responses are weighted by `graeae_weight` before the consensus pick. A provider that drops on Arena.ai also drops in MNEMOS's internal routing on the next timer tick, without any human touching a config file.
+- **GRAEAE consensus scoring** — provider responses are weighted by `graeae_weight` before the consensus pick. A provider that drops on Arena.ai also drops in MNEMOS's internal routing after the sync timer updates the registry, without code changes.
 - **OpenAI-compatible gateway model routing** — when a caller passes `model="auto"`, `model="best-coding"`, `model="best-reasoning"`, `model="fastest"`, `model="cheapest"`, the gateway resolves against the registry rather than a hardcoded alias table.
 - **OpenAI-compatible model discovery** — `/v1/models` and `/v1/models/{model_id}` expose registry rows only; chat routing can still fall back to provider-name heuristics for explicit requests, but discovery does not invent synthetic models.
 
@@ -437,7 +457,7 @@ A lot of the v3.x surface is held up by background work that doesn't show up in 
 - **Full-text search operator filtering** — `/v1/memories/search` uses `plainto_tsquery` rather than `to_tsquery`, so `|`, `&`, `!` and friends get treated as literal text instead of tsquery operators. User input cannot construct adversarial FTS queries.
 - **Federation size caps** — an abusive peer cannot fill your disk: pulled content capped at 1 MB per memory, metadata at 64 KB, name fields at 256 chars.
 - **Rate-limited audit endpoints** — `/v1/consultations/audit/verify` walks the entire chain from genesis for root callers and verifies only the caller's consultation audit rows for non-root callers; capped at 5/min so an authenticated caller cannot force O(N) scans on a large log. `/audit` list is owner-scoped for non-root callers and capped at 30/min.
-- **Quality manifest on every compression** — every compression engine in the stack writes a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
+- **Quality manifest on every compression** — every compression engine in the active stack writes a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
 
 ### Referential integrity (the -ism, spelled out)
 
@@ -470,9 +490,9 @@ This is the part most projects that call themselves "memory" skip, because if th
 
 The constraints are enforced at the database level. Application bugs cannot violate them. Migration bugs cannot silently create orphan rows. The constraint travels with the row.
 
-### Compression — the MOIRAI tiers
+### Compression — the MOIRAI contest
 
-Tiered compression pipeline, each tier named after a Greek figure of memory.
+Compression is operator-batched in v3.5.x. It is not an automatic session-column flag and it no longer uses the retired LETHE / ANAMNESIS / ALETHEIA engines. Operators enqueue work through the admin endpoints; the distillation worker runs a competitive contest over the active engines and persists the winner plus the losing candidates for audit.
 
 - **ARTEMIS** — CPU-only extractive compression with identifier preservation, labeled-block handling, and evidence-based self-scoring.
 - **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use. Rule-based schema detection with optional LLM fallback for fact-shaped content that misses a known schema.
@@ -480,15 +500,11 @@ Tiered compression pipeline, each tier named after a Greek figure of memory.
 - Original content always retained; compressed and original stored independently.
 - Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%).
 - The plugin `CompressionEngine` ABC is open to operator-registered engines. The contest logs the winner plus every loser with its score and rejection reason.
+- `/v1/memories/search` still carries reserved `compression_applied` / `compression_metadata` response fields from the v3.2 API shape; in v3.5.x search responses set `compression_applied=false`. Use `/v1/memories/rehydrate` or `/v1/memories/{id}/compression-manifests` when you need to know whether a compressed variant was used.
 
-### Memory tiers (4-tier system)
+### Memory tier selector (advisory)
 
-| Tier | Description | Compression ratio |
-|------|-------------|------------------|
-| 1 | Recent / active | 20% |
-| 2 | Short-term | 35% |
-| 3 | Medium-term | 50% |
-| 4 | Long-term / archive | task-type dependent |
+The `modules/memory_categorization` package still exposes a hot/warm/cold/archive selector for hook-side prompt budgeting. It is advisory metadata used by integrations; it is not the removed `sessions.compression_tier` database column and does not drive automatic background compression.
 
 ### Versioning and audit
 
@@ -524,16 +540,26 @@ Landed with the v3.0 release line:
 - ✅ **CHARON federation schema preflight** — peers exchange schema signatures before sync and return 409 on incompatible strict-mode pairings.
 - ✅ **Dev↔prod MPF restore drill** — `docs/RESTORE-DRILL.md` is validated on the PYTHIA → PROTEUS path.
 
-### Landed on v3.5-dev (not tagged)
+### Shipped in v3.5.0
 
 - ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
+- ✅ **Webhook retry state machine + leases + outbox discipline** — persisted leases, one-success-per-chain guards, repair worker separation, bulk-create parity, and terminal success trigger.
+- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 18 tools from `api/mcp_tools.py`, including CRUD, KG, DAG, bulk create, stats, and model recommendation.
+- ✅ **Faithful OpenAI-compatible gateway** — propagated generation controls, OpenAI-format SSE, registry-honest model discovery, and explicit 400/404 responses when the selected provider cannot honor a requested feature.
+- ✅ **Namespace-uniform tenancy** — state, journal, entities, sessions, consultations, webhooks, and memory read/history paths use the owner+namespace discipline.
+- ✅ **PostgreSQL streaming-replication doctrine** — single-site HA uses Postgres primary/standby replication; MNEMOS federation is for remote or curated data flows.
+- ✅ **Compression cleanup** — live compression is APOLLO + ARTEMIS through the contest worker; retired compatibility shims and vestigial session compression columns are gone.
 
-### Beyond v3.5-dev
+### v3.5.1
 
-Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists committed v3.1 scope, the v3.2–v3.4 Apollo Program staged rollout, and items explicitly deferred with rationale.
+v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/runtime version metadata to 3.5.1 and reconciles release-state docs with the v3.5.0 GA tag; it does not change product behavior from v3.5.0.
 
-Near-term not-yet-scoped candidates (v3.5+):
+### Beyond v3.5.x
+
+Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists shipped v3.x scope and items explicitly deferred with rationale.
+
+Near-term not-yet-scoped candidates:
 
 - Distributed consensus for multi-writer federation
 - Server-push streaming API for long-lived subscriptions

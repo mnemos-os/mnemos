@@ -3,11 +3,13 @@
 ## Supported versions
 
 The most recently maintained release branch is supported. The current
-development branch is `v3.5-dev`; it is not a release tag.
+release line is `v3.5.x`. v3.5.0 shipped on 2026-04-28; v3.5.1 is the
+2026-04-28 documentation-triage patch with no product behavior changes from
+v3.5.0.
 
 ## Current security invariants
 
-As of v3.5-dev slice 6:
+As of v3.5.x:
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP
@@ -33,7 +35,14 @@ As of v3.5-dev slice 6:
   `/v1/consultations/audit` returns only the caller's consultation audit
   rows, and `/v1/consultations/audit/verify` verifies only that caller's
   rows. Root keeps the global operational audit view. This closes the
-  v3.4.x cross-tenant audit metadata leak in v3.5-dev.
+  v3.4.x cross-tenant audit metadata leak in v3.5.0.
+- Webhook delivery uses persisted leases, retry-chain convergence, terminal
+  success guards, and SSRF checks at subscription and delivery time.
+- MCP stdio and HTTP/SSE use the same registry in `api/mcp_tools.py`, with
+  per-user HTTP token mapping available through `MNEMOS_MCP_TOKENS`.
+- The OpenAI-compatible gateway passes supported generation controls through
+  to providers and rejects unsupported tool, response-format, or multimodal
+  requests instead of silently ignoring them.
 
 ## Reporting a vulnerability
 

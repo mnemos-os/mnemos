@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v3.4.1 latest tag; v3.5-dev in flight on branch
+**Status**: v3.5.x current. v3.5.0 shipped 2026-04-28; v3.5.1 is the 2026-04-28 documentation-triage patch.
 
 ---
 
@@ -10,7 +10,7 @@
 - PostgreSQL 12+ (for memory storage, audit logs, sessions, DAG versioning)
 - Python 3.10+
 - LLM provider API keys (Together AI or Groq free tier recommended)
-- (Optional) GPU for enhanced compression speeds (Tier 2-3)
+- (Optional) GPU or local inference endpoint for APOLLO's LLM fallback and self-hosted LLMs
 
 ### Installation
 
@@ -186,7 +186,7 @@ GROQ_API_KEY=your_key         # Free tier available
 No GPU needed. No inference server needed. Just these 5 variables and you're running MNEMOS in production with full reasoning capability via GRAEAE.
 
 ### Full configuration
-See `.env.example` for complete options including GPU setup, compression tiers, rate limiting, etc.
+See `.env.example` for complete options including GPU setup, compression contests, rate limiting, webhooks, OAuth, federation, and observability.
 
 ---
 
@@ -274,12 +274,12 @@ existing volumes.
 Postgres image init scripts under `/docker-entrypoint-initdb.d` only run
 when the data directory is first initialized. They do not re-run when an
 existing `postgres_data` volume starts with newer migration files mounted.
-For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
+For v3.5.x, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
 then applies the v3.5 upgrade tail before the MNEMOS service starts.
 
 The canonical order lives in `install.py` and `installer/db.py`; compose must
-mirror those loaders. Current v3.5-dev upgrade tail is prefixes 24-38, in
+mirror those loaders. Current v3.5.x upgrade tail is prefixes 24-38, in
 order:
 `trigger-same-memory-parent`, `rls-group-select-unix-bits`,
 `webhook-retry-terminal-state`, `webhook-attempt-lease`,
@@ -315,12 +315,33 @@ SQLite-based laptop/local-replica mode.
 | PostgreSQL streaming replication | Same site / same LAN / same datacenter | Sub-ms latency expected | Single writer; async or sync standby | Postgres-native WAL shipping | Automatic WAL shipping; no MNEMOS app-level config |
 | MNEMOS federation | Cross-site, multi-org, laptop replica, or curated remote feed | High latency tolerated | Opt-in per-memory, peer-to-peer | MNEMOS-level (post-write) | Needs `MNEMOS_FEDERATION_PEERS` configuration or registered federation peers |
 
-**Anti-pattern:** Dont use federation between same-LAN nodes — Postgres
+**Anti-pattern:** Don't use federation between same-LAN nodes — Postgres
 streaming replication is faster, simpler, and avoids multi-master dedup work.
 
 See [`docs/STREAMING_REPLICATION.md`](./docs/STREAMING_REPLICATION.md) for the
 single-primary + N-standby runbook using `pg_basebackup`, WAL streaming,
 promotion, and HAProxy/PgBouncer-style writer endpoints.
+
+---
+
+## Portability, MORPHEUS, and Compression Operations
+
+MPF portability is available through `GET /v1/export` and `POST /v1/import`.
+Use root plus `preserve_owner=true` only for authoritative restores or
+migrations; non-root imports are scoped to the caller's owner+namespace. The
+CLI helpers are `tools/memory_export.py`, `tools/memory_import.py`, and
+`tools/mpf_validate.py`.
+
+MORPHEUS dream-state runs are operator-triggered through
+`POST /admin/morpheus/runs` and inspected through `/v1/morpheus/runs*`.
+Runs are synchronous in v3.5.x, append generated memories tagged with
+`morpheus_run_id`, and roll back by deleting memories from that run.
+
+Compression is operator-batched. Use `POST /admin/compression/enqueue` or
+`POST /admin/compression/enqueue-all` to feed the contest worker. The active
+built-in engines are APOLLO and ARTEMIS; the retired LETHE / ANAMNESIS /
+ALETHEIA engines and the legacy session compression columns are not part of
+the v3.5.x runtime.
 
 ---
 
@@ -421,8 +442,8 @@ curl -X GET http://localhost:5002/v1/models \
 
 ### Sessions (Stateful Chat)
 ```bash
-# POST /sessions - Create session
-curl -X POST http://localhost:5002/sessions \
+# POST /v1/sessions - Create session
+curl -X POST http://localhost:5002/v1/sessions \
   -H "Authorization: Bearer $MNEMOS_API_KEY" \
   -H "Content-Type: application/json" \
   -d '{"model": "auto"}'
@@ -501,7 +522,7 @@ GROQ_API_KEY=xxx           # Recommended free tier
 OPENAI_API_KEY=xxx         # Optional, paid
 ANTHROPIC_API_KEY=xxx      # Optional, paid
 
-# GPU provider (OPTIONAL — only if using Tier 2-3 compression)
+# GPU provider (OPTIONAL — only for APOLLO LLM fallback or local LLM backends)
 # GPU_PROVIDER_HOST=http://gpu.example.com
 # GPU_PROVIDER_PORT=8000
 
@@ -603,7 +624,7 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 
 ### 409: Memory branch state is inconsistent
 
-v3.5-dev maps trigger SQLSTATE `MN001` to HTTP 409 when
+v3.5.x maps trigger SQLSTATE `MN001` to HTTP 409 when
 `memory_branches` is missing, has `NULL head_version_id`, or points at a
 `memory_versions` row from another memory. Inspect and reconcile the
 branch rows before retrying:
