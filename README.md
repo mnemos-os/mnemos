@@ -265,8 +265,8 @@ Multi-LLM consensus reasoning with cited memory artifacts and cryptographic audi
 | `POST /v1/consultations` | Create a consultation (prompt + task_type) |
 | `GET /v1/consultations/{id}` | Retrieve a consultation record |
 | `GET /v1/consultations/{id}/artifacts` | Cited memories used to answer |
-| `GET /v1/consultations/audit` | Hash-chained audit log |
-| `GET /v1/consultations/audit/verify` | Verify audit chain integrity |
+| `GET /v1/consultations/audit` | Hash-chained audit log, owner-scoped for non-root callers |
+| `GET /v1/consultations/audit/verify` | Verify audit chain integrity; root verifies globally, non-root verifies their own consultation rows |
 
 ### Providers — model routing domain (v3, shipped)
 
@@ -418,7 +418,7 @@ A lot of the v3.x surface is held up by background work that doesn't show up in 
 - **pgvector query sanitization** — embedding vectors returned by the embedder are `float()`-cast before being stringified into the query. A poisoned embedder cannot inject SQL via a non-numeric vector "component".
 - **Full-text search operator filtering** — `/v1/memories/search` uses `plainto_tsquery` rather than `to_tsquery`, so `|`, `&`, `!` and friends get treated as literal text instead of tsquery operators. User input cannot construct adversarial FTS queries.
 - **Federation size caps** — an abusive peer cannot fill your disk: pulled content capped at 1 MB per memory, metadata at 64 KB, name fields at 256 chars.
-- **Rate-limited audit endpoints** — `/v1/consultations/audit/verify` walks the entire chain from genesis; capped at 5/min so an authenticated caller cannot force O(N) scans on a large log. `/audit` list is capped at 30/min.
+- **Rate-limited audit endpoints** — `/v1/consultations/audit/verify` walks the entire chain from genesis for root callers and verifies only the caller's consultation audit rows for non-root callers; capped at 5/min so an authenticated caller cannot force O(N) scans on a large log. `/audit` list is owner-scoped for non-root callers and capped at 30/min.
 - **Quality manifest on every compression** — every compression engine in the stack writes a receipt: `{what_was_removed, what_was_preserved, quality_rating, risk_factors, safe_for, not_safe_for}`. Compression-as-data, not compression-as-side-effect.
 
 ### Referential integrity (the -ism, spelled out)

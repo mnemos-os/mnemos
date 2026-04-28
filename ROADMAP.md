@@ -110,7 +110,7 @@ v3.5 is in flight on `v3.5-dev`. Closed items below are merged into the branch; 
 - ✅ **#25 RLS Unix-bit fix** (`pending commit`). `db/migrations_v3_5_rls_group_select_unix_bits.sql` replaces `mnemos_group_select` so RLS and `read_visibility_predicate` both use `((permission_mode / 10) % 10) >= 4` for group-readable rows.
 - ✅ **#20 webhook retry state machine** (`pending commit`). `api/webhook_dispatcher.py` now terminalizes superseded failed attempts as `retry_scheduled`, recovery excludes retry rows that already have successors, and `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs existing superseded rows.
 - ✅ **#21 federation stable cursor tie-breaker** (`pending commit`). `/v1/federation/feed` now uses an opaque `(updated, id)` cursor and `ORDER BY updated, id` so page boundaries inside identical timestamps do not skip rows. Per-peer ACL scope remains split to a later slice.
-- 🔵 **#22 audit endpoint scoping + lifespan teardown.** Audit route scoping and cleanup behavior; still open.
+- ✅ **#22 audit endpoint scoping** (`pending commit`). Consultation audit list and verify routes are owner-scoped for non-root callers, with root retaining global audit visibility.
 - 🔵 **#23 entity namespace conflict-key migration.** Namespace-aware conflict key for entity rows; still open.
 - 🔵 **#19 bulk webhook parity.** Bulk-create webhook behavior still differs from single-create.
 - 🔵 **#15 deletion-log refactor.** Parked; restore-drill cleanup still uses explicit `memory_branches` / `memory_versions` deletes.

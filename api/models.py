@@ -361,7 +361,7 @@ class AuditLogEntry(BaseModel):
     consultation_id: Optional[str] = None
     prompt_hash: str
     response_hash: str
-    chain_hash: str
+    chain_hash: Optional[str] = None
     prev_id: Optional[str] = None
     task_type: Optional[str] = None
     provider: Optional[str] = None
@@ -374,6 +374,7 @@ class AuditVerifyResponse(BaseModel):
     valid: bool
     entries_checked: int
     first_broken_sequence: Optional[int] = None
+    entries_failed: List[int] = Field(default_factory=list)
     message: str
 
 

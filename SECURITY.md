@@ -7,7 +7,7 @@ development branch is `v3.5-dev`; it is not a release tag.
 
 ## Current security invariants
 
-As of v3.5-dev slice 2.5:
+As of v3.5-dev slice 6:
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP
@@ -29,6 +29,11 @@ As of v3.5-dev slice 2.5:
   the `mnemos_group_select` RLS policy and application
   `read_visibility_predicate` both use the Unix group-read bit expression
   `((permission_mode / 10) % 10) >= 4`.
+- Consultation audit metadata is owner-scoped for non-root callers:
+  `/v1/consultations/audit` returns only the caller's consultation audit
+  rows, and `/v1/consultations/audit/verify` verifies only that caller's
+  rows. Root keeps the global operational audit view. This closes the
+  v3.4.x cross-tenant audit metadata leak in v3.5-dev.
 
 ## Reporting a vulnerability
 

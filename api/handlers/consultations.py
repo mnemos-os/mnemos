@@ -27,6 +27,11 @@ router = APIRouter(prefix="/v1", tags=["consultations"])
 _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
 
 
+def _is_root(user: UserContext) -> bool:
+    """Root callers may inspect cross-tenant consultation audit state."""
+    return user.role == "root"
+
+
 # ── Custom Query selection (v3.2) ─────────────────────────────────────────────
 
 _VALID_TIERS = {"frontier", "premium", "budget"}
@@ -472,16 +477,43 @@ async def list_audit_log(
     offset: int = 0,
     user: UserContext = Depends(get_current_user),
 ):
-    """List GRAEAE audit log entries (newest first)."""
+    """List GRAEAE audit log entries (newest first).
+
+    Non-root callers only see audit rows for their own consultations. Root
+    callers keep the operational global view.
+    """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
-            "chain_hash, prev_id, task_type, provider, quality_score, created_at "
-            "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
-            limit, offset,
-        )
+        is_root = _is_root(user)
+        if is_root:
+            rows = await conn.fetch(
+                "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
+                "chain_hash, prev_id, task_type, provider, quality_score, created_at "
+                "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
+                limit, offset,
+            )
+        else:
+            rows = await conn.fetch(
+                "WITH visible AS ("
+                "SELECT al.id, al.sequence_num AS global_sequence_num, "
+                "al.consultation_id, al.prompt_hash, al.response_hash, "
+                "al.task_type, al.provider, al.quality_score, "
+                "al.created_at, "
+                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
+                "FROM graeae_audit_log al "
+                "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                "WHERE c.owner_id = $1 "
+                ") "
+                "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, "
+                "prompt_hash, response_hash, NULL::text AS chain_hash, "
+                "scoped_prev_id AS prev_id, "
+                "task_type, provider, quality_score, created_at "
+                "FROM visible "
+                "ORDER BY global_sequence_num DESC LIMIT $2 OFFSET $3",
+                user.user_id, limit, offset,
+            )
     return [
         AuditLogEntry(
             id=str(r["id"]),
@@ -489,7 +521,7 @@ async def list_audit_log(
             consultation_id=str(r["consultation_id"]) if r["consultation_id"] else None,
             prompt_hash=r["prompt_hash"],
             response_hash=r["response_hash"],
-            chain_hash=r["chain_hash"],
+            chain_hash=r["chain_hash"] if is_root else None,
             prev_id=str(r["prev_id"]) if r["prev_id"] else None,
             task_type=r.get("task_type"),
             provider=r.get("provider"),
@@ -508,45 +540,143 @@ async def verify_audit_chain(
 ):
     """Verify the integrity of the hash chain in the GRAEAE audit log.
 
-    Walks the entire chain from genesis, verifying each link. Rate-limited
-    because the cost grows linearly with audit-log size — otherwise any
-    authenticated caller can force an O(N) scan on a large table.
-    Returns details of any broken sequences.
+    Root walks the entire chain from genesis, verifying each link. Non-root
+    callers verify only rows attached to their own consultations while deriving
+    each predecessor from the immediate previous global sequence row, not from
+    the row's tamperable prev_id. Rate-limited because the cost grows linearly
+    with audit-log size. Returns details of any broken sequences.
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        rows = await conn.fetch(
-            "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
-            "FROM graeae_audit_log ORDER BY sequence_num ASC"
-        )
+        if _is_root(user):
+            rows = await conn.fetch(
+                "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
+                "FROM graeae_audit_log ORDER BY sequence_num ASC"
+            )
+        else:
+            rows = await conn.fetch(
+                "SELECT al.sequence_num, "
+                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "al.prompt_hash, al.response_hash, "
+                "al.chain_hash, al.prev_id, al.prev_chain_hash, "
+                "prev.chain_hash AS expected_prev_hash "
+                "FROM graeae_audit_log al "
+                "JOIN graeae_consultations c ON c.id = al.consultation_id "
+                "LEFT JOIN LATERAL ("
+                "SELECT chain_hash "
+                "FROM graeae_audit_log "
+                "WHERE sequence_num < al.sequence_num "
+                "ORDER BY sequence_num DESC "
+                "LIMIT 1"
+                ") prev ON TRUE "
+                "WHERE c.owner_id = $1 "
+                "ORDER BY al.sequence_num ASC",
+                user.user_id,
+            )
 
     if not rows:
         return AuditVerifyResponse(
             valid=True,
             entries_checked=0,
-            message="Audit log is empty",
+            message=(
+                "Audit log is empty"
+                if _is_root(user)
+                else "No audit entries visible for caller"
+            ),
         )
 
-    prev_chain = _GENESIS_HASH
+    if _is_root(user):
+        prev_chain = _GENESIS_HASH
+        failures: dict[int, str] = {}
+        for row in rows:
+            expected = hashlib.sha256(
+                (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
+            ).hexdigest()
+            if expected != row["chain_hash"]:
+                failures.setdefault(
+                    row["sequence_num"],
+                    f"Chain broken at sequence {row['sequence_num']}: "
+                    f"expected {expected[:16]}…, stored {row['chain_hash'][:16]}…",
+                )
+            prev_chain = row["chain_hash"]
+
+        if failures:
+            entries_failed = sorted(failures)
+            first_broken_sequence = entries_failed[0]
+            message = failures[first_broken_sequence]
+            if len(entries_failed) > 1:
+                message = f"{message}; {len(entries_failed)} entries failed verification"
+            return AuditVerifyResponse(
+                valid=False,
+                entries_checked=len(rows),
+                first_broken_sequence=first_broken_sequence,
+                entries_failed=entries_failed,
+                message=message,
+            )
+
+        return AuditVerifyResponse(
+            valid=True,
+            entries_checked=len(rows),
+            message=f"All {len(rows)} entries verified — chain intact",
+        )
+
+    failures: dict[int, str] = {}
     for row in rows:
+        scoped_sequence_num = row["scoped_sequence_num"]
+        stored_prev_chain = row["prev_chain_hash"]
+        prev_chain = row["expected_prev_hash"] or _GENESIS_HASH
+        if stored_prev_chain and stored_prev_chain != prev_chain:
+            logger.warning(
+                "Scoped audit predecessor mismatch for user=%s scoped_row=%s "
+                "global_sequence=%s expected_prev_hash=%s stored_prev_hash=%s",
+                user.user_id,
+                scoped_sequence_num,
+                row["sequence_num"],
+                prev_chain,
+                stored_prev_chain,
+            )
+            failures.setdefault(
+                scoped_sequence_num,
+                f"Scoped chain broken at row {scoped_sequence_num}: "
+                "stored previous hash does not match actual previous row",
+            )
         expected = hashlib.sha256(
             (prev_chain + row["prompt_hash"] + row["response_hash"]).encode()
         ).hexdigest()
         if expected != row["chain_hash"]:
-            return AuditVerifyResponse(
-                valid=False,
-                entries_checked=row["sequence_num"],
-                first_broken_sequence=row["sequence_num"],
-                message=f"Chain broken at sequence {row['sequence_num']}: "
-                        f"expected {expected[:16]}…, stored {row['chain_hash'][:16]}…",
+            logger.warning(
+                "Scoped audit hash mismatch for user=%s scoped_row=%s "
+                "global_sequence=%s expected_hash=%s stored_hash=%s",
+                user.user_id,
+                scoped_sequence_num,
+                row["sequence_num"],
+                expected,
+                row["chain_hash"],
             )
-        prev_chain = row["chain_hash"]
+            failures.setdefault(
+                scoped_sequence_num,
+                f"Hash mismatch at row {scoped_sequence_num}",
+            )
+
+    if failures:
+        entries_failed = sorted(failures)
+        first_broken_sequence = entries_failed[0]
+        message = failures[first_broken_sequence]
+        if len(entries_failed) > 1:
+            message = f"{message}; {len(entries_failed)} scoped entries failed verification"
+        return AuditVerifyResponse(
+            valid=False,
+            entries_checked=len(rows),
+            first_broken_sequence=first_broken_sequence,
+            entries_failed=entries_failed,
+            message=message,
+        )
 
     return AuditVerifyResponse(
         valid=True,
         entries_checked=len(rows),
-        message=f"All {len(rows)} entries verified — chain intact",
+        message=f"All {len(rows)} scoped entries verified - chain intact",
     )
 
 
@@ -607,7 +737,7 @@ async def get_consultation(
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     async with _lc._pool.acquire() as conn:
-        if user.role == "root":
+        if _is_root(user):
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
@@ -650,7 +780,7 @@ async def get_consultation_artifacts(
 
     async with _lc._pool.acquire() as conn:
         # Get consultation — scoped to caller unless root.
-        if user.role == "root":
+        if _is_root(user):
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations WHERE id = $1",
                 consultation_id,

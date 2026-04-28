@@ -7,7 +7,7 @@ All notable changes to MNEMOS are documented here.
 v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
 as a release tag. Merged slices cover audit quick wins, memory-read tenancy
 + DAG integrity, webhook retry hardening, RLS group-select parity, and the
-federation compound-cursor tie-breaker.
+federation compound-cursor tie-breaker, and consultation audit endpoint scoping.
 
 ### Added
 
@@ -85,6 +85,13 @@ federation compound-cursor tie-breaker.
 
 ### Fixed
 
+- **Slice 6 consultation audit endpoint scoping (#22)** —
+  `/v1/consultations/audit` now returns only the caller's consultation audit
+  rows for non-root users, while root retains the global operational view.
+  `/v1/consultations/audit/verify` now scopes non-root verification to the
+  caller's own consultation audit rows and keeps full-chain verification for
+  root. Existing consultation detail and artifact routes are pinned by
+  regression tests to return 404 for another user's consultation IDs.
 - **Slice 5 round-2 search compression probe cleanup** — large
   `/v1/memories/search` result sets no longer call the retired
   distillation backend health check or log misleading "compression
@@ -221,7 +228,6 @@ federation compound-cursor tie-breaker.
 
 ### Still open on the v3.5 backlog
 
-- #22 audit endpoint scoping + lifespan teardown.
 - #23 entity namespace conflict-key migration.
 - #19 bulk webhook parity.
 - #15 deletion-log refactor.

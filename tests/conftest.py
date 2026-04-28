@@ -14,6 +14,35 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _clear_slowapi_limiter(limiter: Any) -> None:
+    reset = getattr(limiter, "reset", None)
+    if callable(reset):
+        reset()
+        return
+
+    storage = getattr(limiter, "_storage", None)
+    for method_name in ("reset", "clear"):
+        method = getattr(storage, method_name, None)
+        if callable(method):
+            method()
+            return
+
+    for attr_name in ("storage", "_cache"):
+        cache = getattr(storage, attr_name, None)
+        clear = getattr(cache, "clear", None)
+        if callable(clear):
+            clear()
+            return
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter_state():
+    """Prevent SlowAPI's in-memory buckets from leaking across tests."""
+    from api.rate_limit import limiter
+
+    _clear_slowapi_limiter(limiter)
+
+
 def _build_memory_row(
     memory_id: str,
     content: str,
@@ -168,16 +197,26 @@ class FakeConnection:
                 "cost": args[5],
                 "latency_ms": args[6],
                 "mode": args[7],
+                "owner_id": args[8],
                 "created": _utcnow(),
             }
             self.state["consultations"][consultation_id] = record
             return {"id": consultation_id}
 
         if "SELECT id, prompt, task_type, consensus_response" in compact:
-            return self.state["consultations"].get(args[0])
+            consultation = self.state["consultations"].get(args[0])
+            if "AND owner_id = $2" in compact and (
+                not consultation or consultation.get("owner_id") != args[1]
+            ):
+                return None
+            return consultation
 
         if "SELECT id, created FROM graeae_consultations WHERE id = $1" in compact:
             consultation = self.state["consultations"].get(args[0])
+            if "AND owner_id = $2" in compact and (
+                not consultation or consultation.get("owner_id") != args[1]
+            ):
+                return None
             if not consultation:
                 return None
             return {"id": consultation["id"], "created": consultation["created"]}
@@ -228,11 +267,72 @@ class FakeConnection:
     async def fetch(self, query: str, *args):
         compact = " ".join(query.split())
 
-        if "FROM graeae_audit_log ORDER BY sequence_num DESC" in compact:
-            return list(reversed(self.state["audit_log"]))
-
-        if "FROM graeae_audit_log ORDER BY sequence_num ASC" in compact:
-            return list(self.state["audit_log"])
+        if "FROM graeae_audit_log" in compact and "ORDER BY" in compact:
+            rows = list(self.state["audit_log"])
+            if "expected_prev_hash" in compact:
+                prev_hash_by_id = {}
+                prev_chain_hash = None
+                for row in sorted(rows, key=lambda item: item["sequence_num"]):
+                    prev_hash_by_id[row["id"]] = prev_chain_hash
+                    prev_chain_hash = row["chain_hash"]
+                rows = [
+                    {
+                        **row,
+                        "expected_prev_hash": prev_hash_by_id[row["id"]],
+                    }
+                    for row in rows
+                ]
+            if "scoped_sequence_num" in compact:
+                owner_id = args[0]
+                visible_rows = [
+                    row for row in rows
+                    if (
+                        self.state["consultations"]
+                        .get(row["consultation_id"], {})
+                        .get("owner_id") == owner_id
+                    )
+                ]
+                rows = []
+                scoped_prev_id = None
+                verifier_query = "expected_prev_hash" in compact
+                for scoped_sequence_num, row in enumerate(
+                    sorted(visible_rows, key=lambda item: item["sequence_num"]),
+                    start=1,
+                ):
+                    if verifier_query:
+                        rows.append(
+                            {
+                                **row,
+                                "scoped_sequence_num": scoped_sequence_num,
+                            }
+                        )
+                    else:
+                        rows.append(
+                            {
+                                **row,
+                                "global_sequence_num": row["sequence_num"],
+                                "sequence_num": scoped_sequence_num,
+                                "prev_id": scoped_prev_id,
+                            }
+                        )
+                    scoped_prev_id = row["id"]
+            elif "c.owner_id = $1" in compact:
+                owner_id = args[0]
+                rows = [
+                    row for row in rows
+                    if (
+                        self.state["consultations"]
+                        .get(row["consultation_id"], {})
+                        .get("owner_id") == owner_id
+                    )
+                ]
+            if (
+                "ORDER BY global_sequence_num DESC" in compact
+                or "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT" in compact
+                or "ORDER BY al.sequence_num DESC" in compact
+            ):
+                rows = list(reversed(rows))
+            return rows
 
         if "FROM consultation_memory_refs WHERE consultation_id = $1" in compact:
             return [
