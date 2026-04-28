@@ -1,8 +1,9 @@
 """Entities API: CRUD for tracked entities (people, projects, concepts).
 
-Per-owner entity registry. Each (owner_id, entity_type, name) is unique within
-a single owner's namespace, and entities from one owner are invisible to others.
-Root may cross-read by passing `?owner_id=<target>`.
+Per-owner, per-namespace entity registry. Each
+`(owner_id, namespace, entity_type, name)` is unique, and entities from one
+namespace are invisible to another. Root may cross-read by passing
+`?owner_id=<target>&namespace=<target>`.
 """
 import json
 import logging
@@ -62,10 +63,11 @@ def _scope_namespace(
     return user.namespace
 
 
-async def _assert_owned(conn, entity_id: str, user: UserContext) -> str:
-    """Return the entity's owner_id if the caller can access it, else
-    raise 404/403. Two-dimensional tenancy (v3.2): non-root must
-    match BOTH owner_id AND namespace. Root bypasses both.
+async def _assert_owned(conn, entity_id: str, user: UserContext) -> tuple[str, str]:
+    """Return the entity's owner_id and namespace if accessible, else raise.
+
+    Two-dimensional tenancy (v3.2): non-root must match BOTH owner_id AND
+    namespace. Root bypasses both.
     """
     row = await conn.fetchrow(
         "SELECT owner_id, namespace FROM entities WHERE id = $1::uuid",
@@ -79,7 +81,7 @@ async def _assert_owned(conn, entity_id: str, user: UserContext) -> str:
     ):
         # Don't leak existence to non-owner; return 404 as if it didn't exist.
         raise HTTPException(status_code=404, detail="Entity not found")
-    return row["owner_id"]
+    return row["owner_id"], row["namespace"]
 
 
 @router.post("/entities", status_code=201)
@@ -97,7 +99,7 @@ async def create_entity(
             row = await conn.fetchrow(
                 '''INSERT INTO entities (id, owner_id, namespace, entity_type, name, description, metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
-                   ON CONFLICT (owner_id, entity_type, name) DO UPDATE
+                   ON CONFLICT (owner_id, namespace, entity_type, name) DO UPDATE
                    SET description = COALESCE($6, entities.description),
                        updated = NOW()
                    RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
@@ -168,12 +170,13 @@ async def get_entity(entity_id: str, user: UserContext = Depends(get_current_use
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        await _assert_owned(conn, entity_id, user)
+        owner, namespace = await _assert_owned(conn, entity_id, user)
         row = await conn.fetchrow(
             '''SELECT id::text, entity_type, name, description, metadata,
                       related_entities, created::text, updated::text
-               FROM entities WHERE id = $1::uuid''',
-            entity_id
+               FROM entities
+               WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+            entity_id, owner, namespace,
         )
     if not row:
         raise HTTPException(status_code=404, detail="Entity not found")
@@ -197,30 +200,29 @@ async def update_entity(
         raise HTTPException(status_code=400, detail="No fields to update")
     try:
         async with _lc._pool.acquire() as conn:
-            # _assert_owned returns the entity's owner_id; we re-assert in the
-            # UPDATE's WHERE clause so a concurrent ownership change between
-            # the assertion and the update can't land the write on the wrong row.
-            owner = await _assert_owned(conn, entity_id, user)
+            # Re-assert owner + namespace in the UPDATE so concurrent tenancy
+            # changes between the probe and write cannot land on the wrong row.
+            owner, namespace = await _assert_owned(conn, entity_id, user)
             if 'description' in updates and 'metadata' in updates:
                 row = await conn.fetchrow(
                     '''UPDATE entities SET description=$1, metadata=$2::jsonb, updated=NOW()
-                       WHERE id=$3::uuid AND owner_id=$4
+                       WHERE id=$3::uuid AND owner_id=$4 AND namespace=$5
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    updates['description'], json.dumps(updates['metadata']), entity_id, owner,
+                    updates['description'], json.dumps(updates['metadata']), entity_id, owner, namespace,
                 )
             elif 'description' in updates:
                 row = await conn.fetchrow(
                     '''UPDATE entities SET description=$1, updated=NOW()
-                       WHERE id=$2::uuid AND owner_id=$3
+                       WHERE id=$2::uuid AND owner_id=$3 AND namespace=$4
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    updates['description'], entity_id, owner,
+                    updates['description'], entity_id, owner, namespace,
                 )
             else:
                 row = await conn.fetchrow(
                     '''UPDATE entities SET metadata=$1::jsonb, updated=NOW()
-                       WHERE id=$2::uuid AND owner_id=$3
+                       WHERE id=$2::uuid AND owner_id=$3 AND namespace=$4
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
-                    json.dumps(updates['metadata']), entity_id, owner,
+                    json.dumps(updates['metadata']), entity_id, owner, namespace,
                 )
         if not row:
             raise HTTPException(status_code=404, detail="Entity not found")
@@ -245,8 +247,8 @@ async def link_entities(
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
         async with _lc._pool.acquire() as conn:
-            await _assert_owned(conn, entity_id, user)
-            await _assert_owned(conn, req.related_id, user)
+            owner, namespace = await _assert_owned(conn, entity_id, user)
+            related_owner, related_namespace = await _assert_owned(conn, req.related_id, user)
             # Link A->B
             await conn.execute(
                 '''UPDATE entities
@@ -254,8 +256,10 @@ async def link_entities(
                        COALESCE(related_entities, ARRAY[]::uuid[]), $2::uuid
                    ), updated = NOW()
                    WHERE id = $1::uuid
+                   AND owner_id = $3
+                   AND namespace = $4
                    AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
-                entity_id, req.related_id
+                entity_id, req.related_id, owner, namespace,
             )
             # Link B->A
             await conn.execute(
@@ -264,8 +268,10 @@ async def link_entities(
                        COALESCE(related_entities, ARRAY[]::uuid[]), $2::uuid
                    ), updated = NOW()
                    WHERE id = $1::uuid
+                   AND owner_id = $3
+                   AND namespace = $4
                    AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
-                req.related_id, entity_id
+                req.related_id, entity_id, related_owner, related_namespace,
             )
         return {"status": "linked", "entity_id": entity_id, "related_id": req.related_id}
     except HTTPException:
@@ -280,7 +286,7 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
         async with _lc._pool.acquire() as conn:
-            await _assert_owned(conn, entity_id, user)
+            owner, namespace = await _assert_owned(conn, entity_id, user)
             # Remove from other entities' arrays (caller's own only; root clears all)
             if user.role == "root":
                 await conn.execute(
@@ -293,10 +299,15 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
                 await conn.execute(
                     '''UPDATE entities
                        SET related_entities = array_remove(related_entities, $1::uuid)
-                       WHERE owner_id = $2 AND $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
-                    entity_id, user.user_id,
+                       WHERE owner_id = $2
+                       AND namespace = $3
+                       AND $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
+                    entity_id, owner, namespace,
                 )
-            result = await conn.execute('DELETE FROM entities WHERE id = $1::uuid', entity_id)
+            result = await conn.execute(
+                'DELETE FROM entities WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3',
+                entity_id, owner, namespace,
+            )
         if result == 'DELETE 0':
             raise HTTPException(status_code=404, detail="Entity not found")
     except HTTPException:
@@ -310,9 +321,11 @@ async def get_related_entities(entity_id: str, user: UserContext = Depends(get_c
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        target_owner = await _assert_owned(conn, entity_id, user)
+        target_owner, target_ns = await _assert_owned(conn, entity_id, user)
         entity = await conn.fetchrow(
-            'SELECT related_entities FROM entities WHERE id = $1::uuid', entity_id,
+            '''SELECT related_entities FROM entities
+               WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+            entity_id, target_owner, target_ns,
         )
     if entity is None:
         raise HTTPException(status_code=404, detail="Entity not found")
@@ -330,7 +343,7 @@ async def get_related_entities(entity_id: str, user: UserContext = Depends(get_c
         else:
             rows = await conn.fetch(
                 '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                   FROM entities WHERE owner_id = $1 AND id = ANY($2::uuid[])''',
-                target_owner, related_ids
+                   FROM entities WHERE owner_id = $1 AND namespace = $2 AND id = ANY($3::uuid[])''',
+                target_owner, target_ns, related_ids
             )
     return {"related": [dict(r) for r in rows]}

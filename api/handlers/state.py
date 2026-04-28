@@ -1,8 +1,9 @@
 """State API: GET/PUT/DELETE /state/{key}, GET /state
 
-Per-owner KV store. All operations are scoped to the caller's `user.user_id`;
-keys from one owner are invisible to another. Root can read/write any owner's
-keys by passing an `?owner_id=` query parameter on GET/DELETE.
+Per-owner, per-namespace KV store. All operations are scoped to the caller's
+`user.user_id` and `user.namespace`; keys from one namespace are invisible to
+another. Root can target another owner/namespace via `?owner_id=` and
+`?namespace=`.
 """
 import json
 import logging
@@ -31,20 +32,34 @@ def _scope_owner(user: UserContext, override: Optional[str]) -> str:
     return user.user_id
 
 
+def _scope_namespace(user: UserContext, override: Optional[str] = None) -> str:
+    """Return the namespace to query. Only root can cross namespaces."""
+    if override and override != user.namespace:
+        if user.role != "root":
+            raise HTTPException(
+                status_code=403,
+                detail="cross-namespace access requires root",
+            )
+        return override
+    return user.namespace
+
+
 @router.get("/state")
 async def list_state_keys(
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None, description="Admin-only: target another owner"),
+    namespace: Optional[str] = Query(None, description="Admin-only: target another namespace"),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     try:
         async with _lc._pool.acquire() as conn:
             rows = await conn.fetch(
                 'SELECT key, updated::text, version FROM state '
-                'WHERE owner_id = $1 ORDER BY key',
-                target_owner,
+                'WHERE owner_id = $1 AND namespace = $2 ORDER BY key',
+                target_owner, target_ns,
             )
         return {"keys": [dict(r) for r in rows]}
     except Exception as e:
@@ -57,16 +72,18 @@ async def get_state(
     key: str,
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None),
+    namespace: Optional[str] = Query(None),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     try:
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT key, value, updated::text, version FROM state '
-                'WHERE owner_id = $1 AND key = $2',
-                target_owner, key,
+                'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+                target_owner, target_ns, key,
             )
         if not row:
             raise HTTPException(status_code=404, detail=f"State key '{key}' not found")
@@ -84,19 +101,21 @@ async def set_state(
     req: StateSetRequest,
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
+    namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     try:
         async with _lc._pool.acquire() as conn:
             row = await conn.fetchrow(
-                '''INSERT INTO state (owner_id, key, value, updated)
-                   VALUES ($1, $2, $3::jsonb, NOW())
-                   ON CONFLICT (owner_id, key) DO UPDATE
-                   SET value = $3::jsonb, updated = NOW(), version = state.version + 1
+                '''INSERT INTO state (owner_id, namespace, key, value, updated)
+                   VALUES ($1, $2, $3, $4::jsonb, NOW())
+                   ON CONFLICT (owner_id, namespace, key) DO UPDATE
+                   SET value = $4::jsonb, updated = NOW(), version = state.version + 1
                    RETURNING key, value, updated::text, version''',
-                target_owner, key, json.dumps(req.value),
+                target_owner, target_ns, key, json.dumps(req.value),
             )
         return dict(row)
     except HTTPException:
@@ -111,14 +130,16 @@ async def delete_state(
     key: str,
     user: UserContext = Depends(get_current_user),
     owner_id: Optional[str] = Query(None),
+    namespace: Optional[str] = Query(None),
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = _scope_owner(user, owner_id)
+    target_ns = _scope_namespace(user, namespace)
     async with _lc._pool.acquire() as conn:
         result = await conn.execute(
-            'DELETE FROM state WHERE owner_id = $1 AND key = $2',
-            target_owner, key,
+            'DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+            target_owner, target_ns, key,
         )
     if result == 'DELETE 0':
         raise HTTPException(status_code=404, detail=f"State key '{key}' not found")

@@ -78,6 +78,8 @@ services:
       - ./db/migrations_v3_5_webhook_attempt_unique.sql:/docker-entrypoint-initdb.d/31-webhook-attempt-unique.sql
       - ./db/migrations_v3_5_webhook_succeeded_unique.sql:/docker-entrypoint-initdb.d/32-webhook-succeeded-unique.sql
       - ./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql
+      - ./db/migrations_v3_5_entities_namespace_unique.sql:/docker-entrypoint-initdb.d/34-entities-namespace-unique.sql
+      - ./db/migrations_v3_5_state_journal_namespace.sql:/docker-entrypoint-initdb.d/35-state-journal-namespace.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -105,6 +107,8 @@ services:
       - ./db/migrations_v3_5_webhook_attempt_unique.sql:/migrations/31-webhook-attempt-unique.sql:ro
       - ./db/migrations_v3_5_webhook_succeeded_unique.sql:/migrations/32-webhook-succeeded-unique.sql:ro
       - ./db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql:/migrations/33-webhook-succeeded-terminal-trigger.sql:ro
+      - ./db/migrations_v3_5_entities_namespace_unique.sql:/migrations/34-entities-namespace-unique.sql:ro
+      - ./db/migrations_v3_5_state_journal_namespace.sql:/migrations/35-state-journal-namespace.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -117,7 +121,9 @@ services:
       -f /migrations/30-webhook-superseded-marker.sql
       -f /migrations/31-webhook-attempt-unique.sql
       -f /migrations/32-webhook-succeeded-unique.sql
-      -f /migrations/33-webhook-succeeded-terminal-trigger.sql"
+      -f /migrations/33-webhook-succeeded-terminal-trigger.sql
+      -f /migrations/34-entities-namespace-unique.sql
+      -f /migrations/35-state-journal-namespace.sql"
     restart: "no"
 
   mnemos:
