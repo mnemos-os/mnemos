@@ -91,6 +91,12 @@ single-site HA replication doctrine.
   scenarios such as multi-site deployments, multi-org curated feeds, developer
   laptop replicas with intermittent connectivity, and planned v4 SQLite-based
   local-replica profiles.
+- **Slice 12 — compression semantics** — drop session-layer always-NULL
+  `compression_ratio` fiction columns from `session_messages` +
+  `session_memory_injections`; document operator-batched compression doctrine in
+  `docs/COMPRESSION.md`. Real compression layer (`compression_artifacts` /
+  contests, `StatsResponse`, `RehydrationResponse`, admin batch endpoints)
+  unchanged.
 
 ### Fixed
 

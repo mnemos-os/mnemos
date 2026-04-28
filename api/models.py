@@ -191,7 +191,6 @@ class SessionMessageResponse(BaseModel):
     timestamp: str
     tokens_used: int
     memories_injected: int
-    compression_ratio: Optional[float] = None
 
 
 class SessionHistoryRequest(BaseModel):

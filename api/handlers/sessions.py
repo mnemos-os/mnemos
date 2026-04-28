@@ -136,7 +136,7 @@ async def add_session_message(
     This is the main stateful chat endpoint. It:
     1. Stores user message in history
     2. Searches MNEMOS for relevant context
-    3. Injects compressed memories into system prompt
+    3. Injects bounded memory snippets into system prompt
     4. Routes to provider with accumulated context
     5. Stores assistant response in history
     6. Updates session metrics
@@ -246,27 +246,19 @@ async def add_session_message(
 
         if mnemos_docs:
             # Store injection record for each memory.
-            # compression_ratio is NULL because the session-injection path
-            # currently ships raw-slice truncation (doc['content'][:500] below),
-            # not real ARTEMIS compression. Writing a
-            # fabricated ratio (previously: 0.45 literal) turned
-            # `session_memory_injections.compression_ratio` into a fiction
-            # column. It stays NULL until v3.1 wires compression into this
-            # path with a real ratio derived from the compression manifest.
             async with pool.acquire() as conn:
                 for i, doc in enumerate(mnemos_docs):
                     memory_id = doc.get("id", f"doc_{i}")
                     await conn.execute(
                         """
                         INSERT INTO session_memory_injections
-                        (session_id, message_id, memory_id, relevance_score, compression_ratio)
-                        VALUES ($1, $2, $3, $4, $5)
+                        (session_id, message_id, memory_id, relevance_score)
+                        VALUES ($1, $2, $3, $4)
                         """,
                         session_id,
                         message_id,
                         memory_id,
                         0.9 - (i * 0.1),  # decreasing relevance
-                        None,  # real ratio requires compression wired into the session path
                     )
 
             mnemos_context = "\n\n".join([f"[Memory]\n{doc['content'][:500]}" for doc in mnemos_docs])
@@ -300,7 +292,6 @@ async def add_session_message(
     model = request.model or session["model"]
     response_text = ""
     tokens_used = 0
-    compression_ratio = None
 
     try:
         response_text = await _route_to_provider(
@@ -313,11 +304,6 @@ async def add_session_message(
 
         # Estimate tokens (rough approximation: ~4 chars per token)
         tokens_used = len(response_text) // 4
-        # compression_ratio stays NULL at the session-message level until
-        # compression is actually wired into the session-injection path.
-        # Prior code computed `memories_injected / message_count` — a ratio
-        # with no semantic relationship to compression effectiveness.
-        compression_ratio = None
 
     except Exception as e:
         logger.error(f"[SESSIONS] Provider routing failed: {e}")
@@ -329,8 +315,8 @@ async def add_session_message(
         assistant_message_id = await conn.fetchval(
             """
             INSERT INTO session_messages
-            (session_id, role, content, model, tokens_used, memories_injected, compression_ratio)
-            VALUES ($1, 'assistant', $2, $3, $4, $5, $6)
+            (session_id, role, content, model, tokens_used, memories_injected)
+            VALUES ($1, 'assistant', $2, $3, $4, $5)
             RETURNING id
             """,
             session_id,
@@ -338,7 +324,6 @@ async def add_session_message(
             model,
             tokens_used,
             memories_injected,
-            compression_ratio,
         )
 
         # Update session metrics
@@ -368,7 +353,6 @@ async def add_session_message(
         timestamp=datetime.now(timezone.utc).isoformat(),
         tokens_used=tokens_used,
         memories_injected=memories_injected,
-        compression_ratio=compression_ratio,
     )
 
 

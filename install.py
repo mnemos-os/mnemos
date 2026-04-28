@@ -178,6 +178,7 @@ def main() -> None:
         os.path.join(script_dir, "db", "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_entities_namespace_unique.sql"),
         os.path.join(script_dir, "db", "migrations_v3_5_state_journal_namespace.sql"),
+        os.path.join(script_dir, "db", "migrations_v3_5_session_compression_ratio_drop.sql"),
     ]
 
     print("=" * 60)
