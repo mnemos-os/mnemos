@@ -6,8 +6,8 @@ from types import SimpleNamespace
 
 def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch):
     async def run():
-        from api import lifecycle
-        import graeae.engine as graeae_engine
+        import mnemos.domain.graeae.engine as graeae_engine
+        from mnemos.core import lifecycle
 
         class FalsyPool:
             def __bool__(self):

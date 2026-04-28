@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 
 import pytest
 
-from tests.test_namespace_isolation import NamespaceHarness, PG_URL
+from tests.test_namespace_isolation import PG_URL, NamespaceHarness
 
 pytestmark = [
     pytest.mark.integration,
@@ -50,7 +50,7 @@ async def _cleanup(pg_app: NamespaceHarness) -> None:
 
 
 async def test_consultations_are_isolated_by_owner_and_namespace(pg_app: NamespaceHarness, monkeypatch):
-    import graeae.engine as graeae_engine
+    import mnemos.domain.graeae.engine as graeae_engine
 
     monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: _FakeGraeae())
 

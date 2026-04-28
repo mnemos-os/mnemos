@@ -13,8 +13,8 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock
 
-from api.auth import UserContext
-from api.handlers import memories as memories_handler
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import memories as memories_handler
 
 
 def _alice(namespace: str = "alice-ns") -> UserContext:
@@ -70,7 +70,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
@@ -196,8 +196,8 @@ def test_list_memories_rejects_cross_namespace_for_non_root(monkeypatch):
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
 
-    from fastapi import HTTPException
     import pytest as _p
+    from fastapi import HTTPException
     with _p.raises(HTTPException) as exc:
         asyncio.run(memories_handler.list_memories(
             namespace="other-ns", user=_alice("alice-ns"),
@@ -268,8 +268,8 @@ def test_get_memory_returns_404_when_namespace_mismatch(monkeypatch):
     conn = _Conn(row_for_get=None)
     _install(monkeypatch, conn)
 
-    from fastapi import HTTPException
     import pytest as _p
+    from fastapi import HTTPException
     with _p.raises(HTTPException) as exc:
         asyncio.run(memories_handler.get_memory(
             "mem_in_other_ns", user=_alice("alice-ns"),

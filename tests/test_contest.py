@@ -14,20 +14,19 @@ from pathlib import Path
 
 import pytest
 
-from compression.base import (
+from mnemos.domain.compression.base import (
     CompressionEngine,
     CompressionRequest,
     CompressionResult,
     GPUIntent,
 )
-from compression.contest import (
+from mnemos.domain.compression.contest import (
     BUILT_IN_PROFILES,
     ContestOutcome,
     _ratio_term,
     load_scoring_profile,
     run_contest,
 )
-
 
 # ---- test fixtures ---------------------------------------------------------
 

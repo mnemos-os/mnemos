@@ -92,7 +92,7 @@ test:integration:
         fi
         sleep 1
       done
-    # Pre-create roles that install.py / installer/db.py create before migrations.
+    # Pre-create roles that mnemos/installer/db.py creates before migrations.
     # The migrations themselves GRANT to these roles but do not create them, so
     # CI must seed them first or migrations_v1_multiuser.sql:193 fails.
     - |
@@ -107,8 +107,8 @@ test:integration:
         END IF;
       END $$;
       SQL
-    # Apply migrations in the canonical order (mirrors install.py / installer/db.py).
-    # Keep this list in sync with both Python loaders.
+    # Apply migrations in the canonical order (mirrors mnemos/installer/db.py).
+    # Keep this list in sync with the Python loader.
     - |
       for f in \
         db/migrations.sql \

@@ -10,10 +10,9 @@ from __future__ import annotations
 import asyncio
 from typing import Optional
 
-
-from compression.apollo import APOLLOEngine
-from compression.apollo_schemas.base import DetectionResult, Schema
-from compression.base import (
+from mnemos.domain.compression.apollo import APOLLOEngine
+from mnemos.domain.compression.apollo_schemas.base import DetectionResult, Schema
+from mnemos.domain.compression.base import (
     CompressionRequest,
     CompressionResult,
     GPUIntent,
@@ -156,7 +155,7 @@ def test_engine_first_match_wins_ordering():
         "Portfolio: AAPL 100 at 150 now 175. MSFT 50 at 300 now 310."
     )
     # Register stub FIRST; it always matches.
-    from compression.apollo_schemas import PortfolioSchema
+    from mnemos.domain.compression.apollo_schemas import PortfolioSchema
     engine = APOLLOEngine(
         schemas=[_StubSchema(), PortfolioSchema()],
         enable_llm_fallback=False,

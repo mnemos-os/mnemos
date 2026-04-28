@@ -10,7 +10,7 @@
       consensus_score, winning_muse, cost, latency_ms from
       all_responses instead of leaving them None.
 
-  H3. Gateway reliability — graeae.engine.route() applies the same
+  H3. Gateway reliability — mnemos.domain.graeae.engine.route() applies the same
       circuit-breaker / rate-limiter / concurrency stack as consult()
       so /v1/chat/completions gets first-class operational controls.
 """
@@ -20,8 +20,7 @@ from __future__ import annotations
 import asyncio
 from unittest.mock import MagicMock
 
-
-from api.auth import UserContext
+from mnemos.api.dependencies import UserContext
 
 
 def _alice() -> UserContext:
@@ -50,7 +49,7 @@ class _PoolCtx:
 
 
 def _install_pool(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
@@ -58,7 +57,7 @@ def _install_pool(monkeypatch, conn):
 
 def test_h1_fts_fetch_owner_clause_uses_full_visibility(monkeypatch):
     """_fts_fetch with owner_id set must emit the shared read predicate."""
-    from api.lifecycle import _fts_fetch
+    from mnemos.core.lifecycle import _fts_fetch
 
     conn = _Conn()
     asyncio.run(_fts_fetch(conn, "query", 10, owner_id="alice"))
@@ -72,7 +71,7 @@ def test_h1_fts_fetch_owner_clause_uses_full_visibility(monkeypatch):
 
 def test_h1_vector_search_owner_clause_uses_full_visibility(monkeypatch):
     """Same contract for the pgvector variant."""
-    from api.lifecycle import _vector_search
+    from mnemos.core.lifecycle import _vector_search
 
     conn = _Conn()
     asyncio.run(_vector_search(conn, [0.1, 0.2], 10, owner_id="alice"))
@@ -88,7 +87,7 @@ def test_h1_fts_fetch_no_owner_filter_leaves_query_clean(monkeypatch):
     """Root paths (owner_id=None) should NOT inject the federation
     clause — root sees everything anyway, and adding spurious OR
     clauses would degrade query plans."""
-    from api.lifecycle import _fts_fetch
+    from mnemos.core.lifecycle import _fts_fetch
 
     conn = _Conn()
     asyncio.run(_fts_fetch(conn, "query", 10, owner_id=None))
@@ -103,7 +102,7 @@ def test_slice2_fts_fetch_with_group_ids_uses_full_visibility(monkeypatch):
     v1_multiuser-mirror predicate: owner / federation / world /
     group-readable. Slice 2.1 closure — search now matches list/get
     visibility."""
-    from api.lifecycle import _fts_fetch
+    from mnemos.core.lifecycle import _fts_fetch
 
     conn = _Conn()
     asyncio.run(_fts_fetch(
@@ -123,7 +122,7 @@ def test_slice2_fts_fetch_with_group_ids_uses_full_visibility(monkeypatch):
 
 def test_slice2_vector_search_with_group_ids_uses_full_visibility(monkeypatch):
     """Same closure for the pgvector path."""
-    from api.lifecycle import _vector_search
+    from mnemos.core.lifecycle import _vector_search
 
     conn = _Conn()
     asyncio.run(_vector_search(
@@ -143,7 +142,7 @@ def test_slice2_cache_key_no_delimiter_collision():
     subcategory='b:c') hash to the same key, so a request with
     one filter combo could replay the other's cached result. JSON
     encoding fixes this — quoted/escaped values are unambiguous."""
-    from api.lifecycle import _get_cache_key
+    from mnemos.core.lifecycle import _get_cache_key
 
     k1 = _get_cache_key("search", "a:b", "c")
     k2 = _get_cache_key("search", "a", "b:c")
@@ -162,7 +161,7 @@ def test_slice2_cache_key_distinguishes_none_from_empty_string():
     search can be replayed for an explicit-empty-string search.
     Pass-through (no truthy-coalescing) + JSON encoding inside
     _get_cache_key gives None→null vs ''→\"\" — distinct."""
-    from api.lifecycle import _get_cache_key
+    from mnemos.core.lifecycle import _get_cache_key
 
     k_none = _get_cache_key("search", "alice", "default", None, None)
     k_empty = _get_cache_key("search", "alice", "default", "", "")
@@ -185,7 +184,7 @@ def test_h1_gateway_context_search_includes_federation(monkeypatch):
     / world-readable / group-readable — same as list/get/search/
     rehydrate. Otherwise group/world-readable rows visible elsewhere
     silently disappear from gateway context injection."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn()
     _install_pool(monkeypatch, conn)
@@ -205,7 +204,7 @@ def test_h1_gateway_context_search_includes_federation(monkeypatch):
 
 
 def test_h2_consensus_picks_highest_scoring_success():
-    from graeae.engine import _compute_consensus
+    from mnemos.domain.graeae.engine import _compute_consensus
 
     responses = {
         "openai":    {"status": "success",    "response_text": "alpha", "final_score": 0.82, "latency_ms": 300, "cost": 0.002},
@@ -225,7 +224,7 @@ def test_h2_consensus_picks_highest_scoring_success():
 def test_h2_consensus_no_winner_safe_defaults():
     """When every provider failed, consensus fields are present with
     defensive zero/empty defaults — callers never see them missing."""
-    from graeae.engine import _compute_consensus
+    from mnemos.domain.graeae.engine import _compute_consensus
 
     responses = {
         "openai": {"status": "error", "response_text": "", "final_score": 0.0, "latency_ms": 100, "cost": 0.0},
@@ -243,7 +242,7 @@ def test_h2_consensus_contract_has_all_keys_even_when_empty():
     """The contract must always return every field even for an empty
     input — handlers rely on the dict being spreadable into the
     ConsultationResponse without KeyErrors."""
-    from graeae.engine import _compute_consensus
+    from mnemos.domain.graeae.engine import _compute_consensus
 
     out = _compute_consensus({})
     for k in ("consensus_response", "consensus_score", "winning_muse", "cost", "latency_ms"):
@@ -299,7 +298,7 @@ def _engine_with_fakes(*, breaker_allow=True, rate_allow=True, conc_allow=True):
     replaced by controllable fakes. We don't need a real key file or
     HTTP client because the _query_provider call is also stubbed in
     the individual tests."""
-    from graeae.engine import GraeaeEngine
+    from mnemos.domain.graeae.engine import GraeaeEngine
 
     engine = GraeaeEngine()
     engine.providers = {
@@ -313,7 +312,7 @@ def _engine_with_fakes(*, breaker_allow=True, rate_allow=True, conc_allow=True):
     engine._quality = _FakeQuality()
     engine._concurrency = _FakeConcurrency(allow=conc_allow)
     # Pretend we have a key so the route() pre-check doesn't short-circuit
-    from graeae import api_keys
+    from mnemos.domain.graeae import api_keys
     api_keys._LLM_PROVIDERS["openai"] = {"api_key": "sk-test"}
     return engine
 

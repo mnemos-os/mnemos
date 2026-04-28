@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from api.auth import UserContext, get_current_user
+from mnemos.api.dependencies import UserContext, get_current_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -82,7 +82,7 @@ class _BulkPool:
 
 @pytest.fixture
 def current_user_override():
-    from api_server import app
+    from mnemos.api.main import app
 
     current = {"user": _alice()}
 
@@ -97,8 +97,8 @@ def current_user_override():
 
 
 def _install_pool(monkeypatch: pytest.MonkeyPatch, pool: _BulkPool) -> None:
-    import api.lifecycle as lc
-    from api_server import app
+    import mnemos.core.lifecycle as lc
+    from mnemos.api.main import app
 
     monkeypatch.setattr(lc, "_pool", pool)
     monkeypatch.setattr(lc, "_cache", None)
@@ -133,7 +133,7 @@ async def test_bulk_create_emits_memory_created_for_each_success(
             }
         )
 
-    from api import webhook_dispatcher
+    from mnemos.webhooks import dispatcher as webhook_dispatcher
 
     monkeypatch.setattr(webhook_dispatcher, "dispatch", fake_dispatch)
 
@@ -178,7 +178,7 @@ async def test_bulk_create_dispatches_only_successful_items(
     async def fake_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
         events.append({"payload": payload, "owner_id": owner_id, "namespace": namespace})
 
-    from api import webhook_dispatcher
+    from mnemos.webhooks import dispatcher as webhook_dispatcher
 
     monkeypatch.setattr(webhook_dispatcher, "dispatch", fake_dispatch)
 
@@ -216,13 +216,13 @@ async def test_bulk_create_fails_when_outbox_enqueue_fails(
     pool = _BulkPool()
     _install_pool(monkeypatch, pool)
     dispatch_attempts: list[dict[str, Any]] = []
-    caplog.set_level(logging.WARNING, logger="api.handlers.memories")
+    caplog.set_level(logging.WARNING, logger="mnemos.api.routes.memories")
 
     async def failing_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
         dispatch_attempts.append(payload)
         raise RuntimeError("dispatcher unavailable")
 
-    from api import webhook_dispatcher
+    from mnemos.webhooks import dispatcher as webhook_dispatcher
 
     monkeypatch.setattr(webhook_dispatcher, "dispatch", failing_dispatch)
 

@@ -75,7 +75,7 @@ async def main() -> int:
     try:
         # ── 1. Provider API sync ───────────────────────────────────────────────
         if not args.arena_only:
-            from graeae.provider_sync import sync_all_providers
+            from mnemos.domain.graeae.provider_sync import sync_all_providers
             logger.info("=== Provider API sync ===")
             results = await sync_all_providers(
                 pool=pool,
@@ -116,8 +116,8 @@ async def main() -> int:
         if not args.skip_arena:
             logger.info("=== Arena.ai ranking sync ===")
             try:
-                from graeae.elo_sync import fetch_elo_weights, save_weights
-                from graeae.model_registry import _best_per_family, _fetch_arena_rows, _PROVIDER_FAMILIES
+                from mnemos.domain.graeae.elo_sync import fetch_elo_weights, save_weights
+                from mnemos.domain.graeae.model_registry import _PROVIDER_FAMILIES, _best_per_family, _fetch_arena_rows
 
                 rows = _fetch_arena_rows()
                 if rows:
@@ -146,7 +146,7 @@ async def main() -> int:
                         "perplexity":  "perplexity",
                     }
 
-                    from graeae.model_registry import _PROVIDER_FAMILIES
+                    from mnemos.domain.graeae.model_registry import _PROVIDER_FAMILIES
                     for prov, (arena_name, score) in best.items():
                         fam = _PROVIDER_FAMILIES.get(prov, {})
                         normalize = fam.get("normalize")
@@ -159,7 +159,7 @@ async def main() -> int:
                             arena_scores[db_prov] = (api_id, score, rank_map.get(arena_name, 0))
 
                     if pool and not args.dry_run and arena_scores:
-                        from graeae.provider_sync import update_arena_scores
+                        from mnemos.domain.graeae.provider_sync import update_arena_scores
                         await update_arena_scores(pool, arena_scores)
                         logger.info(f"[ARENA] updated scores for {len(arena_scores)} providers")
 

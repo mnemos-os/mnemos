@@ -38,7 +38,7 @@ def _clear_slowapi_limiter(limiter: Any) -> None:
 @pytest.fixture(autouse=True)
 def reset_rate_limiter_state():
     """Prevent SlowAPI's in-memory buckets from leaking across tests."""
-    from api.rate_limit import limiter
+    from mnemos.core.rate_limit import limiter
 
     _clear_slowapi_limiter(limiter)
 
@@ -484,10 +484,10 @@ def mock_graeae_engine():
 @pytest_asyncio.fixture
 async def client(monkeypatch, db_pool: FakePool, mock_graeae_engine):
     """Create an in-process AsyncClient bound to the FastAPI app."""
-    import api.lifecycle as lc
-    from api.auth import configure_auth
-    from api_server import app
-    import graeae.engine as graeae_engine
+    import mnemos.core.lifecycle as lc
+    import mnemos.domain.graeae.engine as graeae_engine
+    from mnemos.api.dependencies import configure_auth
+    from mnemos.api.main import app
 
     configure_auth({"enabled": False})
     monkeypatch.setattr(lc, "_pool", db_pool)

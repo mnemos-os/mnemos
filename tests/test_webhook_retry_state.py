@@ -925,8 +925,9 @@ def _attempt(attempt_num: int = 1) -> dict[str, Any]:
 
 
 async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int]):
-    from api import lifecycle, webhook_dispatcher
-    from api.handlers import webhooks
+    from mnemos.api.routes import webhooks
+    from mnemos.core import lifecycle
+    from mnemos.webhooks import dispatcher as webhook_dispatcher
 
     store = _FakeWebhookStore(rows)
     pool = _FakePool(store)
@@ -1049,7 +1050,7 @@ def test_successful_successor_does_not_replay_prior_failed_attempt(monkeypatch):
 
 def test_final_attempt_failure_is_abandoned_without_successor(monkeypatch):
     async def run():
-        from api.webhook_dispatcher import MAX_ATTEMPTS
+        from mnemos.webhooks.dispatcher import MAX_ATTEMPTS
 
         final = _attempt(attempt_num=MAX_ATTEMPTS)
         dispatcher, conn, http = await _install(monkeypatch, [final], [500])
@@ -1079,8 +1080,8 @@ def test_old_worker_compat_skips_superseded_abandoned_attempt():
 
 def test_delivery_audit_exposes_superseded_marker_for_abandoned_rows():
     repo_root = Path(__file__).resolve().parents[1]
-    handler_source = (repo_root / "api" / "handlers" / "webhooks.py").read_text()
-    model_source = (repo_root / "api" / "models.py").read_text()
+    handler_source = (repo_root / "mnemos" / "api" / "routes" / "webhooks.py").read_text()
+    model_source = (repo_root / "mnemos" / "domain" / "models.py").read_text()
     compact_handler = " ".join(handler_source.split())
 
     assert "superseded: bool = False" in model_source
@@ -1121,7 +1122,7 @@ def test_successor_insert_uses_live_chain_attempt_uniqueness(monkeypatch):
 
 def test_recovery_dequeue_uses_skip_locked_claim():
     repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     compact = " ".join(source.split())
 
     assert "async def _claim_recoverable_deliveries" in source
@@ -1141,7 +1142,7 @@ def test_recovery_dequeue_uses_skip_locked_claim():
 
 def test_recoverable_predicate_requires_current_writer_revision():
     repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     compact = " ".join(source.split())
 
     assert "NEW_CODE_WRITER_REVISION = 1" in source
@@ -1221,7 +1222,7 @@ def test_status_updated_at_trigger_model_advances_on_status_change(monkeypatch):
 
 def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
     async def run():
-        from api import lifecycle
+        from mnemos.core import lifecycle
 
         retrying = _attempt()
         retrying["status"] = "retrying"
@@ -1248,7 +1249,7 @@ def test_concurrent_recovery_claims_retrying_row_once(monkeypatch):
 
 def test_recovery_preclaims_rows_before_send_semaphore_backpressure(monkeypatch):
     async def run():
-        from api import lifecycle
+        from mnemos.core import lifecycle
 
         rows = [_attempt() for _ in range(5)]
         dispatcher, conn, http = await _install(monkeypatch, rows, [204] * len(rows))
@@ -1286,7 +1287,7 @@ def test_recovery_preclaims_rows_before_send_semaphore_backpressure(monkeypatch)
 
 def test_recovery_claim_batch_uses_available_send_slots(monkeypatch):
     async def run():
-        from api import lifecycle
+        from mnemos.core import lifecycle
 
         rows = [_attempt() for _ in range(5)]
         dispatcher, conn, _http = await _install(monkeypatch, rows, [])
@@ -1314,9 +1315,8 @@ def test_recovery_claim_batch_uses_available_send_slots(monkeypatch):
 
 def test_recovery_backpressure_does_not_burn_retries(monkeypatch):
     async def run():
-        from api import lifecycle
-
-        from api.webhook_dispatcher import MAX_ATTEMPTS
+        from mnemos.core import lifecycle
+        from mnemos.webhooks.dispatcher import MAX_ATTEMPTS
 
         rows = [_attempt() for _ in range(10)]
         original_rows = list(rows)
@@ -2814,7 +2814,7 @@ def test_webhook_response_body_is_streamed_and_capped(monkeypatch):
 
 def test_webhook_response_body_cap_bounds_ignored_gzip_body(monkeypatch):
     async def run():
-        from api import webhook_dispatcher as dispatcher
+        from mnemos.webhooks import dispatcher as dispatcher
 
         class _GzipResponse:
             headers = {"content-encoding": "gzip"}
@@ -2844,7 +2844,7 @@ def test_webhook_response_body_cap_bounds_ignored_gzip_body(monkeypatch):
 
 
 def test_webhook_send_deadline_is_derived_from_lease_with_finalize_buffer():
-    from api import webhook_dispatcher as dispatcher
+    from mnemos.webhooks import dispatcher as dispatcher
 
     assert dispatcher._derive_total_send_deadline_seconds(2, 0.5) == 1.5
     assert (
@@ -3008,8 +3008,8 @@ def test_repair_sweep_does_not_strip_active_lease_with_successor(monkeypatch):
 
 def test_lifecycle_runs_webhook_retry_repair_on_startup():
     repo_root = Path(__file__).resolve().parents[1]
-    lifecycle_source = (repo_root / "api" / "lifecycle.py").read_text()
-    dispatcher_source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    lifecycle_source = (repo_root / "mnemos" / "core" / "lifecycle.py").read_text()
+    dispatcher_source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     compact_dispatcher = " ".join(dispatcher_source.split())
 
     assert "repair_worker_loop as _webhook_repair" in lifecycle_source
@@ -3036,7 +3036,7 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
 
 def test_success_finalize_source_shape_is_chain_aware():
     repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     compact = " ".join(source.split())
 
     assert "async def _find_live_unleased_successor_attempt(" not in source
@@ -3057,7 +3057,7 @@ def test_success_finalize_source_shape_is_chain_aware():
 
 def test_succeeded_chain_guard_source_shape_is_chain_aware():
     repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     compact = " ".join(source.split())
 
     assert "async def _has_succeeded_chain_attempt" in source
@@ -3072,7 +3072,7 @@ def test_succeeded_chain_guard_source_shape_is_chain_aware():
 
 def test_failure_finalize_source_shape_requires_live_owned_attempt():
     repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     finalize_source = source[
         source.index("async def _finalize_delivery"):
         source.index("async def _load_delivery_for_claim")
@@ -3095,8 +3095,8 @@ def test_failure_finalize_source_shape_requires_live_owned_attempt():
 
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     repo_root = Path(__file__).resolve().parents[1]
-    lifecycle_source = (repo_root / "api" / "lifecycle.py").read_text()
-    dispatcher_source = (repo_root / "api" / "webhook_dispatcher.py").read_text()
+    lifecycle_source = (repo_root / "mnemos" / "core" / "lifecycle.py").read_text()
+    dispatcher_source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
     recover_source = dispatcher_source[
         dispatcher_source.index("async def _recover_due_deliveries"):
         dispatcher_source.index("async def _recoverable_delivery_ids")
@@ -3121,7 +3121,7 @@ def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
 
 def test_lifecycle_shutdown_during_finalize_drains_delivery_attempt(monkeypatch):
     async def run():
-        from api import lifecycle
+        from mnemos.core import lifecycle
 
         row = _attempt()
         dispatcher, conn, http = await _install(monkeypatch, [row], [204])
@@ -3165,7 +3165,7 @@ def test_lifecycle_shutdown_during_finalize_drains_delivery_attempt(monkeypatch)
 
 def test_recovered_send_shutdown_drains_tracked_attempt(monkeypatch):
     async def run():
-        from api import lifecycle
+        from mnemos.core import lifecycle
 
         row = _attempt()
         dispatcher, conn, http = await _install(monkeypatch, [row], [204])
@@ -3210,7 +3210,7 @@ def test_recovered_send_shutdown_drains_tracked_attempt(monkeypatch):
 
 def test_startup_repair_burst_then_periodic(monkeypatch):
     async def run():
-        from api import webhook_dispatcher as dispatcher
+        from mnemos.webhooks import dispatcher as dispatcher
 
         phases: list[str] = []
         intervals: list[float] = []
@@ -3602,8 +3602,7 @@ def test_webhook_succeeded_terminal_trigger_migration_list_sync():
     migration_name = "migrations_v3_5_webhook_succeeded_terminal_trigger.sql"
 
     for relative in (
-        "install.py",
-        "installer/db.py",
+        "mnemos/installer/db.py",
         "docker-compose.yml",
         "docker-compose.staging.yml",
     ):

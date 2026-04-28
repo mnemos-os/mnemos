@@ -5,6 +5,7 @@ Tests the importable surface of api_server (Pydantic models, app instance).
 """
 
 import asyncio
+
 import pytest
 
 
@@ -14,7 +15,7 @@ class TestAPIEndpoints:
     def test_api_imports(self):
         """Test API server imports"""
         try:
-            from api_server import app
+            from mnemos.api.main import app
             assert app is not None
         except ImportError:
             pytest.skip("API server not available in test environment")
@@ -22,7 +23,7 @@ class TestAPIEndpoints:
     def test_pydantic_models(self):
         """Test API request/response models"""
         try:
-            from api_server import MemoryCreate, HealthResponse
+            from mnemos.api.main import HealthResponse, MemoryCreate
 
             memory = MemoryCreate(
                 content="Test memory",

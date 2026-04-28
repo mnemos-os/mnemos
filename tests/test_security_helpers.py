@@ -5,8 +5,8 @@ import asyncio
 import pytest
 from fastapi import HTTPException
 
-from api.auth import UserContext
-from api.security import (
+from mnemos.api.dependencies import UserContext
+from mnemos.core.security import (
     assert_owned,
     assert_owner_match,
     is_root,

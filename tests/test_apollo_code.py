@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from compression.apollo_schemas.code import CodeSchema
+from mnemos.domain.compression.apollo_schemas.code import CodeSchema
 
 
 @pytest.fixture

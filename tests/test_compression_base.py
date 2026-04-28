@@ -26,7 +26,7 @@ from dataclasses import is_dataclass
 
 import pytest
 
-from compression.base import (
+from mnemos.domain.compression.base import (
     BASE_CHUNK_RATIO,
     MIN_CHUNK_RATIO,
     SAFETY_MARGIN,

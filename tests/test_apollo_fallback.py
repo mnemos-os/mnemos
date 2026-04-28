@@ -16,18 +16,16 @@ import asyncio
 import uuid
 from typing import Any, Dict, Optional
 
-
-from compression.apollo import (
-    APOLLOEngine,
+from mnemos.domain.compression.apollo import (
     _FALLBACK_QUALITY_SCORE,
+    APOLLOEngine,
     _normalize_fallback_output,
 )
-from compression.base import (
+from mnemos.domain.compression.base import (
     CompressionRequest,
     IdentifierPolicy,
 )
-from compression.gpu_guard import get_guard
-
+from mnemos.domain.compression.gpu_guard import get_guard
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 

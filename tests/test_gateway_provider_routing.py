@@ -21,7 +21,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.auth import UserContext
+from mnemos.api.dependencies import UserContext
 
 
 def _user() -> UserContext:
@@ -51,14 +51,14 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
 
 
 def _install_no_pool(monkeypatch):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     monkeypatch.setattr(lc, "_pool", None)
 
 
@@ -72,7 +72,7 @@ def test_resolve_uses_registry_row_when_present(monkeypatch):
     the GRAEAE name so engine.route() can find the dispatch entry —
     a verbatim 'anthropic' return would 503 with 'provider not
     registered'."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn(row={"provider": "anthropic"})
     _install(monkeypatch, conn)
@@ -86,7 +86,7 @@ def test_resolve_normalises_registry_name_only_when_mapped(monkeypatch):
     pass through the resolver verbatim. Locks in the v3.2 contract that
     registry is the source of truth for provider routing — the new
     GRAEAE-normalization step is additive, not a rename pass."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn(row={"provider": "my-local-anthropic-proxy"})
     _install(monkeypatch, conn)
@@ -102,7 +102,7 @@ def test_resolve_handles_gateway_namespaced_slash_id(monkeypatch):
     resolver must split on the FIRST slash and look up the tail with
     the head as a provider filter so the gateway form resolves the same
     way as the bare upstream form."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     # First fetchrow (direct lookup of full 'together/Qwen/...') misses;
     # second fetchrow (provider='together', model_id='Qwen/Qwen3-…') hits.
@@ -137,7 +137,7 @@ def test_resolve_handles_registry_name_in_namespaced_head(monkeypatch):
     accept either by re-mapping the head through _REGISTRY_MAP for the
     WHERE clause and normalising the final answer back to the GRAEAE
     name for the caller."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     class _TwoStep:
         def __init__(self):
@@ -169,7 +169,7 @@ def test_resolve_handles_registry_name_in_namespaced_head(monkeypatch):
 
 
 def test_resolve_falls_back_to_heuristic_on_registry_miss(monkeypatch):
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
@@ -181,7 +181,7 @@ def test_resolve_falls_back_to_heuristic_on_registry_miss(monkeypatch):
 
 def test_resolve_returns_none_on_complete_miss(monkeypatch):
     """Registry miss + no substring match -> None. Caller raises 400."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
@@ -193,7 +193,7 @@ def test_resolve_returns_none_on_complete_miss(monkeypatch):
 def test_resolve_falls_back_when_db_query_raises(monkeypatch):
     """Transient DB failures must NOT 500 the gateway. Fall through
     to substring heuristic."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn(raise_on_query=True)
     _install(monkeypatch, conn)
@@ -207,7 +207,7 @@ def test_resolve_falls_back_when_pool_missing(monkeypatch):
     """Pre-lifespan state: _pool is None. Still fall through to
     heuristic so /v1/chat/completions stays usable during startup
     or in degenerate environments."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     _install_no_pool(monkeypatch)
     result = asyncio.run(openai_compat._resolve_provider_for_model("llama-3.3-70b-versatile"))
@@ -221,7 +221,7 @@ def test_route_unknown_model_raises_404(monkeypatch):
     """Unknown model_id is an explicit OpenAI-style 404, NOT a silent
     route to groq. Operators see the failure at the edge instead of
     getting garbage responses from the wrong provider."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
@@ -242,7 +242,7 @@ def test_route_uses_registry_hit_over_heuristic(monkeypatch):
     """If the registry says model X belongs to provider A but the
     substring heuristic would say B, the registry wins. Allows
     operators to re-map providers without editing code."""
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     # Registry says "claude-*" is served by a custom provider
     # registered as "my-local-anthropic-proxy". The substring

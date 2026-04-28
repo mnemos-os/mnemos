@@ -16,13 +16,12 @@ import json
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
-
-from compression.base import (
+from mnemos.domain.compression.base import (
     CompressionResult,
     IdentifierPolicy,
 )
-from compression.contest import ContestCandidate, ContestOutcome
-from compression.contest_store import persist_contest
+from mnemos.domain.compression.contest import ContestCandidate, ContestOutcome
+from mnemos.domain.compression.contest_store import persist_contest
 
 
 def _result(engine_id: str, *, content: str | None = "x" * 40, ratio: float | None = 0.4,

@@ -10,10 +10,10 @@ import asyncpg
 import pytest
 from fastapi import HTTPException
 
-from api.auth import UserContext
-from api.handlers import memories as memories_handler
-from api.handlers import versions as versions_handler
-from api.models import MemoryUpdateRequest
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import memories as memories_handler
+from mnemos.api.routes import versions as versions_handler
+from mnemos.domain.models import MemoryUpdateRequest
 
 
 def _alice(namespace: str = "alice-ns") -> UserContext:
@@ -160,7 +160,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)

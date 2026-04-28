@@ -62,7 +62,7 @@ def _pool(conn):
 
 
 def test_session_path_loads_namespace_from_users_row():
-    from api.auth import _user_context_from_id
+    from mnemos.api.dependencies import _user_context_from_id
 
     conn = _Conn(
         user_row={"role": "user", "namespace": "alice-ns"},
@@ -81,7 +81,7 @@ def test_session_path_selects_both_role_and_namespace():
     """Regression guard — the SELECT must include both columns.
     Selecting only one causes the later fetchrow lookup on
     row['namespace'] to KeyError."""
-    from api.auth import _user_context_from_id
+    from mnemos.api.dependencies import _user_context_from_id
 
     conn = _Conn(
         user_row={"role": "root", "namespace": "admin-ns"},
@@ -97,8 +97,9 @@ def test_session_path_selects_both_role_and_namespace():
 def test_session_path_404s_when_user_row_missing():
     """An auth'd session for a user that no longer exists should raise
     401, not silently construct a partial UserContext."""
-    from api.auth import _user_context_from_id
     from fastapi import HTTPException
+
+    from mnemos.api.dependencies import _user_context_from_id
 
     conn = _Conn(user_row=None, group_rows=[])
     with pytest.raises(HTTPException) as exc:
@@ -113,8 +114,8 @@ def test_api_key_path_loads_namespace_from_joined_users_row(monkeypatch):
     """The /get_current_user Bearer branch joins api_keys JOIN users.
     After v3.2, the JOIN must pull u.namespace and the UserContext
     must reflect it."""
-    from api.auth import get_current_user
-    import api.auth as auth_mod
+    import mnemos.api.dependencies as auth_mod
+    from mnemos.api.dependencies import get_current_user
 
     conn = _Conn(
         api_key_row={
@@ -131,7 +132,7 @@ def test_api_key_path_loads_namespace_from_joined_users_row(monkeypatch):
     monkeypatch.setattr(auth_mod, "_auth_enabled", True)
 
     # Stub out _schedule_background so it doesn't try to hit the real event loop
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     monkeypatch.setattr(lc, "_schedule_background", lambda coro: coro.close())
 
     # Fake Request with app.state.pool + headers

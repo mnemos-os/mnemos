@@ -18,7 +18,7 @@ import asyncio
 
 import pytest
 
-from compression.artemis import (
+from mnemos.domain.compression.artemis import (
     ARTEMISEngine,
     _anchored_textrank,
     _cosine,
@@ -28,7 +28,7 @@ from compression.artemis import (
     _split_sentences,
     _tfidf_vectors,
 )
-from compression.base import (
+from mnemos.domain.compression.base import (
     CompressionRequest,
     IdentifierPolicy,
 )
@@ -356,7 +356,7 @@ def test_engine_reports_manifest_detail():
 
 
 def test_engine_gpu_intent_is_cpu_only():
-    from compression.base import GPUIntent
+    from mnemos.domain.compression.base import GPUIntent
     assert ARTEMISEngine.gpu_intent == GPUIntent.CPU_ONLY
 
 

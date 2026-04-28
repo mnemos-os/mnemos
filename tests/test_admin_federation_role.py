@@ -1,8 +1,8 @@
 """Admin API must accept role='federation' — and the DB must allow it.
 
 Regression for #M31-03. Before the fix:
-  - api/handlers/admin.py validator rejected anything except ('user', 'root')
-  - api/handlers/federation.py required role == 'federation'
+  - mnemos/api/routes/admin.py validator rejected anything except ('user', 'root')
+  - mnemos/api/routes/federation.py required role == 'federation'
   - db/migrations_v1_multiuser.sql declared CHECK (role IN ('user', 'root'))
 
 All three sites had to be consistent; operators had to hand-write SQL
@@ -24,19 +24,18 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
-from api.handlers.admin import create_user
-from api.models import UserCreateRequest
-
+from mnemos.api.routes.admin import create_user
+from mnemos.domain.models import UserCreateRequest
 
 REPO_ROOT = Path(__file__).parent.parent
-FEDERATION_HANDLER = REPO_ROOT / "api" / "handlers" / "federation.py"
+FEDERATION_HANDLER = REPO_ROOT / "mnemos" / "api" / "routes" / "federation.py"
 FEDERATION_MIGRATION = REPO_ROOT / "db" / "migrations_v3_federation.sql"
 
 
 @pytest.fixture
 def fake_db_pool(monkeypatch):
-    """Mock the api.lifecycle pool so the handler doesn't need a real DB."""
-    from api import lifecycle
+    """Mock the mnemos.core.lifecycle pool so the handler doesn't need a real DB."""
+    from mnemos.core import lifecycle
 
     mock_conn = MagicMock()
     mock_conn.fetchrow = AsyncMock(side_effect=[
@@ -110,7 +109,7 @@ def test_federation_handler_expects_federation_role():
         r"""|role\s+not\s+in\s*\(\s*["']root["'],\s*["']federation["']\s*\)""",
         src,
     ), (
-        "api/handlers/federation.py no longer expects role='federation'. "
+        "mnemos/api/routes/federation.py no longer expects role='federation'. "
         "If the contract changed, admin.py must change to match."
     )
 

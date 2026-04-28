@@ -4,7 +4,7 @@ Covers the rule-based narration dispatcher and the HTTP handler's
 branching on (variant present|absent) × (engine apollo|other) ×
 (format prose|dense) × (tenancy root|non-root).
 
-Helpers directly in compression.apollo get unit-tested separately;
+Helpers directly in mnemos.domain.compression.apollo get unit-tested separately;
 this file validates the HTTP surface + handler logic.
 """
 from __future__ import annotations
@@ -13,14 +13,13 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from api.handlers.narrate import narrate
-from compression.apollo import (
+from mnemos.api.routes.narrate import narrate
+from mnemos.domain.compression.apollo import (
     _narrate_fallback_form,
     looks_like_fallback,
     looks_like_portfolio,
     narrate_encoded,
 )
-
 
 # ── async-context test double (matches the fixture shape used by
 # test_admin_user_namespace / test_admin_federation_role) ────────────────
@@ -38,7 +37,7 @@ class _AsyncContext:
 
 
 def _mock_pool(monkeypatch, memory_row=None, variant_row=None):
-    from api import lifecycle
+    from mnemos.core import lifecycle
 
     mock_conn = MagicMock()
     mock_conn.fetchrow = AsyncMock(side_effect=[memory_row, variant_row])

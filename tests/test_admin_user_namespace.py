@@ -10,13 +10,12 @@ any intended multi-tenant install.
 from __future__ import annotations
 
 import datetime
-
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from api.handlers.admin import create_user, list_users
-from api.models import UserCreateRequest, UserResponse
+from mnemos.api.routes.admin import create_user, list_users
+from mnemos.domain.models import UserCreateRequest, UserResponse
 
 
 class _AsyncContext:
@@ -31,7 +30,7 @@ class _AsyncContext:
 
 
 def _mock_pool(monkeypatch, create_row=None, list_rows=None):
-    from api import lifecycle
+    from mnemos.core import lifecycle
 
     mock_conn = MagicMock()
     side_effects: list = []

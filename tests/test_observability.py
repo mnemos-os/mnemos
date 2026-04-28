@@ -19,7 +19,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from api.observability import (
+from mnemos.core.observability import (
     REQUEST_ID_HEADER,
     RequestIDMiddleware,
     _RequestIDLogFilter,
@@ -128,7 +128,7 @@ def test_log_filter_attaches_request_id_to_records():
     assert filt.filter(record_out) is True
     assert record_out.request_id == "-"
 
-    from api.observability import _request_id_ctx
+    from mnemos.core.observability import _request_id_ctx
     token = _request_id_ctx.set("bound-id-xyz")
     try:
         record_in = logging.LogRecord(
@@ -185,7 +185,7 @@ def test_handler_sees_id_via_current_request_id():
 def _metrics_app():
     """Build a minimal app with the Prometheus middleware + endpoint
     wired, mirroring api_server.py's pattern."""
-    from api.observability import PrometheusMiddleware, metrics_router
+    from mnemos.core.observability import PrometheusMiddleware, metrics_router
 
     app = FastAPI()
     app.add_middleware(PrometheusMiddleware)
@@ -293,15 +293,15 @@ def _tracing_app():
 
     global _SHARED_EXPORTER
     from opentelemetry import trace as otel_trace
+    from opentelemetry.sdk.resources import Resource
     from opentelemetry.sdk.trace import TracerProvider
     from opentelemetry.sdk.trace.export import SimpleSpanProcessor
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import (
         InMemorySpanExporter,
     )
-    from opentelemetry.sdk.resources import Resource
 
-    from api.observability import RequestIDMiddleware, TracingMiddleware
-    import api.observability as obs
+    import mnemos.core.observability as obs
+    from mnemos.core.observability import RequestIDMiddleware, TracingMiddleware
 
     if _SHARED_EXPORTER is None:
         _SHARED_EXPORTER = InMemorySpanExporter()
@@ -398,8 +398,8 @@ def test_install_tracing_is_idempotent():
     """Calling install_tracing twice must not re-install the provider
     (prevents test-suite cross-contamination on dev-server reloads)."""
     pytest.importorskip("opentelemetry")
-    from api.observability import install_tracing
-    import api.observability as obs
+    import mnemos.core.observability as obs
+    from mnemos.core.observability import install_tracing
 
     # Reset the install flag so we can exercise the idempotent path
     obs._TRACING_INSTALLED = False
@@ -413,12 +413,12 @@ def test_install_tracing_is_idempotent():
 def test_tracing_middleware_passthrough_when_otel_missing(monkeypatch):
     """If opentelemetry isn't available, the middleware must pass
     requests through unchanged — never raise, never 500 a caller."""
-    import api.observability as obs
+    import mnemos.core.observability as obs
 
     # Simulate OTel missing
     monkeypatch.setattr(obs, "_OTEL_AVAILABLE", False)
 
-    from api.observability import TracingMiddleware
+    from mnemos.core.observability import TracingMiddleware
     app = FastAPI()
     app.add_middleware(TracingMiddleware)
 
@@ -440,8 +440,8 @@ def test_install_structured_logging_is_idempotent():
     second invocation. Prevents double-install when a dev-server
     reloads and re-imports the module."""
     pytest.importorskip("structlog")
-    from api.observability import install_structured_logging
-    import api.observability as obs
+    import mnemos.core.observability as obs
+    from mnemos.core.observability import install_structured_logging
 
     obs._STRUCTLOG_INSTALLED = False  # reset so first call does work
     install_structured_logging()
@@ -455,7 +455,7 @@ def test_install_structured_logging_noop_when_structlog_missing(monkeypatch):
     """If structlog isn't installed, install_structured_logging
     doesn't raise — it logs + returns. Matches the soft-optional
     contract for OTel and prometheus_client."""
-    import api.observability as obs
+    import mnemos.core.observability as obs
 
     monkeypatch.setattr(obs, "_STRUCTLOG_AVAILABLE", False)
     obs._STRUCTLOG_INSTALLED = False
@@ -475,11 +475,11 @@ def test_structured_logging_renders_json_with_request_id(caplog):
     import json as _json
     import logging as _logging
 
-    from api.observability import (
-        install_structured_logging,
+    import mnemos.core.observability as obs
+    from mnemos.core.observability import (
         _request_id_ctx,
+        install_structured_logging,
     )
-    import api.observability as obs
 
     # Force a clean install
     obs._STRUCTLOG_INSTALLED = False

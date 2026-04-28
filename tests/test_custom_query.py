@@ -17,7 +17,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.handlers import consultations
+from mnemos.api.routes import consultations
 
 
 class _Conn:
@@ -37,7 +37,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
@@ -233,7 +233,7 @@ def test_resolve_tier_empty_registry_raises_404(monkeypatch):
 def test_cache_tag_differs_by_selection():
     """Two different selections must produce distinct cache keys so
     a Custom Query doesn't return a cached all-providers result."""
-    from graeae.engine import _selection_cache_tag
+    from mnemos.domain.graeae.engine import _selection_cache_tag
 
     assert _selection_cache_tag(None) == ""
     assert _selection_cache_tag({}) == ""

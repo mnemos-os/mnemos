@@ -14,11 +14,11 @@ from __future__ import annotations
 from typing import Any
 
 import pytest
-
-import api.lifecycle as _lc
-from api.handlers.morpheus import list_clusters
-from api.auth import UserContext
 from fastapi import HTTPException
+
+import mnemos.core.lifecycle as _lc
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes.morpheus import list_clusters
 
 
 def _user() -> UserContext:
@@ -78,7 +78,7 @@ class _Pool:
 
 @pytest.fixture
 def stub_pool(monkeypatch):
-    """Install a fake pool on api.lifecycle._pool for the duration of the test."""
+    """Install a fake pool on mnemos.core.lifecycle._pool for the duration of the test."""
     holder = {}
 
     def install(conn: _Conn):

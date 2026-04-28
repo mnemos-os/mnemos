@@ -6,8 +6,8 @@ import asyncio
 from datetime import datetime
 from unittest.mock import MagicMock
 
-from api.auth import UserContext
-from api.handlers import dag as dag_handler
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import dag as dag_handler
 
 
 def _alice() -> UserContext:
@@ -109,7 +109,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)

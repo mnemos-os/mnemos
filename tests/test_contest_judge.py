@@ -18,17 +18,15 @@ from __future__ import annotations
 
 import asyncio
 
-
-from compression.base import (
+from mnemos.domain.compression.base import (
     CompressionEngine,
     CompressionRequest,
     CompressionResult,
     GPUIntent,
     IdentifierPolicy,
 )
-from compression.contest import run_contest
-from compression.judge import Judge, JudgeScore, NullJudge
-
+from mnemos.domain.compression.contest import run_contest
+from mnemos.domain.compression.judge import Judge, JudgeScore, NullJudge
 
 # ── stub engines (opt out of GPU, deterministic results) ────────────────
 

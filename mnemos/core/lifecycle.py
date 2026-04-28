@@ -1,0 +1,702 @@
+"""Shared globals, lifespan, and DB/cache helpers for MNEMOS API."""
+import hashlib
+import ipaddress
+import json
+import logging
+import os
+import sys
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+from contextlib import asynccontextmanager
+from typing import Optional
+from urllib.parse import urlparse
+
+import asyncpg
+import httpx
+import redis.asyncio as aioredis
+from fastapi import HTTPException
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+from mnemos.core.config import PG_CONFIG
+from mnemos.domain.graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
+from mnemos.domain.models import MemoryItem
+
+logger = logging.getLogger(__name__)
+
+# Background task registries — keep finite webhook sends out of the cancel-first
+# worker pool so graceful shutdown can let them finalize their leases.
+_background_tasks: set = set()
+_worker_tasks: set = set()
+_delivery_attempt_tasks: set = set()
+_WORKER_SHUTDOWN_CANCEL_SECONDS = float(os.getenv("WORKER_SHUTDOWN_CANCEL_SECONDS", "10.0"))
+_FINAL_CANCEL_WAIT_SECONDS = 5.0
+
+
+def _default_webhook_shutdown_drain_seconds() -> float:
+    dns_timeout = float(os.getenv("WEBHOOK_DNS_TIMEOUT", "10.0"))
+    http_timeout = float(os.getenv("WEBHOOK_HTTP_TIMEOUT", "10.0"))
+    default_lease = max(90, int(dns_timeout + http_timeout + 30))
+    return float(os.getenv("WEBHOOK_LEASE_SECONDS", str(default_lease)))
+
+
+WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(
+    os.getenv("WEBHOOK_SHUTDOWN_DRAIN_SECONDS", str(_default_webhook_shutdown_drain_seconds()))
+)
+
+# Worker health tracking
+_worker_status: dict = {
+    "distillation_worker": "idle",  # idle, healthy, error
+    "last_heartbeat": None,
+}
+
+
+def _schedule_tracked(coro, registry: set):
+    import asyncio as _asyncio
+    task = _asyncio.create_task(coro)
+    registry.add(task)
+    task.add_done_callback(registry.discard)
+    return task
+
+
+def _schedule_background(coro):
+    """Schedule a generic finite background task with lifecycle tracking."""
+    return _schedule_tracked(coro, _background_tasks)
+
+
+def _schedule_worker(coro):
+    """Schedule a perpetual worker loop that shutdown cancels in phase 1."""
+    return _schedule_tracked(coro, _worker_tasks)
+
+
+def _schedule_delivery_attempt(coro):
+    """Schedule a finite webhook send that graceful shutdown drains before cancel."""
+    return _schedule_tracked(coro, _delivery_attempt_tasks)
+
+
+async def _cancel_tracked_tasks(tasks: set, *, label: str, timeout: float) -> None:
+    if not tasks:
+        return
+
+    import asyncio as _asyncio
+
+    snapshot = list(tasks)
+    logger.info(f"Cancelling {len(snapshot)} {label} task(s)…")
+    for task in snapshot:
+        task.cancel()
+
+    done, pending = await _asyncio.wait(snapshot, timeout=timeout)
+    if done:
+        await _asyncio.gather(*done, return_exceptions=True)
+
+    if pending:
+        logger.warning(
+            "%d %s task(s) did not stop within %.1fs; continuing shutdown",
+            len(pending),
+            label,
+            timeout,
+        )
+        for task in pending:
+            task.cancel()
+        stopped, still_pending = await _asyncio.wait(pending, timeout=_FINAL_CANCEL_WAIT_SECONDS)
+        if stopped:
+            await _asyncio.gather(*stopped, return_exceptions=True)
+        if still_pending:
+            logger.error(
+                "%d %s task(s) ignored cancellation for another %.1fs",
+                len(still_pending),
+                label,
+                _FINAL_CANCEL_WAIT_SECONDS,
+            )
+
+
+async def _drain_delivery_attempt_tasks() -> None:
+    if not _delivery_attempt_tasks:
+        return
+
+    import asyncio as _asyncio
+
+    tasks = list(_delivery_attempt_tasks)
+    logger.info(
+        "Waiting up to %.1fs for %d webhook delivery attempt task(s) to finalize",
+        WEBHOOK_SHUTDOWN_DRAIN_SECONDS,
+        len(tasks),
+    )
+    done, pending = await _asyncio.wait(tasks, timeout=WEBHOOK_SHUTDOWN_DRAIN_SECONDS)
+    if done:
+        await _asyncio.gather(*done, return_exceptions=True)
+
+    if pending:
+        logger.error(
+            "Cancelling %d webhook delivery attempt task(s) after %.1fs drain; "
+            "these deliveries may replay on restart if the HTTP side effect already happened",
+            len(pending),
+            WEBHOOK_SHUTDOWN_DRAIN_SECONDS,
+        )
+        for task in pending:
+            task.cancel()
+        stopped, still_pending = await _asyncio.wait(pending, timeout=_FINAL_CANCEL_WAIT_SECONDS)
+        if stopped:
+            await _asyncio.gather(*stopped, return_exceptions=True)
+        if still_pending:
+            logger.error(
+                "%d webhook delivery attempt task(s) ignored last-resort cancellation for %.1fs",
+                len(still_pending),
+                _FINAL_CANCEL_WAIT_SECONDS,
+            )
+
+# DB config sourced from config.PG_CONFIG (env > config.toml > defaults)
+
+# Embedding config (for vector search, MOD-02).
+#
+# The embedding endpoint is BACKEND-AGNOSTIC. The function _get_embedding
+# below auto-detects the wire shape (OpenAI-compat /v1/embeddings vs
+# Ollama-compat /api/embeddings), so the same env var works against:
+#   - llama.cpp llama-server in embeddings mode (CERBERUS/TYPHON/PYTHIA)
+#   - Ollama (dev workstations)
+#   - vLLM with --task embed
+#   - NVIDIA NIM embedding containers (e.g. llama-3.2-nv-embedqa-1b-v2)
+#   - any OpenAI-compatible /v1/embeddings endpoint
+#
+# Canonical env vars are INFERENCE_EMBED_* so embedding config is not
+# tied to any one inference server implementation.
+_EMBED_HOST = os.getenv('INFERENCE_EMBED_HOST', 'http://localhost:11434')
+_EMBED_MODEL = os.getenv('INFERENCE_EMBED_MODEL', 'nomic-embed-text')
+_EMBED_TIMEOUT = float(os.getenv('INFERENCE_EMBED_TIMEOUT', '10'))
+
+# ── Singleton globals ────────────────────────────────────────────────────────
+_pool: Optional[asyncpg.Pool] = None
+_cache: Optional[aioredis.Redis] = None
+_rls_enabled: bool = False   # set from config at startup; read by handlers
+
+
+def _load_config() -> dict:
+    """Load config.toml from standard locations. Returns empty dict if not found."""
+    candidates = [
+        os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "config.toml"),
+        "/etc/mnemos/config.toml",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as f:
+                    return tomllib.load(f)
+            except Exception as e:
+                logger.warning(f"Failed to parse {path}: {e}")
+    return {}
+
+
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configured_federation_peer_urls_from_env() -> list[str]:
+    raw = os.getenv("MNEMOS_FEDERATION_PEERS", "").strip()
+    if not raw:
+        return []
+
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        decoded = None
+
+    if isinstance(decoded, list):
+        urls: list[str] = []
+        for item in decoded:
+            if isinstance(item, str):
+                urls.append(item.strip())
+            elif isinstance(item, dict):
+                url = item.get("base_url") or item.get("url")
+                if isinstance(url, str):
+                    urls.append(url.strip())
+        return [url for url in urls if url]
+
+    urls = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            token = token.split("=", 1)[1].strip()
+        urls.append(token)
+    return urls
+
+
+def _peer_url_looks_same_lan(url: str) -> bool:
+    parsed = urlparse(url if "://" in url else f"//{url}")
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        peer_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return peer_ip.is_private or peer_ip.is_loopback or peer_ip.is_link_local
+
+
+async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
+    env_peer_urls = _configured_federation_peer_urls_from_env()
+    db_peer_urls: list[str] = []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT base_url FROM federation_peers WHERE enabled")
+        db_peer_urls = [row["base_url"] for row in rows if row["base_url"]]
+    except Exception as exc:
+        logger.debug("federation startup guidance skipped DB peer scan: %s", exc)
+
+    if _env_flag_enabled("MNEMOS_FEDERATION_ENABLED") and not env_peer_urls and not db_peer_urls:
+        logger.info("federation enabled but no peers configured — federation pulls and exports are inactive.")
+
+    for peer_url in [*env_peer_urls, *db_peer_urls]:
+        if _peer_url_looks_same_lan(peer_url):
+            logger.warning(
+                "federation peer %s appears to be same-LAN; for single-site HA, "
+                "Postgres streaming replication is faster and simpler — see DEPLOYMENT.md",
+                peer_url,
+            )
+
+
+# ── Distillation Worker Wrapper ─────────────────────────────────────────────────
+
+async def _run_distillation_worker():
+    """Supervised distillation worker loop — restarts on unhandled errors.
+
+    Dispatches unoptimized memories through the v3.3 going-forward
+    compression stack:
+      - ARTEMIS (CPU-only extractive with identifier preservation)
+      - APOLLO  (schema-aware dense encoding, GPU-optional fallback)
+    Selected by the contest framework per memory.
+
+    Previously a single crash set status to 'idle' and left the worker
+    permanently dead for the rest of the process lifetime. We now restart
+    with exponential backoff up to 5 minutes. asyncio.CancelledError (shutdown)
+    propagates so the lifespan drain works correctly.
+    """
+    import asyncio
+    global _worker_status
+
+    try:
+        from mnemos.workers.distillation import MemoryDistillationWorker
+    except ImportError as e:
+        logger.warning(f"Distillation worker not available: {e}")
+        _worker_status["distillation_worker"] = "unavailable"
+        return
+
+    backoff = 1.0
+    while True:
+        worker = MemoryDistillationWorker()
+        try:
+            _worker_status["distillation_worker"] = "starting"
+            await worker.start()
+            # Graceful exit (worker.start() returned) — stop supervising.
+            _worker_status["distillation_worker"] = "idle"
+            return
+        except asyncio.CancelledError:
+            logger.info("Distillation worker cancelled (shutdown)")
+            _worker_status["distillation_worker"] = "idle"
+            raise
+        except Exception as e:
+            _worker_status["distillation_worker"] = "error"
+            logger.exception(f"Distillation worker crashed: {e} — restarting in {backoff:.0f}s")
+        finally:
+            try:
+                if getattr(worker, "db_pool", None):
+                    await worker.db_pool.close()
+            except Exception:
+                pass
+        try:
+            await asyncio.sleep(backoff)
+        except asyncio.CancelledError:
+            _worker_status["distillation_worker"] = "idle"
+            raise
+        backoff = min(backoff * 2, 300.0)  # cap at 5 minutes
+
+
+# ── App lifespan ─────────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(app):
+    """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
+    global _pool, _cache, _rls_enabled, _worker_status
+    logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
+
+    config = _load_config()
+
+    try:
+        _pool = await asyncpg.create_pool(
+            user=PG_CONFIG['user'],
+            password=PG_CONFIG['password'],
+            database=PG_CONFIG['database'],
+            host=PG_CONFIG['host'],
+            port=PG_CONFIG['port'],
+            min_size=PG_CONFIG['pool_min_size'],
+            max_size=PG_CONFIG['pool_max_size'],
+        )
+        app.state.pool = _pool   # auth.py reads this via request.app.state.pool
+        logger.info(
+            f"asyncpg connection pool initialized "
+            f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
+        )
+    except Exception as e:
+        logger.error(f"Failed to create DB pool: {e}")
+        raise
+
+    # Configure auth (personal profile: auth.enabled=false → no-op beyond singleton)
+    from mnemos.api.dependencies import configure_auth
+    configure_auth(config.get("auth", {}))
+
+    # Refresh GRAEAE provider manifest from model_registry in the background
+    # so startup doesn't block on per-provider HTTP probes (each can take up
+    # to ~12s with httpx default timeouts; 8 providers × up to 6 candidates
+    # would otherwise stall lifespan completion for several minutes on a slow
+    # upstream and tie up a DB connection the whole time). The engine starts
+    # with the hardcoded _BUILTIN_PROVIDERS defaults and rotates as soon as
+    # the background task lands. POST /admin/graeae/reload-providers is also
+    # available for on-demand refresh (and is what the daily systemd timer
+    # uses after sync_provider_models.py finishes).
+    import asyncio as _asyncio_for_reload
+    async def _bg_graeae_reload():
+        try:
+            from mnemos.domain.graeae.engine import get_graeae_engine
+            await _asyncio_for_reload.wait_for(
+                get_graeae_engine().reload_from_registry(_pool),
+                timeout=120,
+            )
+        except _asyncio_for_reload.TimeoutError:
+            logger.warning(
+                "[GRAEAE] background manifest reload exceeded 120s — "
+                "keeping built-in defaults; daily timer will retry",
+            )
+        except Exception as e:
+            logger.warning(f"[GRAEAE] background manifest reload failed: {e}")
+    _schedule_background(_bg_graeae_reload())
+
+    # RLS enforcement flag
+    _rls_enabled = config.get("multiuser", {}).get("rls_enabled", False)
+    if _rls_enabled:
+        logger.info("Row Level Security: ENABLED (team/enterprise profile)")
+    else:
+        logger.info("Row Level Security: DISABLED (personal profile)")
+
+    await _log_federation_startup_guidance(_pool)
+
+    _redis_url = os.getenv("MNEMOS_REDIS_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379"
+    try:
+        _cache = aioredis.from_url(_redis_url, decode_responses=True)
+        await _cache.ping()
+        app.state.cache = _cache
+        logger.info(f"Redis cache connected ({_redis_url})")
+    except Exception as e:
+        logger.warning(f"Redis unavailable at {_redis_url}, caching disabled: {e}")
+        _cache = None
+        app.state.cache = None
+
+    # Start background distillation worker (optional)
+    worker_enabled = config.get("worker", {}).get("enabled", True)
+    if worker_enabled and _pool:
+        logger.info("Launching background distillation worker")
+        _schedule_worker(_run_distillation_worker())
+        import asyncio as _asyncio
+        await _asyncio.sleep(0.5)  # Give worker time to initialize
+    else:
+        logger.info("Background distillation worker disabled")
+        _worker_status["distillation_worker"] = "disabled"
+
+    # Webhook retry repair + delivery recovery workers. Repair owns its own
+    # startup burst and periodic cadence, independent of slow webhook sends.
+    if _pool:
+        from mnemos.webhooks.dispatcher import (  # noqa: WPS433
+            delivery_worker_loop as _webhook_delivery,
+        )
+        from mnemos.webhooks.dispatcher import (
+            repair_worker_loop as _webhook_repair,
+        )
+        logger.info('Launching webhook retry repair worker')
+        _schedule_worker(_webhook_repair(_pool))
+        logger.info('Launching webhook delivery recovery worker')
+        _schedule_worker(_webhook_delivery(_pool))
+
+    # Federation sync worker (v3.0.0 — pulls from remote peers on their intervals)
+    if _pool:
+        logger.info('Launching federation sync worker')
+        from mnemos.domain.federation import federation_worker_loop as _federation_worker
+        _schedule_worker(_federation_worker(_pool))
+
+    # OAuth expired-session GC worker (v3.0.0)
+    if _pool:
+        import asyncio as _asyncio
+        async def _oauth_gc_loop():
+            from mnemos.core.oauth import gc_expired_sessions
+            while True:
+                try:
+                    await _asyncio.sleep(3600)  # hourly
+                    deleted = await gc_expired_sessions(_pool)
+                    if deleted:
+                        logger.info(f'oauth gc: deleted {deleted} expired sessions')
+                except _asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception('oauth gc iteration failed')
+        _schedule_worker(_oauth_gc_loop())
+
+    yield
+
+    await _cancel_tracked_tasks(
+        _worker_tasks,
+        label="worker",
+        timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
+    )
+    await _drain_delivery_attempt_tasks()
+    await _cancel_tracked_tasks(
+        _background_tasks,
+        label="background",
+        timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
+    )
+
+    if _pool:
+        await _pool.close()
+        logger.info("DB pool closed")
+    if _cache:
+        await _cache.aclose()
+        logger.info("Redis cache closed")
+    logger.info("Shutting down MNEMOS API Server")
+
+
+# ── Shared helpers ────────────────────────────────────────────────────────────
+
+def _get_cache_key(prefix: str, *args) -> str:
+    """Generate a stable, prefixed cache key.
+
+    The namespace prefix ("mnemos:<prefix>:") is preserved so a pattern-based
+    invalidation (SCAN MATCH "mnemos:search:*") can target only our keys.
+
+    Args are serialized as a JSON list with stable separators before
+    hashing. JSON's quoted strings + escaped delimiters mean two
+    distinct argument tuples can never collide on the wire — e.g.
+    (category='a:b', subcategory='c') and (category='a',
+    subcategory='b:c') were previously both joined to "a:b:c" via
+    the old ':'.join encoding and produced the same MD5 digest;
+    JSON encoding produces ["a:b","c"] vs ["a","b:c"], distinct
+    even before hashing.
+    """
+    serialized = json.dumps(list(args), separators=(",", ":"), default=str)
+    digest = hashlib.md5(serialized.encode(), usedforsecurity=False).hexdigest()
+    return f"mnemos:{prefix}:{digest}"
+
+
+async def _get_db():
+    """Acquire a connection from the pool."""
+    global _pool
+    if not _pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+    return _pool.acquire()
+
+
+_MEMORY_COLS = (
+    "id, content, category, subcategory, created, updated, "
+    "metadata, quality_rating, compressed_content, verbatim_content, "
+    "owner_id, group_id, namespace, permission_mode, "
+    "source_model, source_provider, source_session, source_agent"
+)
+
+
+def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
+    raw_meta = row.get('metadata')
+    if isinstance(raw_meta, str):
+        try:
+            raw_meta = json.loads(raw_meta)
+        except Exception:
+            raw_meta = None
+    elif not isinstance(raw_meta, dict):
+        raw_meta = None
+    return MemoryItem(
+        id=row['id'],
+        content=row['content'],
+        category=row['category'],
+        subcategory=row.get('subcategory'),
+        created=row['created'].isoformat() if row['created'] else '',
+        updated=row['updated'].isoformat() if row.get('updated') else None,
+        metadata=raw_meta if raw_meta else None,
+        quality_rating=row.get('quality_rating'),
+        compressed_content=row.get('compressed_content') if include_compressed else None,
+        verbatim_content=row.get('verbatim_content'),
+        owner_id=row.get('owner_id'),
+        group_id=row.get('group_id'),
+        namespace=row.get('namespace'),
+        permission_mode=row.get('permission_mode'),
+        source_model=row.get('source_model'),
+        source_provider=row.get('source_provider'),
+        source_session=row.get('source_session'),
+        source_agent=row.get('source_agent'),
+    )
+
+
+async def _get_embedding(text: str) -> list:
+    """Get embedding vector from nomic-embed-text. Returns [] on failure.
+
+    Accepts either wire format from the configured INFERENCE_EMBED_HOST:
+      * Ollama-compat /api/embeddings: {"prompt": ...} → {"embedding": [...]}
+        (phi_server.py fastembed, Ollama itself)
+      * OpenAI-compat /v1/embeddings: {"input": ...} →
+        {"data": [{"embedding": [...]}]} (llama.cpp server embeddings mode,
+        OpenAI, vLLM)
+
+    Tries OpenAI first (newer; faster llama.cpp SYCL path on PYTHIA),
+    falls through to Ollama on 404. Same model (nomic-embed-text-v1.5),
+    same 768-dim output — only the wire shape differs.
+    """
+    truncated = text[:2000]
+    try:
+        async with httpx.AsyncClient(timeout=_EMBED_TIMEOUT) as client:
+            r = await client.post(
+                f"{_EMBED_HOST}/v1/embeddings",
+                json={"model": _EMBED_MODEL, "input": truncated},
+            )
+            if r.status_code == 404:
+                r = await client.post(
+                    f"{_EMBED_HOST}/api/embeddings",
+                    json={"model": _EMBED_MODEL, "prompt": truncated},
+                )
+                r.raise_for_status()
+                return r.json().get("embedding", [])
+            r.raise_for_status()
+            data = r.json().get("data") or []
+            if data and isinstance(data[0], dict):
+                return data[0].get("embedding", [])
+            return []
+    except Exception as e:
+        logger.warning(f"[EMBED] Failed to get embedding: {e}")
+        return []
+
+
+async def _vector_search(conn, embedding: list, limit: int,
+                         category=None, subcategory=None, select_cols=None,
+                         source_provider=None, source_model=None,
+                         source_agent=None, namespace=None,
+                         owner_id=None, group_ids=None) -> list:
+    """pgvector cosine similarity search. Returns rows ordered by similarity desc.
+
+    The vector is always $1 — used in both the SELECT similarity expression and
+    the ORDER BY clause.  Passing it as a parameter (not interpolated into the
+    query string) eliminates any injection risk from a poisoned embedding response.
+    Supports optional provenance filters (source_provider, source_model,
+    source_agent, namespace) ANDed into the WHERE clause.
+
+    When the caller passes ``owner_id``, the visibility predicate is the
+    full v1_multiuser-mirror from mnemos.core.visibility — owner / federation /
+    world-readable / group-readable.
+    Non-root callers from /memories/search pin owner_id=user.user_id and
+    pass group_ids=user.group_ids; the same predicate is used by list/get,
+    so a memory visible to one read path is visible to all.
+
+    ``group_ids`` may be an empty list; omitted group_ids are treated as
+    no group memberships.
+    """
+    if select_cols is None:
+        select_cols = _MEMORY_COLS
+    # float() cast guards against non-numeric values in the embedding response
+    vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+    # $1 is the vector — referenced in SELECT and ORDER BY, never interpolated
+    sim_col = "1 - (embedding <=> $1::vector) AS similarity"
+
+    # Dynamic WHERE builder: $1=vec_str, filter params at $2+, limit always last
+    params: list = [vec_str]
+    conditions: list = ["embedding IS NOT NULL"]
+    for col, val in [("category", category), ("subcategory", subcategory),
+                     ("source_provider", source_provider), ("source_model", source_model),
+                     ("source_agent", source_agent), ("namespace", namespace)]:
+        if val is not None:
+            params.append(val)
+            conditions.append(f"{col}=${len(params)}")
+    if owner_id is not None:
+        from mnemos.core.visibility import read_visibility_predicate
+        clause, vis_params = read_visibility_predicate(
+            owner_id, list(group_ids or []), len(params) + 1,
+        )
+        conditions.append(clause)
+        params.extend(vis_params)
+    params.append(limit)
+    limit_ph = f"${len(params)}"
+
+    where = " AND ".join(conditions)
+    sql = (f"SELECT {select_cols}, {sim_col} FROM memories "
+           f"WHERE {where} ORDER BY embedding <=> $1::vector LIMIT {limit_ph}")
+    try:
+        return await conn.fetch(sql, *params)
+    except Exception as e:
+        logger.error(f"[VECTOR] pgvector search failed: {e}")
+        return []
+
+
+async def _fts_fetch(conn, query: str, limit: int,
+                     category=None, subcategory=None, select_cols=None,
+                     source_provider=None, source_model=None,
+                     source_agent=None, namespace=None,
+                     owner_id=None, group_ids=None):
+    """FTS search with ILIKE fallback. Shared by /memories/search and /memories/rehydrate.
+
+    Uses plainto_tsquery (not to_tsquery) so user input is treated as plain text —
+    tsquery operators like |, !, & are not interpreted.  This prevents tsquery
+    operator injection while preserving full-text search quality.
+    Supports optional provenance filters (source_provider, source_model,
+    source_agent, namespace) ANDed into the WHERE clause.
+
+    When the caller passes ``owner_id``, the visibility predicate is the
+    full v1_multiuser-mirror — owner / federation / world-readable /
+    group-readable. Same shape used by list/get; consistent across all read
+    paths so a row visible via one path is visible via all. ``group_ids`` may
+    be an empty list; omitted group_ids are treated as no group memberships.
+    """
+    if select_cols is None:
+        select_cols = _MEMORY_COLS
+    clean_query = query.strip()
+    rank_col = "ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank"
+
+    def _build_filters(start_params: list) -> tuple[list, list]:
+        """Append provenance + visibility conditions to start_params.
+        Returns (conditions, params) so callers can add their own
+        leading conditions (e.g. the FTS match).
+        """
+        params = list(start_params)
+        conditions: list = []
+        for col, val in [("category", category), ("subcategory", subcategory),
+                         ("source_provider", source_provider), ("source_model", source_model),
+                         ("source_agent", source_agent), ("namespace", namespace)]:
+            if val is not None:
+                params.append(val)
+                conditions.append(f"{col}=${len(params)}")
+        if owner_id is not None:
+            from mnemos.core.visibility import read_visibility_predicate
+            clause, vis_params = read_visibility_predicate(
+                owner_id, list(group_ids or []), len(params) + 1,
+            )
+            conditions.append(clause)
+            params.extend(vis_params)
+        return conditions, params
+
+    # FTS path: $1=query, $2=limit; filter params at $3+
+    fts_conditions, fts_params = _build_filters([clean_query, limit])
+    fts_conditions = ["to_tsvector('english', content) @@ plainto_tsquery('english', $1)"] + fts_conditions
+    where = " AND ".join(fts_conditions)
+    sql = (f"SELECT {select_cols}, {rank_col} FROM memories "
+           f"WHERE {where} ORDER BY rank DESC LIMIT $2")
+    try:
+        return await conn.fetch(sql, *fts_params)
+    except Exception:
+        logger.warning(f"[FTS] falling back to ILIKE for: {query[:50]!r}")
+        like_q = f"%{query}%"
+        # ILIKE path: $1=like_q, $2=limit; filter params at $3+
+        ilike_conditions, ilike_params = _build_filters([like_q, limit])
+        ilike_conditions = ["content ILIKE $1"] + ilike_conditions
+        ilike_where = " AND ".join(ilike_conditions)
+        ilike_sql = (f"SELECT {select_cols} FROM memories "
+                     f"WHERE {ilike_where} ORDER BY created DESC LIMIT $2")
+        try:
+            return await conn.fetch(ilike_sql, *ilike_params)
+        except Exception as e2:
+            logger.error(f"[FTS] Both FTS and ILIKE failed: {e2}")
+            return []

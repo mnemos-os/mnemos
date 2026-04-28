@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_namespace_isolation import NamespaceHarness, PG_URL
+from tests.test_namespace_isolation import PG_URL, NamespaceHarness
 
 pytestmark = [
     pytest.mark.integration,
@@ -46,7 +46,7 @@ async def _subscribe(conn, *, owner_id: str, namespace: str) -> None:
 
 
 async def test_ingest_session_stamps_owner_namespace_and_emits_webhooks(pg_app: NamespaceHarness, monkeypatch):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
 
     monkeypatch.setattr(lc, "_schedule_delivery_attempt", lambda coro: coro.close())
 
@@ -131,8 +131,8 @@ async def test_ingest_session_stamps_owner_namespace_and_emits_webhooks(pg_app: 
 
 
 async def test_ingest_session_rolls_back_webhook_when_memory_insert_fails(pg_app: NamespaceHarness, monkeypatch):
-    import api.lifecycle as lc
-    from api.handlers import ingest
+    import mnemos.core.lifecycle as lc
+    from mnemos.api.routes import ingest
 
     monkeypatch.setattr(lc, "_schedule_delivery_attempt", lambda coro: coro.close())
     monkeypatch.setattr(ingest.uuid, "uuid4", lambda: SimpleNamespace(hex="sameid000000000000000000000000"))

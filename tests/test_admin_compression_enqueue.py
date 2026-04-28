@@ -15,7 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from fastapi import HTTPException
 
-from api.handlers.admin import (
+from mnemos.api.routes.admin import (
     CompressionEnqueueAllRequest,
     CompressionEnqueueRequest,
     compression_enqueue,
@@ -37,7 +37,7 @@ class _AsyncContext:
 @pytest.fixture
 def fake_pool(monkeypatch):
     """Mock _lc._pool so handlers get past the 503 gate and into validation."""
-    from api import lifecycle
+    from mnemos.core import lifecycle
     mock_pool = MagicMock()
     mock_pool.acquire = MagicMock(return_value=_AsyncContext(MagicMock()))
     monkeypatch.setattr(lifecycle, "_pool", mock_pool)
