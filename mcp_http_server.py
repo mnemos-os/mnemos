@@ -194,18 +194,34 @@ def _session_id_key(session_id) -> str:
         return session_id_text
 
 
-def _extract_session_id_from_scope(scope) -> str | None:
+class AmbiguousSessionIdError(ValueError):
+    """Raised when a request supplies conflicting session identifiers."""
+
+
+def _extract_query_session_id(scope) -> str | None:
     query_string = scope.get("query_string", b"")
     if isinstance(query_string, str):
         query_string = query_string.encode()
     query_params = parse_qs(query_string.decode("latin-1"), keep_blank_values=True)
-    raw_session_id = (
-        query_params.get("session_id", [None])[0]
-        or query_params.get("sessionId", [None])[0]
-    )
+    has_session_id = "session_id" in query_params
+    has_session_id_camel = "sessionId" in query_params
+    if has_session_id and has_session_id_camel:
+        raise AmbiguousSessionIdError("ambiguous session id")
+    if has_session_id:
+        values = query_params["session_id"]
+    elif has_session_id_camel:
+        values = query_params["sessionId"]
+    else:
+        return None
+    if len(values) > 1:
+        raise AmbiguousSessionIdError("ambiguous session id")
+    raw_session_id = values[0]
     if raw_session_id:
         return _session_id_key(raw_session_id)
+    return None
 
+
+def _extract_path_session_id(scope) -> str | None:
     path = scope.get("path", "")
     root_path = scope.get("root_path", "")
     if root_path and path.startswith(root_path):
@@ -216,6 +232,14 @@ def _extract_session_id_from_scope(scope) -> str | None:
     if root_path.rstrip("/") == "/messages" and path.strip("/"):
         return _session_id_key(path.strip("/"))
     return None
+
+
+def _extract_session_id_from_scope(scope) -> str | None:
+    query_session_id = _extract_query_session_id(scope)
+    path_session_id = _extract_path_session_id(scope)
+    if query_session_id and path_session_id and query_session_id != path_session_id:
+        raise AmbiguousSessionIdError("ambiguous session id")
+    return query_session_id or path_session_id
 
 
 def _scope_state(scope) -> dict:
@@ -267,7 +291,11 @@ async def _bound_sse_connection(request, principal_id: str):
 
 
 async def handle_post_message(scope, receive, send) -> None:
-    session_id = _extract_session_id_from_scope(scope)
+    try:
+        session_id = _extract_session_id_from_scope(scope)
+    except AmbiguousSessionIdError:
+        response = PlainTextResponse("ambiguous session id", status_code=400)
+        return await response(scope, receive, send)
     if session_id is None:
         response = PlainTextResponse("session_id is required", status_code=400)
         return await response(scope, receive, send)
@@ -282,11 +310,8 @@ async def handle_post_message(scope, receive, send) -> None:
         response = PlainTextResponse("session does not belong to caller", status_code=403)
         return await response(scope, receive, send)
 
-    if not scope.get("query_string"):
-        forwarded_scope = dict(scope)
-        forwarded_scope["query_string"] = f"session_id={quote(session_id)}".encode()
-    else:
-        forwarded_scope = scope
+    forwarded_scope = dict(scope)
+    forwarded_scope["query_string"] = f"session_id={quote(session_id, safe='')}".encode()
 
     return await sse.handle_post_message(forwarded_scope, receive, send)
 

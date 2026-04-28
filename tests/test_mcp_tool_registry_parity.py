@@ -225,13 +225,24 @@ async def _open_sse_session(monkeypatch, module, token: str):
     return module.sse.last_session_id.hex, release, task
 
 
-async def _post_message(module, token: str, session_id: str) -> tuple[int, str]:
+async def _post_message(
+    module,
+    token: str,
+    session_id: str | None = None,
+    *,
+    path: str = "/messages/",
+    query_string: str | bytes | None = None,
+) -> tuple[int, str]:
     principal = module.TOKEN_PRINCIPALS[token]
+    if query_string is None:
+        query_string = f"session_id={session_id}" if session_id is not None else ""
+    if isinstance(query_string, str):
+        query_string = query_string.encode()
     scope = {
         "type": "http",
         "method": "POST",
-        "path": "/messages/",
-        "query_string": f"session_id={session_id}".encode(),
+        "path": path,
+        "query_string": query_string,
         "headers": [],
         "state": {
             "mnemos_mcp_principal": principal,
@@ -364,5 +375,78 @@ def test_http_sse_message_posts_are_bound_to_session_principal(monkeypatch):
 
         bob_release.set()
         await bob_task
+
+    asyncio.run(exercise())
+
+
+def test_http_post_rejects_ambiguous_session_id_parameters(monkeypatch):
+    _install_mcp_stubs(monkeypatch)
+    monkeypatch.setenv(
+        "MNEMOS_MCP_TOKENS",
+        "alice:alice-token:alice-api-key,bob:bob-token:bob-api-key",
+    )
+
+    _fresh_import("mcp_server")
+    mcp_http_server = _fresh_import("mcp_http_server")
+
+    async def exercise():
+        alice_session_id, alice_release, alice_task = await _open_sse_session(
+            monkeypatch,
+            mcp_http_server,
+            "alice-token",
+        )
+        bob_session_id, bob_release, bob_task = await _open_sse_session(
+            monkeypatch,
+            mcp_http_server,
+            "bob-token",
+        )
+        try:
+            mcp_http_server.sse.accepted_posts.clear()
+
+            status, _body = await _post_message(
+                mcp_http_server,
+                "bob-token",
+                query_string=(
+                    f"session_id={bob_session_id}&session_id={alice_session_id}"
+                ),
+            )
+            assert status in {400, 403}
+            assert mcp_http_server.sse.accepted_posts == []
+
+            status, _body = await _post_message(
+                mcp_http_server,
+                "bob-token",
+                query_string=(
+                    f"sessionId={alice_session_id}&session_id={bob_session_id}"
+                ),
+            )
+            assert status in {400, 403}
+            assert mcp_http_server.sse.accepted_posts == []
+
+            status, body = await _post_message(
+                mcp_http_server,
+                "bob-token",
+                path=f"/messages/{bob_session_id}",
+                query_string=f"session_id={alice_session_id}",
+            )
+            assert status == 400
+            assert body == "ambiguous session id"
+            assert mcp_http_server.sse.accepted_posts == []
+
+            status, body = await _post_message(
+                mcp_http_server,
+                "bob-token",
+                query_string=f"ignored=1&sessionId={bob_session_id}",
+            )
+            assert status == 202
+            assert body == "Accepted"
+            assert mcp_http_server.sse.accepted_posts == [
+                f"session_id={bob_session_id}".encode()
+            ]
+        finally:
+            alice_release.set()
+            bob_release.set()
+            await alice_task
+            await bob_task
 
     asyncio.run(exercise())
