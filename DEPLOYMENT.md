@@ -279,6 +279,31 @@ the one-shot service. Keep the compose mounts and `installer/db.py` /
 
 ---
 
+## High Availability and Replication
+
+For single-site deployments (all nodes on same LAN/datacenter), use PostgreSQL
+streaming replication. The MNEMOS app talks to a single primary; replicas are
+read-only standbys promoted on failure.
+
+Federation is for genuinely-remote replication scenarios — multi-site
+deployments, multi-org curated feeds, developer laptop replicas with
+intermittent connectivity, and v4 deployment profiles with planned
+SQLite-based laptop/local-replica mode.
+
+| Mode | Use when | Latency model | Write model | Layer | Configuration |
+|------|----------|---------------|-------------|-------|---------------|
+| PostgreSQL streaming replication | Same site / same LAN / same datacenter | Sub-ms latency expected | Single writer; async or sync standby | Postgres-native WAL shipping | Automatic WAL shipping; no MNEMOS app-level config |
+| MNEMOS federation | Cross-site, multi-org, laptop replica, or curated remote feed | High latency tolerated | Opt-in per-memory, peer-to-peer | MNEMOS-level (post-write) | Needs `MNEMOS_FEDERATION_PEERS` configuration or registered federation peers |
+
+**Anti-pattern:** Dont use federation between same-LAN nodes — Postgres
+streaming replication is faster, simpler, and avoids multi-master dedup work.
+
+See [`docs/STREAMING_REPLICATION.md`](./docs/STREAMING_REPLICATION.md) for the
+single-primary + N-standby runbook using `pg_basebackup`, WAL streaming,
+promotion, and HAProxy/PgBouncer-style writer endpoints.
+
+---
+
 ## Core API Endpoints
 
 ### Consultations (GRAEAE Reasoning)

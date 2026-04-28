@@ -1,5 +1,6 @@
 """Shared globals, lifespan, and DB/cache helpers for MNEMOS API."""
 import hashlib
+import ipaddress
 import json
 import logging
 import os
@@ -10,6 +11,7 @@ except ModuleNotFoundError:
     import tomli as tomllib
 from contextlib import asynccontextmanager
 from typing import Optional
+from urllib.parse import urlparse
 
 import asyncpg
 import httpx
@@ -186,6 +188,78 @@ def _load_config() -> dict:
     return {}
 
 
+def _env_flag_enabled(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _configured_federation_peer_urls_from_env() -> list[str]:
+    raw = os.getenv("MNEMOS_FEDERATION_PEERS", "").strip()
+    if not raw:
+        return []
+
+    try:
+        decoded = json.loads(raw)
+    except json.JSONDecodeError:
+        decoded = None
+
+    if isinstance(decoded, list):
+        urls: list[str] = []
+        for item in decoded:
+            if isinstance(item, str):
+                urls.append(item.strip())
+            elif isinstance(item, dict):
+                url = item.get("base_url") or item.get("url")
+                if isinstance(url, str):
+                    urls.append(url.strip())
+        return [url for url in urls if url]
+
+    urls = []
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "=" in token:
+            token = token.split("=", 1)[1].strip()
+        urls.append(token)
+    return urls
+
+
+def _peer_url_looks_same_lan(url: str) -> bool:
+    parsed = urlparse(url if "://" in url else f"//{url}")
+    hostname = parsed.hostname
+    if not hostname:
+        return False
+    if hostname.lower() == "localhost":
+        return True
+    try:
+        peer_ip = ipaddress.ip_address(hostname)
+    except ValueError:
+        return False
+    return peer_ip.is_private or peer_ip.is_loopback or peer_ip.is_link_local
+
+
+async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
+    env_peer_urls = _configured_federation_peer_urls_from_env()
+    db_peer_urls: list[str] = []
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("SELECT base_url FROM federation_peers WHERE enabled")
+        db_peer_urls = [row["base_url"] for row in rows if row["base_url"]]
+    except Exception as exc:
+        logger.debug("federation startup guidance skipped DB peer scan: %s", exc)
+
+    if _env_flag_enabled("MNEMOS_FEDERATION_ENABLED") and not env_peer_urls and not db_peer_urls:
+        logger.info("federation enabled but no peers configured — federation pulls and exports are inactive.")
+
+    for peer_url in [*env_peer_urls, *db_peer_urls]:
+        if _peer_url_looks_same_lan(peer_url):
+            logger.warning(
+                "federation peer %s appears to be same-LAN; for single-site HA, "
+                "Postgres streaming replication is faster and simpler — see DEPLOYMENT.md",
+                peer_url,
+            )
+
+
 # ── Distillation Worker Wrapper ─────────────────────────────────────────────────
 
 async def _run_distillation_worker():
@@ -307,6 +381,8 @@ async def lifespan(app):
         logger.info("Row Level Security: ENABLED (team/enterprise profile)")
     else:
         logger.info("Row Level Security: DISABLED (personal profile)")
+
+    await _log_federation_startup_guidance(_pool)
 
     _redis_url = os.getenv("MNEMOS_REDIS_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379"
     try:

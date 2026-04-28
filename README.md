@@ -32,7 +32,7 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 - Per-owner multi-tenant isolation, Bearer API keys + OAuth/OIDC session cookies, SSRF-hardened webhooks, cross-instance federation with per-memory opt-in. The v3.5-dev read path uses the shared `read_visibility_predicate` in `api/visibility.py:40-96` across memory list/get/search/rehydrate/gateway surfaces.
 - Runs alongside your applications the way Redis, PostgreSQL, or a message bus would. Deploy once, every agent in your stack shares the same memory substrate.
 
-The latest tagged release is **v3.4.1**: CHARON federation schema-compat preflight plus the dev↔prod MPF restore drill. The current development branch is **v3.5-dev** and is not tagged yet. v3.5 slices have landed there for session-history ordering, memory-read tenancy + DAG-integrity hardening, webhook retry hardening, and the federation compound-cursor tie-breaker. The going-forward compression stack is **APOLLO + ARTEMIS**.
+The latest tagged release is **v3.4.1**: CHARON federation schema-compat preflight plus the dev↔prod MPF restore drill. The current development branch is **v3.5-dev** and is not tagged yet. v3.5 slices have landed there for session-history ordering, memory-read tenancy + DAG-integrity hardening, webhook retry hardening, the federation compound-cursor tie-breaker, MCP transport parity, and faithful OpenAI-compatible gateway controls. The going-forward compression stack is **APOLLO + ARTEMIS**.
 
 ## Works with
 
@@ -41,7 +41,7 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 ### How we interoperate
 
 1. **MCP (Model Context Protocol).** MNEMOS ships a stdio MCP server (`mcp_server.py`) that exposes memory operations — search, create, update, delete, DAG versioning, model optimizer — as first-class tool calls. Register it in any MCP-aware client (Claude Code, OpenClaw, ZeroClaw, Hermes) and the agent gets persistent memory without your framework having to know MNEMOS exists at the code level.
-2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, and consensus scoring with zero code change. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
+2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, propagated generation controls (`temperature`, `max_tokens`, `top_p`), streaming SSE, and explicit 400s when the selected provider cannot honor tools, response formats, penalties, or multimodal content. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
 3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
 
 Current MCP tools come from one registry shared by stdio and HTTP/SSE: `search_memories`, `list_memories`, `get_memory`, `create_memory`, `update_memory`, `delete_memory`, `bulk_create_memories`, `get_stats`, `kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`, `delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`, `checkout_memory`, and `recommend_model`.
@@ -286,9 +286,11 @@ Drop-in replacement for the OpenAI Chat Completions API — so any SDK that spea
 
 | Endpoint | What it does |
 |----------|-------------|
-| `GET /v1/models` | List available models across all configured providers |
-| `GET /v1/models/{model_id}` | Model details |
-| `POST /v1/chat/completions` | Chat completion; routes to the appropriate provider; optional memory injection |
+| `GET /v1/models` | List registry-backed models only |
+| `GET /v1/models/{model_id}` | Registry model details; unregistered IDs return 404 |
+| `POST /v1/chat/completions` | Chat completion; routes to the appropriate provider; optional memory injection; supports generation controls, SSE streaming, tools/tool_choice and response_format where provider-supported |
+
+Gateway field support is pass-or-reject: OpenAI-style providers receive `temperature`, `max_tokens`, `top_p`, `stop`, `n`, presence/frequency penalties, and `response_format`; OpenAI and Anthropic receive tool schemas where supported; Gemini maps generation controls and JSON response format to its native fields. Providers that cannot honor a requested tool call, response format, penalty, or multimodal content block return a clear HTTP 400 instead of silently dropping it.
 
 ### Stateful sessions (v3, shipped)
 
@@ -346,9 +348,22 @@ Admin side (`/admin/oauth/*` — root only):
 
 Sessions are DB-backed, revocable, and expire after 30 days by default. User provisioning: same external-id reuses the user; matching email links to an existing user; otherwise a fresh user is created.
 
+### High availability / replication doctrine
+
+For single-site HA, use PostgreSQL streaming replication: one writable primary,
+read-only standbys, and a stable writer endpoint for MNEMOS. Federation remains
+first-class, but it is for genuinely remote data flows: multi-site deployments,
+multi-org curated feeds, developer laptop replicas with intermittent
+connectivity, and planned v4 SQLite-based local-replica profiles.
+
+Do not use federation between same-LAN MNEMOS nodes for HA; it creates
+application-level dedup work that PostgreSQL WAL streaming already solves below
+the app. See [`DEPLOYMENT.md`](./DEPLOYMENT.md#high-availability-and-replication)
+and [`docs/STREAMING_REPLICATION.md`](./docs/STREAMING_REPLICATION.md).
+
 ### Federation — cross-instance memory sync (v3, shipped)
 
-Pull-based one-way federation between MNEMOS instances. Remote peer exposes `/v1/federation/feed`; local instance pulls on a configurable interval, storing remote memories with ids of the form `fed:{peer_name}:{remote_id}` and `federation_source = peer_name`. Federated memories are read-only by application convention.
+Pull-based one-way federation between genuinely remote MNEMOS instances. Remote peer exposes `/v1/federation/feed`; local instance pulls on a configurable interval, storing remote memories with ids of the form `fed:{peer_name}:{remote_id}` and `federation_source = peer_name`. Federated memories are read-only by application convention.
 
 | Endpoint | What it does |
 |----------|-------------|
@@ -399,6 +414,7 @@ Most multi-LLM routers hardcode a provider list. MNEMOS ships a **self-populatin
 - **`/v1/providers/recommend?task_type=...&budget=...`** — returns the cheapest available model that meets the task's capability + quality floor. Uses `graeae_weight` as the quality signal and `input_cost_per_mtok + output_cost_per_mtok` as the cost signal.
 - **GRAEAE consensus scoring** — provider responses are weighted by `graeae_weight` before the consensus pick. A provider that drops on Arena.ai also drops in MNEMOS's internal routing on the next timer tick, without any human touching a config file.
 - **OpenAI-compatible gateway model routing** — when a caller passes `model="auto"`, `model="best-coding"`, `model="best-reasoning"`, `model="fastest"`, `model="cheapest"`, the gateway resolves against the registry rather than a hardcoded alias table.
+- **OpenAI-compatible model discovery** — `/v1/models` and `/v1/models/{model_id}` expose registry rows only; chat routing can still fall back to provider-name heuristics for explicit requests, but discovery does not invent synthetic models.
 
 **Fresh-install behavior.** If the registry is empty (first boot, no sync run yet), `/v1/providers/recommend` falls back to the static GRAEAE provider config so new deployments don't 404. The first `provider_sync` run typically populates 30–50 models depending on which provider API keys you've configured.
 
@@ -410,7 +426,7 @@ A lot of the v3.x surface is held up by background work that doesn't show up in 
 - **Distillation worker supervision** — the compression worker runs under an exponential-backoff supervisor (1s → 2s → 4s → … capped at 5 min). A crash is logged and retried; the worker does not silently die and leave memories un-compressed for the rest of the process lifetime.
 - **Search stays out of the compression control plane** — large `/v1/memories/search` result sets keep the standard raw response shape and no longer probe the retired legacy distillation backend. Compression health and output come from the queue-driven APOLLO/ARTEMIS worker, `memory_compression_queue`, `memory_compressed_variants`, and the APOLLO GPU guard path.
 - **OAuth session garbage collector** — hourly sweep of expired and long-revoked sessions. Bounds the `oauth_sessions` table so a long-running install doesn't accumulate dead rows forever.
-- **Federation sync worker** — iterates enabled peers on their individual sync intervals, pulls batches, reconciles local + remote timestamps before overwriting, logs per-sync results to `federation_sync_log`.
+- **Federation sync worker** — for genuinely remote peers, iterates enabled peers on their individual sync intervals, pulls batches, reconciles local + remote timestamps before overwriting, logs per-sync results to `federation_sync_log`. Single-site HA uses PostgreSQL streaming replication instead.
 - **Advisory-lock-serialized audit chain writer** — the hash chain writer takes `pg_advisory_xact_lock` before reading the chain tip, so concurrent consultations cannot compute against the same stale previous hash. Closes a TOCTOU window in tamper-evident logging that most implementations leave open.
 - **Advisory-lock-serialized DAG writers** — merges and feature-branch reverts share `_branch_advisory_lock_key` in `api/handlers/dag.py:21-40`, then take row locks in the same order. Concurrent writers on the same `(memory_id, branch)` serialize instead of orphaning branch heads.
 - **Trigger-level DAG parent guard** — `db/migrations_v3_5_trigger_same_memory_parent.sql` replaces `mnemos_version_snapshot()` so UPDATE/DELETE resolve branch HEADs under lock, reject missing/NULL/foreign heads with SQLSTATE `MN001`, and keep delete snapshots live for deployments that still attach the delete trigger.
