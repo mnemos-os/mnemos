@@ -8,7 +8,8 @@ v3.5 is being built as a branch sequence after v3.4.1. Do not treat this
 as a release tag. Merged slices cover audit quick wins, memory-read tenancy
 and DAG integrity, webhook retry hardening, RLS group-select parity, the
 federation compound-cursor tie-breaker, consultation audit endpoint scoping,
-MCP transport parity, and faithful OpenAI-compatible gateway controls.
+MCP transport parity, faithful OpenAI-compatible gateway controls, and the
+single-site HA replication doctrine.
 
 ### Added
 
@@ -83,6 +84,13 @@ MCP transport parity, and faithful OpenAI-compatible gateway controls.
   Search helpers also use the full read-visibility predicate whenever
   `owner_id` is supplied instead of preserving the owner/federation-only
   fallback for omitted `group_ids`.
+- **Slice 9 HA replication doctrine** — single-site deployments now document
+  PostgreSQL streaming replication as the canonical HA path: one writable
+  primary, read-only standbys, WAL shipping, and a stable writer endpoint for
+  MNEMOS. Federation stays first-class, but is reserved for genuinely remote
+  scenarios such as multi-site deployments, multi-org curated feeds, developer
+  laptop replicas with intermittent connectivity, and planned v4 SQLite-based
+  local-replica profiles.
 
 ### Fixed
 

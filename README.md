@@ -348,9 +348,22 @@ Admin side (`/admin/oauth/*` — root only):
 
 Sessions are DB-backed, revocable, and expire after 30 days by default. User provisioning: same external-id reuses the user; matching email links to an existing user; otherwise a fresh user is created.
 
+### High availability / replication doctrine
+
+For single-site HA, use PostgreSQL streaming replication: one writable primary,
+read-only standbys, and a stable writer endpoint for MNEMOS. Federation remains
+first-class, but it is for genuinely remote data flows: multi-site deployments,
+multi-org curated feeds, developer laptop replicas with intermittent
+connectivity, and planned v4 SQLite-based local-replica profiles.
+
+Do not use federation between same-LAN MNEMOS nodes for HA; it creates
+application-level dedup work that PostgreSQL WAL streaming already solves below
+the app. See [`DEPLOYMENT.md`](./DEPLOYMENT.md#high-availability-and-replication)
+and [`docs/STREAMING_REPLICATION.md`](./docs/STREAMING_REPLICATION.md).
+
 ### Federation — cross-instance memory sync (v3, shipped)
 
-Pull-based one-way federation between MNEMOS instances. Remote peer exposes `/v1/federation/feed`; local instance pulls on a configurable interval, storing remote memories with ids of the form `fed:{peer_name}:{remote_id}` and `federation_source = peer_name`. Federated memories are read-only by application convention.
+Pull-based one-way federation between genuinely remote MNEMOS instances. Remote peer exposes `/v1/federation/feed`; local instance pulls on a configurable interval, storing remote memories with ids of the form `fed:{peer_name}:{remote_id}` and `federation_source = peer_name`. Federated memories are read-only by application convention.
 
 | Endpoint | What it does |
 |----------|-------------|
@@ -413,7 +426,7 @@ A lot of the v3.x surface is held up by background work that doesn't show up in 
 - **Distillation worker supervision** — the compression worker runs under an exponential-backoff supervisor (1s → 2s → 4s → … capped at 5 min). A crash is logged and retried; the worker does not silently die and leave memories un-compressed for the rest of the process lifetime.
 - **Search stays out of the compression control plane** — large `/v1/memories/search` result sets keep the standard raw response shape and no longer probe the retired legacy distillation backend. Compression health and output come from the queue-driven APOLLO/ARTEMIS worker, `memory_compression_queue`, `memory_compressed_variants`, and the APOLLO GPU guard path.
 - **OAuth session garbage collector** — hourly sweep of expired and long-revoked sessions. Bounds the `oauth_sessions` table so a long-running install doesn't accumulate dead rows forever.
-- **Federation sync worker** — iterates enabled peers on their individual sync intervals, pulls batches, reconciles local + remote timestamps before overwriting, logs per-sync results to `federation_sync_log`.
+- **Federation sync worker** — for genuinely remote peers, iterates enabled peers on their individual sync intervals, pulls batches, reconciles local + remote timestamps before overwriting, logs per-sync results to `federation_sync_log`. Single-site HA uses PostgreSQL streaming replication instead.
 - **Advisory-lock-serialized audit chain writer** — the hash chain writer takes `pg_advisory_xact_lock` before reading the chain tip, so concurrent consultations cannot compute against the same stale previous hash. Closes a TOCTOU window in tamper-evident logging that most implementations leave open.
 - **Advisory-lock-serialized DAG writers** — merges and feature-branch reverts share `_branch_advisory_lock_key` in `api/handlers/dag.py:21-40`, then take row locks in the same order. Concurrent writers on the same `(memory_id, branch)` serialize instead of orphaning branch heads.
 - **Trigger-level DAG parent guard** — `db/migrations_v3_5_trigger_same_memory_parent.sql` replaces `mnemos_version_snapshot()` so UPDATE/DELETE resolve branch HEADs under lock, reject missing/NULL/foreign heads with SQLSTATE `MN001`, and keep delete snapshots live for deployments that still attach the delete trigger.
