@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 
 from api.auth import UserContext
 from api.handlers import openai_compat
@@ -77,6 +78,7 @@ class _FakeGraeae:
         self.stream_calls.append((args, kwargs))
         yield {"index": 0, "content": "hel"}
         yield {"index": 0, "content": "lo"}
+        yield {"index": 0, "finish_reason": "stop"}
 
 
 async def _no_context(*args, **kwargs):
@@ -90,6 +92,49 @@ def _install_gateway(monkeypatch, fake: _FakeGraeae, provider: str = "openai"):
     monkeypatch.setattr(openai_compat, "_search_mnemos_context", _no_context)
     monkeypatch.setattr(openai_compat, "_resolve_provider_for_model", _resolver)
     monkeypatch.setattr(openai_compat, "get_graeae_engine", lambda: fake)
+
+
+def _sse_events(body: str) -> list[str]:
+    return [line.removeprefix("data: ") for line in body.splitlines() if line.startswith("data: ")]
+
+
+async def _collect_stream_body(response: StreamingResponse) -> str:
+    chunks = []
+    async for chunk in response.body_iterator:
+        chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
+    return "".join(chunks)
+
+
+async def _chat_stream_response_and_body(
+    request: openai_compat.ChatCompletionRequest,
+) -> tuple[StreamingResponse, str]:
+    response = await openai_compat.chat_completions(request, authorization=None, user=_user())
+    assert isinstance(response, StreamingResponse)
+    body = await _collect_stream_body(response)
+    return response, body
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("logit_bias", {"50256": -100}),
+        ("seed", 1234),
+        ("parallel_tool_calls", False),
+        ("stream_options", {"include_usage": True}),
+        ("logprobs", True),
+    ],
+)
+def test_chat_request_rejects_unsupported_openai_fields(field, value):
+    payload = {
+        "model": "gpt-5.4",
+        "messages": [{"role": "user", "content": "hello"}],
+        field: value,
+    }
+
+    with pytest.raises(ValidationError) as exc:
+        openai_compat.ChatCompletionRequest.model_validate_json(json.dumps(payload))
+
+    assert field in str(exc.value)
 
 
 def test_temperature_max_tokens_top_p_propagate(monkeypatch):
@@ -125,24 +170,136 @@ def test_stream_returns_sse(monkeypatch):
         stream=True,
     )
 
-    response = asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
-    assert isinstance(response, StreamingResponse)
+    response, body = asyncio.run(_chat_stream_response_and_body(req))
     assert response.media_type == "text/event-stream"
 
-    async def _collect():
-        chunks = []
-        async for chunk in response.body_iterator:
-            chunks.append(chunk.decode() if isinstance(chunk, bytes) else chunk)
-        return "".join(chunks)
-
-    body = asyncio.run(_collect())
-    events = [line.removeprefix("data: ") for line in body.splitlines() if line.startswith("data: ")]
+    events = _sse_events(body)
     assert events[-1] == "[DONE]"
     decoded = [json.loads(event) for event in events[:-1]]
     assert decoded[0]["choices"][0]["delta"]["role"] == "assistant"
     assert decoded[1]["choices"][0]["delta"]["content"] == "hel"
     assert decoded[2]["choices"][0]["delta"]["content"] == "lo"
     assert decoded[-1]["choices"][0]["finish_reason"] == "stop"
+
+
+def test_stream_preflight_failure_returns_error_before_sse(monkeypatch):
+    class _FailingGraeae(_FakeGraeae):
+        async def route_stream(self, *args, **kwargs):
+            self.stream_calls.append((args, kwargs))
+            if False:
+                yield {}
+            raise RuntimeError("missing api_key for provider 'openai'")
+
+    fake = _FailingGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        stream=True,
+    )
+
+    with pytest.raises(HTTPException) as exc:
+        asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    assert exc.value.status_code == 503
+    assert "missing api_key" in exc.value.detail
+
+
+def test_stream_midstream_failure_emits_error_and_done(monkeypatch):
+    class _MidstreamFailGraeae(_FakeGraeae):
+        async def route_stream(self, *args, **kwargs):
+            self.stream_calls.append((args, kwargs))
+            yield {"index": 0, "content": "hel"}
+            raise RuntimeError("upstream closed early")
+
+    fake = _MidstreamFailGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        stream=True,
+    )
+
+    _response, body = asyncio.run(_chat_stream_response_and_body(req))
+    events = _sse_events(body)
+
+    assert events[-1] == "[DONE]"
+    error_event = json.loads(events[-2])
+    assert error_event["error"]["type"] == "provider_stream_error"
+    assert "upstream closed early" in error_event["error"]["message"]
+
+
+def test_stream_finish_reason_tool_calls_propagates(monkeypatch):
+    tool_calls = [
+        {
+            "id": "call_1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": "{}"},
+        }
+    ]
+
+    class _ToolStreamGraeae(_FakeGraeae):
+        async def route_stream(self, *args, **kwargs):
+            self.stream_calls.append((args, kwargs))
+            yield {"index": 0, "tool_calls": tool_calls}
+            yield {"index": 0, "finish_reason": "tool_calls"}
+
+    fake = _ToolStreamGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        stream=True,
+        tools=[{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
+    )
+
+    _response, body = asyncio.run(_chat_stream_response_and_body(req))
+    events = _sse_events(body)
+    decoded = [json.loads(event) for event in events[:-1]]
+
+    assert decoded[-1]["choices"][0]["finish_reason"] == "tool_calls"
+
+
+def test_stream_n_two_gets_per_choice_role_delta_and_terminal(monkeypatch):
+    class _TwoChoiceStreamGraeae(_FakeGraeae):
+        async def route_stream(self, *args, **kwargs):
+            self.stream_calls.append((args, kwargs))
+            yield {"index": 0, "content": "alpha"}
+            yield {"index": 1, "content": "beta"}
+            yield {"index": 0, "finish_reason": "length"}
+            yield {"index": 1, "finish_reason": "stop"}
+
+    fake = _TwoChoiceStreamGraeae()
+    _install_gateway(monkeypatch, fake)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        stream=True,
+        n=2,
+    )
+
+    _response, body = asyncio.run(_chat_stream_response_and_body(req))
+    events = _sse_events(body)
+    decoded = [json.loads(event) for event in events[:-1]]
+    roles = {
+        item["choices"][0]["index"]
+        for item in decoded
+        if item["choices"][0]["delta"].get("role") == "assistant"
+    }
+    content = {
+        item["choices"][0]["index"]: item["choices"][0]["delta"]["content"]
+        for item in decoded
+        if "content" in item["choices"][0]["delta"]
+    }
+    finishes = {
+        item["choices"][0]["index"]: item["choices"][0]["finish_reason"]
+        for item in decoded
+        if item["choices"][0].get("finish_reason")
+    }
+
+    assert roles == {0, 1}
+    assert content == {0: "alpha", 1: "beta"}
+    assert finishes == {0: "length", 1: "stop"}
 
 
 class _Resp:
@@ -216,6 +373,63 @@ def test_tools_passthrough_supported_provider(monkeypatch):
     assert client.payloads[0]["tools"] == tools
     assert client.payloads[0]["tool_choice"] == "auto"
     assert result["choices"][0]["message"]["tool_calls"] == tool_calls
+
+
+def test_anthropic_multiturn_tool_history_preserves_tool_identity(monkeypatch):
+    engine, client = _engine_with_client(
+        monkeypatch,
+        {"content": [{"type": "text", "text": "done"}], "stop_reason": "end_turn"},
+    )
+    messages = [
+        {"role": "user", "content": "what is the weather?"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call_weather",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"},
+                }
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_weather", "content": "sunny"},
+    ]
+
+    asyncio.run(engine._query_anthropic(
+        {
+            "api": "anthropic",
+            "url": "https://api.anthropic.com/v1/messages",
+            "model": "claude-opus-4-6",
+            "key_name": "claude",
+        },
+        "ignored when messages are present",
+        30,
+        messages=messages,
+    ))
+
+    anthropic_messages = client.payloads[0]["messages"]
+    assert anthropic_messages[1] == {
+        "role": "assistant",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": "call_weather",
+                "name": "get_weather",
+                "input": {"city": "SF"},
+            }
+        ],
+    }
+    assert anthropic_messages[2] == {
+        "role": "user",
+        "content": [
+            {
+                "type": "tool_result",
+                "tool_use_id": "call_weather",
+                "content": "sunny",
+            }
+        ],
+    }
 
 
 def test_tools_rejected_unsupported_provider(monkeypatch):

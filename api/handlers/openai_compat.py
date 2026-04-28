@@ -23,7 +23,7 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Depends, Header
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
@@ -86,6 +86,8 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     model: Optional[str] = "auto"
     messages: List[ChatMessage]
     temperature: Optional[float] = None
@@ -541,6 +543,106 @@ def _completion_text_for_usage(choices: List[ChatCompletionChoice]) -> str:
 
 def _stream_event(data: Dict[str, Any]) -> str:
     return f"data: {json.dumps(data, separators=(',', ':'))}\n\n"
+
+
+def _stream_error_event(message: str, error_type: str = "provider_stream_error") -> str:
+    return _stream_event({"error": {"message": message, "type": error_type}})
+
+
+def _stream_preflight_exception(exc: Exception) -> HTTPException:
+    message = str(exc)
+    status_code = 503
+    status_prefix = message.split(":", 1)[0].split()
+    if len(status_prefix) == 2 and status_prefix[0] == "HTTP":
+        try:
+            upstream_status = int(status_prefix[1])
+        except ValueError:
+            upstream_status = 0
+        if 400 <= upstream_status <= 599:
+            status_code = upstream_status
+    elif "rate-limited" in message:
+        status_code = 429
+    return HTTPException(status_code=status_code, detail=f"Streaming request failed: {message}")
+
+
+def _stream_chunk_event(
+    *,
+    stream_id: str,
+    created: int,
+    model: str,
+    index: int,
+    delta: ChatCompletionDelta,
+    finish_reason: Optional[str] = None,
+) -> str:
+    chunk = ChatCompletionStreamResponse(
+        id=stream_id,
+        created=created,
+        model=model,
+        choices=[
+            ChatCompletionStreamChoice(
+                index=index,
+                delta=delta,
+                finish_reason=finish_reason,
+            )
+        ],
+    )
+    return _stream_event(chunk.model_dump(exclude_none=True))
+
+
+def _stream_events_for_provider_delta(
+    *,
+    delta: Dict[str, Any],
+    stream_id: str,
+    created: int,
+    model: str,
+    started_indexes: set[int],
+    finished_indexes: set[int],
+) -> List[str]:
+    index = int(delta.get("index", 0))
+    events: List[str] = []
+
+    if index not in started_indexes:
+        started_indexes.add(index)
+        events.append(
+            _stream_chunk_event(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                delta=ChatCompletionDelta(role=delta.get("role") or "assistant"),
+            )
+        )
+
+    has_delta_payload = delta.get("content") is not None or delta.get("tool_calls") is not None
+    if has_delta_payload:
+        events.append(
+            _stream_chunk_event(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                delta=ChatCompletionDelta(
+                    content=delta.get("content"),
+                    tool_calls=delta.get("tool_calls"),
+                ),
+            )
+        )
+
+    finish_reason = delta.get("finish_reason")
+    if finish_reason is not None and index not in finished_indexes:
+        finished_indexes.add(index)
+        events.append(
+            _stream_chunk_event(
+                stream_id=stream_id,
+                created=created,
+                model=model,
+                index=index,
+                delta=ChatCompletionDelta(),
+                finish_reason=finish_reason,
+            )
+        )
+
+    return events
 
 
 # Substring-to-provider heuristics kept as a last-resort fallback when
@@ -1007,69 +1109,61 @@ async def chat_completions(
 
     if request.stream:
         stream_id = f"chatcmpl-mnemos-{now}"
-        # Run provider resolution/capability validation before returning the
-        # HTTP response object. Otherwise an unsupported stream request would
-        # fail inside the body iterator after the client had already received
-        # a 200 status.
-        await _prepare_provider_route(
+        provider_stream = _route_to_provider_stream(
             model=model,
             messages=messages,
+            generation_params=generation_params,
             request_params=request_params,
+            user=user,
         )
+        try:
+            # Prime the upstream stream before constructing StreamingResponse.
+            # This forces provider resolution, key/reliability checks, and the
+            # initial upstream stream open/status check to fail while FastAPI can
+            # still return a normal JSON error response instead of committing a
+            # 200 SSE response that later truncates.
+            first_delta = await anext(provider_stream)
+        except StopAsyncIteration:
+            first_delta = None
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"[MNEMOS] Streaming request failed before response start: {e}")
+            raise _stream_preflight_exception(e) from e
 
         async def event_source() -> AsyncIterator[str]:
-            role_chunk = ChatCompletionStreamResponse(
-                id=stream_id,
-                created=now,
-                model=model,
-                choices=[
-                    ChatCompletionStreamChoice(
-                        index=0,
-                        delta=ChatCompletionDelta(role="assistant"),
-                        finish_reason=None,
-                    )
-                ],
-            )
-            yield _stream_event(role_chunk.model_dump(exclude_none=True))
+            started_indexes: set[int] = set()
+            finished_indexes: set[int] = set()
+            try:
+                if first_delta is not None:
+                    for event in _stream_events_for_provider_delta(
+                        delta=first_delta,
+                        stream_id=stream_id,
+                        created=now,
+                        model=model,
+                        started_indexes=started_indexes,
+                        finished_indexes=finished_indexes,
+                    ):
+                        yield event
 
-            async for delta in _route_to_provider_stream(
-                model=model,
-                messages=messages,
-                generation_params=generation_params,
-                request_params=request_params,
-                user=user,
-            ):
-                delta_payload = ChatCompletionDelta(
-                    content=delta.get("content"),
-                    tool_calls=delta.get("tool_calls"),
-                )
-                chunk = ChatCompletionStreamResponse(
-                    id=stream_id,
-                    created=now,
-                    model=model,
-                    choices=[
-                        ChatCompletionStreamChoice(
-                            index=delta.get("index", 0),
-                            delta=delta_payload,
-                            finish_reason=None,
-                        )
-                    ],
-                )
-                yield _stream_event(chunk.model_dump(exclude_none=True))
-
-            final_chunk = ChatCompletionStreamResponse(
-                id=stream_id,
-                created=now,
-                model=model,
-                choices=[
-                    ChatCompletionStreamChoice(
-                        index=0,
-                        delta=ChatCompletionDelta(),
-                        finish_reason="stop",
-                    )
-                ],
-            )
-            yield _stream_event(final_chunk.model_dump(exclude_none=True))
+                async for delta in provider_stream:
+                    for event in _stream_events_for_provider_delta(
+                        delta=delta,
+                        stream_id=stream_id,
+                        created=now,
+                        model=model,
+                        started_indexes=started_indexes,
+                        finished_indexes=finished_indexes,
+                    ):
+                        yield event
+            except Exception as e:
+                logger.error(f"[MNEMOS] Streaming response failed after response start: {e}")
+                yield _stream_error_event(str(e))
+            finally:
+                try:
+                    await provider_stream.aclose()
+                except Exception as e:
+                    logger.debug(f"[MNEMOS] Streaming response cleanup failed: {e}")
             yield "data: [DONE]\n\n"
 
         return StreamingResponse(event_source(), media_type="text/event-stream")

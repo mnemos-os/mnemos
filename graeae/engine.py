@@ -202,6 +202,44 @@ def _anthropic_content_parts(content: Any) -> list[dict]:
     return [{"type": "text", "text": _content_text(content)}]
 
 
+def _anthropic_tool_input(arguments: Any) -> dict:
+    if isinstance(arguments, dict):
+        return arguments
+    if isinstance(arguments, str):
+        try:
+            parsed = json.loads(arguments)
+        except json.JSONDecodeError:
+            return {"arguments": arguments}
+        return parsed if isinstance(parsed, dict) else {"arguments": parsed}
+    return {}
+
+
+def _anthropic_tool_use_blocks(tool_calls: Any) -> list[dict]:
+    blocks: list[dict] = []
+    for call in tool_calls or []:
+        if not isinstance(call, dict):
+            continue
+        function = call.get("function") or {}
+        name = function.get("name")
+        call_id = call.get("id")
+        if not name or not call_id:
+            continue
+        blocks.append({
+            "type": "tool_use",
+            "id": call_id,
+            "name": name,
+            "input": _anthropic_tool_input(function.get("arguments")),
+        })
+    return blocks
+
+
+def _append_anthropic_message(messages: list[dict], role: str, content: list[dict]) -> None:
+    if messages and messages[-1]["role"] == role:
+        messages[-1]["content"].extend(content)
+        return
+    messages.append({"role": role, "content": content})
+
+
 def _anthropic_messages(messages: Optional[list[dict]], prompt: str) -> tuple[Optional[str], list[dict]]:
     if not messages:
         return None, [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
@@ -215,12 +253,40 @@ def _anthropic_messages(messages: Optional[list[dict]], prompt: str) -> tuple[Op
             if text:
                 system_parts.append(text)
             continue
-        if role not in {"user", "assistant"}:
-            role = "user"
-        converted.append({"role": role, "content": _anthropic_content_parts(msg.get("content"))})
+        if role == "assistant":
+            content = (
+                []
+                if msg.get("content") is None and msg.get("tool_calls")
+                else _anthropic_content_parts(msg.get("content"))
+            )
+            content.extend(_anthropic_tool_use_blocks(msg.get("tool_calls")))
+            _append_anthropic_message(converted, "assistant", content)
+            continue
+        if role == "tool":
+            tool_call_id = msg.get("tool_call_id")
+            content = [
+                {
+                    "type": "tool_result",
+                    "tool_use_id": tool_call_id,
+                    "content": _content_text(msg.get("content")),
+                }
+            ]
+            _append_anthropic_message(converted, "user", content)
+            continue
+        _append_anthropic_message(converted, "user", _anthropic_content_parts(msg.get("content")))
     if not converted:
         converted.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
     return ("\n\n".join(system_parts) if system_parts else None), converted
+
+
+def _anthropic_finish_reason(stop_reason: Any) -> str:
+    if stop_reason == "tool_use":
+        return "tool_calls"
+    if stop_reason == "max_tokens":
+        return "length"
+    if stop_reason == "end_turn":
+        return "stop"
+    return stop_reason or "stop"
 
 
 def _anthropic_tools(tools: list[dict]) -> list[dict]:
@@ -779,13 +845,21 @@ class GraeaeEngine:
                     )
                     for choice in result.get("choices") or []:
                         msg = choice.get("message") or {}
+                        index = choice.get("index", 0)
+                        if msg.get("role"):
+                            yield {"index": index, "role": msg["role"]}
                         content = msg.get("content")
                         if content:
-                            yield {"index": choice.get("index", 0), "content": content}
+                            yield {"index": index, "content": content}
                         if msg.get("tool_calls"):
-                            yield {"index": choice.get("index", 0), "tool_calls": msg["tool_calls"]}
+                            yield {"index": index, "tool_calls": msg["tool_calls"]}
+                        yield {
+                            "index": index,
+                            "finish_reason": choice.get("finish_reason") or result.get("finish_reason") or "stop",
+                        }
                     if not result.get("choices"):
                         yield {"index": 0, "content": result.get("response_text", "")}
+                        yield {"index": 0, "finish_reason": result.get("finish_reason") or "stop"}
             except Exception:
                 self._circuit_breakers.record_failure(provider)
                 self._quality.record_failure(provider)
@@ -976,10 +1050,17 @@ class GraeaeEngine:
                     continue
                 for choice in data.get("choices", []):
                     delta = choice.get("delta") or {}
-                    if delta.get("content"):
-                        yield {"index": choice.get("index", 0), "content": delta["content"]}
+                    chunk = {"index": choice.get("index", 0)}
+                    if delta.get("role"):
+                        chunk["role"] = delta["role"]
+                    if delta.get("content") is not None:
+                        chunk["content"] = delta["content"]
                     if delta.get("tool_calls"):
-                        yield {"index": choice.get("index", 0), "tool_calls": delta["tool_calls"]}
+                        chunk["tool_calls"] = delta["tool_calls"]
+                    if choice.get("finish_reason") is not None:
+                        chunk["finish_reason"] = choice["finish_reason"]
+                    if len(chunk) > 1:
+                        yield chunk
 
     async def _query_anthropic(
         self,
@@ -1043,7 +1124,7 @@ class GraeaeEngine:
             "response_text": text,
             "latency_ms": 0,
             "model_id": provider["model"],
-            "choices": [{"index": 0, "message": message, "finish_reason": data.get("stop_reason") or "stop"}],
+            "choices": [{"index": 0, "message": message, "finish_reason": _anthropic_finish_reason(data.get("stop_reason"))}],
         }
 
     async def _query_gemini(
