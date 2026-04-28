@@ -13,6 +13,7 @@ import importlib
 import json
 import sys
 import types
+import uuid
 
 
 class _Tool:
@@ -55,14 +56,26 @@ class _Server:
 
 class _SseServerTransport:
     def __init__(self, *_args, **_kwargs):
-        pass
+        self._read_stream_writers = {}
+        self._session_counter = 0
+        self.last_session_id = None
+        self.accepted_posts = []
 
     @contextlib.asynccontextmanager
     async def connect_sse(self, *_args, **_kwargs):
-        yield (None, None)
+        self._session_counter += 1
+        session_id = uuid.UUID(int=self._session_counter)
+        self.last_session_id = session_id
+        self._read_stream_writers[session_id] = object()
+        try:
+            yield (None, None)
+        finally:
+            self._read_stream_writers.pop(session_id, None)
 
-    async def handle_post_message(self, _scope, _receive, _send):
-        return None
+    async def handle_post_message(self, scope, _receive, send):
+        self.accepted_posts.append(scope.get("query_string", b""))
+        await send({"type": "http.response.start", "status": 202, "headers": []})
+        await send({"type": "http.response.body", "body": b"Accepted"})
 
 
 @contextlib.asynccontextmanager
@@ -71,6 +84,10 @@ async def _stdio_server():
 
 
 def _install_mcp_stubs(monkeypatch):
+    # api.mcp_tools imports FastAPI handlers. Load FastAPI against real Starlette
+    # before replacing only the MCP HTTP server's Starlette-facing modules below.
+    importlib.import_module("fastapi")
+
     uvicorn = types.ModuleType("uvicorn")
     uvicorn.run = lambda *_args, **_kwargs: None
 
@@ -101,9 +118,18 @@ def _install_mcp_stubs(monkeypatch):
             self.status_code = status_code
             self.headers = headers or {}
 
+        async def __call__(self, _scope, _receive, send):
+            await send({"type": "http.response.start", "status": self.status_code, "headers": []})
+            await send({"type": "http.response.body", "body": json.dumps(self.content).encode()})
+
     class PlainTextResponse:
-        def __init__(self, text):
+        def __init__(self, text, status_code=200):
             self.text = text
+            self.status_code = status_code
+
+        async def __call__(self, _scope, _receive, send):
+            await send({"type": "http.response.start", "status": self.status_code, "headers": []})
+            await send({"type": "http.response.body", "body": self.text.encode()})
 
     class Mount:
         def __init__(self, *args, **kwargs):
@@ -155,6 +181,76 @@ def _install_mcp_stubs(monkeypatch):
 def _fresh_import(module_name: str):
     sys.modules.pop(module_name, None)
     return importlib.import_module(module_name)
+
+
+async def _empty_receive():
+    return {"type": "http.request", "body": b"", "more_body": False}
+
+
+def _mcp_request(module, token: str):
+    principal = module.TOKEN_PRINCIPALS[token]
+    principal_id = module._principal_id(principal)
+    return types.SimpleNamespace(
+        scope={
+            "type": "http",
+            "method": "GET",
+            "path": "/sse",
+            "query_string": b"",
+            "headers": [],
+            "state": {
+                "mnemos_mcp_principal": principal,
+                "mnemos_mcp_principal_id": principal_id,
+            },
+        },
+        receive=_empty_receive,
+        _send=lambda _message: None,
+        state=types.SimpleNamespace(
+            mnemos_mcp_principal=principal,
+            mnemos_mcp_principal_id=principal_id,
+        ),
+    )
+
+
+async def _open_sse_session(monkeypatch, module, token: str):
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_run(*_args, **_kwargs):
+        started.set()
+        await release.wait()
+
+    monkeypatch.setattr(module.app, "run", blocking_run)
+    task = asyncio.create_task(module.handle_sse(_mcp_request(module, token)))
+    await asyncio.wait_for(started.wait(), timeout=1)
+    return module.sse.last_session_id.hex, release, task
+
+
+async def _post_message(module, token: str, session_id: str) -> tuple[int, str]:
+    principal = module.TOKEN_PRINCIPALS[token]
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "path": "/messages/",
+        "query_string": f"session_id={session_id}".encode(),
+        "headers": [],
+        "state": {
+            "mnemos_mcp_principal": principal,
+            "mnemos_mcp_principal_id": module._principal_id(principal),
+        },
+    }
+    events = []
+
+    async def send(message):
+        events.append(message)
+
+    await module.handle_post_message(scope, _empty_receive, send)
+    status = next(event["status"] for event in events if event["type"] == "http.response.start")
+    body = b"".join(
+        event.get("body", b"")
+        for event in events
+        if event["type"] == "http.response.body"
+    ).decode()
+    return status, body
 
 
 def test_stdio_tool_list_matches_canonical_registry(monkeypatch):
@@ -222,3 +318,51 @@ def test_http_token_map_sets_backend_user_attribution(monkeypatch):
     bob = mcp_http_server.TOKEN_PRINCIPALS["bob-mcp-token"]
     assert bob.user_id == "bob"
     assert bob.api_key == "bob-api-key"
+
+
+def test_http_sse_message_posts_are_bound_to_session_principal(monkeypatch):
+    _install_mcp_stubs(monkeypatch)
+    monkeypatch.setenv(
+        "MNEMOS_MCP_TOKENS",
+        "alice:alice-token:alice-api-key,bob:bob-token:bob-api-key",
+    )
+
+    _fresh_import("mcp_server")
+    mcp_http_server = _fresh_import("mcp_http_server")
+
+    async def exercise():
+        alice_session_id, alice_release, alice_task = await _open_sse_session(
+            monkeypatch,
+            mcp_http_server,
+            "alice-token",
+        )
+
+        status, body = await _post_message(mcp_http_server, "bob-token", alice_session_id)
+        assert status == 403
+        assert body == "session does not belong to caller"
+
+        status, body = await _post_message(mcp_http_server, "alice-token", alice_session_id)
+        assert status == 202
+        assert body == "Accepted"
+
+        alice_release.set()
+        await alice_task
+
+        status, body = await _post_message(mcp_http_server, "bob-token", alice_session_id)
+        assert status == 404
+        assert body == "session expired or never existed"
+
+        bob_session_id, bob_release, bob_task = await _open_sse_session(
+            monkeypatch,
+            mcp_http_server,
+            "bob-token",
+        )
+
+        status, body = await _post_message(mcp_http_server, "bob-token", bob_session_id)
+        assert status == 202
+        assert body == "Accepted"
+
+        bob_release.set()
+        await bob_task
+
+    asyncio.run(exercise())

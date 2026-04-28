@@ -27,10 +27,15 @@ Run:
 from __future__ import annotations
 
 import argparse
+import asyncio
+import hashlib
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from urllib.parse import parse_qs, quote
+from uuid import UUID
 
 import uvicorn
 from starlette.applications import Starlette
@@ -137,6 +142,14 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
 TOKEN_PRINCIPALS = _load_token_principals()
 
 
+def _principal_id(principal: MCPClientPrincipal) -> str:
+    """Return the stable caller identity used to bind SSE sessions."""
+    api_key_fingerprint = hashlib.sha256((principal.api_key or "").encode()).hexdigest()
+    if principal.user_id:
+        return f"user:{principal.user_id}:api:{api_key_fingerprint}"
+    return f"legacy-token:api:{api_key_fingerprint}"
+
+
 class BearerAuthMiddleware(BaseHTTPMiddleware):
     """Validate `Authorization: Bearer <token>` on every request before
     the SSE handshake or the POST-message endpoint sees it. Reject
@@ -162,10 +175,120 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": 'Bearer realm="mnemos-mcp"'},
             )
         request.state.mnemos_mcp_principal = principal
+        request.state.mnemos_mcp_principal_id = _principal_id(principal)
         return await call_next(request)
 
 
 sse = SseServerTransport("/messages/")
+_sse_session_principals: dict[str, str] = {}
+_sse_session_bind_lock = asyncio.Lock()
+
+
+def _session_id_key(session_id) -> str:
+    if isinstance(session_id, UUID):
+        return session_id.hex
+    session_id_text = str(session_id)
+    try:
+        return UUID(session_id_text).hex
+    except ValueError:
+        return session_id_text
+
+
+def _extract_session_id_from_scope(scope) -> str | None:
+    query_string = scope.get("query_string", b"")
+    if isinstance(query_string, str):
+        query_string = query_string.encode()
+    query_params = parse_qs(query_string.decode("latin-1"), keep_blank_values=True)
+    raw_session_id = (
+        query_params.get("session_id", [None])[0]
+        or query_params.get("sessionId", [None])[0]
+    )
+    if raw_session_id:
+        return _session_id_key(raw_session_id)
+
+    path = scope.get("path", "")
+    root_path = scope.get("root_path", "")
+    if root_path and path.startswith(root_path):
+        path = path[len(root_path):]
+    messages_prefix = "/messages/"
+    if path.startswith(messages_prefix) and len(path) > len(messages_prefix):
+        return _session_id_key(path[len(messages_prefix):].strip("/"))
+    if root_path.rstrip("/") == "/messages" and path.strip("/"):
+        return _session_id_key(path.strip("/"))
+    return None
+
+
+def _scope_state(scope) -> dict:
+    state = scope.get("state")
+    if isinstance(state, dict):
+        return state
+    return {}
+
+
+def _authenticated_principal_id_from_scope(scope) -> str | None:
+    state = _scope_state(scope)
+    principal_id = state.get("mnemos_mcp_principal_id")
+    if principal_id:
+        return principal_id
+    principal = state.get("mnemos_mcp_principal")
+    if principal is not None:
+        return _principal_id(principal)
+    return None
+
+
+@asynccontextmanager
+async def _bound_sse_connection(request, principal_id: str):
+    session_key = None
+    transport_context = sse.connect_sse(
+        request.scope, request.receive, request._send,
+    )
+    async with _sse_session_bind_lock:
+        before_sessions = set(getattr(sse, "_read_stream_writers", {}))
+        streams = await transport_context.__aenter__()
+        after_sessions = set(getattr(sse, "_read_stream_writers", {}))
+        new_sessions = after_sessions - before_sessions
+        if len(new_sessions) != 1:
+            await transport_context.__aexit__(None, None, None)
+            raise RuntimeError(
+                "Could not identify newly-created MCP SSE session for principal binding"
+            )
+        session_key = _session_id_key(new_sessions.pop())
+        _sse_session_principals[session_key] = principal_id
+
+    try:
+        yield streams
+    except BaseException as exc:
+        _sse_session_principals.pop(session_key, None)
+        await transport_context.__aexit__(type(exc), exc, exc.__traceback__)
+        raise
+    else:
+        _sse_session_principals.pop(session_key, None)
+        await transport_context.__aexit__(None, None, None)
+
+
+async def handle_post_message(scope, receive, send) -> None:
+    session_id = _extract_session_id_from_scope(scope)
+    if session_id is None:
+        response = PlainTextResponse("session_id is required", status_code=400)
+        return await response(scope, receive, send)
+
+    owner_principal_id = _sse_session_principals.get(session_id)
+    if owner_principal_id is None:
+        response = PlainTextResponse("session expired or never existed", status_code=404)
+        return await response(scope, receive, send)
+
+    caller_principal_id = _authenticated_principal_id_from_scope(scope)
+    if caller_principal_id != owner_principal_id:
+        response = PlainTextResponse("session does not belong to caller", status_code=403)
+        return await response(scope, receive, send)
+
+    if not scope.get("query_string"):
+        forwarded_scope = dict(scope)
+        forwarded_scope["query_string"] = f"session_id={quote(session_id)}".encode()
+    else:
+        forwarded_scope = scope
+
+    return await sse.handle_post_message(forwarded_scope, receive, send)
 
 
 async def handle_sse(request):
@@ -175,14 +298,15 @@ async def handle_sse(request):
     # Starlette exposes the underlying ASGI send via a private attr on
     # request; the SDK examples accept this trade for now.
     principal = getattr(request.state, "mnemos_mcp_principal", None)
+    principal_id = getattr(request.state, "mnemos_mcp_principal_id", None)
+    if principal_id is None and principal is not None:
+        principal_id = _principal_id(principal)
     context_tokens = set_mcp_backend_context(
         api_key=principal.api_key if principal else None,
         user_id=principal.user_id if principal else None,
     )
     try:
-        async with sse.connect_sse(
-            request.scope, request.receive, request._send,
-        ) as streams:
+        async with _bound_sse_connection(request, principal_id or "unknown") as streams:
             read_stream, write_stream = streams
             await app.run(
                 read_stream,
@@ -204,7 +328,7 @@ starlette_app = Starlette(
     routes=[
         Route("/healthz", endpoint=healthz),
         Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=sse.handle_post_message),
+        Mount("/messages/", app=handle_post_message),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
 )
