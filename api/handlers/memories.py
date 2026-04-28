@@ -30,6 +30,7 @@ from api.models import (
     RehydrationRequest,
     RehydrationResponse,
 )
+from api.security import is_root
 from api.visibility import handle_trigger_pgerror
 
 logger = logging.getLogger(__name__)
@@ -50,15 +51,6 @@ async def _rls_context(conn, user: UserContext):
             yield conn
     else:
         yield conn
-
-
-def _is_root(user: UserContext) -> bool:
-    """Root callers see all rows regardless of namespace — they're
-    the operational tier. Everyone else is scoped to their own
-    namespace at the app layer, as defense-in-depth against RLS
-    being disabled in personal-mode installs."""
-    return user.role == "root"
-
 
 def _read_visibility_predicate(
     user: UserContext, start_param_idx: int
@@ -179,13 +171,13 @@ async def list_memories(
     #     group/world-readable rows in team/enterprise mode.
     # Root callers see everything; explicit ?namespace= honored for
     # cross-tenant audit lookups.
-    is_root = _is_root(user)
-    if not is_root and namespace and namespace != user.namespace:
+    root = is_root(user)
+    if not root and namespace and namespace != user.namespace:
         raise HTTPException(
             status_code=403,
             detail="cross-namespace list requires root",
         )
-    effective_namespace = namespace if is_root else user.namespace
+    effective_namespace = namespace if root else user.namespace
 
     # Build dynamic WHERE clauses to avoid 4×2 hardcoded SQL branches.
     # Filter list is preserved across SELECT and COUNT — same params,
@@ -201,7 +193,7 @@ async def list_memories(
     if effective_namespace is not None:
         where_parts.append(f"namespace=${len(params) + 1}")
         params.append(effective_namespace)
-    if not is_root:
+    if not root:
         vis_clause, vis_params = _read_visibility_predicate(
             user, len(params) + 1,
         )
@@ -232,7 +224,7 @@ async def get_memory(
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
-            if _is_root(user):
+            if is_root(user):
                 row = await conn.fetchrow(
                     f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
                 )
@@ -304,7 +296,7 @@ async def get_compression_manifests(
             # leak their existence. RLS (when enabled) scopes owner_id
             # but never namespace; the app-layer filter here is
             # defense-in-depth for the RLS-disabled case too.
-            if _is_root(user):
+            if is_root(user):
                 exists = await conn.fetchval(
                     "SELECT 1 FROM memories WHERE id = $1",
                     memory_id,
@@ -439,7 +431,7 @@ async def search_memories(
     # controlled (a non-root user could search any namespace) and
     # owner_id was never passed at all. Root callers may pass any
     # namespace / owner to support cross-tenant audit.
-    if _is_root(user):
+    if is_root(user):
         search_owner_id = None  # no owner filter for root
         search_namespace = request.namespace  # honor caller's request
     else:
@@ -757,7 +749,7 @@ async def update_memory(
                 # affects zero rows and we 404.
                 set_sql = ", ".join(set_clauses)
                 try:
-                    if user.role == "root":
+                    if is_root(user):
                         row = await conn.fetchrow(
                             f"UPDATE memories SET {set_sql} "
                             f"WHERE id=$1 RETURNING {_lc._MEMORY_COLS}",
@@ -827,7 +819,7 @@ async def delete_memory(
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             try:
-                if user.role == "root":
+                if is_root(user):
                     result = await conn.execute(
                         "DELETE FROM memories WHERE id = $1", memory_id,
                     )
@@ -884,8 +876,8 @@ async def rehydrate_memories(
         raise HTTPException(status_code=503, detail="Database pool not available")
     # Same v3.1.2 Tier 3 pinning as /memories/search — rehydrate is a
     # read path for the caller's own corpus.
-    rehydrate_owner_id = None if _is_root(user) else user.user_id
-    rehydrate_namespace = None if _is_root(user) else user.namespace
+    rehydrate_owner_id = None if is_root(user) else user.user_id
+    rehydrate_namespace = None if is_root(user) else user.namespace
 
     # v3.2 compression-in-hot-paths: rehydrate is the canonical
     # "fit memories into a token budget" path, so it benefits most

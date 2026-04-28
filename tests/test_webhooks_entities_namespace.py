@@ -156,25 +156,25 @@ def test_entities_list_root_may_target_any_namespace(monkeypatch):
 
 
 def test_entities_assert_owned_requires_matching_namespace(monkeypatch):
-    """_assert_owned (used by get/patch/link) must check BOTH owner
+    """assert_owned_context (used by get/patch/link) must check BOTH owner
     and namespace for non-root. Cross-namespace access returns 404."""
-    from api.handlers import entities as ent
+    from api.security import assert_owned_context
 
     conn = _Conn(row={"owner_id": "alice", "namespace": "other-ns"})
 
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
-        asyncio.run(ent._assert_owned(conn, str(uuid.uuid4()), _alice("alice-ns")))
+        asyncio.run(assert_owned_context(conn, "entities", str(uuid.uuid4()), _alice("alice-ns")))
     assert exc.value.status_code == 404
 
 
 def test_entities_assert_owned_root_bypasses_namespace(monkeypatch):
-    from api.handlers import entities as ent
+    from api.security import assert_owned_context
 
     conn = _Conn(row={"owner_id": "bob", "namespace": "bob-ns"})
     # Root call — should NOT raise
-    result = asyncio.run(ent._assert_owned(conn, str(uuid.uuid4()), _root()))
-    assert result == ("bob", "bob-ns")
+    result = asyncio.run(assert_owned_context(conn, "entities", str(uuid.uuid4()), _root()))
+    assert (result.owner, result.namespace) == ("bob", "bob-ns")
 
 
 # ─── webhooks ────────────────────────────────────────────────────────────────

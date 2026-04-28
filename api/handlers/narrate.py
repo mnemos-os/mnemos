@@ -21,6 +21,7 @@ from pydantic import BaseModel, Field
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
+from api.security import is_root
 from compression.apollo import narrate_encoded
 
 
@@ -49,17 +50,10 @@ class NarrateResponse(BaseModel):
     engine_version: Optional[str] = None
 
 
-# ── helpers (mirror the tenancy pattern used elsewhere) ───────────────────
-
-
-def _is_root(user: UserContext) -> bool:
-    return user.role == "root"
-
-
 async def _fetch_memory(conn, memory_id: str, user: UserContext) -> Optional[dict]:
     """Fetch a memory subject to the two-axis tenancy gate. Root
     bypasses both owner_id and namespace filters."""
-    if _is_root(user):
+    if is_root(user):
         return await conn.fetchrow(
             "SELECT id, content FROM memories WHERE id = $1",
             memory_id,

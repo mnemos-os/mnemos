@@ -53,6 +53,7 @@ from pydantic import BaseModel, Field
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
+from api.security import is_root
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["portability"])
@@ -145,11 +146,6 @@ class ImportStats(BaseModel):
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
-
-
-def _is_root(user: UserContext) -> bool:
-    return user.role == "root"
-
 
 def _memory_to_record(row) -> MPFRecord:
     """Shape a memories-row dict into an MPFRecord(kind='memory').
@@ -458,7 +454,7 @@ async def export_memories(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    if _is_root(user):
+    if is_root(user):
         effective_owner = owner_id  # may be None = no filter
         effective_ns = namespace    # may be None = no filter
     else:
@@ -1998,7 +1994,7 @@ async def import_memories(
             detail=f"Unsupported MPF version {envelope.mpf_version!r}; expected {MPF_VERSION_PREFIX}x",
         )
 
-    if preserve_owner and not _is_root(user):
+    if preserve_owner and not is_root(user):
         raise HTTPException(
             status_code=403, detail="preserve_owner=true requires root",
         )
@@ -2033,7 +2029,7 @@ async def import_memories(
     # only import and rely on the trigger-fired default v1, or
     # ship kg_triples / compression_manifest sidecars (no trigger
     # interaction).
-    if envelope.memory_versions and not (preserve_owner and _is_root(user)):
+    if envelope.memory_versions and not (preserve_owner and is_root(user)):
         raise HTTPException(
             status_code=403,
             detail=(
@@ -2140,7 +2136,7 @@ async def import_memories(
             # finding). For root + preserve_owner=true, the dict is
             # the identity mapping — admin migration preserves ids.
             id_remap: Dict[str, str] = {}
-            non_root_id_rewrite = not (preserve_owner and _is_root(user))
+            non_root_id_rewrite = not (preserve_owner and is_root(user))
 
             for record in envelope.records:
                 if record.kind != "memory":
@@ -2427,7 +2423,7 @@ async def import_memories(
             # nonexistent ids. Root with preserve_owner=true: lookup
             # is unscoped — that's the migration/admin path where
             # cross-tenant resolution is the intended behavior.
-            if _is_root(user) and preserve_owner:
+            if is_root(user) and preserve_owner:
                 scope_owner: Optional[str] = None
                 scope_namespace: Optional[str] = None
             else:

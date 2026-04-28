@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 import api.lifecycle as _lc
 from api.auth import UserContext, get_current_user
+from api.security import scope_namespace, scope_owner
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["journal"])
@@ -35,26 +36,6 @@ class JournalEntry(BaseModel):
     metadata: Optional[dict]
     created: str
 
-
-def _scope_owner(user: UserContext, override: Optional[str]) -> str:
-    if override and override != user.user_id:
-        if user.role != "root":
-            raise HTTPException(status_code=403, detail="owner_id override requires root")
-        return override
-    return user.user_id
-
-
-def _scope_namespace(user: UserContext, override: Optional[str] = None) -> str:
-    if override and override != user.namespace:
-        if user.role != "root":
-            raise HTTPException(
-                status_code=403,
-                detail="cross-namespace access requires root",
-            )
-        return override
-    return user.namespace
-
-
 @router.post("/journal", status_code=201)
 async def create_journal_entry(
     req: JournalCreateRequest,
@@ -64,8 +45,8 @@ async def create_journal_entry(
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_owner = _scope_owner(user, owner_id)
-    target_ns = _scope_namespace(user, namespace)
+    target_owner = scope_owner(user, owner_id)
+    target_ns = scope_namespace(user, namespace)
     try:
         entry_id = str(uuid.uuid4())
         async with _lc._pool.acquire() as conn:
@@ -109,8 +90,8 @@ async def list_journal_entries(
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_owner = _scope_owner(user, owner_id)
-    target_ns = _scope_namespace(user, namespace)
+    target_owner = scope_owner(user, owner_id)
+    target_ns = scope_namespace(user, namespace)
     try:
         async with _lc._pool.acquire() as conn:
             if date_str:
@@ -162,8 +143,8 @@ async def delete_journal_entry(
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    target_owner = _scope_owner(user, owner_id)
-    target_ns = _scope_namespace(user, namespace)
+    target_owner = scope_owner(user, owner_id)
+    target_ns = scope_namespace(user, namespace)
     async with _lc._pool.acquire() as conn:
         result = await conn.execute(
             'DELETE FROM journal WHERE id = $1 AND owner_id = $2 AND namespace = $3',
