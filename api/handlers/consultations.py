@@ -485,7 +485,8 @@ async def list_audit_log(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
-        if _is_root(user):
+        is_root = _is_root(user)
+        if is_root:
             rows = await conn.fetch(
                 "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
                 "chain_hash, prev_id, task_type, provider, quality_score, created_at "
@@ -497,7 +498,7 @@ async def list_audit_log(
                 "WITH visible AS ("
                 "SELECT al.id, al.sequence_num AS global_sequence_num, "
                 "al.consultation_id, al.prompt_hash, al.response_hash, "
-                "al.chain_hash, al.task_type, al.provider, al.quality_score, "
+                "al.task_type, al.provider, al.quality_score, "
                 "al.created_at, "
                 "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
                 "LAG(al.id) OVER (ORDER BY al.sequence_num ASC) AS scoped_prev_id "
@@ -506,7 +507,8 @@ async def list_audit_log(
                 "WHERE c.owner_id = $1 "
                 ") "
                 "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, "
-                "prompt_hash, response_hash, chain_hash, scoped_prev_id AS prev_id, "
+                "prompt_hash, response_hash, NULL::text AS chain_hash, "
+                "scoped_prev_id AS prev_id, "
                 "task_type, provider, quality_score, created_at "
                 "FROM visible "
                 "ORDER BY global_sequence_num DESC LIMIT $2 OFFSET $3",
@@ -519,7 +521,7 @@ async def list_audit_log(
             consultation_id=str(r["consultation_id"]) if r["consultation_id"] else None,
             prompt_hash=r["prompt_hash"],
             response_hash=r["response_hash"],
-            chain_hash=r["chain_hash"],
+            chain_hash=r["chain_hash"] if is_root else None,
             prev_id=str(r["prev_id"]) if r["prev_id"] else None,
             task_type=r.get("task_type"),
             provider=r.get("provider"),

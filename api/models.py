@@ -361,7 +361,7 @@ class AuditLogEntry(BaseModel):
     consultation_id: Optional[str] = None
     prompt_hash: str
     response_hash: str
-    chain_hash: str
+    chain_hash: Optional[str] = None
     prev_id: Optional[str] = None
     task_type: Optional[str] = None
     provider: Optional[str] = None

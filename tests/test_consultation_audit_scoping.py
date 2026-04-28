@@ -101,6 +101,7 @@ async def test_list_audit_log_scopes_to_caller(
     assert {
         row["prev_id"] for row in alice_rows if row["prev_id"] is not None
     } <= {row["id"] for row in alice_rows}
+    assert all(row["chain_hash"] is None for row in alice_rows)
 
     current_user_override["user"] = _user("bob")
     bob_resp = await client.get("/v1/consultations/audit", headers=auth_headers)
@@ -114,12 +115,14 @@ async def test_list_audit_log_scopes_to_caller(
     assert {
         row["prev_id"] for row in bob_rows if row["prev_id"] is not None
     } <= {row["id"] for row in bob_rows}
+    assert all(row["chain_hash"] is None for row in bob_rows)
 
 
 async def test_list_audit_log_root_sees_all(
     client: AsyncClient,
     auth_headers: dict,
     current_user_override: dict,
+    db_pool,
 ):
     ids = await _create_alice_bob_consultations(
         client, auth_headers, current_user_override,
@@ -137,6 +140,13 @@ async def test_list_audit_log_root_sees_all(
         assert rows_by_sequence[sequence_num]["prev_id"] == rows_by_sequence[
             sequence_num - 1
         ]["id"]
+    stored_by_sequence = {
+        row["sequence_num"]: row["chain_hash"] for row in db_pool.state["audit_log"]
+    }
+    assert {
+        sequence_num: row["chain_hash"]
+        for sequence_num, row in rows_by_sequence.items()
+    } == stored_by_sequence
 
 
 async def test_verify_audit_chain_scopes_to_caller(
