@@ -188,7 +188,6 @@ backup_count = 5
 host = "0.0.0.0"
 port = 5002           # Default port; override with MNEMOS_PORT env var
 debug = false
-workers = 4
 
 [features]
 compression = true

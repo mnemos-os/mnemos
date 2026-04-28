@@ -242,8 +242,9 @@ class TestWebhookIntegration:
 
             try:
                 await dispatch(
-                    conn, "memory.created",
+                    "memory.created",
                     {"memory_id": "mem_test"},
+                    conn=conn,
                     owner_id="default", namespace="default",
                 )
 

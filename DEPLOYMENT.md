@@ -33,10 +33,19 @@ python install.py
 
 # Start MNEMOS server
 export $(cat .env | grep -v '#' | xargs)
-python -m uvicorn api_server:app --host $MNEMOS_BIND --port $MNEMOS_PORT --workers $MNEMOS_WORKERS
+python -m uvicorn api_server:app --host $MNEMOS_BIND --port $MNEMOS_PORT
 ```
 
 The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
+
+---
+
+## Single-Worker Runtime
+
+MNEMOS v3.5 runs single-worker by design. In-process state (rate limiter,
+dispatch semaphores, recovery worker) is not yet externalized. Horizontal
+scaling is on the v4 roadmap. Operators wanting throughput should scale memory
+size + DB; do not increase workers.
 
 ---
 
@@ -454,7 +463,6 @@ PG_POOL_SIZE=50
 
 MNEMOS_BIND=0.0.0.0
 MNEMOS_PORT=5002
-MNEMOS_WORKERS=1  # Keep at 1 for in-process state
 
 MNEMOS_API_KEY=$(openssl rand -hex 32)
 
@@ -487,8 +495,7 @@ WorkingDirectory=/opt/mnemos
 EnvironmentFile=/opt/mnemos/.env
 ExecStart=/usr/bin/python3 -m uvicorn api_server:app \
   --host ${MNEMOS_BIND} \
-  --port ${MNEMOS_PORT} \
-  --workers ${MNEMOS_WORKERS}
+  --port ${MNEMOS_PORT}
 Restart=always
 RestartSec=10
 

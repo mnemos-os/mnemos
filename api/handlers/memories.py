@@ -526,27 +526,52 @@ async def create_memory(
     owner_id = request.owner_id or user.user_id
     namespace = request.namespace or user.namespace
 
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
-            async with conn.transaction():
-                meta = json.dumps(request.metadata or {"source": request.source})
-                verbatim = request.verbatim_content if request.verbatim_content is not None else request.content
-                await conn.execute(
-                    "INSERT INTO memories "
-                    "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
-                    "owner_id, namespace, permission_mode, "
-                    "source_model, source_provider, source_session, source_agent) "
-                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-                    mem_id, request.content, request.category, request.subcategory, meta, verbatim,
-                    owner_id, namespace, 600,
-                    request.source_model, request.source_provider,
-                    request.source_session, request.source_agent,
-                )
-                # (trigger trg_memory_version_insert inserts version 1 automatically,
-                # computing commit_hash + branch; no explicit handler INSERT needed)
-                row = await conn.fetchrow(
-                    f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
-                )
+    try:
+        async with _lc._pool.acquire() as conn:
+            async with _rls_context(conn, user):
+                async with conn.transaction():
+                    meta = json.dumps(request.metadata or {"source": request.source})
+                    verbatim = (
+                        request.verbatim_content
+                        if request.verbatim_content is not None
+                        else request.content
+                    )
+                    await conn.execute(
+                        "INSERT INTO memories "
+                        "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
+                        "owner_id, namespace, permission_mode, "
+                        "source_model, source_provider, source_session, source_agent) "
+                        "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
+                        mem_id, request.content, request.category, request.subcategory, meta, verbatim,
+                        owner_id, namespace, 600,
+                        request.source_model, request.source_provider,
+                        request.source_session, request.source_agent,
+                    )
+                    # (trigger trg_memory_version_insert inserts version 1 automatically,
+                    # computing commit_hash + branch; no explicit handler INSERT needed)
+                    row = await conn.fetchrow(
+                        f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
+                    )
+                    from api.webhook_dispatcher import dispatch as _dispatch_webhook
+                    await _dispatch_webhook(
+                        "memory.created",
+                        {
+                            "memory_id": mem_id,
+                            "category": request.category,
+                            "subcategory": request.subcategory,
+                            "content": request.content,
+                            "owner_id": owner_id,
+                            "namespace": namespace,
+                        },
+                        conn=conn,
+                        owner_id=owner_id,
+                        namespace=namespace,
+                    )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("memory.create transaction failed for %s: %s", mem_id, e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Memory creation failed") from e
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
@@ -560,19 +585,6 @@ async def create_memory(
                 pass
         except Exception:
             pass
-    try:
-        from api.webhook_dispatcher import dispatch as _dispatch_webhook
-        async with _lc._pool.acquire() as _wh_conn:
-            await _dispatch_webhook(_wh_conn, "memory.created", {
-                "memory_id": mem_id,
-                "category": request.category,
-                "subcategory": request.subcategory,
-                "content": request.content,
-                "owner_id": owner_id,
-                "namespace": namespace,
-            }, owner_id=owner_id, namespace=namespace)
-    except Exception:
-        logger.warning("webhook dispatch failed for memory.created %s", mem_id, exc_info=True)
     return _row_to_memory(row)
 
 
@@ -587,42 +599,67 @@ async def bulk_create_memories(
     import time as _time
     created_ids: list[str] = []
     errors: list[str] = []
-    webhook_events: list[tuple[str, str, str, Optional[str], str, str]] = []
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
-            for i, mem in enumerate(request.memories):
-                if not mem.content.strip():
-                    errors.append(f"[{i}] content is empty")
-                    continue
-                try:
-                    if mem.owner_id and mem.owner_id != user.user_id and user.role != "root":
-                        errors.append(f"[{i}] owner_id override requires root")
-                        continue
-                    if mem.namespace and mem.namespace != user.namespace and user.role != "root":
-                        errors.append(f"[{i}] namespace override requires root")
-                        continue
-                    mid = f"mem_{int(_time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
-                    verbatim = mem.verbatim_content if mem.verbatim_content is not None else mem.content
-                    owner_id = mem.owner_id or user.user_id
-                    namespace = mem.namespace or user.namespace
-                    await conn.execute(
-                        "INSERT INTO memories "
-                        "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
-                        "owner_id, namespace, permission_mode, "
-                        "source_model, source_provider, source_session, source_agent) "
-                        "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-                        mid, mem.content, mem.category, mem.subcategory,
-                        json.dumps(mem.metadata or {}), verbatim,
-                        owner_id, namespace, 600,
-                        mem.source_model, mem.source_provider,
-                        mem.source_session, mem.source_agent,
-                    )
-                    created_ids.append(mid)
-                    webhook_events.append((
-                        mid, mem.content, mem.category, mem.subcategory, owner_id, namespace,
-                    ))
-                except Exception as e:
-                    errors.append(f"[{i}] {e}")
+    try:
+        from api.webhook_dispatcher import dispatch as _dispatch_webhook
+
+        async with _lc._pool.acquire() as conn:
+            async with _rls_context(conn, user):
+                async with conn.transaction():
+                    for i, mem in enumerate(request.memories):
+                        if not mem.content.strip():
+                            errors.append(f"[{i}] content is empty")
+                            continue
+                        if mem.owner_id and mem.owner_id != user.user_id and user.role != "root":
+                            errors.append(f"[{i}] owner_id override requires root")
+                            continue
+                        if mem.namespace and mem.namespace != user.namespace and user.role != "root":
+                            errors.append(f"[{i}] namespace override requires root")
+                            continue
+                        mid = f"mem_{int(_time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+                        verbatim = (
+                            mem.verbatim_content
+                            if mem.verbatim_content is not None
+                            else mem.content
+                        )
+                        owner_id = mem.owner_id or user.user_id
+                        namespace = mem.namespace or user.namespace
+                        try:
+                            async with conn.transaction():
+                                await conn.execute(
+                                    "INSERT INTO memories "
+                                    "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
+                                    "owner_id, namespace, permission_mode, "
+                                    "source_model, source_provider, source_session, source_agent) "
+                                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
+                                    mid, mem.content, mem.category, mem.subcategory,
+                                    json.dumps(mem.metadata or {}), verbatim,
+                                    owner_id, namespace, 600,
+                                    mem.source_model, mem.source_provider,
+                                    mem.source_session, mem.source_agent,
+                                )
+                        except Exception as e:
+                            errors.append(f"[{i}] {e}")
+                            continue
+                        created_ids.append(mid)
+                        await _dispatch_webhook(
+                            "memory.created",
+                            {
+                                "memory_id": mid,
+                                "category": mem.category,
+                                "subcategory": mem.subcategory,
+                                "content": mem.content,
+                                "owner_id": owner_id,
+                                "namespace": namespace,
+                            },
+                            conn=conn,
+                            owner_id=owner_id,
+                            namespace=namespace,
+                        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("memory.bulk_create transaction failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Bulk memory creation failed") from e
     if _lc._cache:
         try:
             await _lc._cache.delete("stats:global")
@@ -636,21 +673,6 @@ async def bulk_create_memories(
                 pass
         except Exception:
             pass
-    if webhook_events:
-        try:
-            from api.webhook_dispatcher import dispatch as _dispatch_webhook
-            async with _lc._pool.acquire() as _wh_conn:
-                for mid, content, category, subcategory, owner_id, namespace in webhook_events:
-                    await _dispatch_webhook(_wh_conn, "memory.created", {
-                        "memory_id": mid,
-                        "category": category,
-                        "subcategory": subcategory,
-                        "content": content,
-                        "owner_id": owner_id,
-                        "namespace": namespace,
-                    }, owner_id=owner_id, namespace=namespace)
-        except Exception:
-            logger.warning("webhook dispatch failed for memory.created bulk", exc_info=True)
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 
 
@@ -740,15 +762,19 @@ async def update_memory(
             pass
     try:
         from api.webhook_dispatcher import dispatch as _dispatch_webhook
-        async with _lc._pool.acquire() as _wh_conn:
-            await _dispatch_webhook(_wh_conn, "memory.updated", {
+        await _dispatch_webhook(
+            "memory.updated",
+            {
                 "memory_id": memory_id,
                 "category": row["category"],
                 "subcategory": row["subcategory"],
                 "content": row["content"],
                 "owner_id": row["owner_id"],
                 "namespace": row["namespace"],
-            }, owner_id=row["owner_id"], namespace=row["namespace"])
+            },
+            owner_id=row["owner_id"],
+            namespace=row["namespace"],
+        )
     except Exception:
         logger.warning("webhook dispatch failed for memory.updated %s", memory_id, exc_info=True)
     return _lc._row_to_memory(row)
@@ -798,12 +824,16 @@ async def delete_memory(
             pass
     try:
         from api.webhook_dispatcher import dispatch as _dispatch_webhook
-        async with _lc._pool.acquire() as _wh_conn:
-            await _dispatch_webhook(_wh_conn, "memory.deleted", {
+        await _dispatch_webhook(
+            "memory.deleted",
+            {
                 "memory_id": memory_id,
                 "owner_id": user.user_id,
                 "namespace": user.namespace,
-            }, owner_id=user.user_id, namespace=user.namespace)
+            },
+            owner_id=user.user_id,
+            namespace=user.namespace,
+        )
     except Exception:
         logger.warning("webhook dispatch failed for memory.deleted %s", memory_id, exc_info=True)
 

@@ -11,10 +11,10 @@ WorkingDirectory=/opt/mnemos
 Environment="PATH=/opt/mnemos/venv/bin"
 EnvironmentFile=/opt/mnemos/.env
 # Canonical port is 5002; this overrides [api].port in config.toml if different
+# MNEMOS v3.5 is single-worker by design; do not configure multiple Uvicorn workers.
 ExecStart=/opt/mnemos/venv/bin/python -m uvicorn api_server:app \
     --host 0.0.0.0 \
     --port 5002 \
-    --workers 1 \
     --log-level info
 
 # Auto-restart on failure

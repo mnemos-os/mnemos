@@ -14,6 +14,8 @@ from typing import Dict, Any
 from datetime import datetime, timezone
 from uuid import uuid4
 
+from api.auth import UserContext
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,9 +61,17 @@ class SessionStartHook:
         # Load state if available
         try:
             if self.state_manager:
-                logger.debug("Loading session state from StateManager")
-                state = await self._load_state()
-                context['state'] = state
+                user = context.get('user') or context.get('user_context')
+                if user is None:
+                    logger.warning(
+                        "StateManager configured but no UserContext in hook context; "
+                        "skipping state load"
+                    )
+                    context['state'] = {}
+                else:
+                    logger.debug("Loading session state from StateManager")
+                    state = await self._load_state(user)
+                    context['state'] = state
             else:
                 logger.debug("No StateManager configured, skipping state load")
         except Exception as e:
@@ -91,7 +101,7 @@ class SessionStartHook:
         logger.info(f"Session initialized: {context['session_id']}")
         return context
 
-    async def _load_state(self) -> Dict[str, Any]:
+    async def _load_state(self, user: UserContext) -> Dict[str, Any]:
         """Load session state
 
         Returns:
@@ -102,7 +112,7 @@ class SessionStartHook:
         try:
             # Load identity
             if hasattr(self.state_manager, 'load_identity'):
-                state['identity'] = await self.state_manager.load_identity()
+                state['identity'] = await self.state_manager.load_identity(user=user)
                 logger.debug("Loaded identity")
         except Exception as e:
             logger.debug(f"Could not load identity: {e}")
@@ -110,7 +120,7 @@ class SessionStartHook:
         try:
             # Load today
             if hasattr(self.state_manager, 'load_today'):
-                state['today'] = await self.state_manager.load_today()
+                state['today'] = await self.state_manager.load_today(user=user)
                 logger.debug("Loaded today")
         except Exception as e:
             logger.debug(f"Could not load today: {e}")
@@ -118,7 +128,7 @@ class SessionStartHook:
         try:
             # Load workspace
             if hasattr(self.state_manager, 'load_workspace'):
-                state['workspace'] = await self.state_manager.load_workspace()
+                state['workspace'] = await self.state_manager.load_workspace(user=user)
                 logger.debug("Loaded workspace")
         except Exception as e:
             logger.debug(f"Could not load workspace: {e}")
@@ -159,16 +169,20 @@ class SessionStartHook:
 
 async def session_start_hook(context: Dict[str, Any],
                             memory_store=None,
-                            state_manager=None) -> Dict[str, Any]:
+                            state_manager=None,
+                            user: UserContext | None = None) -> Dict[str, Any]:
     """Standalone session start hook function
 
     Args:
         context: Hook context
         memory_store: MemoryStore instance
         state_manager: StateManager instance
+        user: Optional UserContext to insert into context for scoped state
 
     Returns:
         Modified context
     """
+    if user is not None:
+        context = {**context, 'user': user}
     hook = SessionStartHook(memory_store, state_manager)
     return await hook(context)
