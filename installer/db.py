@@ -263,6 +263,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_5_webhook_succeeded_terminal_trigger.sql",
         repo_path / "db" / "migrations_v3_5_entities_namespace_unique.sql",
         repo_path / "db" / "migrations_v3_5_state_journal_namespace.sql",
+        repo_path / "db" / "migrations_v3_5_session_compression_ratio_drop.sql",
     ]
 
     print("[db] Running migrations...")
