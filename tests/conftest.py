@@ -14,6 +14,35 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
+def _clear_slowapi_limiter(limiter: Any) -> None:
+    reset = getattr(limiter, "reset", None)
+    if callable(reset):
+        reset()
+        return
+
+    storage = getattr(limiter, "_storage", None)
+    for method_name in ("reset", "clear"):
+        method = getattr(storage, method_name, None)
+        if callable(method):
+            method()
+            return
+
+    for attr_name in ("storage", "_cache"):
+        cache = getattr(storage, attr_name, None)
+        clear = getattr(cache, "clear", None)
+        if callable(clear):
+            clear()
+            return
+
+
+@pytest.fixture(autouse=True)
+def reset_rate_limiter_state():
+    """Prevent SlowAPI's in-memory buckets from leaking across tests."""
+    from api.rate_limit import limiter
+
+    _clear_slowapi_limiter(limiter)
+
+
 def _build_memory_row(
     memory_id: str,
     content: str,
@@ -265,18 +294,27 @@ class FakeConnection:
                 ]
                 rows = []
                 scoped_prev_id = None
+                verifier_query = "expected_prev_hash" in compact
                 for scoped_sequence_num, row in enumerate(
                     sorted(visible_rows, key=lambda item: item["sequence_num"]),
                     start=1,
                 ):
-                    rows.append(
-                        {
-                            **row,
-                            "global_sequence_num": row["sequence_num"],
-                            "sequence_num": scoped_sequence_num,
-                            "prev_id": scoped_prev_id,
-                        }
-                    )
+                    if verifier_query:
+                        rows.append(
+                            {
+                                **row,
+                                "scoped_sequence_num": scoped_sequence_num,
+                            }
+                        )
+                    else:
+                        rows.append(
+                            {
+                                **row,
+                                "global_sequence_num": row["sequence_num"],
+                                "sequence_num": scoped_sequence_num,
+                                "prev_id": scoped_prev_id,
+                            }
+                        )
                     scoped_prev_id = row["id"]
             elif "c.owner_id = $1" in compact:
                 owner_id = args[0]

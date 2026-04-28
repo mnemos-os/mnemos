@@ -215,9 +215,20 @@ async def test_verify_audit_chain_uses_actual_global_predecessor(
     data = resp.json()
     assert data["valid"] is False
     assert data["entries_checked"] == 2
-    assert data["entries_failed"] == [3]
-    assert data["first_broken_sequence"] == 3
+    assert data["entries_failed"] == [2]
+    assert data["first_broken_sequence"] == 2
+    assert "row 2" in data["message"]
+    assert "sequence 3" not in data["message"]
     assert "actual previous row" in data["message"]
+
+    current_user_override["user"] = _user("root", role="root")
+    root_resp = await client.get("/v1/consultations/audit/verify", headers=auth_headers)
+    assert root_resp.status_code == 200
+    root_data = root_resp.json()
+    assert root_data["valid"] is False
+    assert root_data["entries_checked"] == 3
+    assert root_data["entries_failed"] == [3]
+    assert root_data["first_broken_sequence"] == 3
 
 
 async def test_get_consultation_owner_scope(

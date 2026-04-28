@@ -554,7 +554,9 @@ async def verify_audit_chain(
             )
         else:
             rows = await conn.fetch(
-                "SELECT al.sequence_num, al.prompt_hash, al.response_hash, "
+                "SELECT al.sequence_num, "
+                "ROW_NUMBER() OVER (ORDER BY al.sequence_num ASC) AS scoped_sequence_num, "
+                "al.prompt_hash, al.response_hash, "
                 "al.chain_hash, al.prev_id, al.prev_chain_hash, "
                 "prev.chain_hash AS expected_prev_hash "
                 "FROM graeae_audit_log al "
@@ -619,12 +621,13 @@ async def verify_audit_chain(
 
     failures: dict[int, str] = {}
     for row in rows:
+        scoped_sequence_num = row["scoped_sequence_num"]
         stored_prev_chain = row["prev_chain_hash"]
         prev_chain = row["expected_prev_hash"] or _GENESIS_HASH
         if stored_prev_chain and stored_prev_chain != prev_chain:
             failures.setdefault(
-                row["sequence_num"],
-                f"Scoped chain broken at sequence {row['sequence_num']}: "
+                scoped_sequence_num,
+                f"Scoped chain broken at row {scoped_sequence_num}: "
                 "stored previous hash does not match actual previous row",
             )
         expected = hashlib.sha256(
@@ -632,8 +635,8 @@ async def verify_audit_chain(
         ).hexdigest()
         if expected != row["chain_hash"]:
             failures.setdefault(
-                row["sequence_num"],
-                f"Scoped chain broken at sequence {row['sequence_num']}: "
+                scoped_sequence_num,
+                f"Scoped chain broken at row {scoped_sequence_num}: "
                 f"expected {expected[:16]}..., stored {row['chain_hash'][:16]}...",
             )
 
