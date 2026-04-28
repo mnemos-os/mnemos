@@ -367,8 +367,8 @@ Sessions are DB-backed, revocable, and expire after 30 days by default. User pro
 For single-site HA, use PostgreSQL streaming replication: one writable primary,
 read-only standbys, and a stable writer endpoint for MNEMOS. Federation remains
 first-class, but it is for genuinely remote data flows: multi-site deployments,
-multi-org curated feeds, developer laptop replicas with intermittent
-connectivity, and planned v4 SQLite-based local-replica profiles.
+multi-org curated feeds, and developer laptop replicas with intermittent
+connectivity.
 
 Do not use federation between same-LAN MNEMOS nodes for HA; it creates
 application-level dedup work that PostgreSQL WAL streaming already solves below
@@ -637,9 +637,9 @@ curl http://localhost:5002/health
 ```
 
 MNEMOS v3.5 runs single-worker by design. In-process state (rate limiter,
-dispatch semaphores, recovery worker) is not yet externalized. Horizontal
-scaling is on the v4 roadmap. Operators wanting throughput should scale memory
-size + DB; do not increase workers.
+dispatch semaphores, recovery worker) is not yet externalized. Operators
+wanting throughput should scale memory size + DB; do not increase workers.
+Horizontal scaling is tracked in [`ROADMAP.md`](./ROADMAP.md).
 
 ---
 
