@@ -75,6 +75,60 @@ def _read_visibility_predicate(
     )
 
 
+async def _insert_memory_with_created_webhook(
+    *,
+    conn,
+    mem_id: str,
+    content: str,
+    category: str,
+    subcategory: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    owner_id: str,
+    namespace: str,
+    permission_mode: int = 600,
+    verbatim_content: Optional[str] = None,
+    source_model: Optional[str] = None,
+    source_provider: Optional[str] = None,
+    source_session: Optional[str] = None,
+    source_agent: Optional[str] = None,
+    fetch_row: bool = False,
+):
+    """Insert a canonical memory row and enqueue memory.created in the same txn."""
+    verbatim = verbatim_content if verbatim_content is not None else content
+    await conn.execute(
+        "INSERT INTO memories "
+        "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
+        "owner_id, namespace, permission_mode, "
+        "source_model, source_provider, source_session, source_agent) "
+        "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
+        mem_id, content, category, subcategory, json.dumps(metadata or {}), verbatim,
+        owner_id, namespace, permission_mode,
+        source_model, source_provider, source_session, source_agent,
+    )
+    row = None
+    if fetch_row:
+        row = await conn.fetchrow(
+            f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
+        )
+
+    from api.webhook_dispatcher import dispatch as _dispatch_webhook
+    await _dispatch_webhook(
+        "memory.created",
+        {
+            "memory_id": mem_id,
+            "category": category,
+            "subcategory": subcategory,
+            "content": content,
+            "owner_id": owner_id,
+            "namespace": namespace,
+        },
+        conn=conn,
+        owner_id=owner_id,
+        namespace=namespace,
+    )
+    return row
+
+
 async def _bump_recall_counters(memory_ids: list) -> None:
     """Increment recall_count + set last_recalled_at for a hit set.
 
@@ -530,42 +584,24 @@ async def create_memory(
         async with _lc._pool.acquire() as conn:
             async with _rls_context(conn, user):
                 async with conn.transaction():
-                    meta = json.dumps(request.metadata or {"source": request.source})
-                    verbatim = (
-                        request.verbatim_content
-                        if request.verbatim_content is not None
-                        else request.content
-                    )
-                    await conn.execute(
-                        "INSERT INTO memories "
-                        "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
-                        "owner_id, namespace, permission_mode, "
-                        "source_model, source_provider, source_session, source_agent) "
-                        "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-                        mem_id, request.content, request.category, request.subcategory, meta, verbatim,
-                        owner_id, namespace, 600,
-                        request.source_model, request.source_provider,
-                        request.source_session, request.source_agent,
-                    )
                     # (trigger trg_memory_version_insert inserts version 1 automatically,
                     # computing commit_hash + branch; no explicit handler INSERT needed)
-                    row = await conn.fetchrow(
-                        f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
-                    )
-                    from api.webhook_dispatcher import dispatch as _dispatch_webhook
-                    await _dispatch_webhook(
-                        "memory.created",
-                        {
-                            "memory_id": mem_id,
-                            "category": request.category,
-                            "subcategory": request.subcategory,
-                            "content": request.content,
-                            "owner_id": owner_id,
-                            "namespace": namespace,
-                        },
+                    row = await _insert_memory_with_created_webhook(
                         conn=conn,
+                        mem_id=mem_id,
+                        content=request.content,
+                        category=request.category,
+                        subcategory=request.subcategory,
+                        metadata=request.metadata or {"source": request.source},
                         owner_id=owner_id,
                         namespace=namespace,
+                        permission_mode=600,
+                        verbatim_content=request.verbatim_content,
+                        source_model=request.source_model,
+                        source_provider=request.source_provider,
+                        source_session=request.source_session,
+                        source_agent=request.source_agent,
+                        fetch_row=True,
                     )
     except HTTPException:
         raise

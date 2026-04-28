@@ -198,6 +198,7 @@ class FakeConnection:
                 "latency_ms": args[6],
                 "mode": args[7],
                 "owner_id": args[8],
+                "namespace": args[9],
                 "created": _utcnow(),
             }
             self.state["consultations"][consultation_id] = record

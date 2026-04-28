@@ -51,18 +51,19 @@ class EntityManager:
             return entity_id
         try:
             async with self.db_pool.acquire() as conn:
-                await conn.execute(
+                row = await conn.fetchrow(
                     '''INSERT INTO entities
                        (id, owner_id, namespace, entity_type, name, description, metadata)
                        VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
                        ON CONFLICT (owner_id, namespace, entity_type, name) DO UPDATE
                        SET description = COALESCE($6, entities.description),
-                           updated = NOW()''',
+                           updated = NOW()
+                       RETURNING id::text''',
                     entity_id, owner_id, namespace, entity_type, name,
                     description, json.dumps(metadata or {}),
                 )
             logger.debug(f"Created entity: {entity_type}/{name}")
-            return entity_id
+            return row["id"] if row else None
         except Exception as e:
             logger.error(f"Error creating entity: {e}", exc_info=True)
             return None

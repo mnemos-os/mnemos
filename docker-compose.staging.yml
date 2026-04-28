@@ -82,6 +82,7 @@ services:
       - ./db/migrations_v3_5_state_journal_namespace.sql:/docker-entrypoint-initdb.d/35-state-journal-namespace.sql
       - ./db/migrations_v3_5_session_compression_ratio_drop.sql:/docker-entrypoint-initdb.d/36-session-compression-ratio-drop.sql
       - ./db/migrations_v3_5_session_compression_legacy_drop.sql:/docker-entrypoint-initdb.d/37-session-compression-legacy-drop.sql
+      - ./db/migrations_v3_5_sessions_consultations_namespace.sql:/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -113,6 +114,7 @@ services:
       - ./db/migrations_v3_5_state_journal_namespace.sql:/migrations/35-state-journal-namespace.sql:ro
       - ./db/migrations_v3_5_session_compression_ratio_drop.sql:/migrations/36-session-compression-ratio-drop.sql:ro
       - ./db/migrations_v3_5_session_compression_legacy_drop.sql:/migrations/37-session-compression-legacy-drop.sql:ro
+      - ./db/migrations_v3_5_sessions_consultations_namespace.sql:/migrations/38-sessions-consultations-namespace.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -129,7 +131,8 @@ services:
       -f /migrations/34-entities-namespace-unique.sql
       -f /migrations/35-state-journal-namespace.sql
       -f /migrations/36-session-compression-ratio-drop.sql
-      -f /migrations/37-session-compression-legacy-drop.sql"
+      -f /migrations/37-session-compression-legacy-drop.sql
+      -f /migrations/38-sessions-consultations-namespace.sql"
     restart: "no"
 
   mnemos:

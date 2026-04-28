@@ -53,6 +53,7 @@ EXPECTED_MIGRATIONS = [
     "migrations_v3_5_state_journal_namespace.sql",
     "migrations_v3_5_session_compression_ratio_drop.sql",
     "migrations_v3_5_session_compression_legacy_drop.sql",
+    "migrations_v3_5_sessions_consultations_namespace.sql",
 ]
 
 
@@ -247,6 +248,10 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "/docker-entrypoint-initdb.d/37-session-compression-legacy-drop.sql"
         ) in text, compose_name
         assert (
+            "./db/migrations_v3_5_sessions_consultations_namespace.sql:"
+            "/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql"
+        ) in text, compose_name
+        assert (
             "./db/migrations_v3_5_trigger_same_memory_parent.sql:"
             "/migrations/24-trigger-same-memory-parent.sql:ro"
         ) in text, compose_name
@@ -302,6 +307,10 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
             "./db/migrations_v3_5_session_compression_legacy_drop.sql:"
             "/migrations/37-session-compression-legacy-drop.sql:ro"
         ) in text, compose_name
+        assert (
+            "./db/migrations_v3_5_sessions_consultations_namespace.sql:"
+            "/migrations/38-sessions-consultations-namespace.sql:ro"
+        ) in text, compose_name
         assert "psql -h postgres -U mnemos_user -d mnemos" in text, compose_name
         assert "-v ON_ERROR_STOP=1" in text, compose_name
         assert "-f /migrations/24-trigger-same-memory-parent.sql" in text, compose_name
@@ -318,6 +327,7 @@ def test_compose_files_run_v3_5_upgrades_for_existing_volumes():
         assert "-f /migrations/35-state-journal-namespace.sql" in text, compose_name
         assert "-f /migrations/36-session-compression-ratio-drop.sql" in text, compose_name
         assert "-f /migrations/37-session-compression-legacy-drop.sql" in text, compose_name
+        assert "-f /migrations/38-sessions-consultations-namespace.sql" in text, compose_name
         assert "postgres-upgrade:\n        condition: service_completed_successfully" in text, compose_name
 
 

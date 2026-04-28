@@ -147,7 +147,8 @@ test:integration:
         db/migrations_v3_5_entities_namespace_unique.sql \
         db/migrations_v3_5_state_journal_namespace.sql \
         db/migrations_v3_5_session_compression_ratio_drop.sql \
-        db/migrations_v3_5_session_compression_legacy_drop.sql; do
+        db/migrations_v3_5_session_compression_legacy_drop.sql \
+        db/migrations_v3_5_sessions_consultations_namespace.sql; do
         if [ -f "$f" ]; then
           echo "applying $f"
           psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"

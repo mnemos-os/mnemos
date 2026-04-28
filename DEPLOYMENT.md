@@ -276,15 +276,26 @@ when the data directory is first initialized. They do not re-run when an
 existing `postgres_data` volume starts with newer migration files mounted.
 For v3.5-dev, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
-then applies the v3.5 upgrade migrations through
-`db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql` before the MNEMOS service
-starts.
+then applies the v3.5 upgrade tail before the MNEMOS service starts.
 
-Fresh volumes still receive these migrations from the initdb mounts, ending at
-`/docker-entrypoint-initdb.d/33-webhook-succeeded-terminal-trigger.sql`. Existing volumes
-receive the same SQL through `/migrations/33-webhook-succeeded-terminal-trigger.sql` in
-the one-shot service. Keep the compose mounts and `installer/db.py` /
-`install.py` migration order in sync.
+The canonical order lives in `install.py` and `installer/db.py`; compose must
+mirror those loaders. Current v3.5-dev upgrade tail is prefixes 24-38, in
+order:
+`trigger-same-memory-parent`, `rls-group-select-unix-bits`,
+`webhook-retry-terminal-state`, `webhook-attempt-lease`,
+`webhook-writer-revision`, `webhook-status-updated-at`,
+`webhook-superseded-marker`, `webhook-attempt-unique`,
+`webhook-succeeded-unique`, `webhook-succeeded-terminal-trigger`,
+`entities-namespace-unique`, `state-journal-namespace`,
+`session-compression-ratio-drop`, `session-compression-legacy-drop`, and
+`sessions-consultations-namespace`.
+
+Fresh volumes receive these migrations from the initdb mounts, ending at
+`/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql`. Existing
+volumes receive the same SQL through `/migrations/24-...sql` through
+`/migrations/38-sessions-consultations-namespace.sql` in the one-shot
+`postgres-upgrade` service. Use the `docker-compose.yml` `postgres-upgrade`
+service block as the example for manual upgrades.
 
 ---
 
@@ -444,9 +455,27 @@ sudo -u postgres createuser -P mnemos  # Enter password interactively
 # Run migrations in canonical order
 python install.py
 
-# Existing DBs on v3.4.1 that only need the v3.5 trigger replacement:
+# Existing DBs on v3.4.1 must apply v3.5 migrations 24-38 in order.
+# The compose one-shot is the canonical example for existing volumes:
+docker compose up postgres-upgrade
+
+# For non-compose installs, follow the same order as install.py / installer/db.py:
 psql -U mnemos -d mnemos -v ON_ERROR_STOP=1 \
-  -f db/migrations_v3_5_trigger_same_memory_parent.sql
+  -f db/migrations_v3_5_trigger_same_memory_parent.sql \
+  -f db/migrations_v3_5_rls_group_select_unix_bits.sql \
+  -f db/migrations_v3_5_webhook_retry_terminal_state.sql \
+  -f db/migrations_v3_5_webhook_attempt_lease.sql \
+  -f db/migrations_v3_5_webhook_writer_revision.sql \
+  -f db/migrations_v3_5_webhook_status_updated_at.sql \
+  -f db/migrations_v3_5_webhook_superseded_marker.sql \
+  -f db/migrations_v3_5_webhook_attempt_unique.sql \
+  -f db/migrations_v3_5_webhook_succeeded_unique.sql \
+  -f db/migrations_v3_5_webhook_succeeded_terminal_trigger.sql \
+  -f db/migrations_v3_5_entities_namespace_unique.sql \
+  -f db/migrations_v3_5_state_journal_namespace.sql \
+  -f db/migrations_v3_5_session_compression_ratio_drop.sql \
+  -f db/migrations_v3_5_session_compression_legacy_drop.sql \
+  -f db/migrations_v3_5_sessions_consultations_namespace.sql
 
 # Verify
 psql -U mnemos -d mnemos -c "SELECT version();"
