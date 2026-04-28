@@ -587,6 +587,7 @@ async def bulk_create_memories(
     import time as _time
     created_ids: list[str] = []
     errors: list[str] = []
+    webhook_events: list[tuple[str, str, str, Optional[str], str, str]] = []
     async with _lc._pool.acquire() as conn:
         async with _rls_context(conn, user):
             for i, mem in enumerate(request.memories):
@@ -617,6 +618,9 @@ async def bulk_create_memories(
                         mem.source_session, mem.source_agent,
                     )
                     created_ids.append(mid)
+                    webhook_events.append((
+                        mid, mem.content, mem.category, mem.subcategory, owner_id, namespace,
+                    ))
                 except Exception as e:
                     errors.append(f"[{i}] {e}")
     if _lc._cache:
@@ -632,6 +636,21 @@ async def bulk_create_memories(
                 pass
         except Exception:
             pass
+    if webhook_events:
+        try:
+            from api.webhook_dispatcher import dispatch as _dispatch_webhook
+            async with _lc._pool.acquire() as _wh_conn:
+                for mid, content, category, subcategory, owner_id, namespace in webhook_events:
+                    await _dispatch_webhook(_wh_conn, "memory.created", {
+                        "memory_id": mid,
+                        "category": category,
+                        "subcategory": subcategory,
+                        "content": content,
+                        "owner_id": owner_id,
+                        "namespace": namespace,
+                    }, owner_id=owner_id, namespace=namespace)
+        except Exception:
+            logger.warning("webhook dispatch failed for memory.created bulk", exc_info=True)
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 
 
