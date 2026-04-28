@@ -40,6 +40,33 @@ The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
 
 ---
 
+## MCP HTTP/SSE Auth
+
+The stdio MCP server and HTTP/SSE MCP server expose the same canonical tool
+registry. For local single-user stdio clients, set `MNEMOS_BASE` and
+`MNEMOS_API_KEY` in the client MCP config so tool calls reach the REST API under
+that API key's backend identity.
+
+For HTTP/SSE connectors, prefer per-user token issuance:
+
+```bash
+MNEMOS_MCP_TOKENS=alice:<alice-mnemos-api-key>,bob:<bob-mnemos-api-key>
+MNEMOS_BASE=http://mnemos:5002
+python3 mcp_http_server.py --host 127.0.0.1 --port 5004
+```
+
+Each `MNEMOS_MCP_TOKENS` entry is `user_id:token`. The token is accepted at the
+MCP edge and is also used as the backend MNEMOS API key, so the REST API applies
+that user's normal tenancy. If the connector-facing bearer token must differ
+from the backend API key, use `user_id:mcp_token:api_key`.
+
+Legacy `MNEMOS_MCP_TOKEN` remains supported for single-user deployments. In that
+mode every accepted MCP HTTP client shares the process-level `MNEMOS_API_KEY`
+backend identity; the server logs a WARNING at startup so this collapse is
+operationally visible. Do not use shared-token mode for multi-tenant HTTP MCP.
+
+---
+
 ## v3.5 Federation Cursor Compatibility
 
 The v3.5 federation feed cursor is opaque and carries both `updated` and

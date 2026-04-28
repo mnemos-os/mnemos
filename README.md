@@ -44,6 +44,8 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, and consensus scoring with zero code change. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
 3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
 
+Current MCP tools come from one registry shared by stdio and HTTP/SSE: `search_memories`, `list_memories`, `get_memory`, `create_memory`, `update_memory`, `delete_memory`, `bulk_create_memories`, `get_stats`, `kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`, `delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`, `checkout_memory`, and `recommend_model`.
+
 ### Today's integration inventory
 
 - **[Claude Code](https://www.anthropic.com/claude-code)** — drop-in hooks (session-start / user-prompt-submit / stop), skill config, and MCP server. See `integrations/claude-code/`. *MCP.*

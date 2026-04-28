@@ -111,6 +111,7 @@ v3.5 is in flight on `v3.5-dev`. Closed items below are merged into the branch; 
 - ✅ **#20 webhook retry state machine** (`pending commit`). `api/webhook_dispatcher.py` now terminalizes superseded failed attempts as `retry_scheduled`, recovery excludes retry rows that already have successors, and `db/migrations_v3_5_webhook_retry_terminal_state.sql` repairs existing superseded rows.
 - ✅ **#21 federation stable cursor tie-breaker** (`pending commit`). `/v1/federation/feed` now uses an opaque `(updated, id)` cursor and `ORDER BY updated, id` so page boundaries inside identical timestamps do not skip rows. Per-peer ACL scope remains split to a later slice.
 - ✅ **#22 audit endpoint scoping** (`pending commit`). Consultation audit list and verify routes are owner-scoped for non-root callers, with root retaining global audit visibility.
+- ✅ **#24 MCP registry split-brain** (`pending commit`). `api/mcp_tools.py` is the canonical MCP registry for stdio and HTTP/SSE; DAG log/branch/diff/checkout and `recommend_model` are exposed through the live MCP transports, and HTTP/SSE supports per-user token maps instead of one shared backend principal.
 - 🔵 **#23 entity namespace conflict-key migration.** Namespace-aware conflict key for entity rows; still open.
 - 🔵 **#19 bulk webhook parity.** Bulk-create webhook behavior still differs from single-create.
 - 🔵 **#15 deletion-log refactor.** Parked; restore-drill cleanup still uses explicit `memory_branches` / `memory_versions` deletes.
@@ -167,7 +168,7 @@ Same code, same API, same KNOSSOS interop. Single-binary, embeddable, MemPalace-
 
 ### Track 6 — surface integrations (multi-vendor MCP + REST connectors)
 
-MNEMOS exposes a mature MCP server (`mcp_server.py`, 13 tools, working in Claude Code today). Goal: make MNEMOS the easiest memory layer to wire into *any* agent surface. v4.0 ships a connectors gallery + bridge tooling for the surfaces that don't natively speak MCP.
+MNEMOS exposes a mature MCP server (`mcp_server.py`, 18 tools from one canonical registry, working in Claude Code today). Goal: make MNEMOS the easiest memory layer to wire into *any* agent surface. v4.0 ships a connectors gallery + bridge tooling for the surfaces that don't natively speak MCP.
 
 | Surface | MCP support | Plan |
 |---|---|---|
@@ -210,6 +211,7 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 - ✅ HTTP/MCP branch creation had TOCTOU and duplicate-race windows — closed with `FOR SHARE` parent locks plus `INSERT ... ON CONFLICT DO NOTHING RETURNING` (`api/handlers/dag.py:341-450`, `api/mcp_tools.py:183-383`).
 - ✅ `mnemos_version_snapshot()` could write a parent edge to another memory if `memory_branches.head_version_id` was corrupt — closed by `db/migrations_v3_5_trigger_same_memory_parent.sql`, which raises `MN001` and lets `handle_trigger_pgerror` map it to HTTP 409.
 - ✅ `mnemos_group_select` used threshold math that admitted owner-only mode 700 for group members — closed by `db/migrations_v3_5_rls_group_select_unix_bits.sql`, which replaces the policy with the same Unix group-bit expression as `read_visibility_predicate`.
+- ✅ MCP stdio and HTTP/SSE exposed different tool surfaces — closed by moving CRUD/KG/DAG/model tool metadata and dispatch behind `api/mcp_tools.py::TOOL_REGISTRY`, with parity tests for stdio, HTTP/SSE, and per-token MCP HTTP attribution.
 
 ### Codex round 1 — 9-commit deep probe (early v3.2.x cycle)
 

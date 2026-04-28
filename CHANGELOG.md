@@ -85,6 +85,13 @@ federation compound-cursor tie-breaker, and consultation audit endpoint scoping.
 
 ### Fixed
 
+- **Slice 7 MCP split-brain (#24)** — `api/mcp_tools.py` is now the
+  canonical MCP tool registry for stdio and HTTP/SSE transports. The live MCP
+  surface includes CRUD, bulk create, stats, KG tools, DAG log/branch/diff/
+  checkout, and `recommend_model`, with registry parity tests pinning both
+  transports. HTTP/SSE now supports `MNEMOS_MCP_TOKENS=user:api_key` per-user
+  bearer issuance and logs a WARNING when legacy shared `MNEMOS_MCP_TOKEN`
+  mode would collapse clients onto one backend identity.
 - **Slice 6 consultation audit endpoint scoping (#22)** —
   `/v1/consultations/audit` now returns only the caller's consultation audit
   rows for non-root users, while root retains the global operational view.
