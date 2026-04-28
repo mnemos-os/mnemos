@@ -252,7 +252,7 @@ else
     echo -e "${YELLOW}⚠ Some tests failed. See above for details.${NC}"
     echo ""
     echo "Troubleshooting:"
-    echo "1. Is the API server running? (python3 api_server.py)"
+    echo "1. Is the API server running? (python3 -m mnemos.api.main)"
     echo "2. Is the database configured? (check .env)"
     echo "3. Is Python 3.11+ being used? (python3 --version)"
     echo "4. Are LLM provider keys set? (GROQ_API_KEY, TOGETHER_API_KEY, etc.)"

@@ -15,8 +15,8 @@ from typing import Any, List, Tuple
 
 import pytest
 
-import api.lifecycle as _lc
-from api.handlers.memories import _bump_recall_counters
+import mnemos.core.lifecycle as _lc
+from mnemos.api.routes.memories import _bump_recall_counters
 
 
 class _Conn:

@@ -49,6 +49,7 @@ ENV PG_USER=mnemos_user \
     PG_DATABASE=mnemos \
     PG_HOST=postgres \
     INFERENCE_EMBED_HOST=http://ollama:11434 \
+    MNEMOS_BIND=0.0.0.0 \
     MNEMOS_PORT=5002 \
     PYTHONUNBUFFERED=1
 
@@ -58,4 +59,4 @@ EXPOSE 5002
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5002/health').read()" || exit 1
 
-CMD ["python", "-m", "uvicorn", "api_server:app", "--host", "0.0.0.0", "--port", "5002", "--workers", "1"]
+CMD ["python", "-m", "mnemos.api.main"]

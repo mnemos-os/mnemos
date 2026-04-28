@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import pytest
 
-from api.auth import UserContext
-from modules.memory_categorization.entities import EntityManager
+from mnemos.api.dependencies import UserContext
+from mnemos.domain.memory_categorization.entities import EntityManager
 
 pytestmark = pytest.mark.asyncio
 

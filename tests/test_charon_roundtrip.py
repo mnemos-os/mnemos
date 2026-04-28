@@ -44,10 +44,11 @@ pytestmark = pytest.mark.skipif(
 
 @pytest_asyncio.fixture
 async def pool():
-    """asyncpg pool wired into api.lifecycle._pool so the portability
+    """asyncpg pool wired into mnemos.core.lifecycle._pool so the portability
     handlers can reach it the same way they would in production."""
     import asyncpg
-    import api.lifecycle as lc
+
+    import mnemos.core.lifecycle as lc
 
     pool = await asyncpg.create_pool(PG_URL, min_size=1, max_size=2)
     prior = lc._pool
@@ -266,7 +267,7 @@ async def _snapshot(pool) -> Dict[str, Any]:
 
 
 def _root_user():
-    from api.auth import UserContext
+    from mnemos.api.dependencies import UserContext
     return UserContext(
         user_id="root_admin", group_ids=[], role="root",
         namespace="default", authenticated=True,
@@ -282,7 +283,7 @@ async def test_charon_full_round_trip(fresh_db):
     → import(preserve_owner=True) → snapshot. The before-export and
     after-import snapshots must be identical."""
     pool = fresh_db
-    from api.handlers import portability
+    from mnemos.api.routes import portability
 
     await _seed(pool)
     before = await _snapshot(pool)
@@ -361,7 +362,7 @@ async def test_charon_re_import_is_idempotent(fresh_db):
     on-the-wire ON CONFLICT DO NOTHING contract translates to
     `imported=0, skipped=N` on the second pass."""
     pool = fresh_db
-    from api.handlers import portability
+    from mnemos.api.routes import portability
 
     await _seed(pool)
 
@@ -400,7 +401,7 @@ async def test_charon_export_omits_sidecars_when_flag_off(fresh_db):
     NOT carry the three sidecar arrays — back-compat with 0.1.0
     consumers that only know about kind=memory."""
     pool = fresh_db
-    from api.handlers import portability
+    from mnemos.api.routes import portability
 
     await _seed(pool)
 

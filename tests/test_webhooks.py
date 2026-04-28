@@ -23,26 +23,26 @@ class TestWebhookModuleWiring:
     """Confirm modules exist and expose the expected surface."""
 
     def test_handler_imports(self):
-        from api.handlers import webhooks
+        from mnemos.api.routes import webhooks
         assert hasattr(webhooks, "router")
         assert webhooks.router.prefix == "/v1/webhooks"
 
     def test_dispatcher_imports(self):
-        from api import webhook_dispatcher
+        from mnemos.webhooks import dispatcher as webhook_dispatcher
         assert hasattr(webhook_dispatcher, "dispatch")
         assert hasattr(webhook_dispatcher, "repair_worker_loop")
         assert hasattr(webhook_dispatcher, "delivery_worker_loop")
         assert hasattr(webhook_dispatcher, "_sign")
 
     def test_models_imported(self):
-        from api.models import (
+        from mnemos.domain.models import (
             VALID_WEBHOOK_EVENTS,
         )
         assert {"memory.created", "memory.updated", "memory.deleted",
                 "consultation.completed"} <= VALID_WEBHOOK_EVENTS
 
     def test_router_registered_in_app(self):
-        import api_server
+        import mnemos.api.main as api_server
         paths = {r.path for r in api_server.app.routes}
         webhook_paths = [p for p in paths if p.startswith("/v1/webhooks")]
         assert len(webhook_paths) >= 3, f"expected webhook routes, got: {webhook_paths}"
@@ -55,7 +55,7 @@ class TestWebhookSignature:
     """HMAC-SHA256 signature over raw body bytes."""
 
     def test_sign_matches_receiver_verification(self):
-        from api.webhook_dispatcher import _sign
+        from mnemos.webhooks.dispatcher import _sign
 
         secret = "test-secret-abc123"
         body = '{"event":"memory.created","data":{"id":"mem_x"}}'
@@ -69,19 +69,19 @@ class TestWebhookSignature:
         assert _sign(secret, body) == expected
 
     def test_sign_different_secrets_produce_different_signatures(self):
-        from api.webhook_dispatcher import _sign
+        from mnemos.webhooks.dispatcher import _sign
 
         body = '{"x": 1}'
         assert _sign("secret-a", body) != _sign("secret-b", body)
 
     def test_sign_different_bodies_produce_different_signatures(self):
-        from api.webhook_dispatcher import _sign
+        from mnemos.webhooks.dispatcher import _sign
 
         secret = "same"
         assert _sign(secret, '{"a":1}') != _sign(secret, '{"a":2}')
 
     def test_sign_is_hex_string_of_expected_length(self):
-        from api.webhook_dispatcher import _sign
+        from mnemos.webhooks.dispatcher import _sign
 
         sig = _sign("k", "body")
         assert len(sig) == 64  # SHA-256 hex is 64 chars
@@ -95,7 +95,7 @@ class TestEventValidation:
     """The handler's event allowlist."""
 
     def test_valid_events_accepted(self):
-        from api.handlers.webhooks import _validate_events
+        from mnemos.api.routes.webhooks import _validate_events
 
         # None of these should raise
         _validate_events(["memory.created"])
@@ -103,16 +103,18 @@ class TestEventValidation:
         _validate_events(["consultation.completed"])
 
     def test_empty_events_rejected(self):
-        from api.handlers.webhooks import _validate_events
         from fastapi import HTTPException
+
+        from mnemos.api.routes.webhooks import _validate_events
 
         with pytest.raises(HTTPException) as exc:
             _validate_events([])
         assert exc.value.status_code == 422
 
     def test_unknown_event_rejected(self):
-        from api.handlers.webhooks import _validate_events
         from fastapi import HTTPException
+
+        from mnemos.api.routes.webhooks import _validate_events
 
         with pytest.raises(HTTPException) as exc:
             _validate_events(["memory.created", "totally.made.up"])
@@ -122,8 +124,9 @@ class TestEventValidation:
     @pytest.mark.asyncio
     async def test_url_validation(self, monkeypatch):
         """URL validator rejects bad schemes, SSRF targets, and metadata hosts."""
-        from api.handlers import webhooks as wh
         from fastapi import HTTPException
+
+        from mnemos.api.routes import webhooks as wh
 
         async def _fake_resolve_addrs(host: str):
             if host == "localhost":
@@ -162,15 +165,15 @@ class TestRetrySchedule:
     """Retry schedule matches documented contract (1m / 5m / 30m / 2h)."""
 
     def test_backoff_values(self):
-        from api.webhook_dispatcher import BACKOFF_SCHEDULE
+        from mnemos.webhooks.dispatcher import BACKOFF_SCHEDULE
         assert BACKOFF_SCHEDULE == [60, 300, 1800, 7200]
 
     def test_max_attempts_matches_schedule_length(self):
-        from api.webhook_dispatcher import BACKOFF_SCHEDULE, MAX_ATTEMPTS
+        from mnemos.webhooks.dispatcher import BACKOFF_SCHEDULE, MAX_ATTEMPTS
         assert MAX_ATTEMPTS == len(BACKOFF_SCHEDULE)
 
     def test_delivery_timeout_reasonable(self):
-        from api.webhook_dispatcher import DELIVERY_TIMEOUT
+        from mnemos.webhooks.dispatcher import DELIVERY_TIMEOUT
         assert 1.0 <= DELIVERY_TIMEOUT <= 60.0
 
 
@@ -188,7 +191,8 @@ class TestWebhookIntegration:
     @pytest.mark.asyncio
     async def test_webhook_crud_roundtrip(self):
         import asyncpg
-        from api.handlers.webhooks import _to_item
+
+        from mnemos.api.routes.webhooks import _to_item
 
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
         try:
@@ -225,7 +229,8 @@ class TestWebhookIntegration:
     @pytest.mark.asyncio
     async def test_dispatch_writes_delivery_rows(self):
         import asyncpg
-        from api.webhook_dispatcher import dispatch
+
+        from mnemos.webhooks.dispatcher import dispatch
 
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
         try:

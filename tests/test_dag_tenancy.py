@@ -12,8 +12,8 @@ import asyncio
 
 import pytest
 
-from api.auth import UserContext
-from api.handlers.dag import _assert_memory_access
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes.dag import _assert_memory_access
 
 
 def _user(uid: str = "alice", ns: str = "default") -> UserContext:

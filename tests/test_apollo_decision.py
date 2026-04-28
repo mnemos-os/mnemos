@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from compression.apollo_schemas.decision import DecisionSchema
+from mnemos.domain.compression.apollo_schemas.decision import DecisionSchema
 
 
 @pytest.fixture

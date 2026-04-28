@@ -13,8 +13,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.auth import UserContext
-from api.handlers import openai_compat
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import openai_compat
 
 
 def _user() -> UserContext:
@@ -52,7 +52,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
@@ -60,7 +60,7 @@ def _install(monkeypatch, conn):
 
 def _install_no_pool(monkeypatch):
     """Simulate a pre-lifespan state where _pool is None."""
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     monkeypatch.setattr(lc, "_pool", None)
 
 

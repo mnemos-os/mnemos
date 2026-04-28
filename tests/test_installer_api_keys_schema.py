@@ -16,9 +16,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 REPO_ROOT = Path(__file__).parent.parent
-INSTALLER_DB = REPO_ROOT / "installer" / "db.py"
+INSTALLER_DB = REPO_ROOT / "mnemos" / "installer" / "db.py"
 MIGRATION = REPO_ROOT / "db" / "migrations_v1_multiuser.sql"
 
 
@@ -50,7 +49,7 @@ def _api_keys_columns_in_schema() -> set[str]:
 
 def _installer_inserts_columns() -> list[set[str]]:
     """Pull the column lists out of every INSERT INTO api_keys (...) in
-    installer/db.py — the file has three code paths (psycopg, psycopg2,
+    mnemos/installer/db.py — the file has three code paths (psycopg, psycopg2,
     psql-CLI fallback). All must match the schema."""
     src = INSTALLER_DB.read_text(encoding="utf-8")
     matches = re.findall(
@@ -58,7 +57,7 @@ def _installer_inserts_columns() -> list[set[str]]:
         src,
         flags=re.IGNORECASE,
     )
-    assert matches, "installer/db.py has no INSERT INTO api_keys — extraction broken"
+    assert matches, "mnemos/installer/db.py has no INSERT INTO api_keys — extraction broken"
     return [
         {col.strip().strip('"').lower() for col in m.split(",") if col.strip()}
         for m in matches
@@ -77,7 +76,7 @@ def test_installer_insert_columns_exist_in_schema():
     for i, installer_cols in enumerate(_installer_inserts_columns()):
         unknown = installer_cols - schema_cols
         assert not unknown, (
-            f"installer/db.py INSERT #{i+1} targets columns that do not exist on "
+            f"mnemos/installer/db.py INSERT #{i+1} targets columns that do not exist on "
             f"api_keys: {sorted(unknown)}. The schema columns are: "
             f"{sorted(schema_cols)}. This is #M31-04 — auth-enabled installs "
             f"will fail with 'column does not exist' at seed."
@@ -91,7 +90,7 @@ def test_installer_insert_supplies_required_nonnull_columns():
     for i, installer_cols in enumerate(_installer_inserts_columns()):
         missing = required - installer_cols
         assert not missing, (
-            f"installer/db.py INSERT #{i+1} is missing required NOT NULL "
+            f"mnemos/installer/db.py INSERT #{i+1} is missing required NOT NULL "
             f"columns: {sorted(missing)}. Present: {sorted(installer_cols)}."
         )
 
@@ -109,7 +108,7 @@ def test_installer_seeds_user_before_api_key():
         or re.search(r'\(\s*"default"', src)
     )
     assert has_default_ref, (
-        "installer/db.py never references the 'default' user when inserting "
+        "mnemos/installer/db.py never references the 'default' user when inserting "
         "api_keys — api_keys.user_id FK will fail. The migration seeds "
         "users(id='default'); the installer must reuse it."
     )

@@ -24,7 +24,8 @@ import pytest
 
 # Importing the module redirects stdout — restore it so pytest output works.
 _real_stdout = sys.stdout
-import tools.knossos_mcp as kn  # noqa: E402
+import mnemos.tools.knossos_mcp as kn  # noqa: E402
+
 sys.stdout = _real_stdout
 
 
@@ -446,7 +447,7 @@ async def test_kg_stats_relays_total_triples(rec):
 
 
 def test_tool_registry_matches_doc_claim():
-    """docs/KNOSSOS.md "Tool coverage v0.1" claims 16 implemented tools.
+    """docs/KNOSSOS.md "Tool coverage v0.1" claims 16 implemented mnemos.tools.
     The TOOLS dict must agree exactly so no doc/code drift slips in."""
     expected = {
         "mempalace_status",

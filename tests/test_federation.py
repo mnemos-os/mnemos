@@ -80,22 +80,22 @@ class _FeedPool:
 
 class TestFederationWiring:
     def test_federation_module_imports(self):
-        from api import federation
+        from mnemos.domain import federation
         for name in (
             "sync_peer",
             "federation_worker_loop",
             "FEDERATION_ID_PREFIX",
             "FEDERATION_BATCH_LIMIT",
         ):
-            assert hasattr(federation, name), f"api.federation missing: {name}"
+            assert hasattr(federation, name), f"mnemos.domain.federation missing: {name}"
 
     def test_federation_handler_router(self):
-        from api.handlers import federation as handler
+        from mnemos.api.routes import federation as handler
         assert hasattr(handler, "router")
         assert handler.router.prefix == "/v1/federation"
 
     def test_federation_models(self):
-        from api.models import (
+        from mnemos.domain.models import (
             FederationPeerCreateRequest,
         )
         req = FederationPeerCreateRequest(
@@ -106,14 +106,14 @@ class TestFederationWiring:
         assert req.sync_interval_secs == 300
 
     def test_router_registered_in_app(self):
-        import api_server
+        import mnemos.api.main as api_server
         paths = {r.path for r in api_server.app.routes}
         fed_paths = [p for p in paths if p.startswith("/v1/federation")]
         # peers CRUD (5) + sync (1) + log (1) + status (1) + feed (1) = 9 at minimum
         assert len(fed_paths) >= 5, f"expected federation routes, got: {fed_paths}"
 
     def test_feed_route_exists(self):
-        import api_server
+        import mnemos.api.main as api_server
         paths = {r.path for r in api_server.app.routes}
         assert "/v1/federation/feed" in paths
 
@@ -123,12 +123,12 @@ class TestFederationWiring:
 
 class TestFederationIdConvention:
     def test_prefix_constant(self):
-        from api.federation import FEDERATION_ID_PREFIX
+        from mnemos.domain.federation import FEDERATION_ID_PREFIX
         assert FEDERATION_ID_PREFIX == "fed:"
 
     def test_local_id_format_example(self):
         # Docs promise: fed:{peer_name}:{remote_id}
-        from api.federation import FEDERATION_ID_PREFIX
+        from mnemos.domain.federation import FEDERATION_ID_PREFIX
         peer = "alpha"
         remote_id = "mem_abc123"
         local = f"{FEDERATION_ID_PREFIX}{peer}:{remote_id}"
@@ -141,9 +141,9 @@ class TestFederationIdConvention:
 class TestFederationFeedCursor:
     @pytest.mark.asyncio
     async def test_same_timestamp_tie_pages_without_losing_rows(self, monkeypatch):
-        from api import federation as fed
-        import api.lifecycle as lc
-        from api.handlers import federation as handler
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+        from mnemos.domain import federation as fed
 
         updated = datetime(2026, 4, 27, 12, 0, 0)
         rows = [
@@ -171,8 +171,8 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_cross_timestamp_paging_advances_with_compound_cursor(self, monkeypatch):
-        import api.lifecycle as lc
-        from api.handlers import federation as handler
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
 
         t0 = datetime(2026, 4, 27, 12, 0, 0)
         t1 = t0 + timedelta(seconds=1)
@@ -196,9 +196,9 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_empty_feed_keeps_cursor_unchanged(self, monkeypatch):
-        from api import federation as fed
-        import api.lifecycle as lc
-        from api.handlers import federation as handler
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+        from mnemos.domain import federation as fed
 
         updated = datetime(2026, 4, 27, 12, 0, 0)
         cursor = fed._encode_feed_cursor(
@@ -220,9 +220,10 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_malformed_cursor_returns_bad_request(self, monkeypatch):
-        import api.lifecycle as lc
-        from api.handlers import federation as handler
         from fastapi import HTTPException
+
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 4, 27, 12, 0, 0)
         rows = [
@@ -249,9 +250,10 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_empty_malformed_cursor_response_returns_bad_request(self, monkeypatch):
-        import api.lifecycle as lc
-        from api.handlers import federation as handler
         from fastapi import HTTPException
+
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 4, 27, 12, 0, 0)
         pool = _FeedPool([
@@ -275,9 +277,9 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_feed_sql_uses_updated_id_tie_breaker(self, monkeypatch):
-        from api import federation as fed
-        import api.lifecycle as lc
-        from api.handlers import federation as handler
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+        from mnemos.domain import federation as fed
 
         pool = _FeedPool([])
         monkeypatch.setattr(lc, "_pool", pool)

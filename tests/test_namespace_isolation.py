@@ -92,9 +92,10 @@ async def _seed_api_key(conn, *, user_id: str, namespace: str, raw_key: str, rol
 @pytest_asyncio.fixture
 async def pg_app(monkeypatch):
     import asyncpg
-    import api.lifecycle as lc
-    from api.auth import configure_auth
-    from api_server import app
+
+    import mnemos.core.lifecycle as lc
+    from mnemos.api.dependencies import configure_auth
+    from mnemos.api.main import app
 
     assert PG_URL is not None
     prefix = f"nsiso{uuid.uuid4().hex[:12]}"

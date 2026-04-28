@@ -81,17 +81,16 @@ from typing import Dict, List, Optional
 # Repo-root path so the script runs whether via `-m` or direct file.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from compression.apollo import APOLLOEngine
-from compression.artemis import ARTEMISEngine
-from compression.base import CompressionRequest, IdentifierPolicy
-from compression.contest import run_contest
-from compression.judge import (
+from mnemos.domain.compression.apollo import APOLLOEngine
+from mnemos.domain.compression.artemis import ARTEMISEngine
+from mnemos.domain.compression.base import CompressionRequest, IdentifierPolicy
+from mnemos.domain.compression.contest import run_contest
+from mnemos.domain.compression.judge import (
     CrossEncoderJudge,
     EnsembleJudge,
     LLMJudge,
     NullJudge,
 )
-
 
 # ── helpers ───────────────────────────────────────────────────────────────
 

@@ -9,9 +9,10 @@ Tests verify:
 6. Distillation worker registration
 """
 
-import pytest
 import sys
 from pathlib import Path
+
+import pytest
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -23,7 +24,7 @@ class TestOpenAIGatewayStructure:
     def test_openai_compat_handler_exists(self):
         """Gateway handler module imports without error."""
         try:
-            from api.handlers import openai_compat
+            from mnemos.api.routes import openai_compat
             assert hasattr(openai_compat, 'router')
             assert openai_compat.router.routes  # Has registered routes
         except ImportError as e:
@@ -32,7 +33,7 @@ class TestOpenAIGatewayStructure:
     def test_openai_compat_router_registered(self):
         """OpenAI router is registered in app."""
         try:
-            import api_server
+            import mnemos.api.main as api_server
             route_paths = {route.path for route in api_server.app.routes}
             # Should have /v1/chat/completions and /v1/models endpoints
             v1_routes = {r for r in route_paths if '/v1/' in r}
@@ -43,7 +44,7 @@ class TestOpenAIGatewayStructure:
     def test_gateway_imports_graeae(self):
         """Gateway can import GRAEAE routing."""
         try:
-            from api.handlers.openai_compat import _route_to_provider
+            from mnemos.api.routes.openai_compat import _route_to_provider
             assert callable(_route_to_provider)
         except ImportError as e:
             pytest.fail(f"GRAEAE routing not available: {e}")
@@ -51,7 +52,7 @@ class TestOpenAIGatewayStructure:
     def test_gateway_imports_mnemos_search(self):
         """Gateway can import MNEMOS search."""
         try:
-            from api.handlers.openai_compat import _search_mnemos_context
+            from mnemos.api.routes.openai_compat import _search_mnemos_context
             assert callable(_search_mnemos_context)
         except ImportError as e:
             pytest.fail(f"MNEMOS search not available: {e}")
@@ -63,7 +64,7 @@ class TestSessionManagementStructure:
     def test_sessions_handler_exists(self):
         """Session handler module imports without error."""
         try:
-            from api.handlers import sessions
+            from mnemos.api.routes import sessions
             assert hasattr(sessions, 'router')
             assert sessions.router.routes
         except ImportError as e:
@@ -72,7 +73,7 @@ class TestSessionManagementStructure:
     def test_sessions_router_registered(self):
         """Sessions router is registered in app."""
         try:
-            import api_server
+            import mnemos.api.main as api_server
             route_paths = {route.path for route in api_server.app.routes}
             session_routes = {r for r in route_paths if '/sessions' in r}
             assert len(session_routes) > 0, "No /sessions routes found"
@@ -82,12 +83,12 @@ class TestSessionManagementStructure:
     def test_session_models_exist(self):
         """Session models are defined and importable."""
         try:
-            from api.models import (
+            from mnemos.domain.models import (
                 SessionContext,
+                SessionHistoryResponse,
+                SessionMessage,
                 SessionRequest,
                 SessionResponse,
-                SessionMessage,
-                SessionHistoryResponse,
             )
             # Verify BaseModel inheritance
             assert hasattr(SessionContext, 'model_fields')
@@ -105,7 +106,7 @@ class TestDAGImplementation:
     def test_dag_handler_exists(self):
         """DAG handler module imports without error."""
         try:
-            from api.handlers import dag
+            from mnemos.api.routes import dag
             assert hasattr(dag, 'router')
             assert dag.router.routes
         except ImportError as e:
@@ -114,7 +115,7 @@ class TestDAGImplementation:
     def test_dag_router_registered(self):
         """DAG router is registered in app."""
         try:
-            import api_server
+            import mnemos.api.main as api_server
             route_paths = {route.path for route in api_server.app.routes}
             dag_routes = {r for r in route_paths if '/branches' in r or '/commits' in r}
             assert len(dag_routes) > 0, "No DAG routes found"
@@ -124,7 +125,7 @@ class TestDAGImplementation:
     def test_dag_models_exist(self):
         """DAG models are defined."""
         try:
-            from api.handlers.dag import CommitInfo, BranchInfo, BranchCreateRequest
+            from mnemos.api.routes.dag import BranchCreateRequest, BranchInfo, CommitInfo
             assert hasattr(CommitInfo, 'model_fields')
             assert hasattr(BranchInfo, 'model_fields')
             assert hasattr(BranchCreateRequest, 'model_fields')
@@ -151,7 +152,7 @@ class TestCompressionStackV33:
     def test_apollo_engine_importable(self):
         """APOLLO is the schema-aware engine in the v3.3 stack."""
         try:
-            from compression.apollo import APOLLOEngine
+            from mnemos.domain.compression.apollo import APOLLOEngine
             assert APOLLOEngine.id == "apollo"
         except ImportError as e:
             pytest.fail(f"APOLLOEngine missing: {e}")
@@ -159,7 +160,7 @@ class TestCompressionStackV33:
     def test_artemis_engine_importable(self):
         """ARTEMIS is the CPU-only extractive engine in the v3.3 stack."""
         try:
-            from compression.artemis import ARTEMISEngine
+            from mnemos.domain.compression.artemis import ARTEMISEngine
             assert ARTEMISEngine.id == "artemis"
         except ImportError as e:
             pytest.fail(f"ARTEMISEngine missing: {e}")
@@ -167,7 +168,7 @@ class TestCompressionStackV33:
     def test_retired_engines_removed(self):
         """LETHE / ANAMNESIS / ALETHEIA must NOT be importable anymore.
         If a future commit re-introduces them, this test catches it."""
-        for module_name in ("compression.lethe", "compression.anamnesis", "compression.aletheia"):
+        for module_name in ("mnemos.domain.compression.lethe", "mnemos.domain.compression.anamnesis", "mnemos.domain.compression.aletheia"):
             try:
                 __import__(module_name)
                 pytest.fail(f"{module_name} should be gone in v3.3 — found it importable")
@@ -177,8 +178,8 @@ class TestCompressionStackV33:
     def test_compression_manager_removed(self):
         """CompressionManager was deleted in v3.3."""
         try:
-            __import__("compression.manager")
-            pytest.fail("compression.manager should be gone in v3.3")
+            __import__("mnemos.domain.compression.manager")
+            pytest.fail("mnemos.domain.compression.manager should be gone in v3.3")
         except ImportError:
             pass  # expected
 
@@ -189,7 +190,7 @@ class TestDistillationWorkerIntegration:
     def test_worker_in_lifecycle(self):
         """Distillation worker is registered in lifecycle."""
         try:
-            from api import lifecycle
+            from mnemos.core import lifecycle
             assert hasattr(lifecycle, '_run_distillation_worker')
             assert hasattr(lifecycle, '_worker_status')
         except ImportError as e:
@@ -198,7 +199,7 @@ class TestDistillationWorkerIntegration:
     def test_worker_status_in_health(self):
         """Worker status is included in health check."""
         try:
-            from api.models import HealthResponse
+            from mnemos.domain.models import HealthResponse
             # HealthResponse should have distillation_worker field
             fields = HealthResponse.model_fields
             assert 'distillation_worker' in fields
@@ -212,7 +213,7 @@ class TestModelOptimizerIntegration:
     def test_model_registry_recommend_exists(self):
         """Model recommendation endpoint exists."""
         try:
-            from api.handlers.providers import recommend_model
+            from mnemos.api.routes.providers import recommend_model
             assert callable(recommend_model)
         except ImportError as e:
             pytest.fail(f"Model recommendation endpoint missing: {e}")
@@ -220,7 +221,7 @@ class TestModelOptimizerIntegration:
     def test_optimizer_integration(self):
         """Gateway calls optimizer for auto model selection."""
         try:
-            from api.handlers.openai_compat import _get_model_recommendation
+            from mnemos.api.routes.openai_compat import _get_model_recommendation
             assert callable(_get_model_recommendation)
         except ImportError as e:
             pytest.fail(f"Optimizer integration missing: {e}")
@@ -232,7 +233,7 @@ class TestMCPToolsIntegration:
     def test_mcp_tools_module_exists(self):
         """MCP tools module exists."""
         try:
-            from api import mcp_tools
+            from mnemos.mcp import tools as mcp_tools
             assert hasattr(mcp_tools, 'TOOLS')
         except ImportError as e:
             pytest.fail(f"MCP tools module missing: {e}")
@@ -240,7 +241,7 @@ class TestMCPToolsIntegration:
     def test_required_tools_exist(self):
         """All required MCP tools are registered."""
         try:
-            from api.mcp_tools import TOOLS
+            from mnemos.mcp.tools import TOOLS
             required_tools = {
                 'log_memory',
                 'branch_memory',
@@ -319,7 +320,7 @@ class TestV3Surface:
     def test_expected_endpoints_present(self):
         """Core v3 routes are mounted on the app."""
         try:
-            import api_server
+            import mnemos.api.main as api_server
             route_paths = {route.path for route in api_server.app.routes}
             expected_routes = {'/v1/memories', '/v1/consultations', '/health'}
             for route in expected_routes:
@@ -331,7 +332,7 @@ class TestV3Surface:
     def test_memory_model_fields(self):
         """MemoryItem exposes the core v3 fields."""
         try:
-            from api.models import MemoryItem
+            from mnemos.domain.models import MemoryItem
             required_fields = {'id', 'content', 'category', 'created', 'metadata'}
             actual_fields = set(MemoryItem.model_fields.keys())
             assert required_fields.issubset(actual_fields), \

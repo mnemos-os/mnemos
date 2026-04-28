@@ -10,8 +10,8 @@ from fastapi.responses import StreamingResponse
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from api.auth import UserContext, get_current_user
-from api.handlers import openai_compat
+from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.routes import openai_compat
 
 
 def _user() -> UserContext:
@@ -41,7 +41,7 @@ class _PoolCtx:
 
 
 def _install_pool(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
@@ -524,7 +524,7 @@ class _RecorderConcurrency:
 
 
 def _engine_with_client(monkeypatch, data):
-    from graeae import engine as engine_module
+    from mnemos.domain.graeae import engine as engine_module
 
     engine = engine_module.GraeaeEngine()
     client = _Client(data)
@@ -538,7 +538,7 @@ def _engine_with_client(monkeypatch, data):
 
 
 def _stream_engine_gateway(monkeypatch, lines):
-    from graeae import engine as engine_module
+    from mnemos.domain.graeae import engine as engine_module
 
     engine = engine_module.GraeaeEngine()
     engine.providers = {
@@ -1041,7 +1041,7 @@ def test_chat_completion_unknown_model_returns_model_not_found_on_wire(monkeypat
     monkeypatch.setattr(openai_compat, "_search_mnemos_context", _no_context)
     monkeypatch.setattr(openai_compat, "_resolve_provider_for_model", _unknown_model)
 
-    from api_server import app
+    from mnemos.api.main import app
 
     async def _override_user():
         return _user()

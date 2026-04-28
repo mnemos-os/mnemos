@@ -2,7 +2,7 @@
 
 Codex memory-OS audit 019dbd11 flagged: "compression remains mostly
 out of the runtime retrieval path; both search and rehydrate
-explicitly defer real compression." This commit wires the v3.1
+explicitly defer real mnemos.domain.compression." This commit wires the v3.1
 contest winner into:
   - /v1/chat/completions context injection (_search_mnemos_context)
   - /v1/memories/rehydrate
@@ -25,7 +25,7 @@ import asyncio
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
-from api.auth import UserContext
+from mnemos.api.dependencies import UserContext
 
 
 def _alice() -> UserContext:
@@ -52,7 +52,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
@@ -62,7 +62,7 @@ def _install(monkeypatch, conn):
 
 
 def test_gateway_joins_variants_table(monkeypatch):
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     conn = _Conn()
     _install(monkeypatch, conn)
@@ -75,7 +75,7 @@ def test_gateway_joins_variants_table(monkeypatch):
 
 
 def test_gateway_uses_variant_content_when_available(monkeypatch):
-    from api.handlers import openai_compat
+    from mnemos.api.routes import openai_compat
 
     # The SQL COALESCEs (v.compressed_content, m.content) into a
     # column aliased as `content`. The mock returns what the
@@ -102,9 +102,9 @@ def test_gateway_uses_variant_content_when_available(monkeypatch):
 def test_search_large_results_do_not_probe_legacy_backend(monkeypatch):
     """Large search result sets keep the normal response shape without
     probing the removed DISTILLATION_BACKEND/OLLAMA_HOST path."""
-    import api.lifecycle as lc
-    from api.handlers import memories
-    from api.models import MemorySearchRequest
+    import mnemos.core.lifecycle as lc
+    from mnemos.api.routes import memories
+    from mnemos.domain.models import MemorySearchRequest
 
     async def _noop_recall_bump(_ids):
         return None
@@ -150,8 +150,8 @@ def test_search_large_results_do_not_probe_legacy_backend(monkeypatch):
 def test_rehydrate_joins_variants_and_tracks_variant_used(monkeypatch):
     """SQL must LEFT JOIN memory_compressed_variants and expose
     `variant_used` so the handler can report compression_applied."""
-    from api.handlers import memories
-    from api.models import RehydrationRequest
+    from mnemos.api.routes import memories
+    from mnemos.domain.models import RehydrationRequest
 
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
@@ -169,8 +169,8 @@ def test_rehydrate_joins_variants_and_tracks_variant_used(monkeypatch):
 def test_rehydrate_compression_applied_true_when_variant_present(monkeypatch):
     """If any row comes back with variant_used=True, the response
     reports compression_applied=True and a compression_ratio<1.0."""
-    from api.handlers import memories
-    from api.models import RehydrationRequest
+    from mnemos.api.routes import memories
+    from mnemos.domain.models import RehydrationRequest
 
     conn = _Conn(rows=[
         {
@@ -195,8 +195,8 @@ def test_rehydrate_compression_applied_true_when_variant_present(monkeypatch):
 
 def test_rehydrate_compression_applied_false_when_no_variants(monkeypatch):
     """No variant rows -> compression_applied=False, ratio=1.0."""
-    from api.handlers import memories
-    from api.models import RehydrationRequest
+    from mnemos.api.routes import memories
+    from mnemos.domain.models import RehydrationRequest
 
     conn = _Conn(rows=[
         {

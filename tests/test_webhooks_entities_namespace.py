@@ -23,7 +23,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.auth import UserContext
+from mnemos.api.dependencies import UserContext
 
 
 def _alice(ns: str = "alice-ns") -> UserContext:
@@ -68,7 +68,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)
@@ -85,7 +85,7 @@ def _install_public_dns(monkeypatch, wh):
 
 
 def test_entities_create_stamps_caller_namespace(monkeypatch):
-    from api.handlers import entities as ent
+    from mnemos.api.routes import entities as ent
 
     row = {
         "id": str(uuid.uuid4()), "entity_type": "person", "name": "alice",
@@ -106,7 +106,7 @@ def test_entities_create_stamps_caller_namespace(monkeypatch):
 
 
 def test_entities_list_filters_by_owner_and_namespace(monkeypatch):
-    from api.handlers import entities as ent
+    from mnemos.api.routes import entities as ent
 
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
@@ -124,7 +124,7 @@ def test_entities_list_filters_by_owner_and_namespace(monkeypatch):
 
 
 def test_entities_list_rejects_cross_namespace_for_non_root(monkeypatch):
-    from api.handlers import entities as ent
+    from mnemos.api.routes import entities as ent
 
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
@@ -140,7 +140,7 @@ def test_entities_list_rejects_cross_namespace_for_non_root(monkeypatch):
 
 
 def test_entities_list_root_may_target_any_namespace(monkeypatch):
-    from api.handlers import entities as ent
+    from mnemos.api.routes import entities as ent
 
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
@@ -158,7 +158,7 @@ def test_entities_list_root_may_target_any_namespace(monkeypatch):
 def test_entities_assert_owned_requires_matching_namespace(monkeypatch):
     """assert_owned_context (used by get/patch/link) must check BOTH owner
     and namespace for non-root. Cross-namespace access returns 404."""
-    from api.security import assert_owned_context
+    from mnemos.core.security import assert_owned_context
 
     conn = _Conn(row={"owner_id": "alice", "namespace": "other-ns"})
 
@@ -169,7 +169,7 @@ def test_entities_assert_owned_requires_matching_namespace(monkeypatch):
 
 
 def test_entities_assert_owned_root_bypasses_namespace(monkeypatch):
-    from api.security import assert_owned_context
+    from mnemos.core.security import assert_owned_context
 
     conn = _Conn(row={"owner_id": "bob", "namespace": "bob-ns"})
     # Root call — should NOT raise
@@ -181,7 +181,7 @@ def test_entities_assert_owned_root_bypasses_namespace(monkeypatch):
 
 
 def test_webhook_list_filters_by_owner_and_namespace(monkeypatch):
-    from api.handlers import webhooks as wh
+    from mnemos.api.routes import webhooks as wh
 
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
@@ -196,7 +196,7 @@ def test_webhook_list_filters_by_owner_and_namespace(monkeypatch):
 
 
 def test_webhook_list_root_sees_all_without_filter(monkeypatch):
-    from api.handlers import webhooks as wh
+    from mnemos.api.routes import webhooks as wh
 
     conn = _Conn(rows=[])
     _install(monkeypatch, conn)
@@ -210,7 +210,7 @@ def test_webhook_list_root_sees_all_without_filter(monkeypatch):
 
 
 def test_webhook_get_filters_by_owner_and_namespace(monkeypatch):
-    from api.handlers import webhooks as wh
+    from mnemos.api.routes import webhooks as wh
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
@@ -229,7 +229,7 @@ def test_webhook_get_filters_by_owner_and_namespace(monkeypatch):
 
 
 def test_webhook_revoke_filters_by_owner_and_namespace(monkeypatch):
-    from api.handlers import webhooks as wh
+    from mnemos.api.routes import webhooks as wh
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
@@ -249,7 +249,7 @@ def test_webhook_revoke_filters_by_owner_and_namespace(monkeypatch):
 def test_webhook_create_rejects_cross_namespace_for_non_root(monkeypatch):
     """Pre-v3.2 a non-root user could pass request.namespace to create
     a webhook in another namespace. v3.2 closes this: 403."""
-    from api.handlers import webhooks as wh
+    from mnemos.api.routes import webhooks as wh
 
     conn = _Conn(row=None)
     _install(monkeypatch, conn)
@@ -271,7 +271,7 @@ def test_webhook_create_rejects_cross_namespace_for_non_root(monkeypatch):
 def test_webhook_create_own_namespace_succeeds_for_non_root(monkeypatch):
     """Passing request.namespace that equals user.namespace is fine —
     only mismatched namespaces are rejected."""
-    from api.handlers import webhooks as wh
+    from mnemos.api.routes import webhooks as wh
 
     ok_row = {
         "id": uuid.uuid4(),

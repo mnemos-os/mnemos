@@ -16,14 +16,12 @@ import asyncio
 import uuid
 from unittest.mock import AsyncMock, MagicMock
 
-
-from compression.base import (
+from mnemos.domain.compression.base import (
     CompressionEngine,
     CompressionResult,
     GPUIntent,
 )
-from compression.worker_contest import process_contest_queue
-
+from mnemos.domain.compression.worker_contest import process_contest_queue
 
 # ---- test doubles ----------------------------------------------------------
 
@@ -419,7 +417,7 @@ def test_persist_raising_marks_failed():
 # ---- stale-running sweep (v3.1.1) -----------------------------------------
 
 
-from compression.worker_contest import _sweep_stale_running  # noqa: E402
+from mnemos.domain.compression.worker_contest import _sweep_stale_running  # noqa: E402
 
 
 def _sweep_row(*, attempts: int, status: str) -> dict:

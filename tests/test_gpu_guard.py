@@ -11,7 +11,7 @@ import asyncio
 
 import pytest
 
-from compression.gpu_guard import (
+from mnemos.domain.compression.gpu_guard import (
     CircuitState,
     GPUGuard,
     GuardConfig,

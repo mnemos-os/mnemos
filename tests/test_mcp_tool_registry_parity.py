@@ -84,7 +84,7 @@ async def _stdio_server():
 
 
 def _install_mcp_stubs(monkeypatch):
-    # api.mcp_tools imports FastAPI handlers. Load FastAPI against real Starlette
+    # mnemos.mcp.tools imports FastAPI handlers. Load FastAPI against real Starlette
     # before replacing only the MCP HTTP server's Starlette-facing modules below.
     importlib.import_module("fastapi")
 
@@ -266,9 +266,9 @@ async def _post_message(
 
 def test_stdio_tool_list_matches_canonical_registry(monkeypatch):
     _install_mcp_stubs(monkeypatch)
-    from api.mcp_tools import TOOL_REGISTRY
+    from mnemos.mcp.tools import TOOL_REGISTRY
 
-    mcp_server = _fresh_import("mcp_server")
+    mcp_server = _fresh_import("mnemos.mcp.stdio")
     tools = asyncio.run(mcp_server.app._list_tools_handler())
 
     assert {tool.name for tool in tools} == set(TOOL_REGISTRY)
@@ -277,7 +277,7 @@ def test_stdio_tool_list_matches_canonical_registry(monkeypatch):
 
 def test_every_registered_tool_dispatches_through_stdio(monkeypatch):
     _install_mcp_stubs(monkeypatch)
-    from api.mcp_tools import TOOL_REGISTRY
+    from mnemos.mcp.tools import TOOL_REGISTRY
 
     async def fake_handler(**kwargs):
         return {"success": True, "kwargs": kwargs}
@@ -285,7 +285,7 @@ def test_every_registered_tool_dispatches_through_stdio(monkeypatch):
     for tool in TOOL_REGISTRY.values():
         monkeypatch.setitem(tool, "handler", fake_handler)
 
-    mcp_server = _fresh_import("mcp_server")
+    mcp_server = _fresh_import("mnemos.mcp.stdio")
     for name in TOOL_REGISTRY:
         result = asyncio.run(mcp_server.app._call_tool_handler(name, {}))
         payload = json.loads(result[0].text)
@@ -297,10 +297,10 @@ def test_http_registry_parity_with_stdio(monkeypatch):
     _install_mcp_stubs(monkeypatch)
     monkeypatch.setenv("MNEMOS_MCP_TOKENS", "alice:alice-api-key")
 
-    from api.mcp_tools import TOOL_REGISTRY
+    from mnemos.mcp.tools import TOOL_REGISTRY
 
-    _fresh_import("mcp_server")
-    mcp_http_server = _fresh_import("mcp_http_server")
+    _fresh_import("mnemos.mcp.stdio")
+    mcp_http_server = _fresh_import("mnemos.mcp.http")
 
     assert set(mcp_http_server.HTTP_TOOL_REGISTRY) == set(TOOL_REGISTRY)
 
@@ -312,9 +312,9 @@ def test_http_token_map_sets_backend_user_attribution(monkeypatch):
         "alice:alice-api-key,bob:bob-mcp-token:bob-api-key",
     )
 
-    from api.mcp_tools import _backend_headers, reset_mcp_backend_context, set_mcp_backend_context
+    from mnemos.mcp.tools import _backend_headers, reset_mcp_backend_context, set_mcp_backend_context
 
-    mcp_http_server = _fresh_import("mcp_http_server")
+    mcp_http_server = _fresh_import("mnemos.mcp.http")
 
     alice = mcp_http_server.TOKEN_PRINCIPALS["alice-api-key"]
     tokens = set_mcp_backend_context(api_key=alice.api_key, user_id=alice.user_id)
@@ -338,8 +338,8 @@ def test_http_sse_message_posts_are_bound_to_session_principal(monkeypatch):
         "alice:alice-token:alice-api-key,bob:bob-token:bob-api-key",
     )
 
-    _fresh_import("mcp_server")
-    mcp_http_server = _fresh_import("mcp_http_server")
+    _fresh_import("mnemos.mcp.stdio")
+    mcp_http_server = _fresh_import("mnemos.mcp.http")
 
     async def exercise():
         alice_session_id, alice_release, alice_task = await _open_sse_session(
@@ -386,8 +386,8 @@ def test_http_post_rejects_ambiguous_session_id_parameters(monkeypatch):
         "alice:alice-token:alice-api-key,bob:bob-token:bob-api-key",
     )
 
-    _fresh_import("mcp_server")
-    mcp_http_server = _fresh_import("mcp_http_server")
+    _fresh_import("mnemos.mcp.stdio")
+    mcp_http_server = _fresh_import("mnemos.mcp.http")
 
     async def exercise():
         alice_session_id, alice_release, alice_task = await _open_sse_session(

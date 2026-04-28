@@ -21,16 +21,15 @@ from typing import Any
 import numpy as np
 import pytest
 
-from morpheus.runner import (
+from mnemos.domain.morpheus.runner import (
     _cosine_similarity,
-    _parse_pgvector,
-    _majority,
     _first_sentence,
+    _majority,
+    _parse_pgvector,
     _synthesise_cluster_summary,
     phase_cluster,
     phase_synthesise,
 )
-
 
 # ── pure helper tests ────────────────────────────────────────────────────────
 

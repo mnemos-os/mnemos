@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 class TestOAuthWiring:
     def test_oauth_module_imports(self):
-        from api import oauth
+        from mnemos.core import oauth
         # Public surface
         for name in (
             "SESSION_COOKIE_NAME",
@@ -33,15 +33,15 @@ class TestOAuthWiring:
             "revoke_all_sessions",
             "gc_expired_sessions",
         ):
-            assert hasattr(oauth, name), f"api.oauth missing: {name}"
+            assert hasattr(oauth, name), f"mnemos.core.oauth missing: {name}"
 
     def test_oauth_handler_router(self):
-        from api.handlers import oauth as handler
+        from mnemos.api.routes import oauth as handler
         assert hasattr(handler, "router")
         assert handler.router.prefix == "/auth/oauth"
 
     def test_oauth_models(self):
-        from api.models import (
+        from mnemos.domain.models import (
             OAuthProviderCreateRequest,
         )
         # Must instantiate with minimal args
@@ -57,7 +57,7 @@ class TestOAuthWiring:
         assert req.enabled is True
 
     def test_router_registered_in_app(self):
-        import api_server
+        import mnemos.api.main as api_server
         paths = {r.path for r in api_server.app.routes}
         auth_paths = [p for p in paths if p.startswith("/auth/oauth")]
         assert len(auth_paths) >= 3, f"expected oauth routes, got: {auth_paths}"
@@ -70,7 +70,7 @@ class TestOAuthWiring:
 
 class TestOAuthHelpers:
     def test_mint_user_id_sanitizes(self):
-        from api.oauth import _mint_user_id
+        from mnemos.core.oauth import _mint_user_id
         uid = _mint_user_id("google", "12345|user@ex.com/nested")
         # Result should be safe chars only, length-capped
         assert len(uid) <= 64
@@ -80,30 +80,30 @@ class TestOAuthHelpers:
         assert uid.startswith("google:")
 
     def test_extract_external_id_prefers_sub(self):
-        from api.oauth import _extract_external_id
+        from mnemos.core.oauth import _extract_external_id
         assert _extract_external_id("google", {"sub": "abc", "email": "x@y"}) == "abc"
 
     def test_extract_external_id_github_id_fallback(self):
-        from api.oauth import _extract_external_id
+        from mnemos.core.oauth import _extract_external_id
         # GitHub userinfo returns 'id', not 'sub'
         assert _extract_external_id("github", {"id": 12345, "email": "x@y"}) == "12345"
 
     def test_extract_external_id_azure_oid_fallback(self):
-        from api.oauth import _extract_external_id
+        from mnemos.core.oauth import _extract_external_id
         assert _extract_external_id("azure-ad", {"oid": "abc-def", "sub": "xyz"}) == "xyz"
         # When sub absent, falls to oid
         assert _extract_external_id("azure-ad", {"oid": "abc-def"}) == "abc-def"
 
     def test_extract_external_id_email_last_resort(self):
-        from api.oauth import _extract_external_id
+        from mnemos.core.oauth import _extract_external_id
         assert _extract_external_id("custom", {"email": "x@y.com"}) == "email:x@y.com"
 
     def test_extract_external_id_none(self):
-        from api.oauth import _extract_external_id
+        from mnemos.core.oauth import _extract_external_id
         assert _extract_external_id("custom", {}) is None
 
     def test_discovery_url_handles_trailing_slash(self):
-        from api.oauth import _discovery_url
+        from mnemos.core.oauth import _discovery_url
         assert _discovery_url("https://accounts.google.com") == \
             "https://accounts.google.com/.well-known/openid-configuration"
         assert _discovery_url("https://accounts.google.com/") == \
@@ -115,7 +115,7 @@ class TestOAuthHelpers:
 
 class TestSessionTokens:
     def test_session_ttl_reasonable(self):
-        from api.oauth import SESSION_TTL, SESSION_COOKIE_MAX_AGE
+        from mnemos.core.oauth import SESSION_COOKIE_MAX_AGE, SESSION_TTL
         assert SESSION_TTL.total_seconds() >= 86400      # at least one day
         assert SESSION_COOKIE_MAX_AGE == int(SESSION_TTL.total_seconds())
 
@@ -131,10 +131,11 @@ class TestSessionTokens:
 class TestOAuthIntegration:
     @pytest.mark.asyncio
     async def test_session_create_and_resolve(self):
+        from unittest.mock import MagicMock
+
         import asyncpg
 
-        from api.oauth import create_session, resolve_session, revoke_session
-        from unittest.mock import MagicMock
+        from mnemos.core.oauth import create_session, resolve_session, revoke_session
 
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
         try:
@@ -163,10 +164,11 @@ class TestOAuthIntegration:
 
     @pytest.mark.asyncio
     async def test_provision_new_user(self):
-        import asyncpg
         import uuid
 
-        from api.oauth import provision_or_link_user
+        import asyncpg
+
+        from mnemos.core.oauth import provision_or_link_user
 
         conn = await asyncpg.connect(os.environ["MNEMOS_TEST_DB"])
         try:

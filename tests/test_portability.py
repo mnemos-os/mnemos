@@ -26,8 +26,8 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.auth import UserContext
-from api.handlers import portability
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import portability
 
 
 def _alice() -> UserContext:
@@ -99,7 +99,7 @@ class _PoolCtx:
 
 
 def _install(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)

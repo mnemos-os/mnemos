@@ -169,7 +169,7 @@ SQL
 
     echo "Database created"
 
-    # Run migrations in canonical order. Keep install.py::main()
+    # Run migrations in canonical order. Keep mnemos/installer/db.py
     # migration_files as the canonical source.
     cd "$DEPLOY_DIR"
     source venv/bin/activate
@@ -177,9 +177,9 @@ SQL
 import ast
 from pathlib import Path
 
-tree = ast.parse(Path("install.py").read_text())
+tree = ast.parse(Path("mnemos/installer/db.py").read_text())
 for node in ast.walk(tree):
-    if not isinstance(node, ast.FunctionDef) or node.name != "main":
+    if not isinstance(node, ast.FunctionDef) or node.name != "run_migrations":
         continue
     for stmt in ast.walk(node):
         if (
@@ -198,7 +198,7 @@ for node in ast.walk(tree):
                 if filename is not None:
                     print(f"db/{filename}")
             raise SystemExit(0)
-raise SystemExit("migration_files list not found in install.py")
+raise SystemExit("migration_files list not found in mnemos/installer/db.py")
 PY
         [ -n "\$migration_file" ] || continue
         echo "Applying \$migration_file"
@@ -236,10 +236,10 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" bash << VERIFYEOF
 
     # Check if API server starts
     source venv/bin/activate
-    timeout 5 python -c "from api_server import app; print('API server imports OK')"
+    timeout 5 python -c "from mnemos.api.main import app; print('API server imports OK')"
 
     # Check if modules import
-    timeout 5 python -c "from modules.hooks import HookRegistry; print('Hooks module OK')"
+    timeout 5 python -c "from mnemos.hooks import HookRegistry; print('Hooks module OK')"
 
     echo "Module imports verified"
 VERIFYEOF

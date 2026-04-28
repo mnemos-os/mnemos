@@ -36,7 +36,7 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Bypass cache and fetch fresh data")
     parser.parse_args()
 
-    from graeae.elo_sync import fetch_elo_weights, save_weights, _REGISTRY_PATH
+    from mnemos.domain.graeae.elo_sync import _REGISTRY_PATH, fetch_elo_weights, save_weights
 
     logger.info("=== Arena.ai Elo weight refresh ===")
     logger.info(f"Registry path: {_REGISTRY_PATH}")

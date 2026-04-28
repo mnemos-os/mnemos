@@ -10,8 +10,7 @@ import asyncio
 import uuid
 from typing import Any, Dict
 
-
-from compression.judge import (
+from mnemos.domain.compression.judge import (
     JudgeScore,
     LLMJudge,
     NullJudge,
@@ -216,7 +215,7 @@ def test_llmjudge_empty_inputs_short_circuit():
 def test_llmjudge_circuit_open_short_circuits():
     """Pre-open the guard — judge should return None without HTTP."""
     gpu_url = _fresh_gpu_url()
-    from compression.gpu_guard import get_guard
+    from mnemos.domain.compression.gpu_guard import get_guard
     guard = get_guard(gpu_url)
     for _ in range(10):
         asyncio.run(guard.record_failure(RuntimeError("probe fail")))

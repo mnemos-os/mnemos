@@ -65,7 +65,7 @@ if curl -s "$API_URL/health" > /dev/null 2>&1; then
     fi
 else
     echo -e "${RED}✗ Service not responding at $API_URL${NC}"
-    echo "  Start the service with: python api_server.py"
+    echo "  Start the service with: python -m mnemos.api.main"
     exit 1
 fi
 

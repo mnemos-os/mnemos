@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from compression.apollo_schemas.portfolio import PortfolioSchema
+from mnemos.domain.compression.apollo_schemas.portfolio import PortfolioSchema
 
 
 @pytest.fixture

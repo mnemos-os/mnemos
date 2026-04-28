@@ -10,12 +10,11 @@ from __future__ import annotations
 
 import pytest
 
-from compression.apollo_schemas.code import CodeSchema
-from compression.apollo_schemas.commit import CommitSchema
-from compression.apollo_schemas.decision import DecisionSchema
-from compression.apollo_schemas.event import EventSchema
-from compression.apollo_schemas.person import PersonSchema
-
+from mnemos.domain.compression.apollo_schemas.code import CodeSchema
+from mnemos.domain.compression.apollo_schemas.commit import CommitSchema
+from mnemos.domain.compression.apollo_schemas.decision import DecisionSchema
+from mnemos.domain.compression.apollo_schemas.event import EventSchema
+from mnemos.domain.compression.apollo_schemas.person import PersonSchema
 
 # ── CommitSchema: prose-with-a-colon ──
 

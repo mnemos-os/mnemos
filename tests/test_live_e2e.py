@@ -4,10 +4,10 @@
 import json
 import os
 import random
-import time
 import sys
-import urllib.request
+import time
 import urllib.error
+import urllib.request
 
 BASE = os.getenv("MNEMOS_BASE", "http://localhost:5000")
 # Optional bearer token for auth-enabled deployments (team/bearer mode).

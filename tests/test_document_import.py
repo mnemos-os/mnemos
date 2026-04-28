@@ -1,6 +1,7 @@
 """Integration tests for Docling document import functionality."""
-import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
 
 pytestmark = pytest.mark.asyncio
 
@@ -8,22 +9,22 @@ pytestmark = pytest.mark.asyncio
 class TestDoclingImporter:
     """Test document parsing and chunk creation."""
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', True)
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', True)
     def test_docling_import_available(self):
         """Verify Docling import gracefully handles availability."""
         # When DOCLING_AVAILABLE is True, importer should initialize
-        from api.handlers.document_import import DoclingImporter
+        from mnemos.api.routes.document_import import DoclingImporter
 
         # Mock the DocumentConverter
-        with patch('api.handlers.document_import.DocumentConverter'):
+        with patch('mnemos.api.routes.document_import.DocumentConverter'):
             importer = DoclingImporter()
             assert importer.converter is not None
 
     def test_guess_format(self):
         """Test format detection from filename."""
-        from api.handlers.document_import import DoclingImporter
+        from mnemos.api.routes.document_import import DoclingImporter
 
-        with patch('api.handlers.document_import.DocumentConverter'):
+        with patch('mnemos.api.routes.document_import.DocumentConverter'):
             importer = DoclingImporter()
 
             assert importer._guess_format("document.pdf") == "pdf"
@@ -37,9 +38,9 @@ class TestDoclingImporter:
 
     def test_get_document_type(self):
         """Test document type extraction."""
-        from api.handlers.document_import import DoclingImporter
+        from mnemos.api.routes.document_import import DoclingImporter
 
-        with patch('api.handlers.document_import.DocumentConverter'):
+        with patch('mnemos.api.routes.document_import.DocumentConverter'):
             importer = DoclingImporter()
 
             assert importer._get_document_type("paper.pdf") == "PDF"
@@ -47,12 +48,12 @@ class TestDoclingImporter:
             assert importer._get_document_type("slides.pptx") == "PowerPoint"
             assert importer._get_document_type("budget.xlsx") == "Excel Spreadsheet"
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', True)
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', True)
     def test_chunk_content(self):
         """Test content chunking into memory-sized segments."""
-        from api.handlers.document_import import DoclingImporter
+        from mnemos.api.routes.document_import import DoclingImporter
 
-        with patch('api.handlers.document_import.DocumentConverter'):
+        with patch('mnemos.api.routes.document_import.DocumentConverter'):
             importer = DoclingImporter()
 
             text = "# Section 1\nContent for section 1\n# Section 2\nContent for section 2"
@@ -66,12 +67,12 @@ class TestDoclingImporter:
             assert all("content" in c for c in chunks)
             assert all("metadata" in c for c in chunks)
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', True)
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', True)
     def test_extract_sections(self):
         """Test markdown section extraction."""
-        from api.handlers.document_import import DoclingImporter
+        from mnemos.api.routes.document_import import DoclingImporter
 
-        with patch('api.handlers.document_import.DocumentConverter'):
+        with patch('mnemos.api.routes.document_import.DocumentConverter'):
             importer = DoclingImporter()
 
             text = "# Heading 1\nContent 1\n## Heading 2\nContent 2"
@@ -91,12 +92,13 @@ class TestDocumentImportEndpoints:
     async def client(self):
         """Create test HTTP client."""
         from httpx import AsyncClient
-        from api_server import app
+
+        from mnemos.api.main import app
 
         async with AsyncClient(app=app, base_url="http://test") as ac:
             yield ac
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', False)
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', False)
     async def test_import_document_not_available(self, client):
         """Test graceful handling when Docling is not installed."""
         # Create a test PDF file
@@ -112,8 +114,8 @@ class TestDocumentImportEndpoints:
         assert response.status_code == 501
         assert "Docling not installed" in response.json()["detail"]
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', True)
-    @patch('api.handlers.document_import._pool')
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', True)
+    @patch('mnemos.api.routes.document_import._pool')
     async def test_import_document_empty_file(self, mock_pool, client):
         """Test rejection of empty files."""
         response = await client.post(
@@ -125,9 +127,9 @@ class TestDocumentImportEndpoints:
         assert response.status_code == 400
         assert "Empty file" in response.json()["detail"]
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', True)
-    @patch('api.handlers.document_import.DoclingImporter')
-    @patch('api.handlers.document_import._pool')
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', True)
+    @patch('mnemos.api.routes.document_import.DoclingImporter')
+    @patch('mnemos.api.routes.document_import._pool')
     async def test_import_document_success(self, mock_pool, mock_importer_class, client):
         """Test successful document import."""
         # Mock Docling parser
@@ -174,9 +176,9 @@ class TestDocumentImportEndpoints:
         assert len(result["memory_ids"]) == 2
         assert result["chunks_processed"] == 2
 
-    @patch('api.handlers.document_import.DOCLING_AVAILABLE', True)
-    @patch('api.handlers.document_import.DoclingImporter')
-    @patch('api.handlers.document_import._pool')
+    @patch('mnemos.api.routes.document_import.DOCLING_AVAILABLE', True)
+    @patch('mnemos.api.routes.document_import.DoclingImporter')
+    @patch('mnemos.api.routes.document_import._pool')
     async def test_batch_import_documents(self, mock_pool, mock_importer_class, client):
         """Test batch document import."""
         # Mock Docling
@@ -214,7 +216,7 @@ class TestDoclingIntegration:
     )
     def test_parse_markdown_document(self):
         """Test parsing markdown-like content."""
-        from api.handlers.document_import import DoclingImporter
+        from mnemos.api.routes.document_import import DoclingImporter
 
         # Create mock Docling response for markdown
         mock_doc = MagicMock()
@@ -232,7 +234,7 @@ Main content here.
 More details.
 """
 
-        with patch('api.handlers.document_import.DocumentConverter') as mock_converter_class:
+        with patch('mnemos.api.routes.document_import.DocumentConverter') as mock_converter_class:
             mock_converter = MagicMock()
             mock_converter.convert_bytes.return_value = mock_doc
             mock_converter_class.return_value = mock_converter

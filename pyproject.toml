@@ -80,38 +80,20 @@ dev = [
 # Entry points that land in PATH after `pip install mnemos-os`. The installer
 # can then be invoked as `mnemos-install` without needing install.py on the
 # filesystem.
-mnemos-install = "installer.__main__:main"
+mnemos = "mnemos.cli.main:app"
+mnemos-install = "mnemos.installer.__main__:main"
 
 [tool.setuptools]
-py-modules = [
-  "api_server",
-  "config",
-  "distillation_worker",
-  "mcp_server",
-]
 # Ship every file listed in MANIFEST.in (SQL migrations, config example,
-# systemd unit) into the sdist and, via package-data below, into the wheel.
+# systemd unit) into the sdist.
 include-package-data = true
 
 [tool.setuptools.packages.find]
-# Include every Python subpackage we ship, not just the core API. Previously
-# `installer`, `modules*`, and `tools` were omitted, so `pip install mnemos-os`
-# couldn't run the install CLI or the docling-import helpers.
+# Include the coherent v4 Python package tree. Top-level db/ remains a SQL
+# migrations directory and is shipped via MANIFEST.in, not as a Python package.
 include = [
-  "api*",
-  "compression*",
-  "graeae*",
-  "db*",
-  "installer*",
-  "modules*",
-  "tools*",
+  "mnemos*",
 ]
-
-[tool.setuptools.package-data]
-# SQL migrations ride inside the `db` package so `pip install mnemos-os`
-# gives you the full v3 schema bootstrap, not just the Python code. Access
-# them via `importlib.resources.files('db')` at runtime.
-db = ["*.sql"]
 
 # uv: fast Python package installer for Docker builds
 # Install with: curl -LsSf https://astral.sh/uv/install.sh | sh
@@ -127,7 +109,7 @@ exclude = [
   ".venv",
   "dist",
   "build",
-  "tools/export_memories_for_docling.py",  # generated helper
+  "mnemos/tools/export_memories_for_docling.py",  # generated helper
 ]
 
 [tool.ruff.lint]
@@ -143,7 +125,7 @@ ignore = [
 # __init__.py files legitimately re-export symbols
 "**/__init__.py" = ["F401"]
 # Installer uses string forward references to lazily-imported Config
-"installer/__main__.py" = ["F821"]
+"mnemos/installer/__main__.py" = ["F821"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -49,8 +49,8 @@ def main() -> int:
     if args.dry_run:
         logger.info("=== DRY RUN — no files will be modified ===")
 
-    from graeae.model_registry import update_graeae_config, update_openclaw_models
-    from graeae.elo_sync import fetch_elo_weights, save_weights
+    from mnemos.domain.graeae.elo_sync import fetch_elo_weights, save_weights
+    from mnemos.domain.graeae.model_registry import update_graeae_config, update_openclaw_models
 
     all_changes = []
 

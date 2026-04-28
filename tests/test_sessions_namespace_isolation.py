@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from tests.test_namespace_isolation import NamespaceHarness, PG_URL
+from tests.test_namespace_isolation import PG_URL, NamespaceHarness
 
 pytestmark = [
     pytest.mark.integration,

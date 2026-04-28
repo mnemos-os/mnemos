@@ -1,6 +1,6 @@
 """KG-triple tenancy contract tests (v3.1.2).
 
-Pure unit tests against the api.handlers.kg module with a mock
+Pure unit tests against the mnemos.api.routes.kg module with a mock
 connection that records SQL + args. Verifies:
 
   * create_triple stamps owner_id + namespace from UserContext
@@ -22,9 +22,9 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from api.auth import UserContext
-from api.handlers import kg as kg_handlers
-from api.models import KGTripleCreate, KGTripleUpdate
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import kg as kg_handlers
+from mnemos.domain.models import KGTripleCreate, KGTripleUpdate
 
 
 def _alice() -> UserContext:
@@ -155,8 +155,8 @@ class _PoolCtx:
 
 
 def _install_pool(monkeypatch, conn):
-    """Wire a fake pool.acquire() that yields `conn` into api.lifecycle."""
-    import api.lifecycle as lc
+    """Wire a fake pool.acquire() that yields `conn` into mnemos.core.lifecycle."""
+    import mnemos.core.lifecycle as lc
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)
     monkeypatch.setattr(lc, "_pool", pool)

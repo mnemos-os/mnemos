@@ -8,7 +8,7 @@ services:
       POSTGRES_DB: mnemos
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # Migration ordering must match installer/db.py::run_migrations()
+      # Migration ordering must match mnemos/installer/db.py::run_migrations()
       # (see EVOLUTION.md "decisions we would revisit" — the two
       # canonical ordering sites must stay in sync until we move to
       # Alembic or sqitch).

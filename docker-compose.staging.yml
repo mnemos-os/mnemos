@@ -35,15 +35,15 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
       # Pre-init: create the `mnemos` NOLOGIN role that later migrations
-      # GRANT to. Production deployments create this via installer/db.py
+      # GRANT to. Production deployments create this via mnemos/installer/db.py
       # (`sudo -u postgres psql`); staging via docker-entrypoint-initdb
       # only creates POSTGRES_USER → mnemos_user, so we mount this
       # pre-init script that runs before 01-schema.sql alphabetically.
       - ./db/0_init_roles_staging.sql:/docker-entrypoint-initdb.d/00-init-roles.sql
-      # Migration ordering must match installer/db.py::run_migrations()
+      # Migration ordering must match mnemos/installer/db.py::run_migrations()
       # AND docker-compose.yml. Three-way sync enforced by
       # tests/test_migration_lists_sync.py — adding a new migration
-      # requires updating ALL THREE: install.py, installer/db.py, and
+      # requires updating ALL THREE: install.py, mnemos/installer/db.py, and
       # both docker-compose files.
       - ./db/migrations.sql:/docker-entrypoint-initdb.d/01-schema.sql
       - ./db/migrations_v1_multiuser.sql:/docker-entrypoint-initdb.d/02-multiuser.sql

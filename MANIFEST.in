@@ -9,7 +9,6 @@ include ANTI_MEMORY_POISONING.md
 include DOCUMENT_IMPORT_GUIDE.md
 
 # Installer + bootstrap scripts, config templates, systemd unit
-include install.py
 include install.sh
 include deploy.sh
 include Makefile
@@ -23,7 +22,7 @@ include requirements-phi.txt
 include api_keys.json.example
 include .env.example
 
-# SQL migrations (also included as db/ package-data for wheel installs)
+# SQL migrations for source distributions and repo-based installs
 recursive-include db *.sql
 
 # Integrations bundle (claude-code / openclaw / zeroclaw / hermes) —

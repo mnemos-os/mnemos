@@ -8,7 +8,7 @@ import re
 import pytest
 from httpx import AsyncClient
 
-from api.auth import UserContext, get_current_user
+from mnemos.api.dependencies import UserContext, get_current_user
 
 pytestmark = pytest.mark.asyncio
 
@@ -27,7 +27,7 @@ def _user(user_id: str, role: str = "user") -> UserContext:
 
 @pytest.fixture
 def current_user_override():
-    from api_server import app
+    from mnemos.api.main import app
 
     current = {"user": _user("alice")}
 

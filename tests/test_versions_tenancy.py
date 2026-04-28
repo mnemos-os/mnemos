@@ -23,9 +23,9 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import HTTPException
 
-from api.auth import UserContext
-from api.handlers import versions as versions_handler
-from api.handlers.versions import _assert_memory_readable
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import versions as versions_handler
+from mnemos.api.routes.versions import _assert_memory_readable
 
 
 def _alice(ns: str = "alice-ns") -> UserContext:
@@ -118,7 +118,7 @@ class _PoolCtx:
 
 
 def _install_pool(monkeypatch, conn):
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
 
     pool = MagicMock()
     pool.acquire = lambda: _PoolCtx(conn)

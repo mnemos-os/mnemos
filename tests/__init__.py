@@ -7,8 +7,10 @@ Comprehensive testing for all modules:
 - E2E tests (full workflows)
 """
 
-import pytest
 import asyncio
+
+import pytest
+
 
 # Pytest fixtures
 @pytest.fixture

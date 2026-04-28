@@ -4,7 +4,6 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
-
 MIGRATION_NAME = "migrations_v3_5_rls_group_select_unix_bits.sql"
 
 

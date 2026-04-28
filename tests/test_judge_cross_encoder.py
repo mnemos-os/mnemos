@@ -16,13 +16,12 @@ from types import ModuleType
 
 import pytest
 
-from compression.judge import (
+from mnemos.domain.compression.judge import (
     CrossEncoderJudge,
     EnsembleJudge,
     Judge,
     JudgeScore,
 )
-
 
 # ── test double: a CrossEncoder stand-in that returns a canned logit ──
 

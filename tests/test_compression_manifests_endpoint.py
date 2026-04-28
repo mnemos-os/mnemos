@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from api.handlers.memories import _render_content_preview
+from mnemos.api.routes.memories import _render_content_preview
 
 
 @pytest.mark.parametrize(

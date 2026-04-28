@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # MNEMOS Bootstrap Installer
-# Handles system-level prerequisites, then hands off to python -m installer
+# Handles system-level prerequisites, then hands off to python -m mnemos.installer
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/mnemos-os/mnemos/master/install.sh | bash
@@ -214,7 +214,7 @@ setup_repo() {
         return 0
     fi
 
-    if [[ -f "$INSTALL_DIR/api_server.py" ]]; then
+    if [[ -f "$INSTALL_DIR/mnemos/api/main.py" ]]; then
         info "MNEMOS already installed at $INSTALL_DIR (non-git copy)"
         return 0
     fi
@@ -222,7 +222,7 @@ setup_repo() {
     # If install.sh is being run from within the repo directory, use it directly
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo "")"
-    if [[ -f "${script_dir}/api_server.py" ]]; then
+    if [[ -f "${script_dir}/mnemos/api/main.py" ]]; then
         info "Running from repo directory: $script_dir"
         if [[ "$script_dir" != "$INSTALL_DIR" ]]; then
             info "Linking/copying to $INSTALL_DIR"

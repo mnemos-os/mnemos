@@ -8,9 +8,9 @@ from typing import Any
 import pytest
 from fastapi import HTTPException
 
-from api.auth import UserContext
-from api.handlers import memories
-from api.models import MemoryCreateRequest
+from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import memories
+from mnemos.domain.models import MemoryCreateRequest
 
 pytestmark = pytest.mark.asyncio
 
@@ -166,7 +166,7 @@ class _Pool:
 
 
 def _install(monkeypatch: pytest.MonkeyPatch, conn: _OutboxConn) -> None:
-    import api.lifecycle as lc
+    import mnemos.core.lifecycle as lc
 
     monkeypatch.setattr(memories._lc, "_pool", _Pool(conn))
     monkeypatch.setattr(memories._lc, "_cache", None)
