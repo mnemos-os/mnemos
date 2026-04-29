@@ -52,6 +52,7 @@ Repository = "https://github.com/mnemos-os/mnemos"
 Documentation = "https://github.com/mnemos-os/mnemos/blob/master/README.md"
 
 [project.optional-dependencies]
+build = ["pyinstaller>=6.0", "sqlite-vec"]
 docling = ["docling>=2.5.0", "docling-core>=2.0.0", "pillow>=10.0.0"]
 # OpenTelemetry tracing. Without this extra, `install_tracing()` is a
 # no-op and the tracing middleware passes through unchanged. Install
