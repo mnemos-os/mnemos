@@ -203,7 +203,7 @@ async def get_memory_log(
             # private (mode 600) → snapshotted into v1 → relaxed to
             # public (mode 644) MUST NOT expose v1 to readers who
             # only became authorized after the permission flip.
-            # Mirrors api/handlers/versions.py + mnemos/mcp/tools.py.
+            # Mirrors api/handlers/versions.py + mnemos/db/mcp_repo.py.
             if user.role != "root":
                 def _snap_visible(r) -> bool:
                     if r["namespace"] != user.namespace:

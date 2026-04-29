@@ -3,7 +3,7 @@
 remote MCP client that needs an HTTPS URL instead of a stdio process.
 
 Reuses the same `Server("mnemos")` instance as mcp_server.py. Tool
-definitions come from mnemos/mcp/tools.py's canonical registry; the only
+definitions come from mnemos/mcp/tools's canonical registry; the only
 difference is the transport: stdio framing vs SSE-over-HTTP framing.
 Tool surface is identical, so a memory written from Claude Desktop
 (stdio) is queryable from ChatGPT Pro (SSE) and vice versa.
