@@ -68,6 +68,10 @@ tracing = [
 structlog = [
   "structlog>=25.0.0",
 ]
+sqlite = [
+  "aiosqlite>=0.20.0",
+  "sqlite-vec>=0.1.6",
+]
 full = ["sentence-transformers>=2.7.0", "spacy>=3.7.0", "networkx>=3.3"]
 # Note: the `phi` extras are optional GPU-dependent OpenVINO/FastEmbed support. Most installs don't need it.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]

@@ -203,6 +203,65 @@ test:integration:
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+test:persistence-parity:
+  stage: test
+  services:
+    - name: pgvector/pgvector:pg17
+      alias: postgres
+      variables:
+        POSTGRES_PASSWORD: test
+        POSTGRES_DB: mnemos_test
+        POSTGRES_USER: postgres
+  variables:
+    PGHOST: postgres
+    PGUSER: postgres
+    PGPASSWORD: test
+    PGDATABASE: mnemos_test
+    DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
+    MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
+  before_script:
+    - apt-get update -qq && apt-get install -qq -y postgresql-client
+    - pip install --cache-dir=.cache/pip -e ".[dev,sqlite]"
+    - |
+      for i in $(seq 1 30); do
+        if pg_isready -h postgres -U postgres -t 1 >/dev/null 2>&1; then
+          echo "postgres ready"; break
+        fi
+        sleep 1
+      done
+    - |
+      psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 <<'SQL'
+      DO $$
+      BEGIN
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mnemos_user') THEN
+          CREATE ROLE mnemos_user LOGIN PASSWORD 'test';
+        END IF;
+        IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'mnemos') THEN
+          CREATE ROLE mnemos LOGIN PASSWORD 'test';
+        END IF;
+      END $$;
+      SQL
+    - |
+      for f in $(python - <<'PY'
+      from tests.test_migration_lists_sync import EXPECTED_MIGRATIONS
+      print(" ".join(f"db/{name}" for name in EXPECTED_MIGRATIONS))
+      PY
+      ); do
+        echo "applying $f"
+        psql -h postgres -U postgres -d mnemos_test -v ON_ERROR_STOP=1 -f "$f"
+      done
+  script:
+    - pytest tests/test_persistence_parity.py --tb=short -q --junitxml=junit-persistence-parity.xml
+  artifacts:
+    when: always
+    reports:
+      junit: junit-persistence-parity.xml
+    expire_in: 1 week
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == "master"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+
 test:multi-worker:
   stage: test
   image: docker:24

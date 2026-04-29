@@ -8,8 +8,12 @@ to the backend-neutral persistence interfaces.
 from __future__ import annotations
 
 import inspect
+import hashlib
+import json
+import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
 import asyncpg
@@ -447,7 +451,87 @@ class PostgresCompressionRepository(CompressionRepository):
 
 
 class PostgresWebhookRepository(WebhookRepository):
-    pass
+    async def insert_subscription(
+        self,
+        tx: Transaction,
+        *,
+        subscription_id: str | None = None,
+        url: str,
+        events: Sequence[str],
+        secret: str | None = None,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> str:
+        subscription_id = subscription_id or str(uuid.uuid4())
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO webhook_subscriptions (id, url, events, secret, owner_id, namespace)
+            VALUES ($1::uuid, $2, $3::text[], $4, $5, $6)
+            """,
+            subscription_id,
+            url,
+            list(events),
+            secret or "",
+            owner_id,
+            namespace,
+        )
+        return subscription_id
+
+    async def dispatch_event(
+        self,
+        tx: Transaction,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[str]:
+        conn = _postgres_tx(tx).conn
+        query = """
+            SELECT id
+            FROM webhook_subscriptions
+            WHERE NOT revoked AND $1 = ANY(events)
+        """
+        args: list[Any] = [event_type]
+        if owner_id is not None:
+            query += " AND owner_id = $2"
+            args.append(owner_id)
+            if namespace is not None:
+                query += " AND namespace = $3"
+                args.append(namespace)
+        subscriptions = await conn.fetch(query, *args)
+        body = json.dumps(
+            {"event": event_type, "timestamp": datetime.now(timezone.utc).isoformat(), "data": payload},
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        delivery_ids: list[str] = []
+        for sub in subscriptions:
+            delivery_id = str(uuid.uuid4())
+            await conn.execute(
+                """
+                INSERT INTO webhook_deliveries
+                  (id, subscription_id, event_type, payload, payload_hash, status, writer_revision)
+                VALUES ($1::uuid, $2, $3, $4, $5, 'pending', $6)
+                """,
+                delivery_id,
+                sub["id"],
+                event_type,
+                body,
+                body_hash,
+                2,
+            )
+            delivery_ids.append(delivery_id)
+        return delivery_ids
+
+    async def fetch_deliveries(self, tx: Transaction, subscription_id: str | None = None) -> list[Row]:
+        if subscription_id is None:
+            return await _postgres_tx(tx).conn.fetch("SELECT * FROM webhook_deliveries ORDER BY created ASC")
+        return await _postgres_tx(tx).conn.fetch(
+            "SELECT * FROM webhook_deliveries WHERE subscription_id = $1::uuid ORDER BY created ASC",
+            subscription_id,
+        )
 
 
 class PostgresConsultationAuditRepository(ConsultationAuditRepository):
@@ -484,15 +568,125 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class PostgresFederationRepository(FederationRepository):
-    pass
+    async def fetch_memory_page(
+        self,
+        tx: Transaction,
+        *,
+        updated_after: Any | None = None,
+        id_after: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        if updated_after is not None and id_after is not None:
+            return await conn.fetch(
+                """
+                SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated
+                FROM memories
+                WHERE updated > $1 OR (updated = $1 AND id > $2)
+                ORDER BY updated ASC, id ASC
+                LIMIT $3
+                """,
+                updated_after,
+                id_after,
+                limit,
+            )
+        return await conn.fetch(
+            """
+            SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated
+            FROM memories
+            ORDER BY updated ASC, id ASC
+            LIMIT $1
+            """,
+            limit,
+        )
+
+    async def upsert_peer(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        base_url: str,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO federation_peers (id, base_url, name, auth_token, enabled)
+            VALUES ($1::uuid, $2, $3, '', $4)
+            ON CONFLICT (id) DO UPDATE
+            SET base_url = EXCLUDED.base_url,
+                name = EXCLUDED.name,
+                enabled = EXCLUDED.enabled
+            """,
+            peer_id,
+            base_url,
+            name,
+            enabled,
+        )
 
 
 class PostgresStateRepository(StateRepository):
-    pass
+    async def get(
+        self,
+        tx: Transaction,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT key, value, owner_id, namespace FROM state "
+            "WHERE owner_id = $1 AND namespace = $2 AND key = $3",
+            owner_id,
+            namespace,
+            key,
+        )
+
+    async def set(
+        self,
+        tx: Transaction,
+        key: str,
+        value: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            INSERT INTO state (owner_id, namespace, key, value)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (owner_id, namespace, key) DO UPDATE
+            SET value = EXCLUDED.value
+            """,
+            owner_id,
+            namespace,
+            key,
+            value,
+        )
+
+    async def delete(
+        self,
+        tx: Transaction,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3",
+            owner_id,
+            namespace,
+            key,
+        )
 
 
 class PostgresBackend(PersistenceBackend):
     """Postgres persistence facade backed by an asyncpg pool."""
+
+    supports_listen_notify = True
+    supports_advisory_locks = True
+    supports_row_level_security = True
+    supports_pgvector = True
 
     def __init__(self, pool: asyncpg.Pool, settings: Any):
         self._pool = pool

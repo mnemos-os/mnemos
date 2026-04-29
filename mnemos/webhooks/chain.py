@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import hashlib
 from datetime import datetime
-from typing import Optional
+from typing import Any, Optional
 
 import asyncpg
 
@@ -59,8 +59,15 @@ async def _insert_successor_delivery(
     )
 
 
+def _is_sqlite_connection(conn: Any) -> bool:
+    module = type(conn).__module__
+    return module.startswith("sqlite3") or module.startswith("aiosqlite")
+
+
 async def _lock_delivery_chain(conn: asyncpg.Connection, delivery: asyncpg.Record) -> None:
     """Serialize new-code recovery claims and successor inserts per chain."""
+    if _is_sqlite_connection(conn):
+        return
     await conn.execute("SELECT pg_advisory_xact_lock($1)", _delivery_chain_lock_key(delivery))
 
 

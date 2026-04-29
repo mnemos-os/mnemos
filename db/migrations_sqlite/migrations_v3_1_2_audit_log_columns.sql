@@ -1,0 +1,5 @@
+-- SQLite mirror for migrations_v3_1_2_audit_log_columns.
+-- The logical schema change from the PostgreSQL migration is represented
+-- in migrations.sql with SQLite-compatible TEXT/INTEGER/JSON storage and
+-- idempotent indexes. PostgreSQL-only GRANT, COMMENT, RLS, advisory-lock,
+-- and trigger-function statements are intentionally omitted.

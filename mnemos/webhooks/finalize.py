@@ -16,6 +16,48 @@ from .types import _DeliveryResult, _LeaseExpiredBeforeSend, _PostHeaderDelivery
 logger = logging.getLogger(__name__)
 
 
+def _pool_uses_sqlite_backend(pool: Any) -> bool:
+    backend = getattr(pool, "persistence_backend", None)
+    if backend is None:
+        try:
+            from mnemos.core.lifecycle import get_persistence_backend
+
+            backend = get_persistence_backend()
+        except Exception:
+            return False
+    return bool(getattr(backend, "uses_sqlite_vec", False))
+
+
+async def _guard_sqlite_succeeded_terminal(
+    conn: Any,
+    pool: Any,
+    delivery_id: str,
+    attempted_status: str,
+) -> bool:
+    """Return True when SQLite app-level terminal-state enforcement blocks an update."""
+    if attempted_status == "succeeded" or not _pool_uses_sqlite_backend(pool):
+        return False
+
+    row = None
+    for sql, args in (
+        ("SELECT status FROM webhook_deliveries WHERE id=$1::uuid", (delivery_id,)),
+        ("SELECT status FROM webhook_deliveries WHERE id = ?", (delivery_id,)),
+    ):
+        try:
+            row = await conn.fetchrow(sql, *args)
+            break
+        except Exception:
+            continue
+    if row is not None and row["status"] == "succeeded":
+        logger.warning(
+            "webhook delivery %s SQLite terminal-state guard blocked status=%s",
+            delivery_id,
+            attempted_status,
+        )
+        return True
+    return False
+
+
 async def _finalize_delivery(
     pool: asyncpg.Pool,
     delivery: asyncpg.Record,
@@ -61,6 +103,9 @@ async def _finalize_delivery_row(
     async with pool.acquire() as conn:
         async with conn.transaction():
             await webhook_chain._lock_delivery_chain(conn, delivery)
+
+            if await _guard_sqlite_succeeded_terminal(conn, pool, delivery_id, "abandoned"):
+                return False
 
             if delivery["revoked"]:
                 finalized = await conn.fetchrow(

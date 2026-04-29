@@ -210,6 +210,47 @@ def _build_postgres_backend(pool, settings):
     return postgres_module.PostgresBackend(pool, settings)
 
 
+async def _build_sqlite_backend(db_path, settings):
+    """Build and open the SQLite persistence backend."""
+    sqlite_module = importlib.import_module("mnemos.persistence.sqlite")
+    backend = sqlite_module.SqliteBackend(db_path, settings)
+    await backend.open()
+    return backend
+
+
+def _select_persistence_backend(settings) -> str:
+    database_settings = getattr(settings, "database", None)
+    if database_settings is None:
+        return "postgres"
+    configured = getattr(database_settings, "backend", "auto").strip().lower()
+    database_url = getattr(database_settings, "url", "").strip().lower()
+    if configured in {"postgres", "postgresql", "pg"}:
+        return "postgres"
+    if configured in {"sqlite", "sqlite3"}:
+        return "sqlite"
+    if configured == "auto":
+        if database_url.startswith("sqlite:"):
+            return "sqlite"
+        if database_url.startswith(("postgres:", "postgresql:")):
+            return "postgres"
+        return "postgres"
+    raise ValueError(
+        "Unsupported persistence backend "
+        f"{settings.database.backend!r}; expected postgres, sqlite, or auto"
+    )
+
+
+def _sqlite_path_from_settings(settings):
+    database_settings = getattr(settings, "database", None)
+    database_url = getattr(database_settings, "url", "").strip() if database_settings is not None else ""
+    if database_url.startswith("sqlite:"):
+        parsed = urlparse(database_url)
+        if parsed.path in {"", "/:memory:"}:
+            return parsed.netloc or ":memory:"
+        return parsed.path
+    return getattr(database_settings, "sqlite_path", "mnemos.sqlite3")
+
+
 def _load_config() -> dict:
     """Load config.toml from standard locations. Returns empty dict if not found."""
     candidates = [
@@ -286,15 +327,16 @@ def _warn_if_multi_worker_without_redis(settings) -> None:
         )
 
 
-async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
+async def _log_federation_startup_guidance(pool: asyncpg.Pool | None) -> None:
     configured_peer_urls = _configured_federation_peer_urls()
     db_peer_urls: list[str] = []
-    try:
-        async with pool.acquire() as conn:
-            rows = await conn.fetch("SELECT base_url FROM federation_peers WHERE enabled")
-        db_peer_urls = [row["base_url"] for row in rows if row["base_url"]]
-    except Exception as exc:
-        logger.debug("federation startup guidance skipped DB peer scan: %s", exc)
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                rows = await conn.fetch("SELECT base_url FROM federation_peers WHERE enabled")
+            db_peer_urls = [row["base_url"] for row in rows if row["base_url"]]
+        except Exception as exc:
+            logger.debug("federation startup guidance skipped DB peer scan: %s", exc)
 
     if get_settings().federation.enabled and not configured_peer_urls and not db_peer_urls:
         logger.info("federation enabled but no peers configured — federation pulls and exports are inactive.")
@@ -320,27 +362,38 @@ async def lifespan(app):
     settings = get_settings()
     _warn_if_multi_worker_without_redis(settings)
 
+    backend_type = _select_persistence_backend(settings)
     try:
-        _pool = await asyncpg.create_pool(
-            user=PG_CONFIG['user'],
-            password=PG_CONFIG['password'],
-            database=PG_CONFIG['database'],
-            host=PG_CONFIG['host'],
-            port=PG_CONFIG['port'],
-            min_size=PG_CONFIG['pool_min_size'],
-            max_size=PG_CONFIG['pool_max_size'],
-        )
-        _pool_manager = PoolManager(_pool)
-        _persistence_backend = _build_postgres_backend(_pool, settings)
-        app.state.pool = _pool   # auth.py reads this via request.app.state.pool
-        app.state.pool_manager = _pool_manager
-        app.state.persistence_backend = _persistence_backend
-        logger.info(
-            f"asyncpg connection pool initialized "
-            f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
-        )
+        if backend_type == "sqlite":
+            _pool = None
+            _pool_manager = None
+            sqlite_path = _sqlite_path_from_settings(settings)
+            _persistence_backend = await _build_sqlite_backend(sqlite_path, settings)
+            app.state.pool = None
+            app.state.pool_manager = None
+            app.state.persistence_backend = _persistence_backend
+            logger.info("SQLite persistence backend initialized (%s)", sqlite_path)
+        else:
+            _pool = await asyncpg.create_pool(
+                user=PG_CONFIG['user'],
+                password=PG_CONFIG['password'],
+                database=PG_CONFIG['database'],
+                host=PG_CONFIG['host'],
+                port=PG_CONFIG['port'],
+                min_size=PG_CONFIG['pool_min_size'],
+                max_size=PG_CONFIG['pool_max_size'],
+            )
+            _pool_manager = PoolManager(_pool)
+            _persistence_backend = _build_postgres_backend(_pool, settings)
+            app.state.pool = _pool   # auth.py reads this via request.app.state.pool
+            app.state.pool_manager = _pool_manager
+            app.state.persistence_backend = _persistence_backend
+            logger.info(
+                f"asyncpg connection pool initialized "
+                f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
+            )
     except Exception as e:
-        logger.error(f"Failed to create DB pool: {e}")
+        logger.error(f"Failed to initialize {backend_type} persistence backend: {e}")
         raise
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
@@ -379,7 +432,7 @@ async def lifespan(app):
     # the background task lands. POST /admin/graeae/reload-providers is also
     # available for on-demand refresh (and is what the daily systemd timer
     # uses after sync_provider_models.py finishes).
-    if _provider_manifest_reloader is not None:
+    if _provider_manifest_reloader is not None and _pool is not None:
         import asyncio as _asyncio_for_reload
 
         async def _bg_provider_manifest_reload():

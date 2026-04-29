@@ -30,6 +30,18 @@ def _config_model_config(*, env_prefix: str = "", extra: str = "ignore") -> Sett
 class _DatabaseSettings(BaseSettings):
     model_config = _config_model_config(env_prefix="PG_")
 
+    backend: str = Field(
+        "auto",
+        validation_alias=AliasChoices("MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND"),
+    )
+    url: str = Field(
+        "",
+        validation_alias=AliasChoices("MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL"),
+    )
+    sqlite_path: Path = Field(
+        Path("mnemos.sqlite3"),
+        validation_alias=AliasChoices("MNEMOS_SQLITE_PATH", "SQLITE_DB_PATH", "PG_SQLITE_PATH"),
+    )
     host: str = "localhost"
     port: int = 5432
     database: str = "mnemos"

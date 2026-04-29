@@ -48,6 +48,19 @@ circuit-breaker state; see `docs/SCALING.md`.
 
 ---
 
+## SQLite Profile
+
+The SQLite profile is available for local development, laptops, and edge
+single-user deployments. Set `MNEMOS_PERSISTENCE_BACKEND=sqlite` with
+`MNEMOS_SQLITE_PATH=/path/to/mnemos.sqlite3`, or set
+`MNEMOS_PERSISTENCE_BACKEND=auto` with a `sqlite:///...` `MNEMOS_DATABASE_URL`.
+
+See `docs/SQLITE_PROFILE.md` for the constraints: no RLS, no LISTEN/NOTIFY, no
+advisory locks, FTS5 instead of PostgreSQL tsvector, and sqlite-vec instead of
+pgvector.
+
+---
+
 ## MCP HTTP/SSE Auth
 
 The stdio MCP server and HTTP/SSE MCP server expose the same canonical tool
