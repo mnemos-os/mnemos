@@ -21,7 +21,7 @@ import logging
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 from mnemos.domain.memory_categorization.constants import ENTITY_TYPES
 
 logger = logging.getLogger(__name__)

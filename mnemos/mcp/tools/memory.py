@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 
 from ._runtime import _rest_delete, _rest_get, _rest_post, _tool
 

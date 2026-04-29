@@ -933,9 +933,9 @@ def _attempt(attempt_num: int = 1) -> dict[str, Any]:
 
 
 async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int]):
-    from mnemos.api.routes import webhooks
     from mnemos.core import lifecycle
     from mnemos.webhooks import dispatcher as webhook_dispatcher
+    from mnemos.webhooks import validation as webhook_validation
 
     store = _FakeWebhookStore(rows)
     pool = _FakePool(store)
@@ -947,7 +947,7 @@ async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int])
         return None
 
     http_factory = _HTTPClientFactory(statuses)
-    monkeypatch.setattr(webhooks, "validate_webhook_url", _accept_url)
+    monkeypatch.setattr(webhook_validation, "validate_webhook_url", _accept_url)
     monkeypatch.setattr(webhook_dispatcher.httpx, "AsyncClient", http_factory)
     monkeypatch.setattr(webhook_dispatcher, "_send_semaphore", None)
     return webhook_dispatcher, conn, http_factory
@@ -3014,14 +3014,14 @@ def test_repair_sweep_does_not_strip_active_lease_with_successor(monkeypatch):
 
 def test_lifecycle_runs_webhook_retry_repair_on_startup():
     repo_root = Path(__file__).resolve().parents[1]
-    lifecycle_source = (repo_root / "mnemos" / "core" / "lifecycle.py").read_text()
+    lifecycle_hooks_source = (repo_root / "mnemos" / "api" / "lifecycle_hooks.py").read_text()
     dispatcher_source = _webhook_module_source("workers", "repair", "types")
     compact_dispatcher = " ".join(dispatcher_source.split())
 
-    assert "repair_worker_loop as _webhook_repair" in lifecycle_source
-    assert "delivery_worker_loop as _webhook_delivery" in lifecycle_source
-    assert "_schedule_worker(_webhook_repair(_pool))" in lifecycle_source
-    assert "_schedule_worker(_webhook_delivery(_pool))" in lifecycle_source
+    assert "repair_worker_loop" in lifecycle_hooks_source
+    assert "delivery_worker_loop" in lifecycle_hooks_source
+    assert 'register_lifespan_worker("webhook retry repair worker"' in lifecycle_hooks_source
+    assert 'register_lifespan_worker("webhook delivery recovery worker"' in lifecycle_hooks_source
     assert "REPAIR_BURST_SECONDS" in dispatcher_source
     assert "REPAIR_PERIODIC_INTERVAL" in dispatcher_source
     assert "async def repair_worker_loop" in dispatcher_source

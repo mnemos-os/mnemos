@@ -5,11 +5,12 @@ added as a secondary path. Auth-disabled mode unchanged.
 """
 import hashlib
 import logging
-from dataclasses import dataclass
-from typing import List, Optional
+from typing import Optional
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer
+
+from mnemos.core.auth_context import UserContext
 
 logger = logging.getLogger(__name__)
 
@@ -20,15 +21,6 @@ _personal_user_id: str = "default"
 PERSONAL_SINGLETON: "Optional[UserContext]" = None   # set by configure_auth(); None before startup
 
 _bearer = HTTPBearer(auto_error=False)
-
-
-@dataclass
-class UserContext:
-    user_id: str
-    group_ids: List[str]
-    role: str          # "user" | "root"
-    namespace: str
-    authenticated: bool
 
 
 def configure_auth(config: dict) -> None:

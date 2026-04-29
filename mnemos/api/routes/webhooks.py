@@ -3,14 +3,9 @@
 Outbound notifications on memory and consultation events. Delivery is handled
 by `mnemos.webhooks.dispatcher`; this handler is CRUD only.
 """
-import asyncio
-import ipaddress
 import logging
-import os
 import secrets
-import socket
-from typing import List, Union
-from urllib.parse import urlparse
+from typing import List
 
 from fastapi import APIRouter, Depends, HTTPException
 
@@ -26,6 +21,7 @@ from mnemos.domain.models import (
     WebhookItem,
     WebhookListResponse,
 )
+from mnemos.webhooks.validation import validate_webhook_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/webhooks", tags=["webhooks"])
@@ -43,99 +39,6 @@ def _validate_events(events: List[str]) -> None:
             status_code=422,
             detail=f"unknown events: {bad}. valid events: {sorted(VALID_WEBHOOK_EVENTS)}",
         )
-
-
-_WEBHOOK_ALLOW_PRIVATE = os.getenv("WEBHOOK_ALLOW_PRIVATE_HOSTS", "false").lower() == "true"
-
-# Cloud-provider instance-metadata hostnames we always refuse, even when
-# WEBHOOK_ALLOW_PRIVATE_HOSTS=true. Includes the link-local IP literals as a
-# belt check (they're also caught by the is_link_local / is_private tests).
-_BLOCKED_METADATA_HOSTS = frozenset({
-    "metadata.google.internal",
-    "metadata.goog",
-    "metadata.tencentyun.com",
-    "100-100-100-200.cn-hangzhou.ecs.aliyuncs.com",
-    "169.254.169.254",
-    "100.100.100.200",
-    "fd00:ec2::254",
-    "fe80::a9fe:a9fe",
-})
-
-_IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
-
-
-def _is_blocked_ip(ip: _IPAddress) -> bool:
-    """SSRF defense: block loopback, private, link-local, multicast, reserved."""
-    return (
-        ip.is_loopback
-        or ip.is_private
-        or ip.is_link_local
-        or ip.is_multicast
-        or ip.is_reserved
-        or ip.is_unspecified
-    )
-
-
-async def _resolve_addrs(host: str) -> List[str]:
-    """Resolve host asynchronously (non-blocking for the event loop).
-
-    Uses the running loop's getaddrinfo which wraps the system resolver in a
-    thread-executor so a slow DNS server doesn't freeze the ASGI worker.
-    """
-    loop = asyncio.get_event_loop()
-    infos = await loop.getaddrinfo(host, None)
-    return [info[4][0] for info in infos]
-
-
-async def validate_webhook_url(url: str) -> None:
-    """Validate a webhook URL: scheme + host not pointing at internal services.
-
-    Called at both subscription create time and dispatch time. Raises
-    HTTPException(422) on bad input. Set WEBHOOK_ALLOW_PRIVATE_HOSTS=true to
-    permit private/loopback targets (useful for local testing; unsafe in
-    production).
-
-    Caveat — DNS rebinding: between this validation and the subsequent
-    httpx connect, a hostile DNS server could switch the record from a
-    public address to an internal one. For genuinely untrusted subscription
-    creators, enforce server-side TLS pinning to a known egress proxy, or
-    pass the pre-resolved IP to httpx and keep the Host header. This
-    validator is a strong filter, not a complete mitigation on its own.
-    """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise HTTPException(status_code=422, detail="url must start with http:// or https://")
-    host = parsed.hostname
-    if not host:
-        raise HTTPException(status_code=422, detail="url must include a host")
-
-    if host.lower() in _BLOCKED_METADATA_HOSTS:
-        raise HTTPException(status_code=422, detail="url host is not permitted")
-
-    if _WEBHOOK_ALLOW_PRIVATE:
-        return
-
-    # If host is already an IP literal, check it directly. Otherwise resolve
-    # (asynchronously) and check every returned address family.
-    try:
-        ip = ipaddress.ip_address(host)
-        if _is_blocked_ip(ip):
-            raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
-        return
-    except ValueError:
-        pass  # not a literal IP — resolve DNS
-
-    try:
-        addrs = await _resolve_addrs(host)
-    except (socket.gaierror, OSError):
-        raise HTTPException(status_code=422, detail="url host could not be resolved")
-    for addr in addrs:
-        try:
-            ip = ipaddress.ip_address(addr)
-        except ValueError:
-            continue
-        if _is_blocked_ip(ip):
-            raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
 
 
 # Kept as `_validate_url` alias for callers inside this module.

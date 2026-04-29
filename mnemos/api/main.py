@@ -28,6 +28,7 @@ from mnemos.api.routes.sessions import router as sessions_router
 from mnemos.api.routes.state import router as state_router
 from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
+from mnemos.api.lifecycle_hooks import register_lifespan_hooks
 from mnemos.core.lifecycle import lifespan
 from mnemos.core.rate_limit import (
     RateLimitExceeded,
@@ -69,6 +70,8 @@ if os.getenv("MNEMOS_STRUCTURED_LOGS", "").lower() in ("1", "true", "yes"):
     install_structured_logging()
 
 from mnemos._version import __version__ as _MNEMOS_VERSION  # noqa: E402
+
+register_lifespan_hooks()
 
 app = FastAPI(title="MNEMOS API", version=_MNEMOS_VERSION, description="Unified service: GRAEAE consultations + MNEMOS memory + multi-provider inference gateway", lifespan=lifespan)
 

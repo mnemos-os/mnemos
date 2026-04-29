@@ -2,7 +2,7 @@ import logging
 from typing import Any, Dict, List, Optional
 
 import mnemos.core.lifecycle as _lc
-from mnemos.domain.graeae.engine import _REGISTRY_MAP
+from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 
 logger = logging.getLogger(__name__)
 
@@ -193,7 +193,7 @@ async def lookup_provider_for_model(model: str) -> Optional[str]:
 
             if "/" in model:
                 head, tail = model.split("/", 1)
-                head_registry = _REGISTRY_MAP.get(head, {"registry_provider": head})[
+                head_registry = GRAEAE_REGISTRY_MAP.get(head, {"registry_provider": head})[
                     "registry_provider"
                 ]
                 row = await conn.fetchrow(

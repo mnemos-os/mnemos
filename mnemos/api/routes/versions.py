@@ -11,7 +11,7 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
-from mnemos.domain.models import MemoryItem
+from mnemos.domain.models import MemoryItem, row_to_memory as _row_to_memory
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["versions"])
@@ -597,4 +597,4 @@ async def revert_memory(
         f"[VERSION] Reverted {memory_id} to v{version_num} on branch '{branch}' "
         f"by {user.user_id or 'default'}"
     )
-    return _lc._row_to_memory(row)
+    return _row_to_memory(row)

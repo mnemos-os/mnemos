@@ -75,10 +75,12 @@ def _install(monkeypatch, conn):
 
 
 def _install_public_dns(monkeypatch, wh):
+    from mnemos.webhooks import validation as webhook_validation
+
     async def _fake_resolve_addrs(host: str):
         return ["93.184.216.34"]
 
-    monkeypatch.setattr(wh, "_resolve_addrs", _fake_resolve_addrs)
+    monkeypatch.setattr(webhook_validation, "_resolve_addrs", _fake_resolve_addrs)
 
 
 # ─── entities ────────────────────────────────────────────────────────────────

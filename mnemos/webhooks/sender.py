@@ -9,6 +9,8 @@ from typing import Any, Awaitable, Optional
 import asyncpg
 import httpx
 
+from mnemos.webhooks import validation as webhook_validation
+
 from . import lease as webhook_lease
 from . import types as webhook_types
 from ._signing import _sign
@@ -114,9 +116,8 @@ async def _send_claimed_delivery_within_deadline(
     header_deadline = loop.time() + send_window_seconds
 
     try:
-        from mnemos.api.routes.webhooks import validate_webhook_url
         await asyncio.wait_for(
-            validate_webhook_url(delivery["url"]),
+            webhook_validation.validate_webhook_url(delivery["url"]),
             timeout=_remaining_timeout_seconds(header_deadline),
         )
     except asyncio.TimeoutError:
