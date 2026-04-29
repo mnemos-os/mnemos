@@ -140,6 +140,7 @@ type = "layers"
 layers = [
   "mnemos.api",
   "mnemos.domain",
+  "mnemos.persistence",
   "mnemos.db",
   "mnemos.core",
 ]
@@ -182,6 +183,18 @@ allow_indirect_imports = true
 name = "webhooks does not couple to domain"
 type = "independence"
 modules = ["mnemos.webhooks", "mnemos.domain"]
+
+[[tool.importlinter.contracts]]
+name = "persistence has no upward deps"
+type = "forbidden"
+source_modules = ["mnemos.persistence"]
+forbidden_modules = [
+  "mnemos.api",
+  "mnemos.domain",
+  "mnemos.mcp",
+  "mnemos.webhooks",
+  "mnemos.workers",
+]
 
 [[tool.importlinter.contracts]]
 name = "core does not import api/domain/db/webhooks/mcp/etc"
