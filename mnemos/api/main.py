@@ -45,7 +45,11 @@ except ImportError:
     _document_import_available = False
     document_import_router = None
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(name)s: %(message)s')
+_settings = get_settings()
+logging.basicConfig(
+    level=getattr(logging, _settings.logging.level.upper(), logging.INFO),
+    format=_settings.logging.format,
+)
 
 # v3.2 observability foundation: request-ID correlation across logs +
 # response headers. Must run BEFORE any handler emits log records so
@@ -67,7 +71,7 @@ install_tracing()  # no-op unless opentelemetry is installed
 # parsers expect the default format. Without `structlog` installed,
 # or without the env flag set, the standard formatter (with
 # [req:<id>]) is used.
-if get_settings().observability.structured_logs:
+if _settings.observability.structured_logs:
     install_structured_logging()
 
 from mnemos._version import __version__ as _MNEMOS_VERSION  # noqa: E402
@@ -83,7 +87,7 @@ app = FastAPI(title="MNEMOS API", version=_MNEMOS_VERSION, description="Unified 
 # Transfer-Encoding: chunked and omit Content-Length. The previous
 # BaseHTTPMiddleware version only inspected Content-Length and was bypassed
 # by chunked uploads, which Starlette then buffered into memory unbounded.
-_MAX_BODY_BYTES = get_settings().server.max_body_bytes
+_MAX_BODY_BYTES = _settings.server.max_body_bytes
 
 
 class _BodySizeLimitASGI:
@@ -193,7 +197,7 @@ import secrets as _secrets
 
 from starlette.middleware.sessions import SessionMiddleware as _SessionMiddleware
 
-_oauth_state_secret = get_settings().server.session_secret
+_oauth_state_secret = _settings.server.session_secret
 if not _oauth_state_secret:
     logging.getLogger(__name__).warning(
         "MNEMOS_SESSION_SECRET is not set — generating a random key for this "
@@ -212,7 +216,7 @@ app.add_middleware(
 
 # CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).
 # Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
-_cors_origins_raw = get_settings().server.cors_origins
+_cors_origins_raw = _settings.server.cors_origins
 _cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 app.add_middleware(
     CORSMiddleware,

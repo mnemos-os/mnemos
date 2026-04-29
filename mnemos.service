@@ -11,11 +11,12 @@ WorkingDirectory=/opt/mnemos
 Environment="PATH=/opt/mnemos/venv/bin"
 Environment="MNEMOS_BIND=0.0.0.0"
 Environment="MNEMOS_PORT=5002"
+Environment="MNEMOS_PROFILE=edge"
 EnvironmentFile=/opt/mnemos/.env
 # Canonical port is 5002; this overrides [api].port in config.toml if different
-# MNEMOS v3.5 is single-worker by design; do not configure multiple Uvicorn workers.
+# MNEMOS_PROFILE is read from /opt/mnemos/.env; edge is the all-in-one default.
 # Keep the venv path explicit so systemd uses the installed console script.
-ExecStart=/opt/mnemos/venv/bin/mnemos serve
+ExecStart=/opt/mnemos/venv/bin/mnemos serve --profile ${MNEMOS_PROFILE}
 
 # Auto-restart on failure
 Restart=on-failure

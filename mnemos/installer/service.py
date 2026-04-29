@@ -64,11 +64,13 @@ def _write_env_file(config: Config, env_path: str) -> bool:
 
         lines = [
             "# MNEMOS environment — managed by installer",
+            f"MNEMOS_PROFILE={config.profile}",
             f"PG_HOST={config.db_host}",
             f"PG_PORT={config.db_port}",
             f"PG_DATABASE={config.db_name}",
             f"PG_USER={config.db_user}",
             f"PG_PASSWORD={config.db_password}",
+            f"MNEMOS_SQLITE_PATH={config.sqlite_path}",
             f"MNEMOS_LISTEN_PORT={config.listen_port}",
             f"MNEMOS_SERVICE_USER={config.service_user}",
             f"INFERENCE_EMBED_HOST={config.inference_embed_host}",
@@ -122,7 +124,7 @@ def _write_env_file(config: Config, env_path: str) -> bool:
 def install_systemd(config: Config, repo_path: str) -> bool:
     """Write systemd unit file and environment file. Return True on success."""
     repo = Path(repo_path)
-    venv_python = repo / "venv" / "bin" / "python"
+    venv_mnemos = repo / "venv" / "bin" / "mnemos"
     service_path = "/etc/systemd/system/mnemos.service"
     env_path = "/etc/mnemos/mnemos.env"
 
@@ -144,7 +146,7 @@ User={config.service_user}
 Group={config.service_user}
 WorkingDirectory={repo_path}
 EnvironmentFile={env_path}
-ExecStart={venv_python} -m mnemos.api.main
+ExecStart={venv_mnemos} serve --profile ${{MNEMOS_PROFILE}}
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -207,11 +209,13 @@ def install_launchd(config: Config, repo_path: str) -> bool:
     env_file = mnemos_dir / "mnemos.env"
 
     env_vars = {
+        "MNEMOS_PROFILE": config.profile,
         "PG_HOST": config.db_host,
         "PG_PORT": str(config.db_port),
         "PG_DATABASE": config.db_name,
         "PG_USER": config.db_user,
         "PG_PASSWORD": config.db_password,
+        "MNEMOS_SQLITE_PATH": config.sqlite_path,
         "MNEMOS_LISTEN_PORT": str(config.listen_port),
         "INFERENCE_EMBED_HOST": config.inference_embed_host,
     }

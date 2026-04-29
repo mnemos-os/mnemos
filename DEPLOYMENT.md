@@ -4,10 +4,33 @@
 
 ---
 
+## Choose Your Profile
+
+Pick one profile first. The profile sets safe defaults; explicit environment
+variables or `config.toml` entries still override those defaults.
+
+| Profile | Default stack | Use it for |
+|---------|---------------|------------|
+| `server` | Postgres + Redis + single worker by default, multi-worker safe when Redis is present | Production deployments and shared service installs |
+| `edge` | SQLite + in-process rate limits + one worker | Laptop, Pi, edge appliance, Consumer MNEMOS, bigpi/clawpi/zeropi, Termux on S21 |
+| `dev` | SQLite + in-process rate limits + debug logging | Local development and test loops |
+
+Examples:
+
+```bash
+mnemos serve --profile server
+mnemos serve --profile edge
+mnemos serve --profile dev
+```
+
+`MNEMOS_PROFILE=personal` is a legacy v3.x alias and resolves to `edge`.
+
+---
+
 ## Quick Start
 
 ### Prerequisites
-- PostgreSQL 12+ (for memory storage, audit logs, sessions, DAG versioning)
+- PostgreSQL 12+ for the `server` profile, or SQLite for `edge`/`dev`
 - Python 3.10+
 - LLM provider API keys (Together AI or Groq free tier recommended)
 - (Optional) GPU or local inference endpoint for APOLLO's LLM fallback and self-hosted LLMs
@@ -50,10 +73,10 @@ circuit-breaker state; see `docs/SCALING.md`.
 
 ## SQLite Profile
 
-The SQLite profile is available for local development, laptops, and edge
-single-user deployments. Set `MNEMOS_PERSISTENCE_BACKEND=sqlite` with
-`MNEMOS_SQLITE_PATH=/path/to/mnemos.sqlite3`, or set
-`MNEMOS_PERSISTENCE_BACKEND=auto` with a `sqlite:///...` `MNEMOS_DATABASE_URL`.
+Use the `edge` or `dev` deployment profile for SQLite-backed installs. The
+default SQLite path is `~/.mnemos/mnemos.db`; override it with
+`MNEMOS_SQLITE_PATH=/path/to/mnemos.db` or `[database].sqlite_path` in
+`config.toml`.
 
 See `docs/SQLITE_PROFILE.md` for the constraints: no RLS, no LISTEN/NOTIFY, no
 advisory locks, FTS5 instead of PostgreSQL tsvector, and sqlite-vec instead of

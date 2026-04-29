@@ -3,6 +3,7 @@
 import asyncio
 import inspect
 import json
+import os
 import sys
 from contextlib import contextmanager
 from enum import Enum
@@ -13,7 +14,7 @@ from typing import Any, Callable, Optional, Sequence
 import httpx
 import typer
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, reload_settings
 
 
 def _patch_typer_click_compat() -> None:
@@ -109,6 +110,12 @@ class ConsultMode(str, Enum):
     consensus = "consensus"
     debate = "debate"
     single = "single"
+
+
+class DeploymentProfile(str, Enum):
+    server = "server"
+    edge = "edge"
+    dev = "dev"
 
 
 EXPORT_DISPATCH: dict[str, str] = {
@@ -296,6 +303,14 @@ def _parse_consult_mode(mode: str) -> ConsultMode:
         raise typer.Exit(2) from exc
 
 
+def _apply_profile_flag(profile: Optional[DeploymentProfile]) -> None:
+    if profile is None:
+        return
+    os.environ["MNEMOS_PROFILE_OVERRIDE"] = profile.value
+    os.environ["MNEMOS_PROFILE"] = profile.value
+    reload_settings()
+
+
 def _adapter_source_args(import_from: ImportSource, source: Path) -> list[str]:
     source_text = str(source)
 
@@ -328,6 +343,12 @@ def serve(
     ctx: typer.Context,
     host: str = typer.Option("0.0.0.0", "--host", help="API bind address.", is_flag=False),
     port: int = typer.Option(5002, "--port", help="API listen port.", is_flag=False),
+    profile: Optional[DeploymentProfile] = typer.Option(
+        None,
+        "--profile",
+        help="Deployment profile: server, edge, or dev.",
+        is_flag=False,
+    ),
     workers: Optional[int] = typer.Option(
         None,
         "--workers",
@@ -338,6 +359,8 @@ def serve(
     """Run the MNEMOS FastAPI server."""
     if ctx.invoked_subcommand is not None:
         return
+
+    _apply_profile_flag(profile)
 
     import uvicorn
 
@@ -377,6 +400,12 @@ def install(
     unattended: bool = typer.Option(False, "--unattended", help="Non-interactive environment-driven install."),
     upgrade: bool = typer.Option(False, "--upgrade", help="Re-run migrations only."),
     check: bool = typer.Option(False, "--check", help="Run environment checks only."),
+    profile: Optional[DeploymentProfile] = typer.Option(
+        None,
+        "--profile",
+        help="Deployment profile: server, edge, or dev.",
+        is_flag=False,
+    ),
 ) -> None:
     """Run the MNEMOS install wizard."""
     selected_modes = sum(bool(value) for value in (agent, wizard, unattended))
@@ -395,6 +424,8 @@ def install(
         argv.append("--upgrade")
     if check:
         argv.append("--check")
+    if profile is not None:
+        argv.extend(["--profile", profile.value])
 
     _run_module_main("mnemos.installer.__main__", argv, prog="mnemos install")
 
