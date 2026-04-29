@@ -26,7 +26,6 @@ Usage (standalone, for testing):
 import asyncio
 import json
 import logging
-import os
 import time
 from datetime import datetime
 from pathlib import Path
@@ -34,17 +33,16 @@ from typing import Optional
 
 import httpx
 
+from mnemos.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 # ── Key store ──────────────────────────────────────────────────────────────────
-_KEY_FILE = Path(
-    os.getenv("API_KEYS_FILE", Path.home() / ".config" / "mnemos" / "api_keys.json")
-)
 
 def _load_key(provider: str) -> Optional[str]:
     """Load API key from the Provider Registry File."""
     try:
-        data = json.loads(_KEY_FILE.read_text())
+        data = json.loads(get_settings().providers.api_keys_file.expanduser().read_text())
         return data.get("llm_providers", {}).get(provider, {}).get("api_key")
     except Exception:
         return None

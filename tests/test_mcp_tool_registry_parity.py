@@ -179,6 +179,9 @@ def _install_mcp_stubs(monkeypatch):
 
 
 def _fresh_import(module_name: str):
+    from mnemos.core import config
+
+    config._reset_settings_for_tests()
     sys.modules.pop(module_name, None)
     return importlib.import_module(module_name)
 

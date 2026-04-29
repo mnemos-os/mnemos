@@ -3,7 +3,6 @@
 import asyncio
 import inspect
 import json
-import os
 import sys
 from contextlib import contextmanager
 from enum import Enum
@@ -14,11 +13,25 @@ from typing import Any, Callable, Optional, Sequence
 import httpx
 import typer
 
+from mnemos.core.config import get_settings
+
 
 def _patch_typer_click_compat() -> None:
     """Keep Typer 0.9 usable with newer Click releases in older envs."""
     try:
+        from click.core import Parameter
         from typer.core import TyperArgument, TyperOption
+
+        if len(inspect.signature(Parameter.make_metavar).parameters) == 2:
+            original_parameter_make_metavar = Parameter.make_metavar
+
+            if not getattr(Parameter.make_metavar, "_mnemos_click_compat", False):
+
+                def parameter_make_metavar(self: Any, ctx: Any = None) -> str:
+                    return original_parameter_make_metavar(self, ctx)
+
+                parameter_make_metavar._mnemos_click_compat = True
+                Parameter.make_metavar = parameter_make_metavar
 
         if len(inspect.signature(TyperArgument.make_metavar).parameters) == 1:
 
@@ -180,8 +193,9 @@ def _run_async_module_main(module_name: str) -> None:
 
 
 def _api_env(require_key: bool) -> tuple[str, dict[str, str]]:
-    base = os.getenv("MNEMOS_BASE")
-    api_key = os.getenv("MNEMOS_API_KEY")
+    settings = get_settings().server
+    base = settings.base if settings.base_configured else ""
+    api_key = settings.api_key
 
     if not base:
         typer.echo(
@@ -203,8 +217,9 @@ def _api_env(require_key: bool) -> tuple[str, dict[str, str]]:
 
 
 def _append_env_endpoint(argv: list[str]) -> None:
-    base = os.getenv("MNEMOS_BASE")
-    api_key = os.getenv("MNEMOS_API_KEY")
+    settings = get_settings().server
+    base = settings.base if settings.base_configured else ""
+    api_key = settings.api_key
     if base:
         argv.extend(["--endpoint", base])
     if api_key:

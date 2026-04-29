@@ -37,12 +37,13 @@ See ROADMAP.md "Apollo Program" for the full staged plan.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 from typing import List, Optional
 
 import httpx
+
+from mnemos.core.config import get_settings
 
 from .apollo_schemas import (
     CodeSchema,
@@ -65,9 +66,10 @@ from .gpu_guard import get_guard
 logger = logging.getLogger(__name__)
 
 # GPU provider endpoint for APOLLO's LLM fallback.
-_GPU_PROVIDER_HOST = os.getenv("GPU_PROVIDER_HOST", "http://localhost")
-_GPU_PROVIDER_PORT = os.getenv("GPU_PROVIDER_PORT", "8000")
-_GPU_PROVIDER_TIMEOUT = float(os.getenv("GPU_PROVIDER_TIMEOUT", "30.0"))
+_PROVIDER_SETTINGS = get_settings().providers
+_GPU_PROVIDER_HOST = _PROVIDER_SETTINGS.gpu_provider_host
+_GPU_PROVIDER_PORT = _PROVIDER_SETTINGS.gpu_provider_port
+_GPU_PROVIDER_TIMEOUT = _PROVIDER_SETTINGS.gpu_provider_timeout
 
 
 # Default schema registry. Order matters: first match wins.

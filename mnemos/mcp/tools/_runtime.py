@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import contextvars
-import os
 from typing import Any
 
 import httpx
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.config import get_settings
 from mnemos.db.mcp_repo import assert_memory_readable
 
 HTTP_TIMEOUT = 30.0
@@ -47,11 +47,11 @@ def current_mcp_backend_user_id() -> str | None:
 
 
 def _mnemos_base() -> str:
-    return os.getenv("MNEMOS_BASE", "http://localhost:5002").rstrip("/")
+    return get_settings().server.base.rstrip("/")
 
 
 def _backend_headers() -> dict[str, str]:
-    api_key = _MCP_BACKEND_API_KEY.get() or os.getenv("MNEMOS_API_KEY", "")
+    api_key = _MCP_BACKEND_API_KEY.get() or get_settings().server.api_key
     headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
     user_id = _MCP_BACKEND_USER_ID.get()
     if user_id:

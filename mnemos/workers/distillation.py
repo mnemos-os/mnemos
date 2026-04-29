@@ -26,7 +26,7 @@ logging.basicConfig(
 # Config
 # Config — loaded from config.py (single source of truth)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-from mnemos.core.config import PG_CONFIG as _PG_CONFIG  # noqa: E402
+from mnemos.core.config import PG_CONFIG as _PG_CONFIG, get_settings  # noqa: E402
 
 # Contest path: drains memory_compression_queue via the plugin
 # CompressionEngine ABC + run_contest + persist_contest.
@@ -40,7 +40,8 @@ except Exception as _ce:
     logger.warning(f"compression contest path unavailable: {_ce}")
     _CONTEST_AVAILABLE = False
 
-_CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
+_COMPRESSION_SETTINGS = get_settings().compression
+_CONTEST_ENABLED = _COMPRESSION_SETTINGS.contest_enabled
 
 # The current built-in compression stack is APOLLO + ARTEMIS.
 
@@ -48,24 +49,20 @@ _CONTEST_ENABLED = os.getenv("MNEMOS_CONTEST_ENABLED", "true").lower() == "true"
 # Memories shorter than this value are marked 'failed' with
 # error='too_short' before any engine runs. Default 0 = no gate.
 # Recommended 500 for GPU-constrained installs.
-_CONTEST_MIN_CONTENT_LENGTH = int(
-    os.getenv("MNEMOS_CONTEST_MIN_CONTENT_LENGTH", "0")
-)
+_CONTEST_MIN_CONTENT_LENGTH = _COMPRESSION_SETTINGS.contest_min_content_length
 
 # APOLLO joined the default contest in v3.3 S-II. The engine is
 # GPU_OPTIONAL (schema fast path is pure regex; LLM fallback uses
 # the GPU host when reachable, short-circuits on a closed circuit,
 # returns error on parse failure — see compression/apollo.py). The
 # env var lets operators disable APOLLO entirely without editing code.
-_APOLLO_ENABLED = os.getenv("MNEMOS_APOLLO_ENABLED", "true").lower() == "true"
+_APOLLO_ENABLED = _COMPRESSION_SETTINGS.apollo_enabled
 
 # When APOLLO is on but the LLM fallback is unwanted (operators who
 # want only the pure schema fast path — no GPU calls from APOLLO),
 # flip this off. supports() then falls back to the S-IC shape:
 # APOLLO skips non-schema-matching memories entirely.
-_APOLLO_LLM_FALLBACK_ENABLED = (
-    os.getenv("MNEMOS_APOLLO_LLM_FALLBACK_ENABLED", "true").lower() == "true"
-)
+_APOLLO_LLM_FALLBACK_ENABLED = _COMPRESSION_SETTINGS.apollo_llm_fallback_enabled
 
 # Judge-LLM fidelity scoring (v3.3 S-II). When enabled, every
 # successful contest candidate gets its quality_score replaced by a
@@ -74,8 +71,8 @@ _APOLLO_LLM_FALLBACK_ENABLED = (
 # dense encoding preserves meaning. Operators opt in per the judge's
 # GPU cost profile. When on, the MNEMOS_JUDGE_MODEL env var stamps
 # the judge's id onto every scored candidate (default 'judge-default').
-_JUDGE_ENABLED = os.getenv("MNEMOS_JUDGE_ENABLED", "false").lower() == "true"
-_JUDGE_MODEL = os.getenv("MNEMOS_JUDGE_MODEL", "judge-default")
+_JUDGE_ENABLED = _COMPRESSION_SETTINGS.judge_enabled
+_JUDGE_MODEL = _COMPRESSION_SETTINGS.judge_model
 
 # Judge mode selects the scoring implementation:
 #   llm        — LLMJudge only (v3.3 S-II default; reasoning + fidelity)
@@ -87,10 +84,8 @@ _JUDGE_MODEL = os.getenv("MNEMOS_JUDGE_MODEL", "judge-default")
 # (sentence-transformers). Ensemble is the benchmark-gathering mode —
 # run it for a window, compare primary/secondary agreement, decide
 # whether to eventually promote the cross-encoder to the fast path.
-_JUDGE_MODE = os.getenv("MNEMOS_JUDGE_MODE", "llm").lower()
-_CROSS_ENCODER_MODEL = os.getenv(
-    "MNEMOS_CROSS_ENCODER_MODEL", "cross-encoder/ms-marco-MiniLM-L-12-v2",
-)
+_JUDGE_MODE = _COMPRESSION_SETTINGS.judge_mode.lower()
+_CROSS_ENCODER_MODEL = _COMPRESSION_SETTINGS.cross_encoder_model
 
 # Stale-running sweep threshold (v3.1.1). Queue rows stuck in 'running'
 # longer than this are reclaimed at the top of each batch — reset to
@@ -100,26 +95,7 @@ _CROSS_ENCODER_MODEL = os.getenv(
 # AND the fresh-connection fallback mark-failed failed — pool exhausted,
 # SIGKILL, etc.). Default 600s is safe for typical runs that finish in
 # seconds. Set to 0 to disable the sweep entirely.
-def _parse_stale_threshold_secs() -> int:
-    raw = os.getenv("MNEMOS_CONTEST_STALE_THRESHOLD_SECS", "600")
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "MNEMOS_CONTEST_STALE_THRESHOLD_SECS=%r is not an integer; "
-            "disabling stale-running sweep.", raw,
-        )
-        return 0
-    if value < 0:
-        logger.warning(
-            "MNEMOS_CONTEST_STALE_THRESHOLD_SECS=%d is negative; "
-            "disabling stale-running sweep.", value,
-        )
-        return 0
-    return value
-
-
-_CONTEST_STALE_THRESHOLD_SECS = _parse_stale_threshold_secs()
+_CONTEST_STALE_THRESHOLD_SECS = _COMPRESSION_SETTINGS.contest_stale_threshold_secs
 
 # Tuning
 BATCH_SIZE = 5

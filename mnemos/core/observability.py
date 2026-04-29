@@ -32,7 +32,6 @@ is absent or fails validation, we generate a fresh UUID4 hex.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import time
 import uuid
@@ -41,6 +40,8 @@ from typing import Awaitable, Callable, Optional
 
 from fastapi import APIRouter
 from starlette.middleware.base import BaseHTTPMiddleware
+
+from mnemos.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 from starlette.requests import Request
@@ -348,11 +349,12 @@ def install_tracing(service_name: str = "mnemos") -> None:
         _TRACING_INSTALLED = True
         return
 
-    effective_name = os.getenv("OTEL_SERVICE_NAME", service_name)
+    observability_settings = get_settings().observability
+    effective_name = observability_settings.otel_service_name or service_name
     resource = Resource.create({"service.name": effective_name})
     provider = TracerProvider(resource=resource)
 
-    endpoint = os.getenv("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    endpoint = observability_settings.otel_exporter_otlp_endpoint.strip()
     if endpoint:
         try:  # Exporter-proto-http is also soft-optional — a leaner
               # operator may install only the SDK and export some

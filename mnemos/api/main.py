@@ -29,6 +29,7 @@ from mnemos.api.routes.state import router as state_router
 from mnemos.api.routes.versions import router as versions_router
 from mnemos.api.routes.webhooks import router as webhooks_router
 from mnemos.api.lifecycle_hooks import register_lifespan_hooks
+from mnemos.core.config import get_settings
 from mnemos.core.lifecycle import lifespan
 from mnemos.core.rate_limit import (
     RateLimitExceeded,
@@ -66,7 +67,7 @@ install_tracing()  # no-op unless opentelemetry is installed
 # parsers expect the default format. Without `structlog` installed,
 # or without the env flag set, the standard formatter (with
 # [req:<id>]) is used.
-if os.getenv("MNEMOS_STRUCTURED_LOGS", "").lower() in ("1", "true", "yes"):
+if get_settings().observability.structured_logs:
     install_structured_logging()
 
 from mnemos._version import __version__ as _MNEMOS_VERSION  # noqa: E402
@@ -82,7 +83,7 @@ app = FastAPI(title="MNEMOS API", version=_MNEMOS_VERSION, description="Unified 
 # Transfer-Encoding: chunked and omit Content-Length. The previous
 # BaseHTTPMiddleware version only inspected Content-Length and was bypassed
 # by chunked uploads, which Starlette then buffered into memory unbounded.
-_MAX_BODY_BYTES = int(os.getenv("MAX_BODY_BYTES", str(5 * 1024 * 1024)))
+_MAX_BODY_BYTES = get_settings().server.max_body_bytes
 
 
 class _BodySizeLimitASGI:
@@ -188,12 +189,11 @@ app.add_middleware(SlowAPIMiddleware)
 # IMPORTANT: set MNEMOS_SESSION_SECRET to a stable value in production. When
 # unset we generate a random one at startup, which invalidates any in-flight
 # OAuth login on every server restart (the 10-min redirect roundtrip breaks).
-import os as _os
 import secrets as _secrets
 
 from starlette.middleware.sessions import SessionMiddleware as _SessionMiddleware
 
-_oauth_state_secret = _os.environ.get('MNEMOS_SESSION_SECRET')
+_oauth_state_secret = get_settings().server.session_secret
 if not _oauth_state_secret:
     logging.getLogger(__name__).warning(
         "MNEMOS_SESSION_SECRET is not set — generating a random key for this "
@@ -212,7 +212,7 @@ app.add_middleware(
 
 # CORS: set CORS_ORIGINS env var to restrict in production (comma-separated list).
 # Defaults to "*" for local dev. Example: CORS_ORIGINS=https://app.example.com
-_cors_origins_raw = os.getenv("CORS_ORIGINS", "http://localhost,http://127.0.0.1,http://127.0.0.1:5002,http://localhost:5002")
+_cors_origins_raw = get_settings().server.cors_origins
 _cors_origins = [o.strip() for o in _cors_origins_raw.split(",")]
 app.add_middleware(
     CORSMiddleware,
@@ -257,6 +257,7 @@ if __name__ == "__main__":
     # workers=1 is required: GRAEAE circuit breakers, rate limiters, and semaphores
     # are in-process state. Multiple workers each get their own copy and will not
     # share limits. Use MNEMOS_PORT env var to override (default: 5002).
-    port = int(os.getenv("MNEMOS_PORT", "5002"))
-    host = os.getenv("MNEMOS_BIND", "127.0.0.1")
+    settings = get_settings().server
+    port = settings.port
+    host = settings.bind
     uvicorn.run(app, host=host, port=port, workers=1)

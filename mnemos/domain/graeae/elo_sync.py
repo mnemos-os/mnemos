@@ -37,12 +37,12 @@ A separate `scripts/refresh_elo_weights.py` is intended for a quarterly systemd 
 
 import json
 import logging
-import os
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import httpx
+
+from mnemos.core.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -74,9 +74,9 @@ _ELO_MODEL_MAP: dict[str, str] = {
 }
 
 # ── On-disk weight registry ───────────────────────────────────────────────
-_REGISTRY_PATH = Path(
-    os.getenv("GRAEAE_ELO_REGISTRY", "/var/lib/mnemos/graeae_elo_weights.json")
-)
+
+def _registry_path():
+    return get_settings().graeae.elo_registry.expanduser()
 
 
 # ── Normalisation ─────────────────────────────────────────────────────────
@@ -162,10 +162,11 @@ def fetch_elo_weights(timeout: int = 30) -> Optional[dict[str, float]]:
 
 def load_cached_weights() -> Optional[dict[str, float]]:
     """Load weights persisted by a previous sync run."""
-    if not _REGISTRY_PATH.exists():
+    registry_path = _registry_path()
+    if not registry_path.exists():
         return None
     try:
-        data = json.loads(_REGISTRY_PATH.read_text())
+        data = json.loads(registry_path.read_text())
         weights = data.get("weights")
         updated = data.get("updated_at", "unknown")
         if weights:
@@ -178,14 +179,15 @@ def load_cached_weights() -> Optional[dict[str, float]]:
 
 def save_weights(weights: dict[str, float]) -> None:
     """Persist weights to the on-disk registry."""
+    registry_path = _registry_path()
     try:
-        _REGISTRY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        _REGISTRY_PATH.write_text(json.dumps({
+        registry_path.parent.mkdir(parents=True, exist_ok=True)
+        registry_path.write_text(json.dumps({
             "weights": weights,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "source": "arena.ai / lmarena-ai/leaderboard-dataset (text/latest)",
         }, indent=2))
-        logger.info(f"[ELO] weights saved to {_REGISTRY_PATH}")
+        logger.info(f"[ELO] weights saved to {registry_path}")
     except Exception as exc:
         logger.warning(f"[ELO] failed to save weights: {exc}")
 

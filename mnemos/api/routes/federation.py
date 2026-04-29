@@ -127,9 +127,9 @@ def _validate_peer_base_url(base_url: str) -> None:
     """Require https:// for peer base URLs. Set FEDERATION_ALLOW_INSECURE=true
     to permit http:// (lab/local testing only — the peer auth token ships
     in clear over HTTP)."""
-    import os as _os
     from urllib.parse import urlparse
-    allow_insecure = _os.getenv("FEDERATION_ALLOW_INSECURE", "false").lower() == "true"
+    from mnemos.core.config import get_settings
+    allow_insecure = get_settings().federation.allow_insecure
     parsed = urlparse(base_url)
     if parsed.scheme == "https":
         return

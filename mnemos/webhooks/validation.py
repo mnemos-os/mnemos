@@ -3,14 +3,15 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
-import os
 import socket
 from typing import List, Union
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
-_WEBHOOK_ALLOW_PRIVATE = os.getenv("WEBHOOK_ALLOW_PRIVATE_HOSTS", "false").lower() == "true"
+from mnemos.core.config import get_settings
+
+_WEBHOOK_ALLOW_PRIVATE = get_settings().webhook.allow_private_hosts
 
 # Cloud-provider instance-metadata hostnames we always refuse, even when
 # WEBHOOK_ALLOW_PRIVATE_HOSTS=true. Includes the link-local IP literals as a

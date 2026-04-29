@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Callable, Optional, TypeVar
 
 import asyncpg
 
-DEFAULT_ACQUIRE_TIMEOUT = float(os.getenv("MNEMOS_POOL_ACQUIRE_TIMEOUT", "10.0"))
+from mnemos.core.config import get_settings
+
+DEFAULT_ACQUIRE_TIMEOUT = get_settings().runtime.pool_acquire_timeout
 RETRY_DELAY_SECONDS = 0.05
 
 _TRANSIENT_ERRORS = (

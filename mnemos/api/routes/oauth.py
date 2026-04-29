@@ -117,13 +117,14 @@ async def oauth_callback(provider: str, request: Request):
     # `request.url.scheme` is "http" even when the client is on HTTPS — trust
     # X-Forwarded-Proto when OAUTH_TRUST_PROXY is set (and the proxy is
     # configured to rewrite the header).
-    import os as _os
-    _trust_proxy = _os.getenv("OAUTH_TRUST_PROXY", "false").lower() == "true"
+    from mnemos.core.config import get_settings
+    settings = get_settings()
+    _trust_proxy = settings.oauth.trust_proxy
     _xfp = request.headers.get("x-forwarded-proto", "").split(",")[0].strip().lower()
     is_https = (
         request.url.scheme == "https"
         or (_trust_proxy and _xfp == "https")
-        or _os.getenv("MNEMOS_SESSION_HTTPS_ONLY", "").lower() in ("1", "true")
+        or settings.server.session_https_only
     )
     response: RedirectResponse = RedirectResponse(url=post_login_redirect, status_code=303)
     response.set_cookie(

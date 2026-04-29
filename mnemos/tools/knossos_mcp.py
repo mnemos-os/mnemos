@@ -43,22 +43,24 @@ sys.stdout = sys.stderr
 
 import httpx  # noqa: E402
 import mcp.types as types  # noqa: E402
+from mnemos.core.config import get_settings  # noqa: E402
 from mcp.server import Server  # noqa: E402
 from mcp.server.stdio import stdio_server  # noqa: E402
 
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
 logger = logging.getLogger("knossos-mcp")
 
-MNEMOS_BASE = os.environ.get("MNEMOS_BASE", "http://localhost:5002").rstrip("/")
-MNEMOS_API_KEY = os.environ.get("MNEMOS_API_KEY")
+_SETTINGS = get_settings()
+MNEMOS_BASE = _SETTINGS.server.base.rstrip("/")
+MNEMOS_API_KEY = _SETTINGS.server.api_key
 # Default wing_axis is 'namespace': that's the only MNEMOS tenancy
 # axis the /v1/memories/search endpoint accepts as a filter today.
 # 'owner_id' remains configurable for tooling that talks to root
 # (which can pass owner_id on mutations), but search/list scoping
 # requires namespace. Codex caught the prior owner_id default silently
 # dropping wing scope on every search/list call.
-WING_AXIS = os.environ.get("KNOSSOS_WING_AXIS", "namespace")
-DEFAULT_WING = os.environ.get("KNOSSOS_DEFAULT_WING", "default")
+WING_AXIS = _SETTINGS.tools.knossos_wing_axis
+DEFAULT_WING = _SETTINGS.tools.knossos_default_wing
 
 if WING_AXIS not in ("owner_id", "namespace"):
     raise SystemExit(

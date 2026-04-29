@@ -92,7 +92,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 import urllib.error
@@ -100,6 +99,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+from mnemos.core.config import get_settings
 
 MPF_VERSION = "0.1.0"
 # After translation, payloads are MNEMOS-native; declare mnemos-3.1
@@ -390,13 +391,14 @@ class KuzuBackend(GraphitiBackend):
 def _open_backend(args: argparse.Namespace) -> GraphitiBackend:
     """Dispatch to the requested backend (mirrors mempalace._open_collection)."""
     backend = args.backend
+    settings = get_settings().tools
     if backend == "neo4j":
         if not args.neo4j:
             raise SystemExit("--neo4j bolt-URI is required for neo4j backend")
         return Neo4jBackend(
             uri=args.neo4j,
-            user=args.neo4j_user or os.environ.get("NEO4J_USER", "neo4j"),
-            password=args.neo4j_password or os.environ.get("NEO4J_PASSWORD", ""),
+            user=args.neo4j_user or settings.neo4j_user,
+            password=args.neo4j_password or settings.neo4j_password,
             database=args.neo4j_database,
         )
     if backend == "falkordb":
@@ -404,7 +406,7 @@ def _open_backend(args: argparse.Namespace) -> GraphitiBackend:
             host=args.falkordb_host,
             port=args.falkordb_port,
             graph=args.falkordb_graph,
-            password=args.falkordb_password or os.environ.get("FALKORDB_PASSWORD"),
+            password=args.falkordb_password or settings.falkordb_password,
         )
     if backend == "kuzu":
         if not args.kuzu_db:
