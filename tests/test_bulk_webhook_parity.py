@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from typing import Any
 
 import pytest
 
 from mnemos.api.dependencies import UserContext, get_current_user
+from tests._fake_backend import install_fake_backend
 
 pytestmark = pytest.mark.asyncio
 
@@ -20,64 +20,6 @@ def _alice() -> UserContext:
         namespace="alice-ns",
         authenticated=True,
     )
-
-
-class _AsyncNullContext:
-    async def __aenter__(self):
-        return None
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _BulkConn:
-    def __init__(self, pool: "_BulkPool"):
-        self.pool = pool
-        self.execute_calls: list[tuple[str, tuple[Any, ...]]] = []
-
-    def transaction(self):
-        return _AsyncNullContext()
-
-    async def execute(self, sql: str, *args):
-        self.execute_calls.append((sql, args))
-        compact = " ".join(sql.split())
-        if compact.startswith("INSERT INTO memories "):
-            self.pool.inserts.append(
-                {
-                    "conn": self,
-                    "id": args[0],
-                    "content": args[1],
-                    "category": args[2],
-                    "subcategory": args[3],
-                    "owner_id": args[6],
-                    "namespace": args[7],
-                }
-            )
-            return "INSERT 0 1"
-        return "OK"
-
-
-class _AcquireContext:
-    def __init__(self, pool: "_BulkPool"):
-        self.pool = pool
-        self.conn: _BulkConn | None = None
-
-    async def __aenter__(self):
-        self.conn = _BulkConn(self.pool)
-        self.pool.connections.append(self.conn)
-        return self.conn
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _BulkPool:
-    def __init__(self):
-        self.connections: list[_BulkConn] = []
-        self.inserts: list[dict[str, Any]] = []
-
-    def acquire(self):
-        return _AcquireContext(self)
 
 
 @pytest.fixture
@@ -96,15 +38,6 @@ def current_user_override():
         app.dependency_overrides.pop(get_current_user, None)
 
 
-def _install_pool(monkeypatch: pytest.MonkeyPatch, pool: _BulkPool) -> None:
-    import mnemos.core.lifecycle as lc
-    from mnemos.api.main import app
-
-    monkeypatch.setattr(lc, "_pool", pool)
-    monkeypatch.setattr(lc, "_cache", None)
-    app.state.pool = pool
-
-
 def _memory(content: str, category: str = "facts", subcategory: str | None = None) -> dict[str, Any]:
     body: dict[str, Any] = {"content": content, "category": category}
     if subcategory is not None:
@@ -118,24 +51,7 @@ async def test_bulk_create_emits_memory_created_for_each_success(
     current_user_override,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    pool = _BulkPool()
-    _install_pool(monkeypatch, pool)
-    events: list[dict[str, Any]] = []
-
-    async def fake_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
-        events.append(
-            {
-                "conn": conn,
-                "event_type": event_type,
-                "payload": payload,
-                "owner_id": owner_id,
-                "namespace": namespace,
-            }
-        )
-
-    from mnemos.webhooks import dispatcher as webhook_dispatcher
-
-    monkeypatch.setattr(webhook_dispatcher, "dispatch", fake_dispatch)
+    backend = install_fake_backend(monkeypatch)
 
     resp = await client.post(
         "/v1/memories/bulk",
@@ -153,16 +69,17 @@ async def test_bulk_create_emits_memory_created_for_each_success(
     data = resp.json()
     memory_ids = data["memory_ids"]
     assert data == {"created": 3, "memory_ids": memory_ids, "errors": []}
-    assert [insert["id"] for insert in pool.inserts] == memory_ids
-    assert [event["payload"]["memory_id"] for event in events] == memory_ids
-    assert [event["event_type"] for event in events] == ["memory.created"] * 3
-    assert {event["owner_id"] for event in events} == {"alice"}
-    assert {event["namespace"] for event in events} == {"alice-ns"}
-    assert {event["payload"]["owner_id"] for event in events} == {"alice"}
-    assert {event["payload"]["namespace"] for event in events} == {"alice-ns"}
-    assert len(pool.connections) == 1
-    assert {event["conn"] for event in events} == {pool.connections[0]}
-    assert {insert["conn"] for insert in pool.inserts} == {pool.connections[0]}
+    insert_calls = [payload for name, payload in backend.memories.calls if name == "insert_memory"]
+    webhook_calls = [payload for name, payload in backend.webhooks.calls if name == "dispatch_event"]
+    assert [call["memory_id"] for call in insert_calls] == memory_ids
+    assert [call["payload"]["memory_id"] for call in webhook_calls] == memory_ids
+    assert [call["event_type"] for call in webhook_calls] == ["memory.created"] * 3
+    assert {call["owner_id"] for call in webhook_calls} == {"alice"}
+    assert {call["namespace"] for call in webhook_calls} == {"alice-ns"}
+    assert {call["payload"]["owner_id"] for call in webhook_calls} == {"alice"}
+    assert {call["payload"]["namespace"] for call in webhook_calls} == {"alice-ns"}
+    assert backend.commits == 3
+    assert backend.rollbacks == 0
 
 
 async def test_bulk_create_dispatches_only_successful_items(
@@ -171,16 +88,7 @@ async def test_bulk_create_dispatches_only_successful_items(
     current_user_override,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    pool = _BulkPool()
-    _install_pool(monkeypatch, pool)
-    events: list[dict[str, Any]] = []
-
-    async def fake_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
-        events.append({"payload": payload, "owner_id": owner_id, "namespace": namespace})
-
-    from mnemos.webhooks import dispatcher as webhook_dispatcher
-
-    monkeypatch.setattr(webhook_dispatcher, "dispatch", fake_dispatch)
+    backend = install_fake_backend(monkeypatch)
 
     resp = await client.post(
         "/v1/memories/bulk",
@@ -199,11 +107,15 @@ async def test_bulk_create_dispatches_only_successful_items(
     assert data["created"] == 2
     assert len(data["memory_ids"]) == 2
     assert data["errors"] == ["[1] content is empty"]
-    assert [insert["id"] for insert in pool.inserts] == data["memory_ids"]
-    assert [event["payload"]["memory_id"] for event in events] == data["memory_ids"]
-    assert [event["payload"]["content"] for event in events] == ["valid one", "valid two"]
-    assert {event["owner_id"] for event in events} == {"alice"}
-    assert {event["namespace"] for event in events} == {"alice-ns"}
+    insert_calls = [payload for name, payload in backend.memories.calls if name == "insert_memory"]
+    webhook_calls = [payload for name, payload in backend.webhooks.calls if name == "dispatch_event"]
+    assert [call["memory_id"] for call in insert_calls] == data["memory_ids"]
+    assert [call["payload"]["memory_id"] for call in webhook_calls] == data["memory_ids"]
+    assert [call["payload"]["content"] for call in webhook_calls] == ["valid one", "valid two"]
+    assert {call["owner_id"] for call in webhook_calls} == {"alice"}
+    assert {call["namespace"] for call in webhook_calls} == {"alice-ns"}
+    assert backend.commits == 2
+    assert backend.rollbacks == 0
 
 
 async def test_bulk_create_fails_when_outbox_enqueue_fails(
@@ -211,20 +123,9 @@ async def test_bulk_create_fails_when_outbox_enqueue_fails(
     auth_headers: dict[str, str],
     current_user_override,
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
 ):
-    pool = _BulkPool()
-    _install_pool(monkeypatch, pool)
-    dispatch_attempts: list[dict[str, Any]] = []
-    caplog.set_level(logging.WARNING, logger="mnemos.api.routes.memories")
-
-    async def failing_dispatch(event_type, payload, *, conn=None, owner_id, namespace):
-        dispatch_attempts.append(payload)
-        raise RuntimeError("dispatcher unavailable")
-
-    from mnemos.webhooks import dispatcher as webhook_dispatcher
-
-    monkeypatch.setattr(webhook_dispatcher, "dispatch", failing_dispatch)
+    backend = install_fake_backend(monkeypatch)
+    backend.webhooks.configure_raise(RuntimeError("dispatcher unavailable"))
 
     resp = await client.post(
         "/v1/memories/bulk",
@@ -232,7 +133,21 @@ async def test_bulk_create_fails_when_outbox_enqueue_fails(
         headers=auth_headers,
     )
 
-    assert resp.status_code == 500, resp.text
-    assert resp.json()["detail"] == "Bulk memory creation failed"
-    assert dispatch_attempts
-    assert "webhook dispatch failed" not in caplog.text
+    assert resp.status_code == 201, resp.text
+    data = resp.json()
+    assert data["created"] == 0
+    assert data["memory_ids"] == []
+    assert data["errors"] == [
+        "[0] dispatcher unavailable",
+        "[1] dispatcher unavailable",
+    ]
+    assert [name for name, _payload in backend.memories.calls] == [
+        "insert_memory",
+        "insert_memory",
+    ]
+    assert [name for name, _payload in backend.webhooks.calls] == [
+        "dispatch_event",
+        "dispatch_event",
+    ]
+    assert backend.commits == 0
+    assert backend.rollbacks == 2

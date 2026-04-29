@@ -1063,10 +1063,7 @@ class PostgresBackend(PersistenceBackend):
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:
-        acquire_ctx = self._pool.acquire()
-        if inspect.isawaitable(acquire_ctx):
-            acquire_ctx = await acquire_ctx
-        async with acquire_ctx as conn:
+        async with self._pool.acquire() as conn:
             raw_tx = conn.transaction()
             await raw_tx.start()
             tx = PostgresTransaction(conn, raw_tx)

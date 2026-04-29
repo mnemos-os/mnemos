@@ -4,7 +4,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v4.0.0 is the memory operating system for serious agentic work: a
+**MNEMOS v4.1.1 is the memory operating system for serious agentic work: a
 packaged FastAPI runtime, multi-backend persistence layer, GRAEAE reasoning bus,
 operator-audited compression stack, and CLI-first deployment surface.**
 
@@ -28,7 +28,7 @@ federate, export, import, and operate**.
   the `/v1/` REST surface are services built on top of the kernel, not retrofits
   onto a vector store.
 
-The v4.0 codebase is a coherent `mnemos/` package: `api/routes`, `core`, `db`,
+The v4.1 codebase is a coherent `mnemos/` package: `api/routes`, `core`, `db`,
 `domain`, `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`,
 `tools`, and `cli`. The old top-level script sprawl is gone; operators use the
 single `mnemos` command.
@@ -61,7 +61,7 @@ single `mnemos` command.
   isolation, multi-worker smoke, and Postgres/SQLite persistence parity.
 
 MNEMOS has been in daily production use since December 2025. The current release
-line is **v4.0.0**, shipped on **2026-04-29**, and it is the first release where
+line is **v4.1.1**, shipped on **2026-04-29**, and it is the first release where
 the package layout, persistence layer, deployment profiles, CLI, single-binary
 distribution, and multi-worker coordination all match the intended production
 shape.
@@ -69,18 +69,18 @@ shape.
 ## Quick Install
 
 ```bash
-pip install mnemos-os==4.0.0
+pip install mnemos-os==4.1.1
 mnemos serve --profile dev
 ```
 
 ```bash
-docker pull ghcr.io/mnemos-os/mnemos:4.0.0
+docker pull ghcr.io/mnemos-os/mnemos:4.1.1
 ```
 
 For a single binary with no host Python:
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.1.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -141,7 +141,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape; **v4.0.0 is the current shipped GA line**, adding the coherent package layout, persistence abstraction, SQLite profiles, single-binary artifacts, and multi-worker production support. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape; **v4.1.1 is the current shipped GA line**, adding the coherent package layout, persistence abstraction, SQLite profiles, single-binary artifacts, and multi-worker production support. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -248,7 +248,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of the v4.0.0 release line. Features described here are implemented unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
+This is the current state of the v4.1.1 release line. Features described here are implemented unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -622,7 +622,7 @@ Landed with the v3.0 release line:
 
 v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/runtime version metadata to 3.5.1 and reconciles release-state docs with the v3.5.0 GA tag; it does not change product behavior from v3.5.0.
 
-### Shipped in v4.0.0
+### Shipped in v4.1.1
 
 - ✅ **Coherent package layout** — production code now lives under `mnemos/` with `api/routes`, `core`, `db`, `domain`, `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`, `tools`, and `cli` subpackages.
 - ✅ **Persistence abstraction** — `PersistenceBackend` owns the contract; `PostgresBackend` uses asyncpg + pgvector + RLS + LISTEN/NOTIFY, and `SqliteBackend` uses aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL.
@@ -633,9 +633,17 @@ v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/r
 - ✅ **Architectural enforcement** — seven import-linter contracts keep API, domain, db, core, persistence, MCP, and webhook boundaries honest in CI.
 - ✅ **GRAEAE mode validation** — routing modes plus `single`, `debate`, and `majority` are modeled as a `Literal`; unknown modes 422 instead of falling through.
 
-### Beyond v4.0
+### v4.1.1 known limitations
 
-Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists shipped v3.x/v4.0 scope and items explicitly deferred with rationale.
+- `bulk_create_memories` now runs through the backend transaction and webhook
+  outbox surface, so it works on SQLite-backed edge profiles as well as
+  Postgres-backed server profiles.
+- v4.1 still does not ship the separate web frontend, mobile clients, hosted
+  MNEMOS Cloud, or Rust hot-path rewrites; those remain roadmap items.
+
+### Beyond v4.1
+
+Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists shipped v3.x/v4.1 scope and items explicitly deferred with rationale.
 
 Near-term not-yet-scoped candidates:
 
@@ -675,7 +683,7 @@ mnemos.core lifecycle/config/visibility
 ### Edge install (single binary)
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.1.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -684,7 +692,7 @@ chmod +x mnemos
 ### Package install
 
 ```bash
-pip install mnemos-os==4.0.0
+pip install mnemos-os==4.1.1
 mnemos install --profile dev
 mnemos serve --profile dev
 ```

@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import asyncpg
 import pytest
@@ -266,6 +267,67 @@ async def test_backend_exposes_all_repository_properties(backend_case: BackendCa
     assert isinstance(backend.consultations_audit, ConsultationAuditRepository)
     assert isinstance(backend.federation, FederationRepository)
     assert isinstance(backend.state_kv, StateRepository)
+
+
+@pytest.mark.asyncio
+async def test_postgres_transactional_uses_pool_acquire_context_manager():
+    class TxStub:
+        def __init__(self) -> None:
+            self.started = False
+            self.committed = False
+            self.rolled_back = False
+
+        async def start(self) -> None:
+            self.started = True
+
+        async def commit(self) -> None:
+            self.committed = True
+
+        async def rollback(self) -> None:
+            self.rolled_back = True
+
+    class ConnStub:
+        def __init__(self, raw_tx: TxStub) -> None:
+            self.raw_tx = raw_tx
+
+        def transaction(self) -> TxStub:
+            return self.raw_tx
+
+    class AcquireContextStub:
+        def __init__(self, conn: ConnStub) -> None:
+            self.conn = conn
+            self.entered = False
+            self.exited = False
+
+        async def __aenter__(self) -> ConnStub:
+            self.entered = True
+            return self.conn
+
+        async def __aexit__(self, exc_type, exc, tb) -> None:
+            self.exited = True
+
+        def __await__(self):
+            async def _await_conn() -> ConnStub:
+                return self.conn
+
+            return _await_conn().__await__()
+
+    raw_tx = TxStub()
+    conn = ConnStub(raw_tx)
+    acquire_ctx = AcquireContextStub(conn)
+    pool = Mock()
+    pool.acquire.return_value = acquire_ctx
+    backend = PostgresBackend(pool, SimpleNamespace())
+
+    async with backend.transactional() as tx:
+        assert tx.conn is conn
+        assert raw_tx.started is True
+        assert acquire_ctx.entered is True
+
+    pool.acquire.assert_called_once_with()
+    assert acquire_ctx.exited is True
+    assert raw_tx.committed is True
+    assert raw_tx.rolled_back is False
 
 
 def test_sqlite_backend_feature_flags(tmp_path):

@@ -4,9 +4,10 @@ import asyncio
 from types import SimpleNamespace
 
 
-def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch):
+def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch, tmp_path):
     async def run():
         import mnemos.domain.graeae.engine as graeae_engine
+        from mnemos.core import config as core_config
         from mnemos.core import lifecycle
 
         class FalsyPool:
@@ -27,6 +28,9 @@ def test_lifespan_shutdown_without_managed_inference_resource(monkeypatch):
         monkeypatch.setattr(lifecycle, "_background_tasks", set())
         monkeypatch.setattr(lifecycle, "_worker_tasks", set())
         monkeypatch.setattr(lifecycle, "_delivery_attempt_tasks", set())
+        monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
+        monkeypatch.setenv("MNEMOS_SQLITE_PATH", str(tmp_path / "mnemos.sqlite3"))
+        core_config.reload_settings()
         monkeypatch.setattr(lifecycle, "_load_config", lambda: {"worker": {"enabled": False}})
         monkeypatch.setattr(lifecycle.asyncpg, "create_pool", create_pool)
         monkeypatch.setattr(lifecycle.aioredis, "from_url", lambda *_args, **_kwargs: RedisUnavailable())

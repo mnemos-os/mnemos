@@ -707,84 +707,71 @@ async def bulk_create_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Create multiple memories in one request. Per-item errors are collected, not raised."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    backend = _backend_or_503()
     created_ids: list[str] = []
     errors: list[str] = []
-    try:
-        from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-
-        async with _lc._pool.acquire() as conn:
-            async with _rls_context(conn, user):
-                async with conn.transaction():
-                    for i, mem in enumerate(request.memories):
-                        if not mem.content.strip():
-                            errors.append(f"[{i}] content is empty")
-                            continue
-                        if mem.owner_id and mem.owner_id != user.user_id and user.role != "root":
-                            errors.append(f"[{i}] owner_id override requires root")
-                            continue
-                        if mem.namespace and mem.namespace != user.namespace and user.role != "root":
-                            errors.append(f"[{i}] namespace override requires root")
-                            continue
-                        mid = new_memory_id()
-                        verbatim = (
-                            mem.verbatim_content
-                            if mem.verbatim_content is not None
-                            else mem.content
-                        )
-                        owner_id = mem.owner_id or user.user_id
-                        namespace = mem.namespace or user.namespace
-                        try:
-                            async with conn.transaction():
-                                await conn.execute(
-                                    "INSERT INTO memories "
-                                    "(id, content, category, subcategory, metadata, quality_rating, verbatim_content, "
-                                    "owner_id, namespace, permission_mode, "
-                                    "source_model, source_provider, source_session, source_agent) "
-                                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10, $11, $12, $13)",
-                                    mid, mem.content, mem.category, mem.subcategory,
-                                    json.dumps(mem.metadata or {}), verbatim,
-                                    owner_id, namespace, 600,
-                                    mem.source_model, mem.source_provider,
-                                    mem.source_session, mem.source_agent,
-                                )
-                        except Exception as e:
-                            errors.append(f"[{i}] {e}")
-                            continue
-                        created_ids.append(mid)
-                        await _dispatch_webhook(
-                            "memory.created",
-                            {
-                                "memory_id": mid,
-                                "category": mem.category,
-                                "subcategory": mem.subcategory,
-                                "content": mem.content,
-                                "owner_id": owner_id,
-                                "namespace": namespace,
-                            },
-                            conn=conn,
-                            owner_id=owner_id,
-                            namespace=namespace,
-                        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error("memory.bulk_create transaction failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail="Bulk memory creation failed") from e
-    if _lc._cache:
+    delivery_ids: list[str] = []
+    for i, mem in enumerate(request.memories):
+        if not mem.content.strip():
+            errors.append(f"[{i}] content is empty")
+            continue
+        if mem.owner_id and mem.owner_id != user.user_id and user.role != "root":
+            errors.append(f"[{i}] owner_id override requires root")
+            continue
+        if mem.namespace and mem.namespace != user.namespace and user.role != "root":
+            errors.append(f"[{i}] namespace override requires root")
+            continue
+        mid = new_memory_id()
+        verbatim = (
+            mem.verbatim_content
+            if mem.verbatim_content is not None
+            else mem.content
+        )
+        owner_id = mem.owner_id or user.user_id
+        namespace = mem.namespace or user.namespace
         try:
-            await _lc._cache.delete("stats:global")
-            # Invalidate per-user search caches on mutation. Keys are
-            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
-            # entries and safe against shared Redis.
-            try:
-                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                    await _lc._cache.delete(_k)
-            except Exception:
-                pass
-        except Exception:
-            pass
+            async with backend.transactional() as tx:
+                await _maybe_set_pg_rls(tx, user)
+                await backend.memories.insert_memory(
+                    tx,
+                    memory_id=mid,
+                    content=mem.content,
+                    category=mem.category,
+                    subcategory=mem.subcategory,
+                    metadata_json=json.dumps(mem.metadata or {}),
+                    quality_rating=75,
+                    owner_id=owner_id,
+                    namespace=namespace,
+                    permission_mode=600,
+                    source_model=mem.source_model,
+                    source_provider=mem.source_provider,
+                    source_session=mem.source_session,
+                    source_agent=mem.source_agent,
+                    verbatim_content=verbatim,
+                    created=None,
+                    updated=None,
+                )
+                item_delivery_ids = await backend.webhooks.dispatch_event(
+                    tx,
+                    "memory.created",
+                    {
+                        "memory_id": mid,
+                        "category": mem.category,
+                        "subcategory": mem.subcategory,
+                        "content": mem.content,
+                        "owner_id": owner_id,
+                        "namespace": namespace,
+                    },
+                    owner_id=owner_id,
+                    namespace=namespace,
+                )
+        except Exception as e:
+            errors.append(f"[{i}] {e}")
+            continue
+        created_ids.append(mid)
+        delivery_ids.extend(item_delivery_ids)
+    _schedule_outbox_deliveries(delivery_ids)
+    await _invalidate_caches_after_mutation()
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 
 
