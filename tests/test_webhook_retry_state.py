@@ -14,6 +14,14 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+def _webhook_module_source(*module_names: str) -> str:
+    repo_root = Path(__file__).resolve().parents[1]
+    return "\n".join(
+        (repo_root / "mnemos" / "webhooks" / f"{module_name}.py").read_text()
+        for module_name in module_names
+    )
+
+
 class _FakeWebhookStore:
     def __init__(self, rows: list[dict[str, Any]]):
         self.rows = rows
@@ -1121,8 +1129,7 @@ def test_successor_insert_uses_live_chain_attempt_uniqueness(monkeypatch):
 
 
 def test_recovery_dequeue_uses_skip_locked_claim():
-    repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
+    source = _webhook_module_source("workers", "sender", "types")
     compact = " ".join(source.split())
 
     assert "async def _claim_recoverable_deliveries" in source
@@ -1141,8 +1148,7 @@ def test_recovery_dequeue_uses_skip_locked_claim():
 
 
 def test_recoverable_predicate_requires_current_writer_revision():
-    repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
+    source = _webhook_module_source("workers", "lease", "types")
     compact = " ".join(source.split())
 
     assert "NEW_CODE_WRITER_REVISION = 1" in source
@@ -3009,7 +3015,7 @@ def test_repair_sweep_does_not_strip_active_lease_with_successor(monkeypatch):
 def test_lifecycle_runs_webhook_retry_repair_on_startup():
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_source = (repo_root / "mnemos" / "core" / "lifecycle.py").read_text()
-    dispatcher_source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
+    dispatcher_source = _webhook_module_source("workers", "repair", "types")
     compact_dispatcher = " ".join(dispatcher_source.split())
 
     assert "repair_worker_loop as _webhook_repair" in lifecycle_source
@@ -3035,8 +3041,7 @@ def test_lifecycle_runs_webhook_retry_repair_on_startup():
 
 
 def test_success_finalize_source_shape_is_chain_aware():
-    repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
+    source = _webhook_module_source("finalize", "chain", "lease")
     compact = " ".join(source.split())
 
     assert "async def _find_live_unleased_successor_attempt(" not in source
@@ -3056,8 +3061,7 @@ def test_success_finalize_source_shape_is_chain_aware():
 
 
 def test_succeeded_chain_guard_source_shape_is_chain_aware():
-    repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
+    source = _webhook_module_source("finalize", "chain", "lease")
     compact = " ".join(source.split())
 
     assert "async def _has_succeeded_chain_attempt" in source
@@ -3071,12 +3075,7 @@ def test_succeeded_chain_guard_source_shape_is_chain_aware():
 
 
 def test_failure_finalize_source_shape_requires_live_owned_attempt():
-    repo_root = Path(__file__).resolve().parents[1]
-    source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
-    finalize_source = source[
-        source.index("async def _finalize_delivery"):
-        source.index("async def _load_delivery_for_claim")
-    ]
+    finalize_source = _webhook_module_source("finalize")
     compact = " ".join(finalize_source.split())
     success_update = compact[
         compact.index("SET status='succeeded'"):
@@ -3096,10 +3095,11 @@ def test_failure_finalize_source_shape_requires_live_owned_attempt():
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_source = (repo_root / "mnemos" / "core" / "lifecycle.py").read_text()
-    dispatcher_source = (repo_root / "mnemos" / "webhooks" / "dispatcher.py").read_text()
-    recover_source = dispatcher_source[
-        dispatcher_source.index("async def _recover_due_deliveries"):
-        dispatcher_source.index("async def _recoverable_delivery_ids")
+    dispatcher_source = _webhook_module_source("outbox", "workers")
+    workers_source = _webhook_module_source("workers")
+    recover_source = workers_source[
+        workers_source.index("async def _recover_due_deliveries"):
+        workers_source.index("async def _recoverable_delivery_ids")
     ]
 
     assert "_worker_tasks: set = set()" in lifecycle_source
