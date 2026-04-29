@@ -32,6 +32,7 @@ anyio>=4.4.0
 # Utilities
 numpy>=1.26.0
 psutil>=5.9.0
+typer>=0.9.0
 
 # Optional: Intel OpenVINO / phi_server.py (local GPU inference)
 # Install on GPU systems only: pip install mnemos-os[phi]

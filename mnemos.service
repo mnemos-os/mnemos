@@ -14,7 +14,8 @@ Environment="MNEMOS_PORT=5002"
 EnvironmentFile=/opt/mnemos/.env
 # Canonical port is 5002; this overrides [api].port in config.toml if different
 # MNEMOS v3.5 is single-worker by design; do not configure multiple Uvicorn workers.
-ExecStart=/opt/mnemos/venv/bin/python -m mnemos.api.main
+# Keep the venv path explicit so systemd uses the installed console script.
+ExecStart=/opt/mnemos/venv/bin/mnemos serve
 
 # Auto-restart on failure
 Restart=on-failure
