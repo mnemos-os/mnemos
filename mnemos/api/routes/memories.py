@@ -2,7 +2,6 @@
 import asyncio
 import json
 import logging
-import uuid
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -11,6 +10,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.core.ids import new_memory_id
 from mnemos.core.lifecycle import (
     _MEMORY_COLS,
     _fts_fetch,
@@ -558,7 +558,7 @@ async def create_memory(
 ):
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=422, detail="Memory content cannot be empty")
-    mem_id = f"mem_{uuid.uuid4().hex[:12]}"
+    mem_id = new_memory_id()
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -624,7 +624,6 @@ async def bulk_create_memories(
     """Create multiple memories in one request. Per-item errors are collected, not raised."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    import time as _time
     created_ids: list[str] = []
     errors: list[str] = []
     try:
@@ -643,7 +642,7 @@ async def bulk_create_memories(
                         if mem.namespace and mem.namespace != user.namespace and user.role != "root":
                             errors.append(f"[{i}] namespace override requires root")
                             continue
-                        mid = f"mem_{int(_time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+                        mid = new_memory_id()
                         verbatim = (
                             mem.verbatim_content
                             if mem.verbatim_content is not None

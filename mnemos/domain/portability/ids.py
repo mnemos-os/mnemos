@@ -1,10 +1,10 @@
-"""Caller-scoped deterministic ID derivation."""
+"""Portability ID compatibility shims."""
 
 from __future__ import annotations
 
-import hashlib
-import uuid
 from typing import Any, Dict, Optional
+
+from mnemos.core.ids import caller_scoped_id, caller_scoped_uuid
 
 
 def _derive_caller_scoped_uuid(
@@ -14,9 +14,12 @@ def _derive_caller_scoped_uuid(
     caller_namespace: str,
     extra: str = "",
 ) -> str:
-    namespace = uuid.UUID("6ba7b810-9dad-11d1-80b4-00c04fd430c8")
-    name = "\x00".join([caller_owner, caller_namespace, envelope_id, extra])
-    return str(uuid.uuid5(namespace, name))
+    return caller_scoped_uuid(
+        caller_owner=caller_owner,
+        caller_namespace=caller_namespace,
+        envelope_id=envelope_id,
+        extra=extra,
+    )
 
 
 def _derive_caller_scoped_id(
@@ -26,17 +29,12 @@ def _derive_caller_scoped_id(
     caller_namespace: str,
     content: str,
 ) -> str:
-    h = hashlib.sha256(
-        b"\x00".join(
-            [
-                caller_owner.encode("utf-8"),
-                caller_namespace.encode("utf-8"),
-                envelope_id.encode("utf-8"),
-                content.encode("utf-8"),
-            ]
-        )
-    ).hexdigest()[:32]
-    return f"mnemos_{h}"
+    return caller_scoped_id(
+        caller_owner=caller_owner,
+        caller_namespace=caller_namespace,
+        envelope_id=envelope_id,
+        content=content,
+    )
 
 
 def _row_owner_ns(

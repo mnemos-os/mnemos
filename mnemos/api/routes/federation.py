@@ -8,22 +8,14 @@ from __future__ import annotations
 
 import json
 import logging
-import uuid as _uuid
 from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
-
-def _parse_uuid_or_404(value: str) -> str:
-    try:
-        _uuid.UUID(value)
-    except (ValueError, TypeError, AttributeError):
-        raise HTTPException(status_code=404, detail="peer not found")
-    return value
-
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
+from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
 from mnemos.domain.models import (
     FederationFeedResponse,
@@ -202,7 +194,7 @@ async def list_peers(_: UserContext = Depends(require_root)):
 
 @router.get("/peers/{peer_id}", response_model=FederationPeer)
 async def get_peer(peer_id: str, _: UserContext = Depends(require_root)):
-    _parse_uuid_or_404(peer_id)
+    peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
@@ -220,7 +212,7 @@ async def update_peer(
     request: FederationPeerUpdateRequest,
     _: UserContext = Depends(require_root),
 ):
-    _parse_uuid_or_404(peer_id)
+    peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
@@ -258,7 +250,7 @@ async def update_peer(
 
 @router.delete("/peers/{peer_id}", status_code=204)
 async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
-    _parse_uuid_or_404(peer_id)
+    peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
@@ -275,7 +267,7 @@ async def trigger_sync(
     _: UserContext = Depends(require_root),
 ):
     """Run a sync against a peer right now (blocks on completion)."""
-    _parse_uuid_or_404(peer_id)
+    peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
@@ -309,7 +301,7 @@ async def peer_sync_log(
     _: UserContext = Depends(require_root),
     limit: int = 50,
 ):
-    _parse_uuid_or_404(peer_id)
+    peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     async with _lc._pool.acquire() as conn:
