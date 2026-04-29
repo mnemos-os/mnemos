@@ -34,6 +34,24 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 
 The current release line is **v3.5.x**. **v3.5.0 shipped on 2026-04-28** with audit-driven hardening, uniform owner+namespace tenancy, webhook retry and outbox repairs, the federation compound-cursor tie-breaker, MCP transport parity, faithful OpenAI-compatible gateway controls, and the PostgreSQL streaming-replication doctrine. **v3.5.1 is the 2026-04-28 documentation-triage patch**: no product behavior changes, just version metadata and documentation reconciliation. The active built-in compression stack is **APOLLO + ARTEMIS**.
 
+## Quick install — single binary
+
+For edge and dev hosts, download the matching binary from the
+[MNEMOS releases page](https://github.com/mnemos-os/mnemos/releases):
+
+```bash
+chmod +x mnemos-linux-x86_64
+sudo mv mnemos-linux-x86_64 /usr/local/bin/mnemos
+mnemos install --profile edge
+mnemos serve --profile edge
+```
+
+The v4.0 binary artifacts bundle Python, MNEMOS runtime dependencies, sqlite-vec,
+and the migration chain. No host Python or `pip install` is required. See
+[`docs/SINGLE_BINARY.md`](./docs/SINGLE_BINARY.md) for platform-specific
+filenames, macOS quarantine notes, limitations, and build-from-source
+instructions.
+
 ## Works with
 
 MNEMOS is designed to be the memory layer for the agentic tooling you already use — not a replacement for it. We interoperate on purpose, over three mechanisms, so there is no language lock-in and no pressure to rewrite your agent around us.
