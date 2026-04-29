@@ -193,6 +193,7 @@ _EMBED_TIMEOUT = _PROVIDER_SETTINGS.inference_embed_timeout
 _pool: Optional[asyncpg.Pool] = None
 _pool_manager: Optional[PoolManager] = None
 _cache: Optional[aioredis.Redis] = None
+_redis_client: Optional[aioredis.Redis] = None
 _rls_enabled: bool = False   # set from config at startup; read by handlers
 
 
@@ -285,10 +286,11 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
-    global _pool, _pool_manager, _cache, _rls_enabled, _worker_status
+    global _pool, _pool_manager, _cache, _redis_client, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
+    settings = get_settings()
 
     try:
         _pool = await asyncpg.create_pool(
@@ -314,6 +316,29 @@ async def lifespan(app):
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
         _auth_configurer(config.get("auth", {}))
+
+    if settings.rate_limit.storage_uri.startswith(("redis://", "rediss://")):
+        try:
+            _redis_client = aioredis.from_url(settings.rate_limit.storage_uri, decode_responses=True)
+            await _redis_client.ping()
+            app.state.redis_client = _redis_client
+            logger.info("Redis resilience client connected (%s)", settings.rate_limit.storage_uri)
+        except Exception as e:
+            logger.warning(
+                "Redis resilience backend unavailable at %s; "
+                "GRAEAE will fall back to in-process resilience primitives: %s",
+                settings.rate_limit.storage_uri,
+                e,
+            )
+            if _redis_client is not None:
+                close = getattr(_redis_client, "aclose", None)
+                if callable(close):
+                    await close()
+            _redis_client = None
+            app.state.redis_client = None
+    else:
+        _redis_client = None
+        app.state.redis_client = None
 
     # Refresh GRAEAE provider manifest from model_registry in the background
     # so startup doesn't block on per-provider HTTP probes (each can take up
@@ -352,7 +377,7 @@ async def lifespan(app):
 
     await _log_federation_startup_guidance(_pool)
 
-    _redis_url = get_settings().server.redis_url
+    _redis_url = settings.server.redis_url
     try:
         _cache = aioredis.from_url(_redis_url, decode_responses=True)
         await _cache.ping()
@@ -419,6 +444,10 @@ async def lifespan(app):
         await _pool.close()
         logger.info("DB pool closed")
     _pool_manager = None
+    if _redis_client:
+        await _redis_client.aclose()
+        logger.info("Redis resilience client closed")
+    _redis_client = None
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
@@ -463,6 +492,11 @@ def get_pool_manager() -> PoolManager:
             raise HTTPException(status_code=503, detail="Database pool not available")
         _pool_manager = PoolManager(_pool)
     return _pool_manager
+
+
+def get_redis_client() -> Optional[aioredis.Redis]:
+    """Return the lifecycle-owned Redis client for cross-worker resilience."""
+    return _redis_client
 
 
 _MEMORY_COLS = (

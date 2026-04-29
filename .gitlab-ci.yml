@@ -97,6 +97,8 @@ test:integration:
         POSTGRES_PASSWORD: test
         POSTGRES_DB: mnemos_test
         POSTGRES_USER: postgres
+    - name: redis:7-alpine
+      alias: redis
   variables:
     PGHOST: postgres
     PGUSER: postgres
@@ -104,6 +106,7 @@ test:integration:
     PGDATABASE: mnemos_test
     DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
+    RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
     - apt-get update -qq && apt-get install -qq -y postgresql-client
     - pip install --cache-dir=.cache/pip -e ".[dev]"
