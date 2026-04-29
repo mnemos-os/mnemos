@@ -6,7 +6,7 @@ import os
 import platform
 from pathlib import Path
 
-from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs
+from PyInstaller.utils.hooks import collect_data_files, collect_dynamic_libs, collect_submodules
 
 
 ENTRY_POINT = "mnemos.cli.main:app"
@@ -70,6 +70,12 @@ BINARY_NAME = f"mnemos-{BINARY_PLATFORM}"
 
 # PyInstaller hiddenimports use importable module names. The sqlite-vec
 # distribution exposes the sqlite_vec module plus a native vec0 extension.
+#
+# CRITICAL: the mnemos CLI dispatches subcommands through dynamic imports
+# (e.g. `mnemos serve` does `import_module("mnemos.api.main")`); pyinstaller's
+# static analysis cannot follow these. Without collect_submodules("mnemos")
+# every CLI subcommand fails with ModuleNotFoundError at first invocation
+# in the bundled binary. This was the v4.0.0 first-binary-build bug.
 HIDDEN_IMPORTS = [
     "sqlite_vec",
     "aiosqlite",
@@ -86,7 +92,7 @@ HIDDEN_IMPORTS = [
     "anthropic",
     "google.genai",
     "httpx",
-]
+] + collect_submodules("mnemos")
 
 datas = []
 datas += _files_matching("db/migrations*.sql", "db")
