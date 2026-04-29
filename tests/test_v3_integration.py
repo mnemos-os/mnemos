@@ -15,7 +15,7 @@ class TestConsultationsV1:
             json={
                 "prompt": "What is the capital of France?",
                 "task_type": "reasoning",
-                "mode": "consensus",
+                "mode": "auto",
             },
             headers=auth_headers,
         )
