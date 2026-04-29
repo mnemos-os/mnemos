@@ -1,7 +1,6 @@
 """Document import utilities using Docling for intelligent content extraction."""
 import json
 import logging
-import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -15,6 +14,7 @@ except ImportError:
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/documents", tags=["document-import"])
@@ -210,7 +210,7 @@ async def import_memories_from_document(
     )
 
     # Create memories from chunks. Match the canonical /v1/memories create
-    # path exactly: `mem_<hex12>` id, populate verbatim_content +
+    # path exactly: timestamped `mem_...` id, populate verbatim_content +
     # quality_rating + permission_mode, and fire `memory.created` webhooks +
     # search-cache invalidation so document-imported memories behave like
     # any other for downstream subscribers and search consumers. The
@@ -221,7 +221,7 @@ async def import_memories_from_document(
     async with _lc._pool.acquire() as conn:
         for chunk in chunks:
             try:
-                memory_id = f"mem_{uuid.uuid4().hex[:12]}"
+                memory_id = new_memory_id()
                 chunk_metadata = {
                     **doc_metadata,
                     **chunk["metadata"],

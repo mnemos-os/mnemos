@@ -14,13 +14,14 @@ from __future__ import annotations
 import json
 import logging
 import os
-import secrets
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
 
 import asyncpg
 import numpy as np
+
+from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
 
@@ -401,7 +402,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
         owner_id = _majority([m["owner_id"] for m in members]) or "default"
         namespace = _majority([m["namespace"] for m in members]) or "default"
 
-        new_id = f"mem_{secrets.token_hex(6)}"
+        new_id = new_memory_id()
         async with pool.acquire() as conn:
             await conn.execute(
                 """

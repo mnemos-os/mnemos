@@ -9,24 +9,14 @@ import logging
 import os
 import secrets
 import socket
-import uuid as _uuid
 from typing import List, Union
 from urllib.parse import urlparse
 
 from fastapi import APIRouter, Depends, HTTPException
 
-
-def _parse_uuid_or_404(value: str, what: str = "resource") -> str:
-    """Validate a UUID path parameter. Raises 404 on malformed input so we
-    don't surface internal driver errors (`InvalidTextRepresentation`) as 500s."""
-    try:
-        _uuid.UUID(value)
-    except (ValueError, TypeError, AttributeError):
-        raise HTTPException(status_code=404, detail=f"{what} not found")
-    return value
-
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain.models import (
     VALID_WEBHOOK_EVENTS,
     WebhookCreateRequest,
@@ -286,7 +276,7 @@ async def get_webhook(
     webhook_id: str,
     user: UserContext = Depends(get_current_user),
 ):
-    _parse_uuid_or_404(webhook_id, "webhook")
+    webhook_id = parse_uuid_or_404(webhook_id, "webhook")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -326,7 +316,7 @@ async def revoke_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     """Soft-delete: marks the subscription revoked. Delivery log preserved."""
-    _parse_uuid_or_404(webhook_id, "webhook")
+    webhook_id = parse_uuid_or_404(webhook_id, "webhook")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
@@ -369,7 +359,7 @@ async def list_deliveries(
     limit: int = 50,
 ):
     """List recent delivery attempts for a subscription."""
-    _parse_uuid_or_404(webhook_id, "webhook")
+    webhook_id = parse_uuid_or_404(webhook_id, "webhook")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 

@@ -1,6 +1,5 @@
 """Session ingestion endpoint."""
 import logging
-import uuid
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException
@@ -8,6 +7,7 @@ from fastapi import APIRouter, Depends, HTTPException
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.routes.memories import _insert_memory_with_created_webhook, _rls_context
+from mnemos.core.ids import new_memory_id
 from mnemos.domain.models import SessionIngestRequest, SessionIngestResponse
 
 logger = logging.getLogger(__name__)
@@ -62,7 +62,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                             f"Session {request.session_id} — {len(items)} {label}\n"
                             f"{_extract_readable(items)}"
                         )
-                        mem_id = f"mem_{uuid.uuid4().hex[:12]}"
+                        mem_id = new_memory_id()
                         metadata = {
                             "source": request.source,
                             "session_id": request.session_id,
