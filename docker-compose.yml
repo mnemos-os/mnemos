@@ -113,6 +113,7 @@ services:
   mnemos:
     build:
       context: .
+    command: ["mnemos", "serve"]
     depends_on:
       postgres:
         condition: service_healthy

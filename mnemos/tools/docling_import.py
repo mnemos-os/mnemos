@@ -39,6 +39,8 @@ class DoclingImporter:
         overlap: int = 100,
         tags: list = None,
         dry_run: bool = False,
+        owner_id: str = None,
+        namespace: str = None,
     ):
         """
         Args:
@@ -57,6 +59,8 @@ class DoclingImporter:
         self.overlap = overlap
         self.tags = tags or []
         self.dry_run = dry_run
+        self.owner_id = owner_id
+        self.namespace = namespace
 
     # ------------------------------------------------------------------
     # Public API
@@ -326,6 +330,10 @@ class DoclingImporter:
                 "tags": list(self.tags),
                 "metadata": dict(metadata),
             }
+            if self.owner_id is not None:
+                mem["owner_id"] = self.owner_id
+            if self.namespace is not None:
+                mem["namespace"] = self.namespace
             # Attach source tags automatically
             source = metadata.get("source_file", "")
             if source:
@@ -433,6 +441,10 @@ Examples:
                         help="Recurse into sub-directories (only with --source)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print what would be imported without POSTing")
+    parser.add_argument("--owner-id", default=None,
+                        help="Override owner_id on imported memories when supported")
+    parser.add_argument("--namespace", default=None,
+                        help="Override namespace on imported memories when supported")
     return parser
 
 
@@ -450,6 +462,8 @@ def main(argv=None):
         overlap=args.overlap,
         tags=tags,
         dry_run=args.dry_run,
+        owner_id=args.owner_id,
+        namespace=args.namespace,
     )
 
     if args.file:

@@ -49,6 +49,8 @@ def _fetch_export(
     api_key: Optional[str],
     category: Optional[str],
     limit: int,
+    owner_id: Optional[str] = None,
+    namespace: Optional[str] = None,
     include_sidecars: bool = False,
     include_unattached_kg: bool = False,
 ) -> Dict[str, Any]:
@@ -67,6 +69,10 @@ def _fetch_export(
     params: Dict[str, str] = {"limit": str(limit)}
     if category:
         params["category"] = category
+    if owner_id:
+        params["owner_id"] = owner_id
+    if namespace:
+        params["namespace"] = namespace
     if include_sidecars:
         params["include_sidecars"] = "true"
         # CLI default matches HTTP default (false). Common CLI
@@ -103,6 +109,8 @@ def _fetch_memories_flat(
     api_key: Optional[str],
     category: Optional[str],
     limit: int,
+    owner_id: Optional[str] = None,
+    namespace: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Flat memory fetch for markdown/html/text paths.
 
@@ -111,7 +119,7 @@ def _fetch_memories_flat(
     export envelope.
     """
     # Prefer /v1/export (keeps all provenance) and flatten records.
-    envelope = _fetch_export(endpoint, api_key, category, limit)
+    envelope = _fetch_export(endpoint, api_key, category, limit, owner_id, namespace)
     flat: List[Dict[str, Any]] = []
     for rec in envelope.get("records") or []:
         if rec.get("kind") != "memory":
@@ -125,6 +133,8 @@ def _fetch_memories_flat(
 def cmd_json(args: argparse.Namespace) -> None:
     envelope = _fetch_export(
         args.endpoint, args.api_key, args.category, args.limit,
+        owner_id=getattr(args, "owner_id", None),
+        namespace=getattr(args, "namespace", None),
         include_sidecars=getattr(args, "include_sidecars", False),
         include_unattached_kg=getattr(args, "include_unattached_kg", False),
     )
@@ -144,6 +154,8 @@ def cmd_json(args: argparse.Namespace) -> None:
 def cmd_jsonl(args: argparse.Namespace) -> None:
     envelope = _fetch_export(
         args.endpoint, args.api_key, args.category, args.limit,
+        owner_id=getattr(args, "owner_id", None),
+        namespace=getattr(args, "namespace", None),
         include_sidecars=getattr(args, "include_sidecars", False),
         include_unattached_kg=getattr(args, "include_unattached_kg", False),
     )
@@ -178,7 +190,9 @@ def cmd_markdown(args: argparse.Namespace) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from mnemos.tools.export_memories_for_docling import export_memories_markdown  # noqa
     memories = _fetch_memories_flat(args.endpoint, args.api_key,
-                                    args.category, args.limit)
+                                    args.category, args.limit,
+                                    getattr(args, "owner_id", None),
+                                    getattr(args, "namespace", None))
     out = Path(args.out)
     export_memories_markdown(memories, out)
     print(f"Wrote {len(memories)} memories as Markdown → {out}")
@@ -191,7 +205,9 @@ def cmd_html(args: argparse.Namespace) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from mnemos.tools.export_memories_for_docling import export_memories_html  # noqa
     memories = _fetch_memories_flat(args.endpoint, args.api_key,
-                                    args.category, args.limit)
+                                    args.category, args.limit,
+                                    getattr(args, "owner_id", None),
+                                    getattr(args, "namespace", None))
     out = Path(args.out)
     export_memories_html(memories, out)
     print(f"Wrote {len(memories)} memories as HTML → {out}")
@@ -204,7 +220,9 @@ def cmd_text(args: argparse.Namespace) -> None:
         sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
         from mnemos.tools.export_memories_for_docling import export_memories_plaintext  # noqa
     memories = _fetch_memories_flat(args.endpoint, args.api_key,
-                                    args.category, args.limit)
+                                    args.category, args.limit,
+                                    getattr(args, "owner_id", None),
+                                    getattr(args, "namespace", None))
     out = Path(args.out)
     export_memories_plaintext(memories, out)
     print(f"Wrote {len(memories)} memories as plain text → {out}")
@@ -235,6 +253,10 @@ def _add_fetch_args(p: argparse.ArgumentParser) -> None:
                    help="Output file path")
     p.add_argument("--category", default=None,
                    help="Filter memories by category (all if omitted)")
+    p.add_argument("--owner-id", default=None,
+                   help="Filter memories by owner_id (all visible owners if omitted)")
+    p.add_argument("--namespace", default=None,
+                   help="Filter memories by namespace (all visible namespaces if omitted)")
     p.add_argument("--limit", type=int, default=10_000,
                    help="Maximum number of memories (default: 10000). "
                         "Matches the server-side _EXPORT_HARD_LIMIT.")

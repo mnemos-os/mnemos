@@ -93,11 +93,15 @@ class BaseImporter:
         category: str = "imported",
         dry_run: bool = False,
         preserve_metadata: bool = False,
+        owner_id: str = None,
+        namespace: str = None,
     ):
         self.endpoint = endpoint.rstrip("/")
         self.api_key = api_key
         self.category = category
         self.dry_run = dry_run
+        self.owner_id = owner_id
+        self.namespace = namespace
         # preserve_metadata routes through /v1/import (MPF envelope)
         # with preserve_owner=true, which requires a root bearer token
         # and keeps id/owner_id/namespace/timestamps verbatim.
@@ -114,6 +118,16 @@ class BaseImporter:
         # server's per-transaction trigger guard (mnemos_charon_trigger_guard
         # migration) cover the whole import in one shot.
         self.source_envelope: Optional[Dict[str, Any]] = None
+
+    def _apply_scope_overrides(self, mem: dict) -> dict:
+        if self.owner_id is None and self.namespace is None:
+            return mem
+        scoped = dict(mem)
+        if self.owner_id is not None:
+            scoped["owner_id"] = self.owner_id
+        if self.namespace is not None:
+            scoped["namespace"] = self.namespace
+        return scoped
 
     def _post(self, memories: list) -> tuple:
         """POST a list of memories to MNEMOS.
@@ -135,13 +149,14 @@ class BaseImporter:
             # which leaves a window where the version-snapshot
             # trigger fires on the records batch before the sidecar
             # trailer arrives — collisions on (memory_id, version_num).
-            if self.source_envelope is not None:
+            if self.source_envelope is not None and self.owner_id is None and self.namespace is None:
                 return self._post_mpf_passthrough(memories)
             return self._post_mpf(memories)
 
         ok = 0
         fail = 0
         for mem in memories:
+            mem = self._apply_scope_overrides(mem)
             if self.dry_run:
                 preview = str(mem.get("content", ""))[:100].replace("\n", " ")
                 cat = mem.get("category", self.category)
@@ -199,8 +214,8 @@ class BaseImporter:
                 "subcategory": mem.get("subcategory"),
                 "created": mem.get("created"),
                 "updated": mem.get("updated"),
-                "owner_id": mem.get("owner_id") or "default",
-                "namespace": mem.get("namespace") or "default",
+                "owner_id": self.owner_id or mem.get("owner_id") or "default",
+                "namespace": self.namespace or mem.get("namespace") or "default",
                 "permission_mode": mem.get("permission_mode"),
                 "quality_rating": mem.get("quality_rating"),
                 "metadata": mem.get("metadata") or {},
@@ -1145,6 +1160,10 @@ def _add_common_args(parser: argparse.ArgumentParser) -> None:
                         help="Route through /v1/import (MPF envelope, batched) "
                              "keeping id/owner_id/namespace/timestamps verbatim. "
                              "Requires root bearer token.")
+    parser.add_argument("--owner-id", default=None,
+                        help="Override owner_id on imported memories when supported")
+    parser.add_argument("--namespace", default=None,
+                        help="Override namespace on imported memories when supported")
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1230,6 +1249,10 @@ def main(argv=None):
     )
     if hasattr(args, "preserve_metadata"):
         common["preserve_metadata"] = args.preserve_metadata
+    if hasattr(args, "owner_id"):
+        common["owner_id"] = args.owner_id
+    if hasattr(args, "namespace"):
+        common["namespace"] = args.namespace
 
     if args.subcommand == "json":
         importer = JsonImporter(
