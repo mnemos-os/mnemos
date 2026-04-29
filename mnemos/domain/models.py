@@ -80,6 +80,14 @@ class MemoryItem(BaseModel):
     source_agent: Optional[str] = None
 
 
+def _isoformat_value(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.isoformat()
+
+
 def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
     raw_meta = row.get("metadata")
     if isinstance(raw_meta, str):
@@ -94,8 +102,8 @@ def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         content=row["content"],
         category=row["category"],
         subcategory=row.get("subcategory"),
-        created=row["created"].isoformat() if row["created"] else "",
-        updated=row["updated"].isoformat() if row.get("updated") else None,
+        created=_isoformat_value(row["created"]) or "",
+        updated=_isoformat_value(row.get("updated")),
         metadata=raw_meta if raw_meta else None,
         quality_rating=row.get("quality_rating"),
         compressed_content=row.get("compressed_content") if include_compressed else None,

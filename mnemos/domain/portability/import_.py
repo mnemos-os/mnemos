@@ -177,6 +177,7 @@ async def import_memories(
                         source_provider=p.get("source_provider"),
                         source_session=p.get("source_session"),
                         source_agent=p.get("source_agent"),
+                        verbatim_content=p.get("verbatim_content") or content,
                         created=_parse_iso_naive(p.get("created")),
                         updated=_parse_iso_naive(p.get("updated")),
                     )

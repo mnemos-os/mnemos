@@ -1,4 +1,7 @@
-"""SQLite persistence backend for the MNEMOS persistence interface."""
+"""SQLite persistence backend for the MNEMOS persistence interface.
+
+Requires SQLite 3.35.0 or newer for UPDATE ... RETURNING support.
+"""
 
 from __future__ import annotations
 
@@ -22,13 +25,16 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
     aiosqlite = None
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.lifecycle import _MEMORY_COLS
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
+    CompressionStatsRow,
     ConsultationAuditRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    MemoryStatsRow,
     PersistenceBackend,
     StateRepository,
     Transaction,
@@ -36,8 +42,12 @@ from mnemos.persistence.base import (
     WebhookRepository,
 )
 from mnemos.persistence.types import Row
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.webhooks import types as webhook_types
 
 logger = logging.getLogger(__name__)
+
+MIN_SQLITE_VERSION = (3, 35, 0)
 
 
 SQLITE_MIGRATION_FILES = [
@@ -169,6 +179,90 @@ def _version_visibility_clause(
     p = f"{table_alias}." if table_alias else ""
     params.append(user.user_id)
     return f"({p}owner_id = ? OR ({p}permission_mode % 10) >= 4)"
+
+
+def _sqlite_memory_cols(table_alias: str = "") -> str:
+    """Return ``_MEMORY_COLS``-equivalent SELECT list for SQLite.
+
+    The SQLite ``memories`` table lacks the Postgres-only
+    ``compressed_content`` column, so emit ``NULL AS compressed_content``
+    in its place. Timestamp columns are normalized to ISO-shaped TEXT
+    so handler serialization sees the same wire shape as Postgres
+    ``datetime.isoformat()`` output. Other ``_MEMORY_COLS`` columns are
+    present on both backends and pass through with the optional
+    ``table_alias.`` prefix so the result is safe to JOIN.
+    """
+    p = f"{table_alias}." if table_alias else ""
+    out: list[str] = []
+    for raw in _MEMORY_COLS.split(","):
+        col = raw.strip()
+        if col == "compressed_content":
+            out.append("NULL AS compressed_content")
+        elif col in {"created", "updated"}:
+            out.append(f"replace(datetime({p}{col}), ' ', 'T') AS {col}")
+        else:
+            out.append(f"{p}{col}")
+    return ", ".join(out)
+
+
+def _render_sqlite_visibility(
+    visibility: VisibilityFilter,
+    params: list[Any],
+    *,
+    table_alias: str = "",
+) -> str:
+    """SQLite analog of ``mnemos.persistence.postgres._render_postgres_visibility``.
+
+    Appends parameters to ``params`` (qmark style — SQLite has no ``$N``)
+    and returns the WHERE fragment. Returns an empty string for
+    ``ROOT_BYPASS`` with no namespace pin so callers can omit the WHERE
+    entirely.
+
+    Mirrors the existing ``_read_visibility_clause`` shape (the
+    v1_multiuser RLS read predicate, expanded inline because SQLite has
+    no RLS), but takes a backend-neutral ``VisibilityFilter`` so the
+    repository surface stays dialect-agnostic.
+    """
+    p = f"{table_alias}." if table_alias else ""
+
+    if visibility.scope == VisibilityScope.ROOT_BYPASS:
+        if visibility.namespace is None:
+            return ""
+        params.append(visibility.namespace)
+        return f"{p}namespace = ?"
+
+    if visibility.namespace is None:
+        return "1=0"
+
+    if visibility.scope == VisibilityScope.OWN_ONLY:
+        # Mutation path: strict owner_id + namespace.
+        clauses: list[str] = [f"{p}owner_id = ?", f"{p}namespace = ?"]
+        params.append(visibility.user_id)
+        params.append(visibility.namespace)
+        return " AND ".join(clauses)
+
+    # READABLE: full v1_multiuser predicate (own / federation / world /
+    # group), namespace pin appended after.
+    user_id = visibility.user_id or ""
+    group_ids = list(visibility.group_ids)
+    params.append(user_id)
+    if group_ids:
+        group_clause = f"{p}group_id IN ({_placeholders(group_ids)})"
+        params.extend(group_ids)
+    else:
+        group_clause = "0"
+    clause = (
+        "("
+        f"{p}owner_id = ?"
+        f" OR {p}federation_source IS NOT NULL"
+        f" OR ({p}permission_mode % 10) >= 4"
+        f" OR ((({p}permission_mode / 10) % 10) >= 4 "
+        f"AND {p}group_id IS NOT NULL AND {group_clause})"
+        ")"
+    )
+    clause = f"{clause} AND {p}namespace = ?"
+    params.append(visibility.namespace)
+    return clause
 
 
 def _parse_embedding(raw: Any) -> list[float]:
@@ -506,6 +600,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_provider: str | None,
         source_session: str | None,
         source_agent: str | None,
+        verbatim_content: str | None,
         created: Any,
         updated: Any,
     ) -> str:
@@ -514,13 +609,13 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             """
             INSERT OR IGNORE INTO memories (
                 id, content, category, subcategory, metadata,
-                quality_rating, owner_id, namespace, permission_mode,
+                quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
                 created, updated
             )
             VALUES (
                 ?, ?, ?, ?, ?,
-                ?, ?, ?, ?,
+                ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP)
             )
@@ -532,6 +627,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 subcategory,
                 metadata_json,
                 quality_rating,
+                verbatim_content,
                 owner_id,
                 namespace,
                 permission_mode,
@@ -636,25 +732,40 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
     async def semantic_search(
         self,
         tx: Transaction,
-        embedding: Sequence[float],
         *,
-        limit: int = 5,
-        owner_id: str | None = None,
-        namespace: str | None = None,
+        embedding: Sequence[float],
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
     ) -> list[Row]:
         embedding_json = json.dumps([float(value) for value in embedding])
-        conditions = ["me.embedding IS NOT NULL"]
+        conditions: list[str] = ["me.embedding IS NOT NULL"]
         params: list[Any] = [embedding_json]
-        if owner_id is not None:
-            conditions.append("m.owner_id = ?")
-            params.append(owner_id)
-        if namespace is not None:
-            conditions.append("m.namespace = ?")
-            params.append(namespace)
+        for col, val in (
+            ("category", category),
+            ("subcategory", subcategory),
+            ("source_provider", source_provider),
+            ("source_model", source_model),
+            ("source_agent", source_agent),
+        ):
+            if val is not None:
+                conditions.append(f"m.{col} = ?")
+                params.append(val)
+        vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
+        if vis_clause:
+            conditions.append(vis_clause)
         params.append(limit)
+        # SELECT ``_MEMORY_COLS`` (with the ``m.`` alias) so the row
+        # shape matches what the handler's ``row_to_memory`` consumes —
+        # parity with PostgresMemoryRepository.semantic_search.
+        select_cols = _sqlite_memory_cols("m")
         return await _fetch_all(
             self._conn(tx),
-            "SELECT m.id, m.content, m.category, "
+            f"SELECT {select_cols}, "
             "mnemos_cosine_similarity(me.embedding, ?) AS similarity "
             "FROM memory_embeddings me "
             "JOIN memories m ON m.id = me.memory_id "
@@ -666,27 +777,43 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
     async def fts_search(
         self,
         tx: Transaction,
-        query: str,
         *,
-        limit: int = 5,
-        owner_id: str | None = None,
-        namespace: str | None = None,
+        query: str,
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
     ) -> list[Row]:
         conn = self._conn(tx)
-        conditions: list[str] = []
+        # FTS path: $1=query (MATCH), filter+visibility params in the
+        # middle, $LAST=limit. Mirrors the legacy shape but with the
+        # full _MEMORY_COLS row so the handler can pass results
+        # straight to row_to_memory.
         params: list[Any] = [query]
-        if owner_id is not None:
-            conditions.append("m.owner_id = ?")
-            params.append(owner_id)
-        if namespace is not None:
-            conditions.append("m.namespace = ?")
-            params.append(namespace)
+        conditions: list[str] = []
+        for col, val in (
+            ("category", category),
+            ("subcategory", subcategory),
+            ("source_provider", source_provider),
+            ("source_model", source_model),
+            ("source_agent", source_agent),
+        ):
+            if val is not None:
+                conditions.append(f"m.{col} = ?")
+                params.append(val)
+        vis_clause = _render_sqlite_visibility(visibility, params, table_alias="m")
+        if vis_clause:
+            conditions.append(vis_clause)
         where_extra = f" AND {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
+        select_cols = _sqlite_memory_cols("m")
         try:
             return await _fetch_all(
                 conn,
-                "SELECT m.id, m.content, m.category, bm25(memories_fts) AS rank "
+                f"SELECT {select_cols}, bm25(memories_fts) AS rank "
                 "FROM memories_fts "
                 "JOIN memories m ON m.id = memories_fts.id "
                 f"WHERE memories_fts MATCH ?{where_extra} "
@@ -694,21 +821,189 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 params,
             )
         except sqlite3.Error:
+            # ILIKE-equivalent fallback when FTS5 isn't available or
+            # the query is malformed for tsquery purposes. Same
+            # predicate shape, content LIKE instead of MATCH.
             like_params: list[Any] = [f"%{query}%"]
-            like_conditions = ["lower(m.content) LIKE lower(?)"]
-            if owner_id is not None:
-                like_conditions.append("m.owner_id = ?")
-                like_params.append(owner_id)
-            if namespace is not None:
-                like_conditions.append("m.namespace = ?")
-                like_params.append(namespace)
+            like_conditions: list[str] = ["lower(m.content) LIKE lower(?)"]
+            for col, val in (
+                ("category", category),
+                ("subcategory", subcategory),
+                ("source_provider", source_provider),
+                ("source_model", source_model),
+                ("source_agent", source_agent),
+            ):
+                if val is not None:
+                    like_conditions.append(f"m.{col} = ?")
+                    like_params.append(val)
+            like_vis_clause = _render_sqlite_visibility(
+                visibility, like_params, table_alias="m",
+            )
+            if like_vis_clause:
+                like_conditions.append(like_vis_clause)
             like_params.append(limit)
             return await _fetch_all(
                 conn,
-                "SELECT m.id, m.content, m.category FROM memories m "
-                f"WHERE {' AND '.join(like_conditions)} ORDER BY m.updated DESC LIMIT ?",
+                f"SELECT {select_cols} FROM memories m "
+                f"WHERE {' AND '.join(like_conditions)} "
+                "ORDER BY m.updated DESC LIMIT ?",
                 like_params,
             )
+
+    # --- v4.1 handler-through-backend impls -----------------------------------
+
+    async def list_memories(
+        self,
+        tx: Transaction,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[Row], int]:
+        conn = self._conn(tx)
+        where_parts: list[str] = []
+        params: list[Any] = []
+        if category is not None:
+            where_parts.append("category = ?")
+            params.append(category)
+        if subcategory is not None:
+            where_parts.append("subcategory = ?")
+            params.append(subcategory)
+        vis_clause = _render_sqlite_visibility(visibility, params)
+        if vis_clause:
+            where_parts.append(vis_clause)
+        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        select_sql = (
+            f"SELECT {_sqlite_memory_cols()} FROM memories{where_sql} "
+            "ORDER BY created DESC LIMIT ? OFFSET ?"
+        )
+        # COUNT(*) first (without limit/offset params), then paged
+        # SELECT with the same predicate params plus limit/offset.
+        count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"
+        total = await _fetch_val(conn, count_sql, params)
+        rows = await _fetch_all(conn, select_sql, [*params, limit, offset])
+        return rows, int(total or 0)
+
+    async def get_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = self._conn(tx)
+        if visibility.scope == VisibilityScope.ROOT_BYPASS and visibility.namespace is None:
+            return await _fetch_one(
+                conn,
+                f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ?",
+                (memory_id,),
+            )
+        params: list[Any] = [memory_id]
+        vis_clause = _render_sqlite_visibility(visibility, params)
+        sql = f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ? AND {vis_clause}"
+        return await _fetch_one(conn, sql, params)
+
+    async def update_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        fields: dict[str, Any],
+    ) -> Row | None:
+        if not fields:
+            return None
+        conn = self._conn(tx)
+        keys = list(fields.keys())
+        set_clauses = [f"{col} = ?" for col in keys]
+        set_clauses.append("updated = CURRENT_TIMESTAMP")
+        set_sql = ", ".join(set_clauses)
+        values: list[Any] = [fields[k] for k in keys]
+        # WHERE id=? + visibility predicate. Authorization folded into
+        # the same UPDATE/RETURNING — same TOCTOU-safe shape as the
+        # Postgres impl.
+        params: list[Any] = [*values, memory_id]
+        vis_clause = _render_sqlite_visibility(visibility, params)
+        if vis_clause:
+            sql = (
+                f"UPDATE memories SET {set_sql} "
+                f"WHERE id = ? AND {vis_clause} "
+                f"RETURNING {_sqlite_memory_cols()}"
+            )
+        else:
+            sql = (
+                f"UPDATE memories SET {set_sql} WHERE id = ? "
+                f"RETURNING {_sqlite_memory_cols()}"
+            )
+        return await _fetch_one(conn, sql, params)
+
+    async def delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = self._conn(tx)
+        params: list[Any] = [memory_id]
+        vis_clause = _render_sqlite_visibility(visibility, params)
+        if vis_clause:
+            sql = (
+                "DELETE FROM memories "
+                f"WHERE id = ? AND {vis_clause} "
+                "RETURNING owner_id, namespace, id, content, category, subcategory"
+            )
+        else:
+            sql = (
+                "DELETE FROM memories WHERE id = ? "
+                "RETURNING owner_id, namespace, id, content, category, subcategory"
+            )
+        return await _fetch_one(conn, sql, params)
+
+    async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
+        conn = self._conn(tx)
+        total = await _fetch_val(conn, "SELECT COUNT(*) FROM memories")
+        native = await _fetch_val(
+            conn, "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
+        )
+        federated = await _fetch_val(
+            conn,
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL",
+        )
+        peer_rows = await _fetch_all(
+            conn,
+            "SELECT federation_source, COUNT(*) AS cnt FROM memories "
+            "WHERE federation_source IS NOT NULL "
+            "GROUP BY federation_source ORDER BY cnt DESC",
+        )
+        cat_rows = await _fetch_all(
+            conn,
+            "SELECT category, COUNT(*) AS cnt FROM memories GROUP BY category",
+        )
+        sub_rows = await _fetch_all(
+            conn,
+            "SELECT category, subcategory, COUNT(*) AS cnt FROM memories "
+            "WHERE subcategory IS NOT NULL "
+            "GROUP BY category, subcategory ORDER BY cnt DESC",
+        )
+        avg_quality = await _fetch_val(
+            conn,
+            "SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL",
+        )
+        memories_by_subcategory: dict[str, dict[str, int]] = {}
+        for r in sub_rows:
+            memories_by_subcategory.setdefault(r["category"], {})[r["subcategory"]] = r["cnt"]
+        return MemoryStatsRow(
+            total_memories=int(total or 0),
+            native_memories=int(native or 0),
+            federated_memories=int(federated or 0),
+            memories_by_peer={r["federation_source"]: r["cnt"] for r in peer_rows},
+            memories_by_category={r["category"]: r["cnt"] for r in cat_rows},
+            memories_by_subcategory=memories_by_subcategory,
+            avg_quality_rating=float(avg_quality) if avg_quality is not None else None,
+        )
 
 
 class SqliteKGRepository(_SqliteRepository, KGRepository):
@@ -1279,6 +1574,25 @@ class SqliteCompressionRepository(_SqliteRepository, CompressionRepository):
             (memory_id,),
         )
 
+    async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
+        conn = self._conn(tx)
+        total = await _fetch_val(
+            conn, "SELECT COUNT(*) FROM memory_compressed_variants",
+        )
+        avg_ratio = await _fetch_val(
+            conn, "SELECT AVG(compression_ratio) FROM memory_compressed_variants",
+        )
+        unreviewed = await _fetch_val(
+            conn,
+            "SELECT COUNT(*) FROM memory_compressed_variants "
+            "WHERE quality_score IS NULL",
+        )
+        return CompressionStatsRow(
+            total_compressions=int(total or 0),
+            average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
+            unreviewed_compressions=int(unreviewed or 0),
+        )
+
 
 class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
     async def insert_subscription(
@@ -1340,7 +1654,14 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                 "INSERT INTO webhook_deliveries "
                 "(id, subscription_id, event_type, payload, payload_hash, status, writer_revision) "
                 "VALUES (?, ?, ?, ?, ?, 'pending', ?)",
-                (delivery_id, sub["id"], event_type, body, body_hash, 2),
+                (
+                    delivery_id,
+                    sub["id"],
+                    event_type,
+                    body,
+                    body_hash,
+                    webhook_types.NEW_CODE_WRITER_REVISION,
+                ),
             )
             delivery_ids.append(delivery_id)
         return delivery_ids
@@ -1565,6 +1886,7 @@ class SqliteBackend(PersistenceBackend):
         else:
             conn = sqlite3.connect(str(self._db_path))
         conn.row_factory = _dict_factory
+        await self._check_sqlite_version(conn)
         self._conn = conn
         await _execute(conn, "PRAGMA journal_mode=WAL")
         await _execute(conn, "PRAGMA foreign_keys=ON")
@@ -1573,6 +1895,17 @@ class SqliteBackend(PersistenceBackend):
         await self._apply_migrations(conn)
         await self._create_vec_virtual_table(conn)
         await _commit(conn)
+
+    async def _check_sqlite_version(self, conn: Any) -> None:
+        raw_version = await _fetch_val(conn, "SELECT sqlite_version()")
+        version = tuple(int(part) for part in str(raw_version).split(".")[:3])
+        if version < MIN_SQLITE_VERSION:
+            await _call(conn.close)
+            required = ".".join(str(part) for part in MIN_SQLITE_VERSION)
+            raise RuntimeError(
+                f"SQLite {required}+ is required for UPDATE ... RETURNING support; "
+                f"found {raw_version}"
+            )
 
     async def _register_functions(self, conn: Any) -> None:
         await _call(conn.create_function, "mnemos_cosine_similarity", 2, _cosine_similarity)

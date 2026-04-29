@@ -19,14 +19,20 @@ from typing import Any
 import asyncpg
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.lifecycle import _MEMORY_COLS
+from mnemos.core.visibility import (
+    read_visibility_predicate as _core_read_visibility_predicate,
+)
 from mnemos.db import mcp_repo, openai_compat_repo, portability_repo
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
+    CompressionStatsRow,
     ConsultationAuditRepository,
     FederationRepository,
     KGRepository,
     MemoryRepository,
+    MemoryStatsRow,
     PersistenceBackend,
     StateRepository,
     Transaction,
@@ -34,6 +40,60 @@ from mnemos.persistence.base import (
     WebhookRepository,
 )
 from mnemos.persistence.types import Row
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
+from mnemos.webhooks import types as webhook_types
+
+
+def _render_postgres_visibility(
+    visibility: VisibilityFilter,
+    *,
+    start_idx: int = 1,
+    table_alias: str = "",
+) -> tuple[str, list[Any], int]:
+    """Render a ``VisibilityFilter`` into a Postgres WHERE fragment.
+
+    Returns ``(clause, params, next_idx)`` where ``clause`` is the SQL
+    fragment using ``$N`` placeholders starting at ``start_idx``,
+    ``params`` is the list of values to extend the caller's params
+    list with (in placeholder order), and ``next_idx`` is the first
+    free placeholder index after consuming ``params``.
+
+    Returns ``("", [], start_idx)`` for ``ROOT_BYPASS`` with no
+    namespace pin — the caller omits the WHERE entirely. The
+    ``READABLE`` branch delegates to ``mnemos.core.visibility`` so the
+    predicate stays one-to-one with the v1_multiuser RLS read policy.
+    """
+    p = f"{table_alias}." if table_alias else ""
+
+    if visibility.scope == VisibilityScope.ROOT_BYPASS:
+        if visibility.namespace is None:
+            return "", [], start_idx
+        return f"{p}namespace=${start_idx}", [visibility.namespace], start_idx + 1
+
+    if visibility.namespace is None:
+        return "1=0", [], start_idx
+
+    if visibility.scope == VisibilityScope.OWN_ONLY:
+        # Mutation path: strict owner_id + namespace match.
+        return (
+            f"{p}owner_id=${start_idx} AND {p}namespace=${start_idx + 1}",
+            [visibility.user_id, visibility.namespace],
+            start_idx + 2,
+        )
+
+    # READABLE: full v1_multiuser read predicate via core helper, plus
+    # namespace pin appended after.
+    clause, vis_params = _core_read_visibility_predicate(
+        visibility.user_id or "",
+        list(visibility.group_ids),
+        start_idx,
+        table_alias=table_alias,
+    )
+    next_idx = start_idx + len(vis_params)
+    clause = f"{clause} AND {p}namespace=${next_idx}"
+    vis_params = vis_params + [visibility.namespace]
+    next_idx += 1
+    return clause, vis_params, next_idx
 
 
 class PostgresTransaction:
@@ -155,6 +215,7 @@ class PostgresMemoryRepository(MemoryRepository):
         source_provider: str | None,
         source_session: str | None,
         source_agent: str | None,
+        verbatim_content: str | None,
         created: Any,
         updated: Any,
     ) -> str:
@@ -173,6 +234,7 @@ class PostgresMemoryRepository(MemoryRepository):
             source_provider=source_provider,
             source_session=source_session,
             source_agent=source_agent,
+            verbatim_content=verbatim_content,
             created=created,
             updated=updated,
         )
@@ -198,6 +260,281 @@ class PostgresMemoryRepository(MemoryRepository):
     ) -> list[dict[str, Any]]:
         _postgres_tx(tx)
         return await openai_compat_repo.fetch_memory_context(query, user, limit=limit)
+
+    # --- v4.1 handler-through-backend impls -----------------------------------
+
+    async def list_memories(
+        self,
+        tx: Transaction,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[Row], int]:
+        conn = _postgres_tx(tx).conn
+        where_parts: list[str] = []
+        params: list[Any] = []
+        if category is not None:
+            params.append(category)
+            where_parts.append(f"category=${len(params)}")
+        if subcategory is not None:
+            params.append(subcategory)
+            where_parts.append(f"subcategory=${len(params)}")
+        vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility, start_idx=len(params) + 1,
+        )
+        if vis_clause:
+            where_parts.append(vis_clause)
+            params.extend(vis_params)
+        where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+        select_sql = (
+            f"SELECT {_MEMORY_COLS} FROM memories{where_sql} "
+            f"ORDER BY created DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+        )
+        count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"
+        rows = await conn.fetch(select_sql, *params, limit, offset)
+        total = await conn.fetchval(count_sql, *params)
+        return list(rows), int(total or 0)
+
+    async def get_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        if visibility.scope == VisibilityScope.ROOT_BYPASS and visibility.namespace is None:
+            return await conn.fetchrow(
+                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
+            )
+        vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility, start_idx=2,
+        )
+        sql = f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1 AND {vis_clause}"
+        return await conn.fetchrow(sql, memory_id, *vis_params)
+
+    async def update_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        fields: dict[str, Any],
+    ) -> Row | None:
+        if not fields:
+            return None
+        conn = _postgres_tx(tx).conn
+        # $1 = memory_id, $2.. = field values, then visibility params,
+        # so update_memory writes are atomic with their authorization
+        # check (folded into the WHERE on the same UPDATE).
+        keys = list(fields.keys())
+        set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(keys)]
+        set_clauses.append("updated=NOW()")
+        set_sql = ", ".join(set_clauses)
+        values = [fields[k] for k in keys]
+        vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility, start_idx=len(values) + 2,
+        )
+        if vis_clause:
+            sql = (
+                f"UPDATE memories SET {set_sql} "
+                f"WHERE id=$1 AND {vis_clause} "
+                f"RETURNING {_MEMORY_COLS}"
+            )
+            return await conn.fetchrow(sql, memory_id, *values, *vis_params)
+        sql = (
+            f"UPDATE memories SET {set_sql} WHERE id=$1 "
+            f"RETURNING {_MEMORY_COLS}"
+        )
+        return await conn.fetchrow(sql, memory_id, *values)
+
+    async def delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility, start_idx=2,
+        )
+        if vis_clause:
+            sql = (
+                "DELETE FROM memories "
+                f"WHERE id=$1 AND {vis_clause} "
+                "RETURNING owner_id, namespace, id, content, category, subcategory"
+            )
+            return await conn.fetchrow(sql, memory_id, *vis_params)
+        return await conn.fetchrow(
+            "DELETE FROM memories WHERE id=$1 "
+            "RETURNING owner_id, namespace, id, content, category, subcategory",
+            memory_id,
+        )
+
+    async def semantic_search(
+        self,
+        tx: Transaction,
+        *,
+        embedding: Sequence[float],
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
+    ) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        # $1 is the embedding vector, used in both SELECT (for the
+        # similarity score) and ORDER BY. Passing as a parameter (not
+        # interpolated) eliminates injection risk from a poisoned
+        # embedding response.
+        vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
+        params: list[Any] = [vec_str]
+        conditions: list[str] = ["embedding IS NOT NULL"]
+        for col, val in (
+            ("category", category),
+            ("subcategory", subcategory),
+            ("source_provider", source_provider),
+            ("source_model", source_model),
+            ("source_agent", source_agent),
+        ):
+            if val is not None:
+                params.append(val)
+                conditions.append(f"{col}=${len(params)}")
+        vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility, start_idx=len(params) + 1,
+        )
+        if vis_clause:
+            conditions.append(vis_clause)
+            params.extend(vis_params)
+        params.append(limit)
+        sql = (
+            f"SELECT {_MEMORY_COLS}, 1 - (embedding <=> $1::vector) AS similarity "
+            "FROM memories "
+            f"WHERE {' AND '.join(conditions)} "
+            f"ORDER BY embedding <=> $1::vector LIMIT ${len(params)}"
+        )
+        return list(await conn.fetch(sql, *params))
+
+    async def fts_search(
+        self,
+        tx: Transaction,
+        *,
+        query: str,
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
+    ) -> list[Row]:
+        # plainto_tsquery treats user input as plain text — tsquery
+        # operators like |, !, & are not interpreted. Prevents tsquery
+        # operator injection.
+        conn = _postgres_tx(tx).conn
+        clean_query = query.strip()
+        # FTS path: $1=query, $2=limit, filter+visibility params at $3+
+        params: list[Any] = [clean_query, limit]
+        conditions: list[str] = [
+            "to_tsvector('english', content) @@ plainto_tsquery('english', $1)",
+        ]
+        for col, val in (
+            ("category", category),
+            ("subcategory", subcategory),
+            ("source_provider", source_provider),
+            ("source_model", source_model),
+            ("source_agent", source_agent),
+        ):
+            if val is not None:
+                params.append(val)
+                conditions.append(f"{col}=${len(params)}")
+        vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility, start_idx=len(params) + 1,
+        )
+        if vis_clause:
+            conditions.append(vis_clause)
+            params.extend(vis_params)
+        sql = (
+            f"SELECT {_MEMORY_COLS}, "
+            "ts_rank(to_tsvector('english', content), "
+            "plainto_tsquery('english', $1)) AS rank "
+            "FROM memories "
+            f"WHERE {' AND '.join(conditions)} "
+            "ORDER BY rank DESC LIMIT $2"
+        )
+        try:
+            return list(await conn.fetch(sql, *params))
+        except Exception:
+            # ILIKE fallback: same predicate shape, $1 becomes the LIKE
+            # pattern, $2 still the limit.
+            like_q = f"%{query}%"
+            ilike_params: list[Any] = [like_q, limit]
+            ilike_conditions: list[str] = ["content ILIKE $1"]
+            for col, val in (
+                ("category", category),
+                ("subcategory", subcategory),
+                ("source_provider", source_provider),
+                ("source_model", source_model),
+                ("source_agent", source_agent),
+            ):
+                if val is not None:
+                    ilike_params.append(val)
+                    ilike_conditions.append(f"{col}=${len(ilike_params)}")
+            ilike_vis_clause, ilike_vis_params, _ = _render_postgres_visibility(
+                visibility, start_idx=len(ilike_params) + 1,
+            )
+            if ilike_vis_clause:
+                ilike_conditions.append(ilike_vis_clause)
+                ilike_params.extend(ilike_vis_params)
+            ilike_sql = (
+                f"SELECT {_MEMORY_COLS} FROM memories "
+                f"WHERE {' AND '.join(ilike_conditions)} "
+                "ORDER BY created DESC LIMIT $2"
+            )
+            return list(await conn.fetch(ilike_sql, *ilike_params))
+
+    async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
+        conn = _postgres_tx(tx).conn
+        total = await conn.fetchval("SELECT COUNT(*) FROM memories")
+        native = await conn.fetchval(
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
+        )
+        federated = await conn.fetchval(
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL",
+        )
+        peer_rows = await conn.fetch(
+            "SELECT federation_source, COUNT(*) AS cnt FROM memories "
+            "WHERE federation_source IS NOT NULL "
+            "GROUP BY federation_source ORDER BY cnt DESC",
+        )
+        cat_rows = await conn.fetch(
+            "SELECT category, COUNT(*) AS cnt FROM memories GROUP BY category",
+        )
+        sub_rows = await conn.fetch(
+            "SELECT category, subcategory, COUNT(*) AS cnt FROM memories "
+            "WHERE subcategory IS NOT NULL GROUP BY category, subcategory ORDER BY cnt DESC",
+        )
+        avg_quality = await conn.fetchval(
+            "SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL",
+        )
+        memories_by_subcategory: dict[str, dict[str, int]] = {}
+        for r in sub_rows:
+            memories_by_subcategory.setdefault(r["category"], {})[r["subcategory"]] = r["cnt"]
+        return MemoryStatsRow(
+            total_memories=int(total or 0),
+            native_memories=int(native or 0),
+            federated_memories=int(federated or 0),
+            memories_by_peer={r["federation_source"]: r["cnt"] for r in peer_rows},
+            memories_by_category={r["category"]: r["cnt"] for r in cat_rows},
+            memories_by_subcategory=memories_by_subcategory,
+            avg_quality_rating=float(avg_quality) if avg_quality is not None else None,
+        )
 
 
 class PostgresKGRepository(KGRepository):
@@ -449,6 +786,24 @@ class PostgresCompressionRepository(CompressionRepository):
     async def fetch_compressed_variant_by_memory_id(self, tx: Transaction, memory_id: str) -> Row | None:
         return await portability_repo.fetch_compressed_variant_by_memory_id(_postgres_tx(tx).conn, memory_id)
 
+    async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
+        conn = _postgres_tx(tx).conn
+        total = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_compressed_variants",
+        ) or 0
+        avg_ratio = await conn.fetchval(
+            "SELECT AVG(v.compression_ratio) FROM memory_compressed_variants v",
+        )
+        unreviewed = await conn.fetchval(
+            "SELECT COUNT(*) FROM memory_compressed_variants "
+            "WHERE quality_score IS NULL",
+        ) or 0
+        return CompressionStatsRow(
+            total_compressions=int(total),
+            average_compression_ratio=float(avg_ratio) if avg_ratio is not None else None,
+            unreviewed_compressions=int(unreviewed),
+        )
+
 
 class PostgresWebhookRepository(WebhookRepository):
     async def insert_subscription(
@@ -494,11 +849,11 @@ class PostgresWebhookRepository(WebhookRepository):
         """
         args: list[Any] = [event_type]
         if owner_id is not None:
-            query += " AND owner_id = $2"
             args.append(owner_id)
-            if namespace is not None:
-                query += " AND namespace = $3"
-                args.append(namespace)
+            query += f" AND owner_id = ${len(args)}"
+        if namespace is not None:
+            args.append(namespace)
+            query += f" AND namespace = ${len(args)}"
         subscriptions = await conn.fetch(query, *args)
         body = json.dumps(
             {"event": event_type, "timestamp": datetime.now(timezone.utc).isoformat(), "data": payload},
@@ -520,7 +875,7 @@ class PostgresWebhookRepository(WebhookRepository):
                 event_type,
                 body,
                 body_hash,
-                2,
+                webhook_types.NEW_CODE_WRITER_REVISION,
             )
             delivery_ids.append(delivery_id)
         return delivery_ids

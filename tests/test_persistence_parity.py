@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -9,7 +10,11 @@ from typing import Any
 import asyncpg
 import pytest
 import pytest_asyncio
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
+from mnemos.api.dependencies import configure_auth
+from mnemos.api.routes import memories as memories_handler
 import mnemos.core.lifecycle as lifecycle
 from mnemos.core.auth_context import UserContext
 from mnemos.persistence import (
@@ -28,6 +33,8 @@ from mnemos.persistence import (
     WebhookRepository,
 )
 from mnemos.persistence import sqlite as sqlite_persistence
+from mnemos.webhooks import lease as webhook_lease
+from mnemos.webhooks import types as webhook_types
 
 
 PG_URL = os.environ.get("MNEMOS_TEST_DB")
@@ -104,6 +111,20 @@ def _dicts(rows: list[Any]) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def test_visibility_filter_requires_namespace_for_non_root_read():
+    from mnemos.persistence.visibility import VisibilityFilter
+
+    with pytest.raises(ValueError, match="requires a namespace"):
+        VisibilityFilter.for_read(_user("alice"), namespace=None)
+
+
+def test_visibility_filter_requires_namespace_for_non_root_mutation():
+    from mnemos.persistence.visibility import VisibilityFilter
+
+    with pytest.raises(ValueError, match="requires a namespace"):
+        VisibilityFilter.for_mutation(_user("alice"), namespace=None)
+
+
 async def _raw_execute(case: BackendCase, tx: Any, pg_sql: str, *pg_args: Any, sqlite_sql: str | None = None) -> None:
     if case.name == "sqlite":
         await sqlite_persistence._execute(tx.conn, sqlite_sql or pg_sql, pg_args)
@@ -170,6 +191,7 @@ async def _insert_memory(
         source_provider=None,
         source_session=None,
         source_agent=None,
+        verbatim_content=content,
         created=None,
         updated=None,
     )
@@ -256,6 +278,160 @@ def test_sqlite_backend_feature_flags(tmp_path):
     assert backend.uses_fts5 is True
 
 
+def test_edge_sqlite_list_memories_serializes_timestamp_text(tmp_path, monkeypatch):
+    backend = SqliteBackend(tmp_path / "edge-handler.sqlite3", SimpleNamespace())
+    memory_id = f"edge-{uuid.uuid4().hex[:8]}"
+
+    class FakeCache:
+        def __init__(self) -> None:
+            self.deleted: list[str] = []
+
+        async def delete(self, key: str) -> None:
+            self.deleted.append(key)
+
+        async def scan_iter(self, *, match: str, count: int):
+            if False:
+                yield match
+
+    fake_cache = FakeCache()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        configure_auth(
+            {
+                "enabled": False,
+                "default_namespace": "default",
+                "personal_user_id": "edge-owner",
+            },
+        )
+        await backend.open()
+        monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+        monkeypatch.setattr(lifecycle, "_cache", fake_cache)
+        app.state.persistence_backend = backend
+        async with backend.transactional() as tx:
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=memory_id,
+                content="edge sqlite timestamp content",
+                category="solutions",
+                subcategory=None,
+                metadata_json='{"source":"edge-test"}',
+                quality_rating=75,
+                owner_id="edge-owner",
+                namespace="default",
+                permission_mode=600,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content="edge sqlite timestamp content",
+                created="2026-04-29 12:34:56",
+                updated="2026-04-29 12:34:56",
+            )
+        try:
+            yield
+        finally:
+            await backend.close()
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(memories_handler.router)
+
+    with TestClient(app) as client:
+        response = client.get("/v1/memories")
+        create_response = client.post(
+            "/v1/memories",
+            json={
+                "content": "created memory defaults verbatim",
+                "category": "solutions",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    assert body["memories"][0]["id"] == memory_id
+    assert body["memories"][0]["created"] == "2026-04-29T12:34:56"
+    assert body["memories"][0]["verbatim_content"] == "edge sqlite timestamp content"
+    assert create_response.status_code == 201
+    assert create_response.json()["verbatim_content"] == "created memory defaults verbatim"
+    assert "stats:global:v2" in fake_cache.deleted
+    assert "stats:global" not in fake_cache.deleted
+
+
+def test_edge_sqlite_search_memories_serializes_timestamp_text(tmp_path, monkeypatch):
+    backend = SqliteBackend(tmp_path / "edge-search-handler.sqlite3", SimpleNamespace())
+    memory_id = f"edge-search-{uuid.uuid4().hex[:8]}"
+
+    class FakeCache:
+        async def get(self, key: str):
+            return None
+
+        async def setex(self, key: str, ttl: int, value: str) -> None:
+            return None
+
+    async def _noop_bump_recall_counters(memory_ids: list[str]) -> None:
+        return None
+
+    @asynccontextmanager
+    async def lifespan(app):
+        configure_auth(
+            {
+                "enabled": False,
+                "default_namespace": "default",
+                "personal_user_id": "edge-owner",
+            },
+        )
+        await backend.open()
+        monkeypatch.setattr(lifecycle, "_persistence_backend", backend)
+        monkeypatch.setattr(lifecycle, "_cache", FakeCache())
+        monkeypatch.setattr(
+            memories_handler,
+            "_bump_recall_counters",
+            _noop_bump_recall_counters,
+        )
+        app.state.persistence_backend = backend
+        async with backend.transactional() as tx:
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=memory_id,
+                content="edge sqlite search timestamp content",
+                category="solutions",
+                subcategory=None,
+                metadata_json='{"source":"edge-search-test"}',
+                quality_rating=75,
+                owner_id="edge-owner",
+                namespace="default",
+                permission_mode=600,
+                source_model=None,
+                source_provider=None,
+                source_session=None,
+                source_agent=None,
+                verbatim_content="edge sqlite search timestamp content",
+                created="2026-04-29 12:34:56",
+                updated="2026-04-29 12:34:56",
+            )
+        try:
+            yield
+        finally:
+            await backend.close()
+
+    app = FastAPI(lifespan=lifespan)
+    app.include_router(memories_handler.router)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/v1/memories/search",
+            json={"query": "sqlite search timestamp", "semantic": False},
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["count"] == 1
+    assert body["memories"][0]["id"] == memory_id
+    assert body["memories"][0]["created"] == "2026-04-29T12:34:56"
+    assert body["memories"][0]["verbatim_content"] == "edge sqlite search timestamp content"
+
+
 @pytest.mark.asyncio
 async def test_memory_commit_roundtrip(backend_case: BackendCase):
     async with backend_case.backend.transactional() as tx:
@@ -263,6 +439,47 @@ async def test_memory_commit_roundtrip(backend_case: BackendCase):
     async with backend_case.backend.transactional() as tx:
         row = await backend_case.backend.memories.fetch_memory_by_id(tx, memory_id)
     assert row["content"] == "commit roundtrip"
+
+
+@pytest.mark.asyncio
+async def test_delete_memory_returns_deleted_row_and_none_for_missing(backend_case: BackendCase):
+    from mnemos.persistence.visibility import VisibilityFilter
+
+    owner = f"{backend_case.prefix}-delete-owner"
+    async with backend_case.backend.transactional() as tx:
+        memory_id = await _insert_memory(
+            backend_case,
+            tx,
+            content="delete returns metadata",
+            category="facts",
+            owner_id=owner,
+            namespace="delete-ns",
+        )
+        row = await backend_case.backend.memories.delete_memory(
+            tx,
+            memory_id,
+            visibility=VisibilityFilter.for_mutation(
+                _user(owner, "delete-ns"),
+                namespace="delete-ns",
+            ),
+        )
+        missing = await backend_case.backend.memories.delete_memory(
+            tx,
+            memory_id,
+            visibility=VisibilityFilter.for_mutation(
+                _user(owner, "delete-ns"),
+                namespace="delete-ns",
+            ),
+        )
+
+    assert row is not None
+    assert row["id"] == memory_id
+    assert row["owner_id"] == owner
+    assert row["namespace"] == "delete-ns"
+    assert row["content"] == "delete returns metadata"
+    assert row["category"] == "facts"
+    assert row["subcategory"] is None
+    assert missing is None
 
 
 @pytest.mark.asyncio
@@ -285,6 +502,7 @@ async def test_transaction_exception_rolls_back_memory(backend_case: BackendCase
                 source_provider=None,
                 source_session=None,
                 source_agent=None,
+                verbatim_content="rollback",
                 created=None,
                 updated=None,
             )
@@ -870,6 +1088,44 @@ async def test_webhook_outbox_commits_with_memory(backend_case: BackendCase):
 
 
 @pytest.mark.asyncio
+async def test_webhook_dispatch_event_writes_claimable_writer_revision(backend_case: BackendCase):
+    owner = f"{backend_case.prefix}-claim-owner"
+    subscription_id = str(uuid.uuid4())
+    async with backend_case.backend.transactional() as tx:
+        await _ensure_user(backend_case, tx, owner)
+        await backend_case.backend.webhooks.insert_subscription(
+            tx,
+            subscription_id=subscription_id,
+            url="https://example.com/webhook",
+            events=["memory.created"],
+            secret="secret",
+            owner_id=owner,
+            namespace="default",
+        )
+        delivery_ids = await backend_case.backend.webhooks.dispatch_event(
+            tx,
+            "memory.created",
+            {"memory_id": "claimable"},
+            owner_id=owner,
+            namespace="default",
+        )
+
+    assert len(delivery_ids) == 1
+    async with backend_case.backend.transactional() as tx:
+        deliveries = await backend_case.backend.webhooks.fetch_deliveries(tx, subscription_id)
+    assert len(deliveries) == 1
+    assert deliveries[0]["writer_revision"] == webhook_types.NEW_CODE_WRITER_REVISION
+
+    if backend_case.name == "postgres":
+        claimed = await webhook_lease._claim_delivery(
+            lifecycle._pool,
+            delivery_ids[0],
+            lease_token=str(uuid.uuid4()),
+        )
+        assert claimed is not None
+
+
+@pytest.mark.asyncio
 async def test_webhook_event_filter_does_not_enqueue_unmatched_event(backend_case: BackendCase):
     owner = f"{backend_case.prefix}-owner"
     subscription_id = str(uuid.uuid4())
@@ -892,6 +1148,46 @@ async def test_webhook_event_filter_does_not_enqueue_unmatched_event(backend_cas
             namespace="default",
         )
     assert delivery_ids == []
+
+
+@pytest.mark.asyncio
+async def test_webhook_dispatch_namespace_filter_applies_without_owner(backend_case: BackendCase):
+    owner = f"{backend_case.prefix}-owner"
+    sub_ns_a = str(uuid.uuid4())
+    sub_ns_b = str(uuid.uuid4())
+    async with backend_case.backend.transactional() as tx:
+        await _ensure_user(backend_case, tx, owner)
+        await backend_case.backend.webhooks.insert_subscription(
+            tx,
+            subscription_id=sub_ns_a,
+            url="https://example.com/webhook-a",
+            events=["memory.created"],
+            secret="secret",
+            owner_id=owner,
+            namespace="ns-a",
+        )
+        await backend_case.backend.webhooks.insert_subscription(
+            tx,
+            subscription_id=sub_ns_b,
+            url="https://example.com/webhook-b",
+            events=["memory.created"],
+            secret="secret",
+            owner_id=owner,
+            namespace="ns-b",
+        )
+        delivery_ids = await backend_case.backend.webhooks.dispatch_event(
+            tx,
+            "memory.created",
+            {"memory_id": "namespace-only"},
+            owner_id=None,
+            namespace="ns-a",
+        )
+    async with backend_case.backend.transactional() as tx:
+        deliveries_ns_a = await backend_case.backend.webhooks.fetch_deliveries(tx, sub_ns_a)
+        deliveries_ns_b = await backend_case.backend.webhooks.fetch_deliveries(tx, sub_ns_b)
+    assert len(delivery_ids) == 1
+    assert len(deliveries_ns_a) == 1
+    assert deliveries_ns_b == []
 
 
 @pytest.mark.asyncio
@@ -926,6 +1222,7 @@ async def test_webhook_outbox_rolls_back_with_memory(backend_case: BackendCase):
                 source_provider=None,
                 source_session=None,
                 source_agent=None,
+                verbatim_content="rollback webhook",
                 created=None,
                 updated=None,
             )
@@ -1026,15 +1323,21 @@ async def test_state_kv_is_namespace_scoped(backend_case: BackendCase):
 
 @pytest.mark.asyncio
 async def test_sqlite_vector_semantic_search(tmp_path):
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
     backend = SqliteBackend(tmp_path / "vector.sqlite3", SimpleNamespace())
     await backend.open()
+    visibility = VisibilityFilter(
+        scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None,
+    )
     async with backend.transactional() as tx:
         near = await _insert_memory(BackendCase("sqlite", backend, "sqlite_vector"), tx, suffix="near", content="near")
         far = await _insert_memory(BackendCase("sqlite", backend, "sqlite_vector"), tx, suffix="far", content="far")
         assert isinstance(tx, SqliteTransaction)
         await backend.memories.upsert_memory_embedding(tx, near, [1.0, 0.0, 0.0])
         await backend.memories.upsert_memory_embedding(tx, far, [0.0, 1.0, 0.0])
-        rows = await backend.memories.semantic_search(tx, [0.9, 0.1, 0.0], limit=2)
+        rows = await backend.memories.semantic_search(
+            tx, embedding=[0.9, 0.1, 0.0], limit=2, visibility=visibility,
+        )
     await backend.close()
     assert [row["id"] for row in rows] == [near, far]
     assert rows[0]["similarity"] > rows[1]["similarity"]
@@ -1042,13 +1345,19 @@ async def test_sqlite_vector_semantic_search(tmp_path):
 
 @pytest.mark.asyncio
 async def test_sqlite_fts5_relevance_ordering(tmp_path):
+    from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
     backend = SqliteBackend(tmp_path / "fts.sqlite3", SimpleNamespace())
     await backend.open()
+    visibility = VisibilityFilter(
+        scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None,
+    )
     case = BackendCase("sqlite", backend, "sqlite_fts")
     async with backend.transactional() as tx:
         best = await _insert_memory(case, tx, suffix="best", content="apollo apollo apollo sqlite")
         other = await _insert_memory(case, tx, suffix="other", content="apollo persistence")
-        rows = await backend.memories.fts_search(tx, "apollo", limit=2)
+        rows = await backend.memories.fts_search(
+            tx, query="apollo", limit=2, visibility=visibility,
+        )
     await backend.close()
     assert [row["id"] for row in rows] == [best, other]
 

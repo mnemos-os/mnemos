@@ -13,13 +13,12 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.ids import new_memory_id
 from mnemos.core.lifecycle import (
     _MEMORY_COLS,
-    _fts_fetch,
     _get_cache_key,
     _get_embedding,
-    _vector_search,
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.domain.models import (
     BulkCreateRequest,
     BulkCreateResponse,
@@ -51,6 +50,102 @@ async def _rls_context(conn, user: UserContext):
             yield conn
     else:
         yield conn
+
+
+async def _maybe_set_pg_rls(tx, user: UserContext) -> None:
+    """Apply Postgres RLS GUCs inside a backend-neutral transaction.
+
+    No-op on SQLite (no RLS). Postgres ``transactional()`` already
+    opened a transaction before yielding, so ``SET LOCAL`` applies
+    only within that scope.
+
+    Repository SQL also bakes the visibility predicate inline as
+    primary enforcement; this helper is defense-in-depth for the
+    Postgres path.
+    """
+    if not _lc._rls_enabled or not user.authenticated:
+        return
+    # Lazy import keeps this module from owning a Postgres-only
+    # dependency at module load time on edge profiles.
+    from mnemos.persistence.postgres import PostgresTransaction
+    if not isinstance(tx, PostgresTransaction):
+        return
+    await tx.conn.execute("SET LOCAL mnemos.current_user_id = $1", user.user_id)
+    await tx.conn.execute("SET LOCAL mnemos.current_role = $1", user.role)
+
+
+def _backend_or_503():
+    """Return the active persistence backend or raise 503."""
+    backend = _lc._persistence_backend
+    if backend is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Persistence backend not available",
+        )
+    return backend
+
+
+def _read_visibility_for(user: UserContext, *, namespace: str) -> VisibilityFilter:
+    """Read-path visibility for an already-resolved namespace.
+
+    Root callers bypass; non-root callers are pinned. Use when the
+    handler has already pinned the namespace explicitly (e.g. on
+    create/update) so the same-namespace round-trip doesn't reject.
+    """
+    if is_root(user):
+        return VisibilityFilter(
+            scope=VisibilityScope.ROOT_BYPASS,
+            user_id=None,
+            group_ids=(),
+            namespace=namespace,
+        )
+    return VisibilityFilter.for_read(user, namespace=namespace)
+
+
+def _mutation_visibility_for(user: UserContext, *, namespace: str | None) -> VisibilityFilter:
+    """Mutation-path visibility for an already-resolved namespace.
+
+    Root callers bypass; non-root callers are owner+namespace pinned.
+    """
+    if is_root(user):
+        return VisibilityFilter(
+            scope=VisibilityScope.ROOT_BYPASS,
+            user_id=None,
+            group_ids=(),
+            namespace=namespace,
+        )
+    return VisibilityFilter.for_mutation(user, namespace=namespace)
+
+
+def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
+    """Schedule HTTP send attempts for newly-enqueued outbox rows.
+
+    Called AFTER the writing transaction commits so the delivery
+    worker sees a committed row when it runs. ``_attempt_delivery``
+    is imported lazily to avoid pulling the webhook subsystem into
+    edge-profile cold paths.
+    """
+    if not delivery_ids:
+        return
+    from mnemos.webhooks.sender import _attempt_delivery
+    for did in delivery_ids:
+        _lc._schedule_delivery_attempt(_attempt_delivery(str(did)))
+
+
+async def _invalidate_caches_after_mutation() -> None:
+    """Drop /stats + per-user search cache entries on any memory write."""
+    if not _lc._cache:
+        return
+    try:
+        await _lc._cache.delete("stats:global:v2")
+        try:
+            async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                await _lc._cache.delete(_k)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
 
 def _read_visibility_predicate(
     user: UserContext, start_param_idx: int
@@ -156,21 +251,10 @@ async def list_memories(
     offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-
-    # Tenancy scoping for non-root callers:
-    #   - Namespace pinned. Cross-namespace request returns 403
-    #     (mirrors search_memories' parity contract).
-    #   - Read-visibility predicate aligned with the v1_multiuser
-    #     RLS policies (see _read_visibility_predicate). Combines
-    #     owner / federation / group-readable / world-readable into
-    #     a single OR-clause at the app layer because RLS cannot
-    #     RE-ADD rows that the handler WHERE has already excluded —
-    #     a strict owner-only WHERE would silently hide
-    #     group/world-readable rows in team/enterprise mode.
-    # Root callers see everything; explicit ?namespace= honored for
-    # cross-tenant audit lookups.
+    backend = _backend_or_503()
+    # Cross-namespace request rejected explicitly for non-root —
+    # don't silently scope and hide rows. Root callers may pass any
+    # namespace for cross-tenant audit lookups.
     root = is_root(user)
     if not root and namespace and namespace != user.namespace:
         raise HTTPException(
@@ -178,41 +262,21 @@ async def list_memories(
             detail="cross-namespace list requires root",
         )
     effective_namespace = namespace if root else user.namespace
+    visibility = VisibilityFilter.for_read(user, namespace=effective_namespace)
 
-    # Build dynamic WHERE clauses to avoid 4×2 hardcoded SQL branches.
-    # Filter list is preserved across SELECT and COUNT — same params,
-    # same predicate.
-    where_parts: list[str] = []
-    params: list = []
-    if category is not None:
-        where_parts.append(f"category=${len(params) + 1}")
-        params.append(category)
-    if subcategory is not None:
-        where_parts.append(f"subcategory=${len(params) + 1}")
-        params.append(subcategory)
-    if effective_namespace is not None:
-        where_parts.append(f"namespace=${len(params) + 1}")
-        params.append(effective_namespace)
-    if not root:
-        vis_clause, vis_params = _read_visibility_predicate(
-            user, len(params) + 1,
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        rows, total = await backend.memories.list_memories(
+            tx,
+            visibility=visibility,
+            category=category,
+            subcategory=subcategory,
+            limit=limit,
+            offset=offset,
         )
-        where_parts.append(vis_clause)
-        params.extend(vis_params)
-
-    where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
-
-    select_sql = (
-        f"SELECT {_MEMORY_COLS} FROM memories{where_sql} "
-        f"ORDER BY created DESC LIMIT ${len(params) + 1} OFFSET ${len(params) + 2}"
+    return MemoryListResponse(
+        count=total, memories=[_row_to_memory(r) for r in rows],
     )
-    count_sql = f"SELECT COUNT(*) FROM memories{where_sql}"
-
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
-            rows = await conn.fetch(select_sql, *params, limit, offset)
-            total = await conn.fetchval(count_sql, *params)
-    return MemoryListResponse(count=total, memories=[_row_to_memory(r) for r in rows])
 
 
 @router.get("/memories/{memory_id}", response_model=MemoryItem)
@@ -220,30 +284,19 @@ async def get_memory(
     memory_id: str,
     user: UserContext = Depends(get_current_user),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
-            if is_root(user):
-                row = await conn.fetchrow(
-                    f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
-                )
-            else:
-                # Read visibility for non-root: namespace pinned + the
-                # shared read-visibility predicate (own / federation /
-                # world-readable / group-readable), mirroring the
-                # v1_multiuser RLS policies. Same predicate as
-                # list_memories so a memory visible to a user via
-                # list/search is also visible via GET-by-id.
-                # Mutation paths (update/delete) keep strict
-                # owner_id scoping. 404 (not 403) keeps other-tenant
-                # memory existence invisible.
-                vis_clause, vis_params = _read_visibility_predicate(user, 3)
-                row = await conn.fetchrow(
-                    f"SELECT {_MEMORY_COLS} FROM memories "
-                    f"WHERE id=$1 AND namespace=$2 AND {vis_clause}",
-                    memory_id, user.namespace, *vis_params,
-                )
+    backend = _backend_or_503()
+    # Root callers see everything (namespace=None); non-root callers
+    # are pinned to their namespace by the visibility factory. 404
+    # (not 403) keeps other-tenant memory existence invisible — same
+    # contract as the legacy handler.
+    visibility = VisibilityFilter.for_read(
+        user, namespace=None if is_root(user) else user.namespace,
+    )
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        row = await backend.memories.get_memory(
+            tx, memory_id, visibility=visibility,
+        )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
     return _row_to_memory(row, include_compressed=True)
@@ -481,47 +534,55 @@ async def search_memories(
         except Exception as e:
             logger.warning(f"[CACHE] search read error: {e}")
 
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    backend = _backend_or_503()
+    # Root callers can search across namespaces (search_owner_id is
+    # None); non-root callers are pinned. The visibility factory
+    # rejects namespace=None for non-root, which the namespace 403
+    # check above already prevents reaching.
+    visibility = VisibilityFilter.for_read(user, namespace=search_namespace)
 
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
-            # group_ids is set only for non-root callers (search_owner_id
-            # set means the predicate should mirror the v1_multiuser
-            # full read-visibility, including group-readable rows).
-            search_group_ids = (
-                list(user.group_ids) if search_owner_id is not None else None
-            )
-            _prov = dict(
+    async with backend.transactional() as tx:
+        await _maybe_set_pg_rls(tx, user)
+        if request.semantic:
+            embedding = await _get_embedding(request.query)
+            if not embedding:
+                logger.warning("[VECTOR] Embedding failed, falling back to FTS")
+                rows = await backend.memories.fts_search(
+                    tx,
+                    query=request.query,
+                    limit=request_limit,
+                    visibility=visibility,
+                    category=request.category,
+                    subcategory=request.subcategory,
+                    source_provider=request.source_provider,
+                    source_model=request.source_model,
+                    source_agent=request.source_agent,
+                )
+            else:
+                logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
+                rows = await backend.memories.semantic_search(
+                    tx,
+                    embedding=embedding,
+                    limit=request_limit,
+                    visibility=visibility,
+                    category=request.category,
+                    subcategory=request.subcategory,
+                    source_provider=request.source_provider,
+                    source_model=request.source_model,
+                    source_agent=request.source_agent,
+                )
+        else:
+            rows = await backend.memories.fts_search(
+                tx,
+                query=request.query,
+                limit=request_limit,
+                visibility=visibility,
+                category=request.category,
+                subcategory=request.subcategory,
                 source_provider=request.source_provider,
                 source_model=request.source_model,
                 source_agent=request.source_agent,
-                namespace=search_namespace,
-                owner_id=search_owner_id,
-                group_ids=search_group_ids,
             )
-            if request.semantic:
-                embedding = await _get_embedding(request.query)
-                if not embedding:
-                    logger.warning("[VECTOR] Embedding failed, falling back to FTS")
-                    rows = await _fts_fetch(
-                        conn, request.query, request_limit,
-                        request.category, request.subcategory,
-                        **_prov,
-                    )
-                else:
-                    logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
-                    rows = await _vector_search(
-                        conn, embedding, request_limit,
-                        request.category, request.subcategory,
-                        **_prov,
-                    )
-            else:
-                rows = await _fts_fetch(
-                    conn, request.query, request_limit,
-                    request.category, request.subcategory,
-                    **_prov,
-                )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
 
@@ -558,13 +619,12 @@ async def create_memory(
 ):
     if not request.content or not request.content.strip():
         raise HTTPException(status_code=422, detail="Memory content cannot be empty")
+    backend = _backend_or_503()
     mem_id = new_memory_id()
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
 
-    # Only root may create a memory attributed to a different owner or namespace
-    # than the caller. Previously any user could set request.owner_id and
-    # ghost-write memories under someone else's identity.
+    # Only root may create a memory attributed to a different owner
+    # or namespace than the caller — closes the ghost-writing
+    # vulnerability where any user could set request.owner_id.
     if request.owner_id and request.owner_id != user.user_id and user.role != "root":
         raise HTTPException(status_code=403, detail="owner_id override requires root")
     if request.namespace and request.namespace != user.namespace and user.role != "root":
@@ -572,47 +632,72 @@ async def create_memory(
     owner_id = request.owner_id or user.user_id
     namespace = request.namespace or user.namespace
 
+    metadata_json = json.dumps(request.metadata or {"source": request.source})
+    delivery_ids: list[str] = []
     try:
-        async with _lc._pool.acquire() as conn:
-            async with _rls_context(conn, user):
-                async with conn.transaction():
-                    # (trigger trg_memory_version_insert inserts version 1 automatically,
-                    # computing commit_hash + branch; no explicit handler INSERT needed)
-                    row = await _insert_memory_with_created_webhook(
-                        conn=conn,
-                        mem_id=mem_id,
-                        content=request.content,
-                        category=request.category,
-                        subcategory=request.subcategory,
-                        metadata=request.metadata or {"source": request.source},
-                        owner_id=owner_id,
-                        namespace=namespace,
-                        permission_mode=600,
-                        verbatim_content=request.verbatim_content,
-                        source_model=request.source_model,
-                        source_provider=request.source_provider,
-                        source_session=request.source_session,
-                        source_agent=request.source_agent,
-                        fetch_row=True,
-                    )
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            # The Postgres trg_memory_version_insert trigger writes
+            # version 1 + branch automatically; the SQLite path does
+            # not have that trigger today (deferred to v4.2 with
+            # branch/version surface).
+            await backend.memories.insert_memory(
+                tx,
+                memory_id=mem_id,
+                content=request.content,
+                category=request.category,
+                subcategory=request.subcategory,
+                metadata_json=metadata_json,
+                quality_rating=75,
+                owner_id=owner_id,
+                namespace=namespace,
+                permission_mode=600,
+                source_model=request.source_model,
+                source_provider=request.source_provider,
+                source_session=request.source_session,
+                source_agent=request.source_agent,
+                verbatim_content=(
+                    request.verbatim_content
+                    if request.verbatim_content is not None
+                    else request.content
+                ),
+                created=None,
+                updated=None,
+            )
+            # Same-tx outbox enqueue — preserves the v4.0 contract
+            # that webhook_deliveries rows commit atomically with
+            # the data write.
+            delivery_ids = await backend.webhooks.dispatch_event(
+                tx,
+                "memory.created",
+                {
+                    "memory_id": mem_id,
+                    "category": request.category,
+                    "subcategory": request.subcategory,
+                    "content": request.content,
+                    "owner_id": owner_id,
+                    "namespace": namespace,
+                },
+                owner_id=owner_id,
+                namespace=namespace,
+            )
+            # Re-fetch the row inside the same tx so the response
+            # carries DB-resolved values (created/updated, etc).
+            row = await backend.memories.get_memory(
+                tx,
+                mem_id,
+                visibility=_read_visibility_for(user, namespace=namespace),
+            )
     except HTTPException:
         raise
     except Exception as e:
         logger.error("memory.create transaction failed for %s: %s", mem_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail="Memory creation failed") from e
-    if _lc._cache:
-        try:
-            await _lc._cache.delete("stats:global")
-            # Invalidate per-user search caches on mutation. Keys are
-            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
-            # entries and safe against shared Redis.
-            try:
-                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                    await _lc._cache.delete(_k)
-            except Exception:
-                pass
-        except Exception:
-            pass
+
+    # Schedule HTTP delivery for each enqueued outbox row, after the
+    # transaction has committed.
+    _schedule_outbox_deliveries(delivery_ids)
+    await _invalidate_caches_after_mutation()
     return _row_to_memory(row)
 
 
@@ -710,9 +795,8 @@ async def update_memory(
     user: UserContext = Depends(get_current_user),
 ):
     """Partially update a memory (content, category, subcategory, metadata)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    updates = {}
+    backend = _backend_or_503()
+    updates: dict = {}
     if request.content is not None:
         if not request.content.strip():
             raise HTTPException(status_code=422, detail="Memory content cannot be empty")
@@ -728,82 +812,47 @@ async def update_memory(
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
 
-    set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
-    set_clauses.append("updated=NOW()")
-    values = list(updates.values())
-
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
-            async with conn.transaction():
-                # Authorization + mutation in a single statement to
-                # close the TOCTOU window. The earlier shape was a
-                # SELECT-then-UPDATE pair where the SELECT proved
-                # owner+namespace but the UPDATE filtered by id alone
-                # — between the two, a concurrent admin/repair path
-                # could have changed ownership and the caller would
-                # still complete the update. Folding the predicate
-                # into the UPDATE … RETURNING makes the authorization
-                # atomic with the mutation: if the row no longer
-                # satisfies the predicate at write time, the update
-                # affects zero rows and we 404.
-                set_sql = ", ".join(set_clauses)
-                try:
-                    if is_root(user):
-                        row = await conn.fetchrow(
-                            f"UPDATE memories SET {set_sql} "
-                            f"WHERE id=$1 RETURNING {_lc._MEMORY_COLS}",
-                            memory_id, *values,
-                        )
-                    else:
-                        # Append owner_id + namespace placeholders after
-                        # the existing $1 (id) + values placeholders.
-                        owner_ph = f"${len(values) + 2}"
-                        ns_ph = f"${len(values) + 3}"
-                        row = await conn.fetchrow(
-                            f"UPDATE memories SET {set_sql} "
-                            f"WHERE id=$1 AND owner_id={owner_ph} "
-                            f"AND namespace={ns_ph} "
-                            f"RETURNING {_lc._MEMORY_COLS}",
-                            memory_id, *values, user.user_id, user.namespace,
-                        )
-                except asyncpg.PostgresError as exc:
-                    handle_trigger_pgerror(exc)
-                if not row:
-                    raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-                # mnemos_version_snapshot AFTER UPDATE trigger writes
-                # the new memory_versions row (commit_hash + bumped
-                # version_num); the handler must not duplicate that
-                # INSERT.
-    if _lc._cache:
-        try:
-            await _lc._cache.delete("stats:global")
-            # Invalidate per-user search caches on mutation. Keys are
-            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
-            # entries and safe against shared Redis.
-            try:
-                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                    await _lc._cache.delete(_k)
-            except Exception:
-                pass
-        except Exception:
-            pass
+    # Authorization + mutation in a single repository call: the
+    # visibility predicate folds into the UPDATE … RETURNING, so a
+    # concurrent admin/repair changing ownership between auth check
+    # and write cannot complete the update. Same TOCTOU-safe shape
+    # as the legacy handler.
+    visibility = _mutation_visibility_for(
+        user,
+        namespace=None if is_root(user) else user.namespace,
+    )
+    delivery_ids: list[str] = []
     try:
-        from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-        await _dispatch_webhook(
-            "memory.updated",
-            {
-                "memory_id": memory_id,
-                "category": row["category"],
-                "subcategory": row["subcategory"],
-                "content": row["content"],
-                "owner_id": row["owner_id"],
-                "namespace": row["namespace"],
-            },
-            owner_id=row["owner_id"],
-            namespace=row["namespace"],
-        )
-    except Exception:
-        logger.warning("webhook dispatch failed for memory.updated %s", memory_id, exc_info=True)
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            try:
+                row = await backend.memories.update_memory(
+                    tx, memory_id, visibility=visibility, fields=updates,
+                )
+            except asyncpg.PostgresError as exc:
+                handle_trigger_pgerror(exc)
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail=f"Memory {memory_id} not found",
+                )
+            delivery_ids = await backend.webhooks.dispatch_event(
+                tx,
+                "memory.updated",
+                {
+                    "memory_id": memory_id,
+                    "category": row["category"],
+                    "subcategory": row["subcategory"],
+                    "content": row["content"],
+                    "owner_id": row["owner_id"],
+                    "namespace": row["namespace"],
+                },
+                owner_id=row["owner_id"],
+                namespace=row["namespace"],
+            )
+    except HTTPException:
+        raise
+    _schedule_outbox_deliveries(delivery_ids)
+    await _invalidate_caches_after_mutation()
     return _row_to_memory(row)
 
 
@@ -813,56 +862,47 @@ async def delete_memory(
     user: UserContext = Depends(get_current_user),
 ):
     """Delete a memory by ID."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
-        async with _rls_context(conn, user):
+    backend = _backend_or_503()
+    # Mutation visibility: non-root pinned to (owner_id, namespace);
+    # root sees everything. Closes the cross-namespace deletion path
+    # where a namespace-A user could delete a namespace-B row under
+    # the same owner_id.
+    visibility = _mutation_visibility_for(
+        user,
+        namespace=None if is_root(user) else user.namespace,
+    )
+    delivery_ids: list[str] = []
+    try:
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
             try:
-                if is_root(user):
-                    result = await conn.execute(
-                        "DELETE FROM memories WHERE id = $1", memory_id,
-                    )
-                else:
-                    # Two-dimensional check: non-root can only delete
-                    # rows in their own namespace, preventing a namespace
-                    # A user from deleting a namespace B row even under
-                    # the same owner_id.
-                    result = await conn.execute(
-                        "DELETE FROM memories "
-                        "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
-                        memory_id, user.user_id, user.namespace,
-                    )
+                row = await backend.memories.delete_memory(
+                    tx, memory_id, visibility=visibility,
+                )
             except asyncpg.PostgresError as exc:
                 handle_trigger_pgerror(exc)
-    if result == "DELETE 0":
-        raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
-    if _lc._cache:
-        try:
-            await _lc._cache.delete("stats:global")
-            # Invalidate per-user search caches on mutation. Keys are
-            # namespaced "mnemos:search:*" so SCAN MATCH is bounded to our
-            # entries and safe against shared Redis.
-            try:
-                async for _k in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
-                    await _lc._cache.delete(_k)
-            except Exception:
-                pass
-        except Exception:
-            pass
-    try:
-        from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-        await _dispatch_webhook(
-            "memory.deleted",
-            {
-                "memory_id": memory_id,
-                "owner_id": user.user_id,
-                "namespace": user.namespace,
-            },
-            owner_id=user.user_id,
-            namespace=user.namespace,
-        )
-    except Exception:
-        logger.warning("webhook dispatch failed for memory.deleted %s", memory_id, exc_info=True)
+            if not row:
+                raise HTTPException(
+                    status_code=404, detail=f"Memory {memory_id} not found",
+                )
+            delivery_ids = await backend.webhooks.dispatch_event(
+                tx,
+                "memory.deleted",
+                {
+                    "memory_id": row["id"],
+                    "category": row["category"],
+                    "subcategory": row["subcategory"],
+                    "content": row["content"],
+                    "owner_id": row["owner_id"],
+                    "namespace": row["namespace"],
+                },
+                owner_id=row["owner_id"],
+                namespace=row["namespace"],
+            )
+    except HTTPException:
+        raise
+    _schedule_outbox_deliveries(delivery_ids)
+    await _invalidate_caches_after_mutation()
 
 
 @router.post("/memories/rehydrate", response_model=RehydrationResponse)

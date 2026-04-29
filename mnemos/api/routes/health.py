@@ -3,7 +3,6 @@ import json
 import logging
 from datetime import datetime, timezone
 
-import asyncpg
 from fastapi import APIRouter, HTTPException
 
 import mnemos.core.lifecycle as _lc
@@ -59,65 +58,34 @@ async def get_stats() -> StatsResponse:
         except Exception as e:
             logger.warning(f"[CACHE] /stats read error: {e}")
 
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    backend = _lc._persistence_backend
+    if backend is None:
+        raise HTTPException(status_code=503, detail="Persistence backend not available")
 
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            total = await conn.fetchval('SELECT COUNT(*) FROM memories')
-            # Federation-aware split: native rows have federation_source
-            # NULL; pulled rows carry the peer name there. memories_by_peer
-            # is the per-peer count for operator visibility into what a
-            # given staging/prod node is hosting from each upstream.
-            native = await conn.fetchval(
-                'SELECT COUNT(*) FROM memories WHERE federation_source IS NULL'
-            )
-            federated = await conn.fetchval(
-                'SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL'
-            )
-            peer_rows = await conn.fetch(
-                'SELECT federation_source, COUNT(*) AS cnt FROM memories '
-                'WHERE federation_source IS NOT NULL '
-                'GROUP BY federation_source ORDER BY cnt DESC'
-            )
-            memories_by_peer = {r['federation_source']: r['cnt'] for r in peer_rows}
-            cat_rows = await conn.fetch('SELECT category, COUNT(*) as cnt FROM memories GROUP BY category')
-            memories_by_category = {row['category']: row['cnt'] for row in cat_rows}
-            sub_rows = await conn.fetch(
-                'SELECT category, subcategory, COUNT(*) as cnt FROM memories '
-                'WHERE subcategory IS NOT NULL GROUP BY category, subcategory ORDER BY cnt DESC'
-            )
-            memories_by_subcategory: dict = {}
-            for r in sub_rows:
-                memories_by_subcategory.setdefault(r['category'], {})[r['subcategory']] = r['cnt']
-            avg_quality = await conn.fetchval(
-                'SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL'
-            )
-            total_compressions = (
-                await conn.fetchval("SELECT COUNT(*) FROM memory_compressed_variants") or 0
-            )
-            avg_ratio_row = await conn.fetchval("""
-                SELECT AVG(v.compression_ratio)
-                FROM memory_compressed_variants v
-            """)
-            unreviewed_compressions = (
-                await conn.fetchval(
-                    "SELECT COUNT(*) FROM memory_compressed_variants "
-                    "WHERE quality_score IS NULL"
-                ) or 0
-            )
+        async with backend.transactional() as tx:
+            memory_stats = await backend.memories.gather_stats(tx)
+            compression_stats = await backend.compression.gather_stats(tx)
 
         result = StatsResponse(
-            total_memories=total or 0,
-            native_memories=native or 0,
-            federated_memories=federated or 0,
-            memories_by_peer=memories_by_peer,
-            total_compressions=total_compressions,
-            average_compression_ratio=round(avg_ratio_row, 2) if avg_ratio_row else 0.57,
-            average_quality_rating=int(avg_quality) if avg_quality else 75,
-            memories_by_category=memories_by_category,
-            memories_by_subcategory=memories_by_subcategory,
-            unreviewed_compressions=unreviewed_compressions,
+            total_memories=memory_stats.total_memories,
+            native_memories=memory_stats.native_memories,
+            federated_memories=memory_stats.federated_memories,
+            memories_by_peer=memory_stats.memories_by_peer,
+            total_compressions=compression_stats.total_compressions,
+            average_compression_ratio=(
+                round(compression_stats.average_compression_ratio, 2)
+                if compression_stats.average_compression_ratio is not None
+                else 0.57
+            ),
+            average_quality_rating=(
+                int(memory_stats.avg_quality_rating)
+                if memory_stats.avg_quality_rating is not None
+                else 75
+            ),
+            memories_by_category=memory_stats.memories_by_category,
+            memories_by_subcategory=memory_stats.memories_by_subcategory,
+            unreviewed_compressions=compression_stats.unreviewed_compressions,
             timestamp=datetime.now(timezone.utc).replace(tzinfo=None).isoformat(),
         )
 
@@ -129,9 +97,6 @@ async def get_stats() -> StatsResponse:
 
         return result
 
-    except asyncpg.PostgresError as e:
-        logger.error(f"Stats DB error: {e}")
-        raise HTTPException(status_code=503, detail=f"Database error: {e}")
     except Exception as e:
         logger.error(f"Stats error: {e}")
         raise HTTPException(status_code=503, detail=f"Internal error: {e}")
