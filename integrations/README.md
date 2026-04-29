@@ -8,7 +8,10 @@ Each bundle contains:
 - A **config snippet** for the framework's MCP / hook system.
 - A **README** with install steps specific to that framework.
 
-All bundles talk to MNEMOS through the stdio MCP server at `mcp_server.py` in the repo root. **You must set `MNEMOS_BASE`** to your MNEMOS deployment's URL — there is no default. MNEMOS is network infrastructure; localhost is not a meaningful fallback.
+All bundles talk to MNEMOS through the stdio MCP transport (`mnemos serve
+mcp-stdio`, implemented by `mnemos.mcp.stdio`). **You must set `MNEMOS_BASE`**
+to your MNEMOS deployment's URL — there is no default. MNEMOS is network
+infrastructure; localhost is not a meaningful fallback.
 
 | Bundle | Discovery | Access | Enforcement |
 |--------|-----------|--------|-------------|
@@ -25,14 +28,18 @@ MNEMOS is designed to run as a shared network service on a dedicated host (a "me
 
 Pick your deployment URL:
 
-- **Unified MNEMOS+GRAEAE:** `http://mnemos.internal:5002` (default in v3)
+- **Unified MNEMOS+GRAEAE:** `http://mnemos.internal:5002`
 - **Loopback-only personal dev:** `http://127.0.0.1:5002`
 
-Use the same `MNEMOS_BASE` value everywhere. If you run team or enterprise profile, set `MNEMOS_API_KEY` too.
+Use the same `MNEMOS_BASE` value everywhere. If you run the `server` profile
+with auth enabled, set `MNEMOS_API_KEY` too.
 
 ## Authentication
 
-Set `MNEMOS_API_KEY` in the MCP server's environment — `mcp_server.py` attaches `Authorization: Bearer $MNEMOS_API_KEY` on every outbound HTTP request when the var is set, and omits the header when it isn't. For personal-profile installs (no auth) leave it unset.
+Set `MNEMOS_API_KEY` in the MCP server's environment; the v4 MCP transport
+attaches `Authorization: Bearer $MNEMOS_API_KEY` on every outbound HTTP request
+when the var is set, and omits the header when it isn't. For unauthenticated
+edge/dev installs, leave it unset.
 
 The bundled MCP config examples may still omit `MNEMOS_API_KEY` — add it to the `env` block of each framework's MCP server entry if you run team or enterprise profile:
 
@@ -40,8 +47,8 @@ The bundled MCP config examples may still omit `MNEMOS_API_KEY` — add it to th
 {
   "mcpServers": {
     "mnemos": {
-      "command": "python",
-      "args": ["/opt/mnemos/mcp_server.py"],
+      "command": "/opt/mnemos/venv/bin/mnemos",
+      "args": ["serve", "mcp-stdio"],
       "env": {
         "MNEMOS_BASE": "http://mnemos.internal:5002",
         "MNEMOS_API_KEY": "mnemos_..."   // only if MNEMOS has auth enabled
@@ -56,4 +63,4 @@ The Claude Code hooks (bundle in `claude-code/hooks/`) already handle `MNEMOS_AP
 Alternative transports for operators who don't want the token in a local env file:
 
 1. Run the MCP server on the same host as MNEMOS with MNEMOS bound to loopback (`listen_host = "127.0.0.1"`). Local MCP connects without auth; external network can't reach MNEMOS directly.
-2. Use SSH transport: `command: ssh` and `args: ["user@host", "/opt/mnemos/venv/bin/python", "/opt/mnemos/mcp_server.py"]`. Credentials ride the SSH channel, not the MCP config.
+2. Use SSH transport: `command: ssh` and `args: ["user@host", "/opt/mnemos/venv/bin/mnemos", "serve", "mcp-stdio"]`. Credentials ride the SSH channel, not the MCP config.

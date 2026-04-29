@@ -41,7 +41,7 @@ What this doc does NOT cover:
                      /         \
                     /           \
               PYTHIA (.67)    CERBERUS (.96)
-              v3.5.x prod     dark prod / GPU host
+              v4.0 prod       dark prod / GPU host
               pg17 primary    standby + inference
               11,756 memories + Apollo Gemma 4 (ports 8080/8081)
               5,045 compressions
@@ -64,8 +64,8 @@ What this doc does NOT cover:
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v3.5.x stable target | ✅ Operational |
-| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v3.5.x stable target | ✅ Operational |
+| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v4.0 stable target | ✅ Operational |
+| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v4.0 stable target | ✅ Operational |
 | **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
 | **ARGONAS** | 192.168.207.101 | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
@@ -88,7 +88,7 @@ Production MNEMOS runs on a **canary + ratchet** model: new features bake in sta
 
 | Tier | Host(s) | Version target | Stability | Deployment source |
 |---|---|---|---|---|
-| **Prod** | PYTHIA + CERBERUS | *latest stable* (v3.5.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
+| **Prod** | PYTHIA + CERBERUS | *latest stable* (v4.0.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
 | **Staging** | PROTEUS | *latest cut* / next release branch | alpha/rc, real federation | release branch, merged + tagged |
 | **Test** | docker-compose + mnemos-test-pg on CERBERUS | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
 
@@ -248,7 +248,8 @@ sudo -u postgres psql -d mnemos -v ON_ERROR_STOP=1 \
   -f db/migrations_v3_5_trigger_same_memory_parent.sql
 ```
 
-See `installer/db.py:51-63` (`_psql_superuser`) and `installer/db.py:230-254` (migration sequence) for canonical order. `install.py:150-169` carries the ordered installer migration list and must stay in the same order.
+See `mnemos/installer/db.py` for the canonical migration order. Docker compose,
+the CLI installer, and manual runbooks must mirror that loader.
 
 ### 5.3 Pre-migration backup (mandatory)
 
@@ -318,7 +319,7 @@ WHERE proname = 'mnemos_version_snapshot';
 
 `MN001` means the trigger found broken branch state while resolving the
 parent for an UPDATE or DELETE. The API maps it to HTTP 409 through
-`handle_trigger_pgerror` (`api/visibility.py:24-37`).
+`handle_trigger_pgerror` (`mnemos/core/visibility.py`).
 
 Causes:
 
@@ -389,7 +390,7 @@ pg_dump -U postgres mnemos | gzip > \
 
 ### 6.3 Restore procedure (quarterly drill)
 
-**Status:** Dev↔prod MPF restore drill documented and last run for v3.4.1; repeat before high-risk v3.5.x schema work.
+**Status:** Dev↔prod MPF restore drill documented and last run for v3.4.1; repeat before high-risk schema work.
 Repeat quarterly and before high-risk schema work.
 
 To restore from backup to PROTEUS (test/staging host):
@@ -461,7 +462,8 @@ Response (JSON):
 ```json
 {
   "status": "healthy",
-  "version": "3.5.1",
+  "version": "4.0.0",
+  "profile": "server",
   "database_connected": true,
   "distillation_worker": "healthy"
 }
@@ -474,8 +476,8 @@ Response (JSON):
 Simple dashboard (Grafana or custom HTML) that queries each node's `/health` and shows:
 
 ```
-PYTHIA:   3.5.1         (prod target)
-CERBERUS: 3.5.1         (dark prod / GPU host)
+PYTHIA:   4.0.0         (prod target)
+CERBERUS: 4.0.0         (dark prod / GPU host)
 PROTEUS:  next cut      (staging / restore-drill target)
 ```
 
@@ -580,14 +582,14 @@ During the 2026-04-26 audit:
 
 ### 9.2 Solution: weekly version check
 
-Implement `scripts/ops/version_check.sh` (to be written, v3.5 target):
+Implement `scripts/ops/version_check.sh`:
 
 ```bash
 #!/bin/bash
 # Check each node's version vs. declared target
 
-PYTHIA_DECLARED="3.5.1"
-CERBERUS_DECLARED="3.5.1"
+PYTHIA_DECLARED="4.0.0"
+CERBERUS_DECLARED="4.0.0"
 PROTEUS_DECLARED="next-cut"
 
 PYTHIA_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
@@ -652,14 +654,16 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 ## 11. Federation health
 
-### 11.1 Architecture (v3.5.x current)
+### 11.1 Architecture (v4.0.0 current)
 
-Federation (peer-to-peer memory sync) is specified in `api/handlers/federation.py:280-390`. Key points:
+Federation (peer-to-peer memory sync) is specified in `mnemos/api/routes/federation.py`. Key points:
 
 - Each MNEMOS node maintains a `federation_peers` table (schema in `db/migrations_v3_federation.sql`)
 - Sync is **pull-based:** node A asks node B for updates since the last sync point
 - Compound-cursor pagination over `(updated, id)` (not full-dump on every sync)
-- **Status as of 2026-04-28:** Schema-compat preflight, restore drills, and the stable compound cursor are validated. Peer heartbeat and per-peer ACL remain future work.
+- **Status as of 2026-04-29:** Schema-compat preflight, restore drills, the
+  stable compound cursor, and v4 package boundaries are validated. Peer
+  heartbeat and per-peer ACL remain future work.
 
 ### 11.2 What happens when a peer is unreachable
 
@@ -667,9 +671,9 @@ Currently: node logs an error and retries on next sync interval (default 1h). **
 
 Risk: Silent failure — if CERBERUS goes down mid-night, PYTHIA won't know for 1–2 hours.
 
-### 11.3 Required: Peer heartbeat detection (v3.5 target)
+### 11.3 Required: Peer heartbeat detection
 
-Implement lightweight heartbeat check in `api/handlers/federation.py`:
+Implement lightweight heartbeat check in `mnemos/api/routes/federation.py`:
 
 ```python
 async def check_peer_health(peer_url: str, token: str, timeout: int = 5) -> bool:
@@ -833,9 +837,9 @@ The following three shell scripts codify operational patterns and reduce manual 
 - **Feature roadmap:** `docs/V3_5_CHARTER.md` (PANTHEON + IRIS + ops hardening), `docs/V3_6_CHARTER.md` (APOLLO consolidation + PERSEPHONE archival), `docs/V4_PLAN.md` (API consolidation + GPU stack)
 - **Architecture:** `README.md`, `docs/ARCHITECTURE.md`
 - **API docs:** `docs/API.md`, `examples/`
-- **Database:** `db/migrations_*.sql` (all schema changes), `installer/db.py` (canonical migration order)
-- **Observability:** `api/observability.py` (request-ID middleware, Prometheus, OTEL)
-- **Federation:** `api/handlers/federation.py` (peer sync logic)
+- **Database:** `db/migrations_*.sql` and `db/migrations_sqlite/` (schema changes), `mnemos/installer/db.py` (canonical migration order)
+- **Observability:** `mnemos/api/observability.py` (request-ID middleware, Prometheus, OTEL)
+- **Federation:** `mnemos/api/routes/federation.py` (peer sync logic)
 
 ---
 

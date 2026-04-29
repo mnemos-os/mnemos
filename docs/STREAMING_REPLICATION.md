@@ -7,8 +7,8 @@ receive WAL from that primary and stay read-only until promoted.
 
 Federation is not the single-site HA mechanism. Keep federation for genuinely
 remote data flows: multi-site deployments, multi-org curated feeds, developer
-laptop replicas with intermittent connectivity, and planned v4 SQLite-based
-local-replica profiles.
+laptop replicas with intermittent connectivity, and v4 SQLite-backed edge
+profiles.
 
 References:
 

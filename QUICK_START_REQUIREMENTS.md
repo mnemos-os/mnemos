@@ -1,12 +1,26 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v3.5.x release line
-**TL;DR**: Python 3.11+, PostgreSQL 16, 8GB RAM, 50GB disk
+**Applies to**: current v4.0.0 release line
+**TL;DR**: Python 3.11+ for package installs; no host Python for single-binary.
+Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
 
 ---
 
-## Bare Metal (Fastest to Deploy)
+## Single Binary (Fastest Edge Deploy)
+
+```bash
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.0.0/mnemos-linux-x86_64 -o mnemos
+chmod +x mnemos
+./mnemos install --profile edge
+./mnemos serve --profile edge
+```
+
+**Total Time**: ~5 minutes
+
+---
+
+## Bare Metal Python Package
 
 ### Install (Ubuntu 22.04 LTS)
 
@@ -14,30 +28,30 @@
 # 1. Python (2 minutes)
 sudo apt update && sudo apt install -y python3.11 python3.11-venv python3.11-dev
 
-# 2. PostgreSQL with pgvector (5 minutes)
-sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client
-
-# 3. System dependencies (1 minute)
+# 2. System dependencies (1 minute)
 sudo apt install -y git curl build-essential libpq-dev
 
-# 4. MNEMOS code (2 minutes)
-git clone https://github.com/mnemos-os/mnemos
-cd mnemos
+# 3. MNEMOS package (2 minutes)
+python3.11 -m venv ~/.venvs/mnemos
+source ~/.venvs/mnemos/bin/activate
+pip install mnemos-os==4.0.0
+
+# 4. SQLite-backed dev profile
+mnemos install --profile dev
+mnemos serve --profile dev
+```
+
+For a production `server` profile, add PostgreSQL + pgvector and Redis:
+
+```bash
+sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client redis-server
 python3.11 -m venv venv
 source venv/bin/activate
-pip install -e .
-
-# 5. Database setup and migrations (1 minute)
-psql -U postgres -d postgres -c "CREATE USER mnemos_user WITH PASSWORD 'mnemos_local';"
-psql -U postgres -d postgres -c "CREATE DATABASE mnemos OWNER mnemos_user;"
-python install.py
-
-# 6. Configure (if install.py did not already write config)
-cp .env.example .env
-# Edit .env with your settings
-
-# 7. Run (30 seconds)
-python api_server.py
+pip install mnemos-os==4.0.0
+export MNEMOS_PROFILE=server
+export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
+mnemos install --profile server
+mnemos serve --profile server
 ```
 
 **Total Time**: ~15 minutes
@@ -73,7 +87,7 @@ curl http://localhost:5002/health
 
 For existing Docker volumes, `docker compose up -d` also runs the
 one-shot `postgres-upgrade` service before MNEMOS starts. This applies
-the v3.5.x migration tail because Postgres initdb scripts do not rerun on
+the ordered migration tail because Postgres initdb scripts do not rerun on
 already-initialized volumes.
 
 ---
@@ -269,7 +283,7 @@ export MNEMOS_API_KEY=$(uuidgen)
 ```bash
 lsof -i :5002
 kill -9 <PID>
-# or use different port: MNEMOS_PORT=5003 python api_server.py
+# or use a different port: mnemos serve --profile dev --port 5003
 ```
 
 **"Connection timeout to api.together.ai"**
@@ -312,6 +326,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: v3.5.x; v3.5.1 documentation-triage patch
+**Version**: v4.0.0
 **Updated**: 2026-04-28
 **Accuracy**: Production-verified

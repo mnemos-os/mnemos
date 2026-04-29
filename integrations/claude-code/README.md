@@ -6,7 +6,7 @@ Two integration modes. You can use either or both.
 
 Set `MNEMOS_BASE` to your MNEMOS deployment's URL. **There is no default** — MNEMOS is network infrastructure, not an embedded library. Typical values:
 
-- `http://mnemos.internal:5002` — unified MNEMOS+GRAEAE (default in v3)
+- `http://mnemos.internal:5002` — unified MNEMOS+GRAEAE
 - `http://127.0.0.1:5002` — loopback-only personal dev
 
 ## 1. MCP server (recommended)
@@ -17,7 +17,7 @@ Gives Claude Code direct tool access to MNEMOS: `search_memories`, `create_memor
 
 ```bash
 cp integrations/claude-code/mcp.example.json ./.mcp.json
-# edit .mcp.json — set MNEMOS_BASE and the absolute path to mcp_server.py
+# edit .mcp.json — set MNEMOS_BASE and the absolute path to the mnemos CLI
 ```
 
 Claude Code auto-detects `.mcp.json` on session start.

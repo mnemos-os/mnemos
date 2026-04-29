@@ -74,7 +74,7 @@ the MemPalace tool-response shape.
 
 ## What you gain by moving
 
-| Capability | MemPalace 3.3.x | MNEMOS v3.5.x via KNOSSOS |
+| Capability | MemPalace 3.3.x | MNEMOS v4.0 via KNOSSOS |
 |---|---|---|
 | Multi-user memory | ❌ | ✅ — `owner_id`, `group_id`, `permission_mode` |
 | HTTP API | ❌ | ✅ — `/v1/memories/*`, `/v1/kg/*`, `/v1/export`, `/v1/import` |
@@ -84,7 +84,7 @@ the MemPalace tool-response shape.
 | Version/audit trail | ❌ | ✅ — memory DAG snapshots, consultation hash chain, webhook/compression audit rows |
 | Compression (APOLLO/ARTEMIS contest) | AAAK only (~30× on a subset) | Full contest — APOLLO schema + ARTEMIS extractive, judge-scored |
 | Federation across instances | ❌ | ✅ — `/v1/federation/*`, pull-based |
-| Knowledge graph (temporal) | ✅ — SQLite-backed | ✅ — Postgres-backed, same temporal semantics |
+| Knowledge graph (temporal) | ✅ — SQLite-backed | ✅ — Postgres-backed server profile or SQLite edge profile, same temporal semantics |
 | MCP surface | 29 native tools | 16 MemPalace-compatible phase-1 tools via KNOSSOS, plus the native 18-tool MNEMOS MCP surface |
 | Retrieval benchmark R@5 (LongMemEval) | 96.6% raw / 98.4% hybrid | (see `benchmarks/compression_corpus_v3_3.jsonl`) |
 
@@ -196,7 +196,7 @@ Deferred phase-2 surface:
 
 KNOSSOS is one spoke; CHARON is the hub. KNOSSOS translates the
 MemPalace MCP tool surface. CHARON handles bulk import/export via
-MPF envelopes (`tools/memory_import.py`, `tools/memory_export.py`,
+MPF envelopes (`mnemos/tools/memory_import.py`, `mnemos/tools/memory_export.py`,
 `docs/MEMORY_EXPORT_FORMAT.md`). A full MemPalace → MNEMOS migration uses both:
 
 1. CHARON one-time bulk import of the existing palace (via

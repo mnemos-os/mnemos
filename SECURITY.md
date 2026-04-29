@@ -3,20 +3,18 @@
 ## Supported versions
 
 The most recently maintained release branch is supported. The current
-release line is `v3.5.x`. v3.5.0 shipped on 2026-04-28; v3.5.1 is the
-2026-04-28 documentation-triage patch with no product behavior changes from
-v3.5.0.
+release line is `v4.0.x`. v4.0.0 shipped on 2026-04-29.
 
 ## Current security invariants
 
-As of v3.5.x:
+As of v4.0.0:
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP
   version tools. The live-memory predicate is centralized in
-  `read_visibility_predicate` (`api/visibility.py:40-96`).
+  `read_visibility_predicate` (`mnemos/core/visibility.py`).
 - Version history is gated per snapshot by `version_visibility_predicate`
-  (`api/visibility.py:99-137`), so a later-public memory does not expose
+  (`mnemos/core/visibility.py`), so a later-public memory does not expose
   an earlier private snapshot.
 - DAG logs stay within one memory and do not bridge across invisible
   snapshots. `parent_hash` is emitted only when the immediate parent is
@@ -38,8 +36,14 @@ As of v3.5.x:
   v3.4.x cross-tenant audit metadata leak in v3.5.0.
 - Webhook delivery uses persisted leases, retry-chain convergence, terminal
   success guards, and SSRF checks at subscription and delivery time.
-- MCP stdio and HTTP/SSE use the same registry in `api/mcp_tools.py`, with
+- MCP stdio and HTTP/SSE use the same registry under `mnemos/mcp/tools/`, with
   per-user HTTP token mapping available through `MNEMOS_MCP_TOKENS`.
+- Multi-worker server deployments use Redis-backed circuit breaker, rate-limit,
+  and concurrency state. The in-process fallback remains for single-worker edge
+  and dev installs and logs a warning if multiple workers are configured.
+- Runtime configuration is centralized in the Pydantic Settings singleton;
+  direct `os.environ` reads are limited to `mnemos/core/config.py` and the
+  installer path.
 - The OpenAI-compatible gateway passes supported generation controls through
   to providers and rejects unsupported tool, response-format, or multimodal
   requests instead of silently ignoring them.

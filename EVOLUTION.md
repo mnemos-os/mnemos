@@ -2,7 +2,7 @@
 
 The version numbers on releases are tidy. The actual path was not. This
 document is the honest version — decisions, refactors, mistakes, and the
-reasoning that got us from the original prototype to the current v3.5.x release line. If you
+reasoning that got us from the original prototype to the current v4.0.0 release line. If you
 are considering MNEMOS for your own stack, you should know where it came
 from; if you are contributing, you should know which doors have been closed
 and why.
@@ -40,11 +40,14 @@ codebase took along the way.
 | 2026-04-26 | **v3.5.0 slice 2** — memory-read tenancy and DAG-integrity hardening (`d42c475`). Shared read visibility moves into `api/visibility.py`; version history becomes per-snapshot visible; merge/revert/branch writers serialize around branch heads; the v3.5 trigger raises `MN001` rather than accepting missing, NULL, or cross-memory branch heads. |
 | 2026-04-28 | **v3.5.0 GA** — the hardening branch ships: webhook retry leases/outbox discipline, federation compound cursor, consultation audit scoping, MCP stdio/HTTP registry parity, faithful OpenAI-compatible gateway behavior, PostgreSQL streaming-replication doctrine, namespace-uniform state/journal/entities/sessions/consultations, bulk webhook parity, compression cleanup, and audit closure. |
 | 2026-04-28 | **v3.5.1** — documentation-triage patch. Version metadata moves to 3.5.1 and docs are reconciled with the shipped v3.5.x state; no product behavior changes from v3.5.0. |
+| 2026-04-29 | **v4.0.0** — structural refactor release. The codebase becomes a coherent `mnemos/` package; `PersistenceBackend` lands with Postgres and SQLite implementations; `server`, `edge`, and `dev` profiles make Pi/laptop/Termux and production deployments first-class; Redis-backed reliability primitives remove the production `workers=1` pin; PyInstaller single-binary artifacts ship for Linux x86_64, Linux aarch64, and macOS aarch64. |
 
 Roughly five months. One developer with three reviewers (Codex, GRAEAE
 multi-LLM consensus, occasional Sonnet / Opus passes for design). Several
 rounds of audit-driven rework — every major surface in v3.0.0-beta has had
-its seams moved at least once, on evidence rather than vibes. The point of
+its seams moved at least once, on evidence rather than vibes. v4.0 is the point
+where those seams became explicit package boundaries instead of conventions.
+The point of
 the timeline is not the version count; it's that nothing here is a
 two-week-sprint prototype, and every architectural seam has paid for
 itself in a real failure mode at least once.
@@ -598,11 +601,10 @@ is, the list of non-obvious calls that proved out:
 Equally important — the calls that were correct at the time but would
 be made differently today:
 
-1. **Single-writer assumption.** The app currently requires `workers=1`
-   because the circuit breakers, rate limiters, and semaphores are
-   in-process state. A v3.1+ move to a shared state backend (Redis or
-   the DB itself) would let us scale horizontally. Today it's a scale
-   ceiling we accept.
+1. **Single-writer assumption.** v3.x required `workers=1` because the
+   circuit breakers, rate limiters, and semaphores were in-process state.
+   v4.0 resolved this for server deployments with Redis-backed coordination,
+   while keeping the in-process fallback for edge/dev.
 2. **OAuth state via Starlette `SessionMiddleware`.** Works, but the
    signing key regenerates on restart if `MNEMOS_SESSION_SECRET` is
    unset. We warn about it loudly; we should probably refuse to start
@@ -610,8 +612,8 @@ be made differently today:
 3. **SQL migrations as sequential files rather than a migration tool.**
    Worked at v1 when there was one file. At v3 with eleven ordered
    files, we should probably move to Alembic or sqitch. The current
-   ordering is documented in `install.py` and `installer/db.py` but
-   that documentation is two places that must stay in sync.
+   ordering now lives in `mnemos/installer/db.py`, but sequential SQL files
+   still require discipline.
 4. **FakePool in the test harness.** Substring-match-on-SQL is
    fundamentally the wrong abstraction; it silently matches shorter
    patterns as prefixes of longer ones and we've been bitten by that
@@ -628,9 +630,9 @@ If you're here to contribute and want to understand the history:
 - Read `CHANGELOG.md` for what shipped.
 - Read this file for why, and what almost shipped and didn't.
 - The biggest "don't touch this without understanding why" areas are:
-  - **The audit chain lock** (`api/handlers/consultations.py::_write_audit_entry_on_conn`) — widening or narrowing the lock window changes both correctness and throughput. Don't adjust casually.
+  - **The audit chain lock** (`mnemos/api/routes/consultations.py::_write_audit_entry_on_conn`) — widening or narrowing the lock window changes both correctness and throughput. Don't adjust casually.
   - **The FK edge ON-DELETE choices** (`db/migrations_*.sql`) — each one is the result of a real design conversation about whether history survives deletion.
-  - **The SSRF validator** (`api/handlers/webhooks.py::validate_webhook_url`) — the block list and the async-resolve path have both been tightened in response to real concerns. Loosen carefully.
+  - **The SSRF validator** (`mnemos/webhooks/validation.py::validate_webhook_url`) — the block list and the async-resolve path have both been tightened in response to real concerns. Loosen carefully.
   - **The Greek names.** They look like whimsy from outside. From inside they are subsystem labels that appear in logs, tables, migrations, and code paths. Renaming one is a distributed refactor.
 
 ---

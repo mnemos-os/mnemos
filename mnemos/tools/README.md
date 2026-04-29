@@ -10,11 +10,11 @@ it's built to be trustworthy when you can't casually recross.
 
 | Piece | Role |
 |---|---|
-| `tools/memory_import.py` | Load side. Reads JSON / JSONL / CSV / ChatGPT / Obsidian / text into MNEMOS. |
-| `tools/memory_export.py` | Save side. Writes MNEMOS memories as JSON / JSONL / Markdown / HTML / plain text. |
-| `tools/export_memories_for_docling.py` | Formatter library for Docling-compatible text outputs (called by `memory_export.py`). |
-| `tools/docling_import.py` | Document ingest (PDF / DOCX / HTML / etc) via IBM Docling. |
-| `api/handlers/portability.py` | REST endpoints — `GET /v1/export`, `POST /v1/import`. Native MPF envelope. |
+| `mnemos/tools/memory_import.py` | Load side. Reads JSON / JSONL / CSV / ChatGPT / Obsidian / text into MNEMOS. |
+| `mnemos/tools/memory_export.py` | Save side. Writes MNEMOS memories as JSON / JSONL / Markdown / HTML / plain text. |
+| `mnemos/tools/export_memories_for_docling.py` | Formatter library for Docling-compatible text outputs (called by `memory_export.py`). |
+| `mnemos/tools/docling_import.py` | Document ingest (PDF / DOCX / HTML / etc) via IBM Docling. |
+| `mnemos/api/routes/portability.py` | REST endpoints — `GET /v1/export`, `POST /v1/import`. Native MPF envelope. |
 
 ## MPF (Memory Portability Format) envelope
 
@@ -22,7 +22,7 @@ it's built to be trustworthy when you can't casually recross.
 {
   "mpf_version": "0.1.0",
   "source_system": "mnemos",
-  "source_version": "3.2.0",
+  "source_version": "4.0.0",
   "records": [
     {
       "id": "mem_abc123",
@@ -46,7 +46,7 @@ it's built to be trustworthy when you can't casually recross.
 }
 ```
 
-## Cross-version migration (v2.3.0 → v3.x)
+## Cross-version migration (v2.3.0 -> v3.x/v4.x)
 
 The `--preserve-metadata` flag on `memory_import.py json` routes
 through the MPF envelope path (`POST /v1/import?preserve_owner=true`)
@@ -73,8 +73,8 @@ PGPASSWORD=$PG_PASSWORD psql -h localhost -U mnemos_user -d mnemos \
 # 2. Validate the JSONL parses cleanly (optional but encouraged).
 python3 -c 'import json, sys; [json.loads(l) for l in open("memories-v2.jsonl")]; print("OK")'
 
-# 3. Load into the v3.x instance, preserving ids/owners/namespaces.
-python3 tools/memory_import.py json \
+# 3. Load into the v3.x/v4.x instance, preserving ids/owners/namespaces.
+python3 -m mnemos.tools.memory_import json \
     --file memories-v2.jsonl \
     --jsonl \
     --preserve-metadata \

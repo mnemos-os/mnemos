@@ -1,8 +1,8 @@
 # MNEMOS Scaling
 
-MNEMOS defaults to one Uvicorn worker and `RATE_LIMIT_STORAGE_URI=memory://`.
-That shape remains valid for existing single-host installs and does not require
-Redis.
+MNEMOS defaults to one Uvicorn worker. The `edge` and `dev` profiles use
+SQLite plus in-process coordination; the `server` profile should use Redis when
+you raise the worker count.
 
 Multi-worker deployments are supported when shared rate-limit and resilience
 state is backed by Redis. Without Redis, each worker keeps its own in-process
@@ -18,8 +18,8 @@ MNEMOS_WORKERS=1
 RATE_LIMIT_STORAGE_URI=memory://
 ```
 
-This is the migration-safe path for existing v3.5 installs. No Redis service,
-schema change, or config migration is required.
+This is the migration-safe path for edge/dev and existing single-host installs.
+No Redis service, schema change, or config migration is required.
 
 ## Multi-worker pattern
 
@@ -112,8 +112,8 @@ Current operator notes:
 
 ## Migration Story
 
-Existing v3.5 single-worker installs continue to work without changing
-anything. `memory://` remains the default fallback.
+Existing single-worker installs continue to work without changing anything.
+`memory://` remains the default fallback for dev/edge profiles.
 
 Operators who want more throughput should:
 

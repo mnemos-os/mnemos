@@ -31,8 +31,8 @@ MNEMOS is persistent memory infrastructure running as a separate network service
 
 ```bash
 hermes mcp add mnemos \
-  --command python \
-  --args "/path/to/mnemos/mcp_server.py" \
+  --command /path/to/mnemos/venv/bin/mnemos \
+  --args "serve mcp-stdio" \
   --env MNEMOS_BASE=http://mnemos.internal:5002
 ```
 
@@ -41,8 +41,8 @@ Or edit `~/.hermes/config.yaml` directly (replace placeholder with your MNEMOS h
 ```yaml
 mcp_servers:
   mnemos:
-    command: python
-    args: ["/path/to/mnemos/mcp_server.py"]
+    command: /path/to/mnemos/venv/bin/mnemos
+    args: ["serve", "mcp-stdio"]
     env:
       MNEMOS_BASE: http://<your-mnemos-host>:5002
 ```
@@ -78,7 +78,7 @@ results = mcp.call("mnemos", "search_memories", {
 })
 
 # Large context load under a token budget — REST endpoint (not an MCP tool
-# in the current mcp_server.py). Use via httpx against MNEMOS directly, or
+# in the current `mnemos serve mcp-stdio` transport). Use via httpx against MNEMOS directly, or
 # chain several search_memories calls with a running token tally.
 #
 # POST /v1/memories/rehydrate
@@ -140,7 +140,7 @@ Before acting on a retrieved memory:
 MNEMOS API is not running, or `MNEMOS_BASE` points to the wrong host/port. Check with `curl $MNEMOS_BASE/health`.
 
 **Authentication errors on team/enterprise profiles**
-`mcp_server.py` forwards Bearer tokens when `MNEMOS_API_KEY` is set in its environment. Ensure the env block in your Hermes MCP config includes `MNEMOS_API_KEY` alongside `MNEMOS_BASE`. If you can't put the token in the MCP config, run the MCP server on the same host as MNEMOS with MNEMOS bound to loopback, or use SSH transport (see MNEMOS `mcp_server.py` docstring).
+The v4 MCP transport forwards Bearer tokens when `MNEMOS_API_KEY` is set in its environment. Ensure the env block in your Hermes MCP config includes `MNEMOS_API_KEY` alongside `MNEMOS_BASE`. If you can't put the token in the MCP config, run the MCP server on the same host as MNEMOS with MNEMOS bound to loopback, or use SSH transport with `mnemos serve mcp-stdio`.
 
 **Memories returned but low relevance**
 Try `semantic: true` for concept-level search, or narrow with `category` filter.

@@ -46,10 +46,9 @@ service; everything stays in your MNEMOS.
                   via tunnel: ngrok / cloudflared / Tailscale
 ```
 
-The MCP HTTP/SSE bridge (`mcp_http_server.py`) shares the exact same
-`Server("mnemos")` instance and 18 tool definitions as the stdio MCP
-server. A memory written from Claude Desktop is queryable from
-ChatGPT and vice versa.
+The MCP HTTP/SSE bridge (`mnemos serve mcp-http`) shares the exact same
+18 tool definitions as the stdio MCP server. A memory written from Claude
+Desktop is queryable from ChatGPT and vice versa.
 
 ## Setup — manual path (works today)
 
@@ -60,12 +59,12 @@ Add to your `docker-compose.override.yml` (PYTHIA prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: mnemos-v3x-mnemos
+    image: ghcr.io/mnemos-os/mnemos:4.0.0
     pull_policy: never
     depends_on:
       - mnemos
     restart: unless-stopped
-    command: ["python3", "/app/mcp_http_server.py", "--host", "0.0.0.0", "--port", "5004"]
+    command: ["mnemos", "serve", "mcp-http", "--host", "0.0.0.0", "--port", "5004"]
     ports:
       - "5004:5004"
     environment:
@@ -210,7 +209,7 @@ token, prints the connector config, and copies URL+token to your clipboard.
 
 - **ngrok free tier URL rotates**: re-paste into ChatGPT after every
   ngrok restart. Use the paid tier or Cloudflare Named Tunnel to fix.
-- **TLS is the tunnel's responsibility**: `mcp_http_server.py` listens
+- **TLS is the tunnel's responsibility**: `mnemos serve mcp-http` listens
   on plain HTTP. Never bind it to a public IP without the tunnel
   providing TLS termination.
 - **No OAuth on the MCP edge yet**: bearer auth only. Anyone with the token can

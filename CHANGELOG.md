@@ -2,6 +2,45 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [4.0.0] — 2026-04-29
+
+Major refactor + multi-backend persistence + multi-worker support release.
+
+### Added
+
+- Persistence abstraction (`PersistenceBackend` ABC) plus SQLite implementation
+  using sqlite-vec / FTS5 / JSON1 / WAL.
+- Deployment profiles: server (Postgres + Redis + multi-worker), edge
+  (SQLite single-worker), dev (SQLite + DEBUG).
+- Multi-worker support via Redis-backed circuit breaker / rate limiter /
+  concurrency limiter; in-process fallback preserved.
+- Single-binary distribution via pyinstaller for linux-x86_64,
+  linux-aarch64, macos-aarch64 with sqlite-vec bundled.
+- Unified `mnemos` CLI: serve / install / worker / export / import /
+  consult / health / version.
+- 7 import-linter contracts enforce package boundaries in CI.
+- Pydantic Settings singleton replaces 105 ad-hoc `os.environ.get` calls;
+  CI bans `os.environ` outside `core.config` + `installer`.
+- 3 new GRAEAE reasoning modes: single, debate, majority.
+
+### Changed
+
+- Codebase restructured into `mnemos/` package (`api/routes` / `core` / `db` /
+  `domain` / `mcp` / `webhooks` / `workers` / `hooks` / `installer` / `tools` /
+  `cli`).
+- `portability.py` (2679 LOC) split into 10 focused files + repository
+  layer; route file is now 82 LOC.
+- `openai_compat.py` (1366 LOC) -> 7 focused files; route file 270 LOC.
+- `mcp_tools.py` (1278 LOC) -> 6 per-domain modules.
+- `webhook_dispatcher.py` (1748 LOC) -> 11 modules per concern.
+- `workers=1` pin removed; multi-worker safe with Redis.
+
+### Fixed
+
+- GRAEAE empty-body bug (HTTP 200 + 0 bytes on short prompts under
+  `arch_design` with no mode field).
+- Unknown mode values now 422-rejected (was silent fallthrough).
+
 ## [3.5.1] — 2026-04-28 (doc-triage patch)
 
 Documentation and version-state reconciliation only. No product behavior

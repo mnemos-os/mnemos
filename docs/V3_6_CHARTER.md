@@ -1,7 +1,9 @@
 # MNEMOS v3.6 Charter — APOLLO S-IVB Evolution + IRIS Second-Wave Adoption + Mutation Paths
 
-**Status:** Forward-looking specification (target: ships after v3.5.x; not shipped in v3.5.0 or v3.5.1)
-**Position in roadmap:** Extends APOLLO S-IVB work after the v3.5.0 hardening release; broadens any shipped IRIS adoption across frameworks; sets stage for v4.0 consolidation.
+**Status:** Historical / deferred specification. v4.0.0 shipped on 2026-04-29
+without this v3.6 feature bundle; unshipped items move to v4.1+ planning.
+**Position in roadmap:** Preserved as design context for APOLLO S-IVB,
+PERSEPHONE, and IRIS adoption ideas. It no longer gates v4.0.
 **Theme:** *Derivative-idea layers + memory state evolution + industry-wide IRIS adoption.*
 
 ---
@@ -165,11 +167,11 @@ env = {PANTHEON_API_KEY = "..."}
 
 ## 3. Explicitly NOT in v3.6
 
-- **KRONOS** (Tesseract time-series) → v4.0
-- **API consolidation pass** → v4.0
-- **MCP consolidation** → v4.0
-- **Encrypted CHARON envelopes** → v4.0
-- **GDPR wipe path** → v4.0
+- **KRONOS** (Tesseract time-series) → deferred beyond v4.0
+- **API consolidation pass** → shipped in v4.0
+- **MCP memory-tool consolidation** → shipped in v4.0; IRIS discovery remains deferred
+- **Encrypted CHARON envelopes** → deferred beyond v4.0
+- **GDPR wipe path** → deferred beyond v4.0
 - **Rust ports** → v5.0
 - **PANTHEON streaming-via-MQ** (Nats-token-by-token) → v4.1 (bypass-direct sufficient for v3.6)
 - **Content-hash caching layer for reasoning workloads** → v4.1
@@ -226,13 +228,14 @@ v3.6 GA gate:
 
 ## 7. Post-v3.6 preview
 
-v3.6 GA unlocks the v4.0 sprint:
+Historical v3.6 framing expected this work to unlock the v4.0 sprint. Actual
+v4.0 shipped the structural pieces directly:
 
-- **API consolidation:** Now that APOLLO S-IVB dream-state, compression, and archival are stable, consolidate the 9 handler files' security/pool/ID patterns into reusable modules.
-- **MCP consolidation:** Merge `mcp_server.py` + `api/mcp_tools.py` into one source of truth.
-- **Horizontal scaling:** Move GRAEAE breaker + rate-limit state from in-process to Redis (unlock multi-worker PANTHEON deployment).
-- **GPU expansion:** Deploy KRONOS + Tesseract on CERBERUS/TYPHON; measure time-series anomaly detection + forecasting cost/accuracy.
-- **MCP-MD v1.0 stabilization:** Throughout v3.5–v3.6, the MCP-MD specification collects feedback from second-wave implementer adoption (Hermes, Continue, AutoGPT, CrewAI). By v4.0 entry, the specification is ready for promotion to v1.0 (stable contract; breaking changes require v2). v1.0 stabilization gates the formal proposal to Linux Foundation AI & Data for Sandbox standardization.
+- **API/package consolidation:** Shipped in v4.0 as the coherent `mnemos/` package.
+- **MCP consolidation:** Memory tools now live under `mnemos/mcp/tools/`; IRIS discovery remains deferred.
+- **Horizontal scaling:** Shipped in v4.0 with Redis-backed breaker/rate-limit/concurrency state.
+- **GPU expansion / KRONOS:** Deferred.
+- **MCP-MD v1.0 stabilization:** Deferred to v5.0+ foundation-tier work.
 
 ---
 
@@ -244,7 +247,9 @@ v3.6 GA unlocks the v4.0 sprint:
 - **APOLLO S-IVB dream-state:** Foundation in v3.3, slice 2 in v3.3 (parallel), phases 3–4 in v3.6.
 - **PERSEPHONE archival:** Planned for v3.6; no v3.5.0 archival foundation shipped beyond recall tracking already present from v3.3.
 - **Design papers:** Existing `PANTHEON.md`, new `IRIS_DISCOVERY.md`, `DREAM_STATE_DESIGN.md`, new `MEMORY_ARCHITECTURE.md` (v3.6).
-- **v4.0 next:** Modularization, GPU scaling, surface integrations, IRIS expansion to all ETLANTIS operations.
+- **v4.0 actual:** Modularization, SQLite profile, single-binary distribution,
+  multi-worker Redis support, and architectural enforcement shipped; GPU
+  scaling, broad surface integrations, and IRIS expansion moved later.
 
 ---
 
