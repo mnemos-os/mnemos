@@ -49,7 +49,7 @@ async def create_journal_entry(
     target_ns = scope_namespace(user, namespace)
     try:
         entry_id = str(uuid.uuid4())
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().transactional() as conn:
             if req.date:
                 try:
                     entry_date = date.fromisoformat(req.date)
@@ -93,7 +93,7 @@ async def list_journal_entries(
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             if date_str:
                 try:
                     parsed_date = date.fromisoformat(date_str)
@@ -145,7 +145,7 @@ async def delete_journal_entry(
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().transactional() as conn:
         result = await conn.execute(
             'DELETE FROM journal WHERE id = $1 AND owner_id = $2 AND namespace = $3',
             entry_id, target_owner, target_ns,

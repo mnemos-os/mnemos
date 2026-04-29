@@ -34,7 +34,7 @@ async def list_state_keys(
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             rows = await conn.fetch(
                 'SELECT key, updated::text, version FROM state '
                 'WHERE owner_id = $1 AND namespace = $2 ORDER BY key',
@@ -58,7 +58,7 @@ async def get_state(
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT key, value, updated::text, version FROM state '
                 'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
@@ -87,7 +87,7 @@ async def set_state(
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().transactional() as conn:
             row = await conn.fetchrow(
                 '''INSERT INTO state (owner_id, namespace, key, value, updated)
                    VALUES ($1, $2, $3, $4::jsonb, NOW())
@@ -115,7 +115,7 @@ async def delete_state(
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().transactional() as conn:
         result = await conn.execute(
             'DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3',
             target_owner, target_ns, key,
