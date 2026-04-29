@@ -1,0 +1,123 @@
+"""Shared runtime plumbing for MCP tools."""
+
+from __future__ import annotations
+
+import contextvars
+import os
+from typing import Any
+
+import httpx
+
+from mnemos.api.dependencies import UserContext
+from mnemos.db.mcp_repo import assert_memory_readable
+
+HTTP_TIMEOUT = 30.0
+_MCP_BACKEND_API_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mnemos_mcp_backend_api_key",
+    default=None,
+)
+_MCP_BACKEND_USER_ID: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mnemos_mcp_backend_user_id",
+    default=None,
+)
+
+
+def set_mcp_backend_context(
+    *,
+    api_key: str | None = None,
+    user_id: str | None = None,
+) -> tuple[contextvars.Token[str | None], contextvars.Token[str | None]]:
+    """Attach per-client backend attribution for the current MCP session."""
+    api_key_token = _MCP_BACKEND_API_KEY.set(api_key)
+    user_id_token = _MCP_BACKEND_USER_ID.set(user_id)
+    return api_key_token, user_id_token
+
+
+def reset_mcp_backend_context(
+    tokens: tuple[contextvars.Token[str | None], contextvars.Token[str | None]],
+) -> None:
+    """Reset context set by set_mcp_backend_context()."""
+    api_key_token, user_id_token = tokens
+    _MCP_BACKEND_API_KEY.reset(api_key_token)
+    _MCP_BACKEND_USER_ID.reset(user_id_token)
+
+
+def current_mcp_backend_user_id() -> str | None:
+    return _MCP_BACKEND_USER_ID.get()
+
+
+def _mnemos_base() -> str:
+    return os.getenv("MNEMOS_BASE", "http://localhost:5002").rstrip("/")
+
+
+def _backend_headers() -> dict[str, str]:
+    api_key = _MCP_BACKEND_API_KEY.get() or os.getenv("MNEMOS_API_KEY", "")
+    headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+    user_id = _MCP_BACKEND_USER_ID.get()
+    if user_id:
+        headers["X-MNEMOS-User-Id"] = user_id
+    return headers
+
+
+async def _rest_get(path: str, params: dict[str, Any] | None = None) -> Any:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.get(
+            f"{_mnemos_base()}{path}",
+            params=params,
+            headers=_backend_headers(),
+        )
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+
+async def _rest_post(path: str, body: dict[str, Any], method: str = "POST") -> Any:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        if method == "PATCH":
+            response = await client.patch(
+                f"{_mnemos_base()}{path}",
+                json=body,
+                headers=_backend_headers(),
+            )
+        else:
+            response = await client.post(
+                f"{_mnemos_base()}{path}",
+                json=body,
+                headers=_backend_headers(),
+            )
+        response.raise_for_status()
+        return response.json() if response.content else {}
+
+
+async def _rest_delete(path: str) -> int:
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.delete(f"{_mnemos_base()}{path}", headers=_backend_headers())
+        return response.status_code
+
+
+def _mcp_user_required(user: UserContext | None) -> UserContext:
+    """Require the authenticated user context used by HTTP-backed MCP."""
+    if user is None or not user.authenticated:
+        raise PermissionError("authenticated user required for version tools")
+    return user
+
+
+def _mcp_is_root(user: UserContext) -> bool:
+    return user.role == "root"
+
+
+async def _mcp_assert_memory_readable(conn: Any, memory_id: str, user: UserContext) -> None:
+    await assert_memory_readable(conn, memory_id, user)
+
+
+def _tool(
+    description: str,
+    parameters: dict[str, Any],
+    required: list[str] | None,
+    handler: Any,
+) -> dict[str, Any]:
+    return {
+        "description": description,
+        "parameters": parameters,
+        "required": required or [],
+        "handler": handler,
+    }
