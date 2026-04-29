@@ -127,13 +127,14 @@ class TestEventValidation:
         from fastapi import HTTPException
 
         from mnemos.api.routes import webhooks as wh
+        from mnemos.webhooks import validation as webhook_validation
 
         async def _fake_resolve_addrs(host: str):
             if host == "localhost":
                 return ["127.0.0.1"]
             return ["93.184.216.34"]
 
-        monkeypatch.setattr(wh, "_resolve_addrs", _fake_resolve_addrs)
+        monkeypatch.setattr(webhook_validation, "_resolve_addrs", _fake_resolve_addrs)
 
         # Public host — fake DNS keeps the hostname-resolution path covered
         # without requiring external DNS in CI/sandboxed runners.

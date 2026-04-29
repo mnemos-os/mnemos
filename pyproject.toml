@@ -71,6 +71,7 @@ full = ["sentence-transformers>=2.7.0", "spacy>=3.7.0", "networkx>=3.3"]
 # Note: the `phi` extras are optional GPU-dependent OpenVINO/FastEmbed support. Most installs don't need it.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
 dev = [
+  "import-linter>=2.0.0",
   "pytest>=8.0.0",
   "pytest-asyncio>=0.23.0",
   "pytest-cov>=5.0.0",
@@ -127,6 +128,76 @@ ignore = [
 "**/__init__.py" = ["F401"]
 # Installer uses string forward references to lazily-imported Config
 "mnemos/installer/__main__.py" = ["F821"]
+
+[tool.importlinter]
+root_package = "mnemos"
+include_external_packages = false
+
+[[tool.importlinter.contracts]]
+name = "mnemos layered architecture"
+type = "layers"
+layers = [
+  "mnemos.api",
+  "mnemos.domain",
+  "mnemos.db",
+  "mnemos.core",
+]
+
+[[tool.importlinter.contracts]]
+name = "api routes use domain, not db"
+type = "forbidden"
+source_modules = ["mnemos.api.routes"]
+forbidden_modules = ["mnemos.db"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "domain modules are siblings"
+type = "independence"
+modules = [
+  "mnemos.domain.compression",
+  "mnemos.domain.graeae",
+  "mnemos.domain.morpheus",
+  "mnemos.domain.memory_categorization",
+  "mnemos.domain.openai_compat",
+  "mnemos.domain.portability",
+]
+ignore_imports = [
+  # MORPHEUS intentionally invokes GRAEAE as its reasoning backend.
+  "mnemos.domain.morpheus.runner -> mnemos.domain.graeae.engine",
+  # The OpenAI-compatible gateway is an adapter over GRAEAE provider routing.
+  "mnemos.domain.openai_compat.providers -> mnemos.domain.graeae.engine",
+  # Streaming needs GRAEAE's ProviderStreamError to preserve provider error frames.
+  "mnemos.domain.openai_compat.streaming -> mnemos.domain.graeae.engine",
+]
+
+[[tool.importlinter.contracts]]
+name = "mcp does not call route handlers as functions"
+type = "forbidden"
+source_modules = ["mnemos.mcp"]
+forbidden_modules = ["mnemos.api.routes"]
+allow_indirect_imports = true
+
+[[tool.importlinter.contracts]]
+name = "webhooks does not couple to domain"
+type = "independence"
+modules = ["mnemos.webhooks", "mnemos.domain"]
+
+[[tool.importlinter.contracts]]
+name = "core does not import api/domain/db/webhooks/mcp/etc"
+type = "forbidden"
+source_modules = ["mnemos.core"]
+forbidden_modules = [
+  "mnemos.api",
+  "mnemos.domain",
+  "mnemos.db",
+  "mnemos.webhooks",
+  "mnemos.mcp",
+  "mnemos.workers",
+  "mnemos.cli",
+  "mnemos.tools",
+  "mnemos.installer",
+  "mnemos.hooks",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

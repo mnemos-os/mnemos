@@ -7,7 +7,6 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.db import openai_compat_repo
 from mnemos.domain.openai_compat import content, providers, router as domain_router, schemas, streaming
 
 router = APIRouter(tags=["openai"])
@@ -58,8 +57,8 @@ _EXPORTS = {
     "_stream_error_event": (streaming, "_stream_error_event"),
     "_stream_preflight_exception": (streaming, "_stream_preflight_exception"),
     "_stream_events_for_provider_delta": (streaming, "_stream_events_for_provider_delta"),
-    "_search_mnemos_context": (openai_compat_repo, "fetch_memory_context"),
-    "_get_model_recommendation": (openai_compat_repo, "fetch_model_recommendation"),
+    "_search_mnemos_context": (domain_router, "search_memory_context"),
+    "_get_model_recommendation": (domain_router, "get_model_recommendation"),
 }
 
 __all__ = [
@@ -251,11 +250,11 @@ async def chat_completions(
             user=user,
             search_context=globals().get(
                 "_search_mnemos_context",
-                openai_compat_repo.fetch_memory_context,
+                domain_router.search_memory_context,
             ),
             get_model_recommendation=globals().get(
                 "_get_model_recommendation",
-                openai_compat_repo.fetch_model_recommendation,
+                domain_router.get_model_recommendation,
             ),
             route_to_provider_response=_route_to_provider_response_for_domain,
             route_to_provider_stream=_route_to_provider_stream_for_domain,

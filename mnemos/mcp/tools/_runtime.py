@@ -8,7 +8,7 @@ from typing import Any
 
 import httpx
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 from mnemos.db.mcp_repo import assert_memory_readable
 
 HTTP_TIMEOUT = 30.0

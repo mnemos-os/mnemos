@@ -1,8 +1,9 @@
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
+from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
 from mnemos.db import openai_compat_repo
-from mnemos.domain.graeae.engine import _REGISTRY_MAP, get_graeae_engine
+from mnemos.domain.graeae.engine import get_graeae_engine
 
 from .content import _flatten_messages_for_prompt, _has_content_blocks, _has_message_names, _plain_value
 from .schemas import ChatCompletionRequest
@@ -28,7 +29,7 @@ MODEL_ALIASES = {
 
 _REGISTRY_PROVIDER_TO_GRAEAE: Dict[str, str] = {
     cfg["registry_provider"]: name
-    for name, cfg in _REGISTRY_MAP.items()
+    for name, cfg in GRAEAE_REGISTRY_MAP.items()
 }
 
 
@@ -199,8 +200,8 @@ def _model_not_found_error(model: str) -> dict[str, dict[str, str]]:
 
 def _strip_gateway_namespace(model: str, provider: str) -> str:
     candidate_prefixes = [f"{provider}/"]
-    if provider in _REGISTRY_MAP:
-        registry_name = _REGISTRY_MAP[provider]["registry_provider"]
+    if provider in GRAEAE_REGISTRY_MAP:
+        registry_name = GRAEAE_REGISTRY_MAP[provider]["registry_provider"]
         if registry_name != provider:
             candidate_prefixes.append(f"{registry_name}/")
 

@@ -1,4 +1,5 @@
 """Pydantic models for MNEMOS API."""
+import json
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -64,6 +65,37 @@ class MemoryItem(BaseModel):
     source_provider: Optional[str] = None
     source_session: Optional[str] = None
     source_agent: Optional[str] = None
+
+
+def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
+    raw_meta = row.get("metadata")
+    if isinstance(raw_meta, str):
+        try:
+            raw_meta = json.loads(raw_meta)
+        except Exception:
+            raw_meta = None
+    elif not isinstance(raw_meta, dict):
+        raw_meta = None
+    return MemoryItem(
+        id=row["id"],
+        content=row["content"],
+        category=row["category"],
+        subcategory=row.get("subcategory"),
+        created=row["created"].isoformat() if row["created"] else "",
+        updated=row["updated"].isoformat() if row.get("updated") else None,
+        metadata=raw_meta if raw_meta else None,
+        quality_rating=row.get("quality_rating"),
+        compressed_content=row.get("compressed_content") if include_compressed else None,
+        verbatim_content=row.get("verbatim_content"),
+        owner_id=row.get("owner_id"),
+        group_id=row.get("group_id"),
+        namespace=row.get("namespace"),
+        permission_mode=row.get("permission_mode"),
+        source_model=row.get("source_model"),
+        source_provider=row.get("source_provider"),
+        source_session=row.get("source_session"),
+        source_agent=row.get("source_agent"),
+    )
 
 
 class MemoryListResponse(BaseModel):

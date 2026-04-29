@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 from mnemos.core.visibility import read_visibility_predicate, version_visibility_predicate
 
 

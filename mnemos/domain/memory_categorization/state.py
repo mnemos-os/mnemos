@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 
 logger = logging.getLogger(__name__)
 

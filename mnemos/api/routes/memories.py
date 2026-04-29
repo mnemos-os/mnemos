@@ -16,7 +16,6 @@ from mnemos.core.lifecycle import (
     _fts_fetch,
     _get_cache_key,
     _get_embedding,
-    _row_to_memory,
     _vector_search,
 )
 from mnemos.core.security import is_root
@@ -31,6 +30,7 @@ from mnemos.domain.models import (
     MemoryUpdateRequest,
     RehydrationRequest,
     RehydrationResponse,
+    row_to_memory as _row_to_memory,
 )
 
 logger = logging.getLogger(__name__)
@@ -804,7 +804,7 @@ async def update_memory(
         )
     except Exception:
         logger.warning("webhook dispatch failed for memory.updated %s", memory_id, exc_info=True)
-    return _lc._row_to_memory(row)
+    return _row_to_memory(row)
 
 
 @router.delete("/memories/{memory_id}", status_code=204)

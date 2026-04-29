@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 
 from ._runtime import (
     _backend_headers,

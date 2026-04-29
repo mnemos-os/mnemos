@@ -7,7 +7,7 @@ from typing import Optional
 
 from fastapi import HTTPException
 
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _CAST_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[\])?$")

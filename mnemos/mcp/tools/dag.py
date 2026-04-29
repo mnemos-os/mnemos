@@ -7,7 +7,7 @@ import logging
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
-from mnemos.api.dependencies import UserContext
+from mnemos.core.auth_context import UserContext
 from mnemos.db import mcp_repo
 
 from ._runtime import _mcp_assert_memory_readable, _mcp_user_required, _rest_get, _rest_post, _tool

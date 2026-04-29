@@ -31,5 +31,8 @@ jobs:
       - name: Lint (ruff)
         run: .venv/bin/ruff check .
 
+      - name: Lint imports
+        run: .venv/bin/lint-imports --config pyproject.toml
+
       - name: Unit tests
         run: .venv/bin/pytest tests/ --tb=short --ignore=tests/test_live_e2e.py -q

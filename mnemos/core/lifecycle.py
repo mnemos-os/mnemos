@@ -22,8 +22,6 @@ from fastapi import HTTPException
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG
 from mnemos.core.pool import PoolManager
-from mnemos.domain.graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
-from mnemos.domain.models import MemoryItem
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +73,38 @@ def _schedule_worker(coro):
 def _schedule_delivery_attempt(coro):
     """Schedule a finite webhook send that graceful shutdown drains before cancel."""
     return _schedule_tracked(coro, _delivery_attempt_tasks)
+
+
+_auth_configurer = None
+_provider_manifest_reloader = None
+_lifespan_worker_factories: dict = {}
+
+
+def register_auth_configurer(configurer) -> None:
+    """Register the API-owned auth configurer without making core import API."""
+    global _auth_configurer
+    _auth_configurer = configurer
+
+
+def register_provider_manifest_reloader(reloader) -> None:
+    """Register the domain-owned provider manifest reload hook."""
+    global _provider_manifest_reloader
+    _provider_manifest_reloader = reloader
+
+
+def register_lifespan_worker(name: str, factory, *, honor_worker_enabled: bool = False) -> None:
+    """Register an app worker factory called with the lifecycle DB pool."""
+    _lifespan_worker_factories[name] = (factory, honor_worker_enabled)
+
+
+async def _run_distillation_worker(pool=None):
+    """Compatibility shim for the registered distillation worker supervisor."""
+    factory_entry = _lifespan_worker_factories.get("distillation_worker")
+    if factory_entry is None:
+        _worker_status["distillation_worker"] = "unavailable"
+        return
+    factory, _honor_worker_enabled = factory_entry
+    await factory(pool)
 
 
 async def _cancel_tracked_tasks(tasks: set, *, label: str, timeout: float) -> None:
@@ -262,62 +292,6 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
             )
 
 
-# ── Distillation Worker Wrapper ─────────────────────────────────────────────────
-
-async def _run_distillation_worker():
-    """Supervised distillation worker loop — restarts on unhandled errors.
-
-    Dispatches unoptimized memories through the v3.3 going-forward
-    compression stack:
-      - ARTEMIS (CPU-only extractive with identifier preservation)
-      - APOLLO  (schema-aware dense encoding, GPU-optional fallback)
-    Selected by the contest framework per memory.
-
-    Previously a single crash set status to 'idle' and left the worker
-    permanently dead for the rest of the process lifetime. We now restart
-    with exponential backoff up to 5 minutes. asyncio.CancelledError (shutdown)
-    propagates so the lifespan drain works correctly.
-    """
-    import asyncio
-    global _worker_status
-
-    try:
-        from mnemos.workers.distillation import MemoryDistillationWorker
-    except ImportError as e:
-        logger.warning(f"Distillation worker not available: {e}")
-        _worker_status["distillation_worker"] = "unavailable"
-        return
-
-    backoff = 1.0
-    while True:
-        worker = MemoryDistillationWorker()
-        try:
-            _worker_status["distillation_worker"] = "starting"
-            await worker.start()
-            # Graceful exit (worker.start() returned) — stop supervising.
-            _worker_status["distillation_worker"] = "idle"
-            return
-        except asyncio.CancelledError:
-            logger.info("Distillation worker cancelled (shutdown)")
-            _worker_status["distillation_worker"] = "idle"
-            raise
-        except Exception as e:
-            _worker_status["distillation_worker"] = "error"
-            logger.exception(f"Distillation worker crashed: {e} — restarting in {backoff:.0f}s")
-        finally:
-            try:
-                if getattr(worker, "db_pool", None):
-                    await worker.db_pool.close()
-            except Exception:
-                pass
-        try:
-            await asyncio.sleep(backoff)
-        except asyncio.CancelledError:
-            _worker_status["distillation_worker"] = "idle"
-            raise
-        backoff = min(backoff * 2, 300.0)  # cap at 5 minutes
-
-
 # ── App lifespan ─────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -349,9 +323,9 @@ async def lifespan(app):
         logger.error(f"Failed to create DB pool: {e}")
         raise
 
-    # Configure auth (personal profile: auth.enabled=false → no-op beyond singleton)
-    from mnemos.api.dependencies import configure_auth
-    configure_auth(config.get("auth", {}))
+    # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
+    if _auth_configurer is not None:
+        _auth_configurer(config.get("auth", {}))
 
     # Refresh GRAEAE provider manifest from model_registry in the background
     # so startup doesn't block on per-provider HTTP probes (each can take up
@@ -362,22 +336,24 @@ async def lifespan(app):
     # the background task lands. POST /admin/graeae/reload-providers is also
     # available for on-demand refresh (and is what the daily systemd timer
     # uses after sync_provider_models.py finishes).
-    import asyncio as _asyncio_for_reload
-    async def _bg_graeae_reload():
-        try:
-            from mnemos.domain.graeae.engine import get_graeae_engine
-            await _asyncio_for_reload.wait_for(
-                get_graeae_engine().reload_from_registry(_pool),
-                timeout=120,
-            )
-        except _asyncio_for_reload.TimeoutError:
-            logger.warning(
-                "[GRAEAE] background manifest reload exceeded 120s — "
-                "keeping built-in defaults; daily timer will retry",
-            )
-        except Exception as e:
-            logger.warning(f"[GRAEAE] background manifest reload failed: {e}")
-    _schedule_background(_bg_graeae_reload())
+    if _provider_manifest_reloader is not None:
+        import asyncio as _asyncio_for_reload
+
+        async def _bg_provider_manifest_reload():
+            try:
+                await _asyncio_for_reload.wait_for(
+                    _provider_manifest_reloader(_pool),
+                    timeout=120,
+                )
+            except _asyncio_for_reload.TimeoutError:
+                logger.warning(
+                    "[GRAEAE] background manifest reload exceeded 120s - "
+                    "keeping built-in defaults; daily timer will retry",
+                )
+            except Exception as e:
+                logger.warning(f"[GRAEAE] background manifest reload failed: {e}")
+
+        _schedule_background(_bg_provider_manifest_reload())
 
     # RLS enforcement flag
     _rls_enabled = config.get("multiuser", {}).get("rls_enabled", False)
@@ -399,36 +375,26 @@ async def lifespan(app):
         _cache = None
         app.state.cache = None
 
-    # Start background distillation worker (optional)
+    # Start registered background workers. API owns registrations so core stays
+    # below API/domain/webhook/worker packages in the dependency graph.
     worker_enabled = config.get("worker", {}).get("enabled", True)
-    if worker_enabled and _pool:
-        logger.info("Launching background distillation worker")
-        _schedule_worker(_run_distillation_worker())
+    scheduled_workers = 0
+    if _pool:
+        for worker_name, (factory, honor_worker_enabled) in _lifespan_worker_factories.items():
+            if honor_worker_enabled and not worker_enabled:
+                logger.info("%s disabled", worker_name)
+                if worker_name == "distillation_worker":
+                    _worker_status["distillation_worker"] = "disabled"
+                continue
+            logger.info("Launching %s", worker_name)
+            _schedule_worker(factory(_pool))
+            scheduled_workers += 1
+    if scheduled_workers:
         import asyncio as _asyncio
         await _asyncio.sleep(0.5)  # Give worker time to initialize
-    else:
+    elif not worker_enabled:
         logger.info("Background distillation worker disabled")
         _worker_status["distillation_worker"] = "disabled"
-
-    # Webhook retry repair + delivery recovery workers. Repair owns its own
-    # startup burst and periodic cadence, independent of slow webhook sends.
-    if _pool:
-        from mnemos.webhooks import (  # noqa: WPS433
-            delivery_worker_loop as _webhook_delivery,
-        )
-        from mnemos.webhooks import (
-            repair_worker_loop as _webhook_repair,
-        )
-        logger.info('Launching webhook retry repair worker')
-        _schedule_worker(_webhook_repair(_pool))
-        logger.info('Launching webhook delivery recovery worker')
-        _schedule_worker(_webhook_delivery(_pool))
-
-    # Federation sync worker (v3.0.0 — pulls from remote peers on their intervals)
-    if _pool:
-        logger.info('Launching federation sync worker')
-        from mnemos.domain.federation import federation_worker_loop as _federation_worker
-        _schedule_worker(_federation_worker(_pool))
 
     # OAuth expired-session GC worker (v3.0.0)
     if _pool:
@@ -517,37 +483,6 @@ _MEMORY_COLS = (
     "owner_id, group_id, namespace, permission_mode, "
     "source_model, source_provider, source_session, source_agent"
 )
-
-
-def _row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
-    raw_meta = row.get('metadata')
-    if isinstance(raw_meta, str):
-        try:
-            raw_meta = json.loads(raw_meta)
-        except Exception:
-            raw_meta = None
-    elif not isinstance(raw_meta, dict):
-        raw_meta = None
-    return MemoryItem(
-        id=row['id'],
-        content=row['content'],
-        category=row['category'],
-        subcategory=row.get('subcategory'),
-        created=row['created'].isoformat() if row['created'] else '',
-        updated=row['updated'].isoformat() if row.get('updated') else None,
-        metadata=raw_meta if raw_meta else None,
-        quality_rating=row.get('quality_rating'),
-        compressed_content=row.get('compressed_content') if include_compressed else None,
-        verbatim_content=row.get('verbatim_content'),
-        owner_id=row.get('owner_id'),
-        group_id=row.get('group_id'),
-        namespace=row.get('namespace'),
-        permission_mode=row.get('permission_mode'),
-        source_model=row.get('source_model'),
-        source_provider=row.get('source_provider'),
-        source_session=row.get('source_session'),
-        source_agent=row.get('source_agent'),
-    )
 
 
 async def _get_embedding(text: str) -> list:

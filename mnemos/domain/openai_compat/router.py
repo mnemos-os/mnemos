@@ -169,6 +169,14 @@ async def get_model(model_id: str, user: Any) -> ModelInfo:
     return ModelInfo(id=resolved_model, owned_by=_owned_by(provider))
 
 
+async def search_memory_context(*args: Any, **kwargs: Any) -> Any:
+    return await openai_compat_repo.fetch_memory_context(*args, **kwargs)
+
+
+async def get_model_recommendation(*args: Any, **kwargs: Any) -> Any:
+    return await openai_compat_repo.fetch_model_recommendation(*args, **kwargs)
+
+
 async def chat_completion(
     request: ChatCompletionRequest,
     user: Any,
