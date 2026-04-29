@@ -1,6 +1,6 @@
 # MPF restore drill — dev ↔ prod import / export
 
-CHARON's `tools/memory_export.py` + `tools/memory_import.py` are
+CHARON's `mnemos/tools/memory_export.py` + `mnemos/tools/memory_import.py` are
 the primary tools for moving an MNEMOS corpus between deployments.
 This document is the operator runbook for the drill — exporting from
 a source MNEMOS, validating the envelope, and restoring into a target.
@@ -46,7 +46,7 @@ curl -s -H "Authorization: Bearer $TOKEN" \
 
 ```bash
 cd /path/to/mnemos
-python3 tools/mpf_validate.py --file /tmp/source-export.json
+python3 -m mnemos.tools.mpf_validate --file /tmp/source-export.json
 ```
 
 Output should include `OK`. A failed validation means either the source
@@ -61,7 +61,7 @@ For anything bigger, use the CLI tool.
 ```bash
 TARGET='http://192.168.207.25:5002'
 
-python3 tools/memory_import.py json \
+python3 -m mnemos.tools.memory_import json \
     --file /tmp/source-export.json \
     --preserve-metadata \
     --endpoint "$TARGET" \

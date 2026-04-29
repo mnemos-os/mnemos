@@ -355,11 +355,11 @@ With IRIS in place, other MCP-aware frameworks (Hermes, Continue, AutoGPT, CrewA
 
 ## 4. Explicitly NOT in v3.5
 
-- **KRONOS** (Tesseract time-series integration) → v4.0
-- **API consolidation pass** (unifying security, pool, IDs logic) → v4.0
-- **MCP consolidation** (merging `mcp_server.py` + `api/mcp_tools.py`) → v4.0
-- **Encrypted CHARON envelopes** (NaCl-style optional encryption) → v4.0
-- **GDPR wipe path** (right-to-be-forgotten for compliance) → v4.0
+- **KRONOS** (Tesseract time-series integration) → deferred beyond v4.0
+- **API/package consolidation** → shipped in v4.0
+- **MCP memory-tool consolidation** → shipped in v4.0 under `mnemos/mcp/tools/`
+- **Encrypted CHARON envelopes** (NaCl-style optional encryption) → deferred beyond v4.0
+- **GDPR wipe path** (right-to-be-forgotten for compliance) → deferred beyond v4.0
 - **Rust ports** → v5.0
 - **Full PERSEPHONE archival** (cold-set rotation) → v3.6; foundation only in v3.5
 - **APOLLO S-IVB phases 3–4** (CONSOLIDATE / ARCHIVE / EXTRACT mutation paths) → v3.6; EXTRACT mining only in v3.5

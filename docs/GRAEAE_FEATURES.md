@@ -1,7 +1,6 @@
 # GRAEAE Feature Surface
 
-**Status:** current v3.5.x documentation. v3.5.0 shipped on 2026-04-28;
-v3.5.1 is the documentation-triage patch.
+**Status:** current v4.0.0 documentation. v4.0.0 shipped on 2026-04-29.
 
 GRAEAE is MNEMOS's multi-provider reasoning bus. It fans a prompt out to live
 LLM providers, scores the responses, persists consultations, and writes a
@@ -11,17 +10,17 @@ hash-chained audit record for each committed consultation.
 
 | Capability | Current module | Notes |
 |---|---|---|
-| Provider routing | `graeae/engine.py` | Config-driven providers with OpenAI-compatible, Anthropic, and Gemini adapter paths. |
-| Circuit breaking | `graeae/_circuit_breaker.py` | Per-provider CLOSED / OPEN / HALF_OPEN guard; process-local. |
-| Rate limiting | `graeae/_rate_limiter.py` | Sliding-window requests-per-minute guard; process-local. |
-| Concurrency limiting | `graeae/_concurrency.py` | Per-provider async slot limiter; skips saturated providers instead of queueing them. |
-| Quality weighting | `graeae/_quality.py` | Rolling success-rate and latency tracker used to adjust provider weights. |
-| Response cache | `graeae/_cache.py` | In-memory normalized prompt cache with TTL; not a persistent semantic cache. |
-| Model registry sync | `graeae/provider_sync.py`, `graeae/elo_sync.py`, `scripts/sync_provider_models.py` | Provider model discovery plus Arena.ai/LMArena weighting when the sync job is installed. |
+| Provider routing | `mnemos/domain/graeae/engine.py` | Config-driven providers with OpenAI-compatible, Anthropic, and Gemini adapter paths. |
+| Circuit breaking | `mnemos/domain/graeae/_circuit_breaker.py` | Per-provider CLOSED / OPEN / HALF_OPEN guard; Redis-backed in server multi-worker mode, in-process fallback otherwise. |
+| Rate limiting | `mnemos/domain/graeae/_rate_limiter.py` | Sliding-window requests-per-minute guard; Redis-backed when configured. |
+| Concurrency limiting | `mnemos/domain/graeae/_concurrency.py` | Per-provider async slot limiter; Redis-backed when configured. |
+| Quality weighting | `mnemos/domain/graeae/_quality.py` | Rolling success-rate and latency tracker used to adjust provider weights. |
+| Response cache | `mnemos/domain/graeae/_cache.py` | In-memory normalized prompt cache with TTL; not a persistent semantic cache. |
+| Model registry sync | `mnemos/domain/graeae/provider_sync.py`, `mnemos/domain/graeae/elo_sync.py`, `scripts/sync_provider_models.py` | Provider model discovery plus Arena.ai/LMArena weighting when the sync job is installed. |
 
-The reliability state above is intentionally process-local in v3.5.x. MNEMOS
-therefore remains pinned to one API worker for production correctness; moving
-these guards to shared/external coordination is future horizontal-scaling work.
+The reliability state above uses Redis in the `server` profile when
+`RATE_LIMIT_STORAGE_URI=redis://...` is configured. In-process fallback remains
+for `edge`/`dev` and logs a warning when used with multiple workers.
 
 ## API Surface
 
@@ -58,7 +57,7 @@ request validation with HTTP 422.
 
 OpenAI-compatible access is separate but uses the same routing engine:
 `POST /v1/chat/completions`, `GET /v1/models`, and `GET /v1/models/{model_id}`.
-In v3.5.x, generation controls propagate when the selected provider supports
+In v4.0, generation controls propagate when the selected provider supports
 them; unsupported tools, response formats, and multimodal requests are rejected
 instead of silently ignored.
 
@@ -74,6 +73,6 @@ Committed consultations write three related records in one transaction:
 
 If the audit write fails, consultation persistence fails too. This is the
 current compliance boundary for GRAEAE. MNEMOS does not have one generic
-`audit_log` table for every memory operation in v3.5.x; memory integrity is
+`audit_log` table for every memory operation in v4.0; memory integrity is
 tracked through the version DAG, webhook delivery rows, compression contest
 records, and subsystem-specific audit tables.

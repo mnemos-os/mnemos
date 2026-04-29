@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v3.5.x current. v3.5.0 shipped 2026-04-28; v3.5.1 is the 2026-04-28 documentation-triage patch.
+**Status**: v4.0.0 current. v4.0.0 shipped 2026-04-29.
 
 ---
 
@@ -30,44 +30,37 @@ mnemos serve --profile dev
 ## Quick Start
 
 ### Prerequisites
-- PostgreSQL 12+ for the `server` profile, or SQLite for `edge`/`dev`
-- Python 3.10+
+- PostgreSQL 12+ and Redis for the `server` profile, or SQLite for `edge`/`dev`
+- Python 3.11+ when using the Python package; no host Python is required for the single-binary artifact
 - LLM provider API keys (Together AI or Groq free tier recommended)
 - (Optional) GPU or local inference endpoint for APOLLO's LLM fallback and self-hosted LLMs
 
 ### Installation
 
 ```bash
-# Clone repository
-git clone https://github.com/mnemos-os/mnemos.git
-cd mnemos
-
-# Copy environment template
-cp .env.example .env
-
-# Edit .env with your configuration
-nano .env
-
-# Install dependencies (with uv)
-uv pip install -r requirements.txt
-
-# Apply database migrations in canonical order
-python install.py
-
-# Start MNEMOS server
-export $(cat .env | grep -v '#' | xargs)
-python -m uvicorn api_server:app --host $MNEMOS_BIND --port $MNEMOS_PORT
+python -m pip install mnemos-os==4.0.0
+mnemos install --profile dev
+mnemos serve --profile dev
 ```
 
-The API will be available at `http://$MNEMOS_BIND:$MNEMOS_PORT`
+The API will be available at `http://localhost:5002`.
+
+For the no-Python edge path:
+
+```bash
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.0.0/mnemos-linux-x86_64 -o mnemos
+chmod +x mnemos
+./mnemos install --profile edge
+./mnemos serve --profile edge
+```
 
 ---
 
 ## Runtime Scaling
 
-MNEMOS runs single-worker by default with `RATE_LIMIT_STORAGE_URI=memory://`.
-Horizontal scaling is supported when Redis backs shared rate-limit and
-circuit-breaker state; see `docs/SCALING.md`.
+MNEMOS runs one worker by default. Horizontal scaling is supported when Redis
+backs shared rate-limit, circuit-breaker, and concurrency state; see
+`docs/SCALING.md`.
 
 ---
 
@@ -96,7 +89,7 @@ For HTTP/SSE connectors, prefer per-user token issuance:
 ```bash
 MNEMOS_MCP_TOKENS=alice:<alice-mnemos-api-key>,bob:<bob-mnemos-api-key>
 MNEMOS_BASE=http://mnemos:5002
-python3 mcp_http_server.py --host 127.0.0.1 --port 5004
+mnemos serve mcp-http --host 127.0.0.1 --port 5004
 ```
 
 Each `MNEMOS_MCP_TOKENS` entry is `user_id:token`. The token is accepted at the
@@ -258,7 +251,7 @@ export GPU_PROVIDER_HOST=http://localhost
 export GPU_PROVIDER_PORT=11434
 
 # Start MNEMOS
-python -m uvicorn api_server:app
+mnemos serve --profile dev
 ```
 
 **Option 2: vLLM (CPU or GPU)**
@@ -276,7 +269,7 @@ export GPU_PROVIDER_HOST=http://localhost
 export GPU_PROVIDER_PORT=8000
 
 # Start MNEMOS
-python -m uvicorn api_server:app
+mnemos serve --profile dev
 ```
 
 **The real question:** Do you need any of this? **Probably not.** Just use Together AI or Groq (free tier).
@@ -284,7 +277,7 @@ python -m uvicorn api_server:app
 export TOGETHER_API_KEY=your_key
 export GROQ_API_KEY=your_key
 
-python -m uvicorn api_server:app
+mnemos serve --profile dev
 # That's it. No GPU, no inference server, no hassle.
 ```
 
@@ -309,13 +302,13 @@ existing volumes.
 Postgres image init scripts under `/docker-entrypoint-initdb.d` only run
 when the data directory is first initialized. They do not re-run when an
 existing `postgres_data` volume starts with newer migration files mounted.
-For v3.5.x, `docker-compose.yml` and `docker-compose.staging.yml`
+For current installs, `docker-compose.yml` and `docker-compose.staging.yml`
 therefore include `postgres-upgrade`, which waits for Postgres health and
-then applies the v3.5 upgrade tail before the MNEMOS service starts.
+then applies the ordered migration tail before the MNEMOS service starts.
 
-The canonical order lives in `install.py` and `installer/db.py`; compose must
-mirror those loaders. Current v3.5.x upgrade tail is prefixes 24-38, in
-order:
+The canonical order lives in `mnemos/installer/db.py`; compose must mirror that
+loader. The v3.5 upgrade tail remains relevant for pre-v4 databases and is
+followed by the v4 profile/persistence additions where needed.
 `trigger-same-memory-parent`, `rls-group-select-unix-bits`,
 `webhook-retry-terminal-state`, `webhook-attempt-lease`,
 `webhook-writer-revision`, `webhook-status-updated-at`,
@@ -342,8 +335,7 @@ read-only standbys promoted on failure.
 
 Federation is for genuinely-remote replication scenarios — multi-site
 deployments, multi-org curated feeds, developer laptop replicas with
-intermittent connectivity, and v4 deployment profiles with planned
-SQLite-based laptop/local-replica mode.
+intermittent connectivity, and v4 SQLite-backed edge profiles.
 
 | Mode | Use when | Latency model | Write model | Layer | Configuration |
 |------|----------|---------------|-------------|-------|---------------|
@@ -364,19 +356,19 @@ promotion, and HAProxy/PgBouncer-style writer endpoints.
 MPF portability is available through `GET /v1/export` and `POST /v1/import`.
 Use root plus `preserve_owner=true` only for authoritative restores or
 migrations; non-root imports are scoped to the caller's owner+namespace. The
-CLI helpers are `tools/memory_export.py`, `tools/memory_import.py`, and
-`tools/mpf_validate.py`.
+CLI helpers are available through `mnemos export`, `mnemos import`, and the
+modules under `mnemos/tools/`.
 
 MORPHEUS dream-state runs are operator-triggered through
 `POST /admin/morpheus/runs` and inspected through `/v1/morpheus/runs*`.
-Runs are synchronous in v3.5.x, append generated memories tagged with
+Runs are synchronous in v4.0, append generated memories tagged with
 `morpheus_run_id`, and roll back by deleting memories from that run.
 
 Compression is operator-batched. Use `POST /admin/compression/enqueue` or
 `POST /admin/compression/enqueue-all` to feed the contest worker. The active
 built-in engines are APOLLO and ARTEMIS; the retired LETHE / ANAMNESIS /
 ALETHEIA engines and the legacy session compression columns are not part of
-the v3.5.x runtime.
+the v4.0 runtime.
 
 ---
 
@@ -512,14 +504,14 @@ curl -X DELETE http://localhost:5002/v1/sessions/{id} \
 sudo -u postgres createdb mnemos
 sudo -u postgres createuser -P mnemos  # Enter password interactively
 
-# Run migrations in canonical order
-python install.py
+# Run migrations in canonical order through the installer
+mnemos install --profile server
 
-# Existing DBs on v3.4.1 must apply v3.5 migrations 24-38 in order.
+# Existing DBs on v3.4.1 must apply v3.5 migrations 24-38 in order before the v4 tail.
 # The compose one-shot is the canonical example for existing volumes:
 docker compose up postgres-upgrade
 
-# For non-compose installs, follow the same order as install.py / installer/db.py:
+# For non-compose installs, follow the same order as mnemos/installer/db.py:
 psql -U mnemos -d mnemos -v ON_ERROR_STOP=1 \
   -f db/migrations_v3_5_trigger_same_memory_parent.sql \
   -f db/migrations_v3_5_rls_group_select_unix_bits.sql \
@@ -582,9 +574,9 @@ Type=notify
 User=mnemos
 WorkingDirectory=/opt/mnemos
 EnvironmentFile=/opt/mnemos/.env
-ExecStart=/usr/bin/python3 -m uvicorn api_server:app \
-  --host ${MNEMOS_BIND} \
-  --port ${MNEMOS_PORT}
+ExecStart=/opt/mnemos/venv/bin/mnemos serve --profile ${MNEMOS_PROFILE:-server} \
+  --host ${MNEMOS_BIND:-0.0.0.0} \
+  --port ${MNEMOS_PORT:-5002}
 Restart=always
 RestartSec=10
 
@@ -663,7 +655,7 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 
 ### 409: Memory branch state is inconsistent
 
-v3.5.x maps trigger SQLSTATE `MN001` to HTTP 409 when
+v4.0 keeps the v3.5 trigger behavior: SQLSTATE `MN001` maps to HTTP 409 when
 `memory_branches` is missing, has `NULL head_version_id`, or points at a
 `memory_versions` row from another memory. Inspect and reconcile the
 branch rows before retrying:

@@ -6,6 +6,36 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ---
 
+## Current status — v4.0.0 shipped on 2026-04-29
+
+v4.0.0 is shipped. The v4.0 work that used to be forward-looking is now current
+state:
+
+- ✅ Coherent `mnemos/` package layout: `api/routes`, `core`, `db`, `domain`,
+  `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`, `tools`,
+  `cli`.
+- ✅ `PersistenceBackend` abstraction with Postgres and SQLite implementations.
+- ✅ Deployment profiles: `server`, `edge`, and `dev`.
+- ✅ SQLite profile: aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL.
+- ✅ Single-binary distribution for linux-x86_64, linux-aarch64, and
+  macos-aarch64.
+- ✅ Unified `mnemos` CLI for serve / install / worker / export / import /
+  consult / health / version.
+- ✅ Redis-backed multi-worker support for circuit breaker, rate limiter, and
+  concurrency limiter state.
+- ✅ Seven import-linter contracts and Pydantic Settings singleton discipline.
+- ✅ GRAEAE modes: `auto`, `local`, `external`, `all`, `single`, `debate`,
+  `majority`; unknown values now 422.
+
+Next planning focus:
+
+- **v4.1**: web UX in the separate `mnemos-web` frontend repo (Tier-1 MVP),
+  mobile hardening for Android Termux first, iOS native client later, connector
+  gallery expansion, and any targeted Rust rewrites deferred on 2026-04-29.
+- **v5.0+**: hosted MNEMOS Cloud, foundation-tier OSS standardization
+  (MCP-MD via LF AI & Data), and larger Rust/mobile investments once the v4
+  Python architecture has settled under production use.
+
 ## v3.1 — compression platform + v3.0 unblocks
 
 **Headline:** plugin-interfaced compression platform with competitive per-memory engine selection, a persisted audit log on every compression decision, and a first-class GPU batcher that works across integrated graphics, discrete GPUs, and remote OpenAI-compatible endpoints.
@@ -144,35 +174,41 @@ Remaining after v3.5.0:
 
 ---
 
-## v4.0 — Pluggable Monolith + Surface Integrations + Lite Profile
+## v4.0 — Pluggable Monolith + Lite Profile — SHIPPED 2026-04-29
 
-The 4.0 charter is structural, not feature-driven. Three coupled work streams:
+The 4.0 charter was structural, not feature-driven. Tracks 5, 5b, and horizontal
+scaling shipped in v4.0.0. Connector gallery expansion moves to v4.1; hosted
+cloud, MCP-MD foundation standardization, and larger Rust/mobile work move to
+v5.0+ framing.
 
 ### Track 5 — modularization + persistence abstraction
 
 Same repo, internal API boundaries enforced by tooling. Pattern: Django, SQLAlchemy, Airflow.
 
-- 🔵 `src/mnemos/` package layout. Subsystems become subpackages (`mnemos.graeae`, `mnemos.compression`, `mnemos.morpheus`, `mnemos.federation`, `mnemos.charon`, `mnemos.knossos`).
-- 🔵 `import-linter` config in `pyproject.toml`. CI fails on cross-subsystem internal imports.
-- 🔵 Public APIs via `__all__`; private surfaces under `_internal/`.
-- 🔵 `installer/` extracted to a separate package (operators don't need it at runtime).
-- 🔵 Plugin entry-points for `CompressionEngine`, judges, federation backends, MORPHEUS phases. Third-party engines install as packages and self-register on startup.
-- 🔵 Optional-extras: `pip install mnemos-os`, `mnemos-os[graeae,morpheus]`, `mnemos-os[full]`. Lets embedding apps pull only the slice they need.
-- 🔵 **Persistence abstraction** — `mnemos.persistence.{postgres,sqlite}` swappable. Foundation for the lite profile (next).
+- ✅ `mnemos/` package layout. Subsystems are subpackages: `api/routes`, `core`, `db`, `domain`, `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`, `tools`, `cli`.
+- ✅ Seven `import-linter` contracts in `pyproject.toml`. CI fails on package-boundary regressions.
+- ✅ Public API surfaces exposed through package modules; top-level Python script entry points retired in favor of `mnemos`.
+- ✅ `mnemos/installer/` extracted from the old top-level installer flow.
+- ✅ Plugin entry-points and ABCs remain for `CompressionEngine`; third-party extension work continues after v4.0.
+- ✅ Optional extras: `build`, `sqlite`, `tracing`, `structlog`, `docling`, `full`, `phi`.
+- ✅ **Persistence abstraction** — `mnemos.persistence.{postgres,sqlite}` swappable.
 
 ### Track 5b — SQLite "lite" profile
 
 Same code, same API, same KNOSSOS interop. Single-binary, embeddable, MemPalace-compatible MCP from day one.
 
-- 🔵 `mnemos.persistence.sqlite` implementation: SQLite + `sqlite-vec` (replaces pgvector) + FTS5 (replaces pg's tsvector).
-- 🔵 SQL dialect translation: `<=>` cosine ops, jsonb, generated columns, partial indexes — the persistence layer hides this.
-- 🔵 Migration parity: `db/migrations/sqlite/` mirrors `db/migrations/postgres/`. Same conceptual schema, different SQL.
-- 🔵 Single-binary build: `pyinstaller`-style bundle that ships MNEMOS + SQLite-vec + the static assets in one executable.
-- 🔵 Pitch: **"Run it as a single SQLite binary on your laptop, scale it to a Postgres+pgvector+GPU stack on a fleet, anywhere in between."** The MemPalace-compatible variant of MNEMOS that doesn't sacrifice the schema-extensibility our database choice gives us.
+- ✅ `mnemos.persistence.sqlite` implementation: SQLite + `sqlite-vec` + FTS5 + JSON1 + WAL.
+- ✅ SQL dialect translation lives behind the persistence layer.
+- ✅ SQLite migration chain mirrors the Postgres conceptual schema.
+- ✅ Single-binary build via PyInstaller ships MNEMOS + sqlite-vec + migrations in one executable.
+- ✅ Pitch: **"Run it as a single SQLite binary on your laptop, scale it to a Postgres+pgvector+GPU stack on a fleet, anywhere in between."**
 
-### Track 6 — surface integrations (multi-vendor MCP + REST connectors)
+### Track 6 — surface integrations (multi-vendor MCP + REST connectors) — v4.1
 
-MNEMOS exposes a mature MCP server (`mcp_server.py`, 18 tools from one canonical registry, working in Claude Code today). Goal: make MNEMOS the easiest memory layer to wire into *any* agent surface. v4.0 ships a connectors gallery + bridge tooling for the surfaces that don't natively speak MCP.
+MNEMOS exposes mature MCP transports (`mnemos.mcp.stdio`, `mnemos.mcp.http`) and
+18 tools from one canonical registry. v4.0 keeps the working MCP surface and the
+initial connector docs; broad connector-gallery packaging and bridge tooling are
+v4.1 work.
 
 | Surface | MCP support | Plan |
 |---|---|---|
@@ -188,11 +224,11 @@ MNEMOS exposes a mature MCP server (`mcp_server.py`, 18 tools from one canonical
 | **OpenWebUI / LM Studio / Ollama** | ⚠️ partial | OpenAI-compat tool-call path; MNEMOS REST endpoints accessible via tool-use config |
 
 Deliverables:
-- 🔵 `docs/connectors/` directory with one Markdown per surface, including the exact config snippet to paste.
-- 🔵 `mnemos-openapi.json` published as a downloadable artifact in CI; consumed by Custom GPTs and any OpenAPI-aware client.
-- 🔵 `mnemos-bridges/gemini/` — small Python package that runs alongside MNEMOS, exposes the MCP tool surface as a Gemini-compatible REST endpoint.
-- 🔵 `mnemos-bridges/openai-actions/` — Custom GPT manifest + OAuth scaffold for the consumer ChatGPT path.
-- 🔵 Smoke tests per surface in CI (where automatable; some surfaces require real credentials and are manual).
+- ✅ Initial `docs/connectors/` directory exists with ChatGPT Pro Developer Mode guidance.
+- 🔵 v4.1: one Markdown per surface with exact config snippets.
+- 🔵 v4.1: `mnemos-openapi.json` artifact for Custom GPTs and OpenAPI-aware clients.
+- 🔵 v4.1: Gemini and OpenAI Actions bridge packages if demand holds.
+- 🔵 v4.1: smoke tests per surface where automatable.
 
 ---
 

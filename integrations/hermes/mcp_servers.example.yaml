@@ -3,8 +3,8 @@
 
 mcp_servers:
   mnemos:
-    command: python
-    args: ["/path/to/mnemos/mcp_server.py"]
+    command: /path/to/mnemos/venv/bin/mnemos
+    args: ["serve", "mcp-stdio"]
     env:
-      MNEMOS_BASE: "http://<your-mnemos-host>:5000"
+      MNEMOS_BASE: "http://<your-mnemos-host>:5002"
       # MNEMOS_API_KEY: "<optional-bearer-key-for-team-enterprise-profiles>"

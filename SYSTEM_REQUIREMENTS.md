@@ -1,7 +1,7 @@
 # MNEMOS System Requirements
 
-**Applies to**: current v3.5.x release line
-**Updated**: 2026-04-28
+**Applies to**: current v4.0.0 release line
+**Updated**: 2026-04-29
 **Applies To**: Bare Metal, Docker, and Cloud Deployments
 
 ---
@@ -11,10 +11,10 @@
 | Component | Minimum | Recommended | Notes |
 |-----------|---------|-------------|-------|
 | **CPU** | 2 cores | 4+ cores | More cores = faster GRAEAE consensus |
-| **RAM** | 4 GB | 8+ GB | Python + PostgreSQL + service |
+| **RAM** | 4 GB | 8+ GB | Python + SQLite edge, or Python + PostgreSQL server |
 | **Disk** | 10 GB | 50+ GB | Depends on memory storage size |
 | **Python** | 3.11 | 3.11+ | Required for asyncio features |
-| **PostgreSQL** | 13 | 16 (pgvector) | Requires pgvector, pgcrypto, uuid-ossp |
+| **Database** | SQLite 3.40+ for edge/dev | PostgreSQL 16 + pgvector for server | Server profile also expects Redis for multi-worker |
 | **Docker** | 20.10+ | 24+ | If using containers |
 | **GPU** | Optional | Optional | Not required; fully CPU-capable |
 
@@ -94,9 +94,9 @@ psql -U postgres -d mnemos -c "CREATE EXTENSION IF NOT EXISTS uuid-ossp;"
 ```
 
 **Migration note for Docker volumes**: fresh volumes run all mounted
-`/docker-entrypoint-initdb.d` SQL. Existing volumes do not. The v3.5.x
-compose files therefore include a one-shot `postgres-upgrade` service
-that applies the v3.5 migration tail before MNEMOS starts.
+`/docker-entrypoint-initdb.d` SQL. Existing volumes do not. The compose files
+therefore include a one-shot `postgres-upgrade` service that applies the ordered
+migration tail before MNEMOS starts.
 
 **Storage Requirements**:
 - Initial database: ~50 MB (empty schema)
@@ -682,5 +682,5 @@ Solution: Check disk usage: df -h
 ---
 
 **Last Updated**: 2026-04-28
-**Version**: v3.5.x; v3.5.1 documentation-triage patch
+**Version**: v4.0.0
 **Status**: Production-ready for tagged releases

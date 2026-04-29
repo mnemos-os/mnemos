@@ -30,7 +30,7 @@ import path to the **root + preserve_owner=true** admin/migration
 path. Non-root callers can ship `kg_triples` and
 `compression_manifest` sidecars without restriction, but
 `memory_versions` requires a root bearer token (`--preserve-metadata`
-on `tools/memory_import.py`). This restriction is structural:
+on `mnemos/tools/memory_import.py`). This restriction is structural:
 the interaction of caller-scoped deterministic id derivation,
 ON CONFLICT idempotency, and `memory_versions` surviving memory
 deletion makes the non-root path a defect-prone surface where

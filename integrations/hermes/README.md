@@ -12,8 +12,8 @@
 2. Register MNEMOS as an MCP server via the Hermes CLI:
    ```bash
    hermes mcp add mnemos \
-     --command python \
-     --args "/path/to/mnemos/mcp_server.py" \
+     --command /path/to/mnemos/venv/bin/mnemos \
+     --args "serve mcp-stdio" \
      --env MNEMOS_BASE=http://mnemos.internal:5002
    ```
 

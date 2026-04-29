@@ -23,7 +23,7 @@ The compression flow is:
    compression artifacts.
 
 The admin endpoint request models and queue inserts live in
-[`api/handlers/admin.py`](../api/handlers/admin.py).
+[`mnemos/api/routes/admin.py`](../mnemos/api/routes/admin.py).
 
 Session messages and session memory injections do not carry compression tags.
 Slice 12 dropped the always-NULL `compression_ratio` columns from

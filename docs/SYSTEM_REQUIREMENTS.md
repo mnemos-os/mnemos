@@ -1,7 +1,7 @@
 # System Requirements
 
 Reference for operators planning a MNEMOS deployment. Covers the
-resource floor for each of the operating modes that the v3.x line supports
+resource floor for each of the operating modes that the v4.0 line supports
 today, plus what drops off at each tier.
 
 Profiles are descriptive sizing tiers. The feature set is controlled by
@@ -12,29 +12,27 @@ section at the bottom.
 
 | Tier          | CPU     | RAM    | Disk (data) | GPU        | Notes                                              |
 | ------------- | ------- | ------ | ----------- | ---------- | -------------------------------------------------- |
-| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Full contest path (APOLLO + ARTEMIS); Postgres 15+ on same host or nearby |
-| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | Full contest path; APOLLO LLM fallback uses GPU when configured |
-| **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | Contest path disabled via `MNEMOS_CONTEST_ENABLED=false`; compression queue is not drained |
+| **Server**    | 8+ cores| 16 GB+ | 50 GB+ SSD  | CUDA 12+ GPU w/ 8 GB+ VRAM (recommended) | Postgres + pgvector + Redis; multi-worker supported |
+| **Workstation** | 4+ cores | 8 GB  | 20 GB SSD  | Optional GPU (4 GB+ VRAM acceptable)     | `dev` profile with SQLite, or `server` profile for local Postgres |
+| **Edge**      | 2 cores | 4 GB   | 10 GB       | None       | SQLite + sqlite-vec single-worker profile |
 
-Embedded Pi-class is now a **lite-profile target** (SQLite + sqlite-vec
-backend) and is out of scope for the current Postgres-only branch. Pi 4 class is the intended
-floor for the embedded tier when it lands.
+Embedded Pi-class is now the **edge** profile target (SQLite + sqlite-vec
+backend). Pi 4 class is the intended floor for the embedded tier.
 
 ## Baseline requirements (all tiers)
 
 * **Python**: 3.11+ (`tomllib` stdlib dependency)
-* **Postgres**: 15+ with `pgvector` extension. Either co-located or on
-  a local network (latency < 5 ms for the worker's dequeue path to
-  keep up with production ingest).
+* **Database**: SQLite for `edge`/`dev`; Postgres 15+ with `pgvector`
+  extension for `server`. Server multi-worker deployments also need Redis.
 * **Disk**: corpus + manifests + backups.
   - Memory text: ~1 KB/row average; 100k rows ≈ 100 MB.
   - v3.1 compression candidates: ~1.5x the memory row count, ~2 KB/row.
-  - Backups: see `tools/backup/` — daily pg_dump + weekly rsync
+  - Backups: see `mnemos/tools/backup/` — daily pg_dump + weekly rsync
     pattern uses another ~2x the live corpus size in rolling storage.
-* **Network**: internal only for the v3.1 contest path; outbound only
+* **Network**: internal only for the contest path; outbound only
   required if using an externally hosted embedding/LLM endpoint.
 
-## Server tier — full v3.1 feature set
+## Server tier — full v4.0 feature set
 
 Intended for the primary deployment host that runs the API + worker
 for production ingest.
@@ -113,13 +111,13 @@ From real deployments as of 2026-04-23:
 These are operational rather than prescriptive — real workloads will
 differ. Use these as a sanity check when sizing a new host.
 
-## v3.5.x deployment note
+## Deployment note
 
 Docker fresh volumes run all mounted initdb migrations. Existing volumes
-do not. For v3.5.x, the compose files include a one-shot
-`postgres-upgrade` service so the trigger replacement migration applies
-to existing data directories before MNEMOS starts.
+do not. The compose files include a one-shot `postgres-upgrade` service so the
+ordered migration tail applies to existing data directories before MNEMOS
+starts.
 
 ---
 
-*Last updated: 2026-04-28 (v3.5.1 doc triage)*
+*Last updated: 2026-04-29 (v4.0.0 doc triage)*

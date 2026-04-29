@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v3.5.x current; v3.5.0 shipped 2026-04-28, v3.5.1 is the 2026-04-28 documentation-triage patch
+**Version**: v4.0.0 current; shipped 2026-04-29
 **Format**: JSON
 
 ---
@@ -61,9 +61,11 @@ Liveness + readiness check (no auth required).
 ```json
 {
   "status": "healthy",
-  "timestamp": "2026-04-21T14:30:00.000Z",
+  "timestamp": "2026-04-29T14:30:00.000Z",
   "database_connected": true,
-  "version": "3.5.1"
+  "version": "4.0.0",
+  "profile": "edge",
+  "distillation_worker": "idle"
 }
 ```
 
@@ -92,13 +94,13 @@ Read behavior is symmetric across REST, gateway context, and MCP:
 non-root callers can read a memory when they are the owner, when the
 row is federated, when the Unix world-read bit is set, or when the
 Unix group-read bit is set for one of their groups. The shared helper
-is `read_visibility_predicate` (`api/visibility.py:40-96`). Writes
+is `read_visibility_predicate` (`mnemos/core/visibility.py`). Writes
 remain owner+namespace scoped.
 
 ### POST /v1/memories
 
 Create a memory. This writes the memory row and emits a transactional
-`memory.created` webhook event. Compression is operator-batched in v3.5.x:
+`memory.created` webhook event. Compression is operator-batched in v4.0:
 root users enqueue memories through `/admin/compression/enqueue` or
 `/admin/compression/enqueue-all`; the distillation worker then drains
 `memory_compression_queue`.
@@ -125,7 +127,7 @@ Update content, category, subcategory, metadata, or verbatim content.
 The update is owner+namespace scoped. If the version trigger detects a
 missing, NULL, or cross-memory branch HEAD, the API returns `409` with
 manual reconciliation guidance (`handle_trigger_pgerror` in
-`api/visibility.py:24-37`).
+`mnemos/core/visibility.py`).
 
 ### DELETE /v1/memories/{memory_id}
 
@@ -144,7 +146,7 @@ Semantic + keyword search.
 
 Search hits update `recall_count` and `last_recalled_at` in the background.
 `compression_applied` and `compression_metadata` are reserved response fields
-on `MemoryListResponse`; v3.5.x search responses set
+on `MemoryListResponse`; v4.0 search responses set
 `compression_applied=false`. Use `/v1/memories/rehydrate` to receive compressed
 variants when present, or `/v1/memories/{id}/compression-manifests` to inspect
 contest output.
@@ -159,7 +161,7 @@ contest output.
 
 ### DAG versioning (git-like)
 
-- `GET /v1/memories/{id}/versions` — version summaries on a branch, filtered per snapshot by `version_visibility_predicate` (`api/visibility.py:99-137`).
+- `GET /v1/memories/{id}/versions` — version summaries on a branch, filtered per snapshot by `version_visibility_predicate` (`mnemos/core/visibility.py`).
 - `GET /v1/memories/{id}/versions/{n}` — one version on a branch, filtered by that snapshot's own owner/namespace/permission mode.
 - `GET /v1/memories/{id}/diff` — diff between visible snapshots.
 - `POST /v1/memories/{id}/revert/{n}` — revert to version n. Main-branch revert updates the live row under the trigger after a live-row/main-HEAD drift guard; feature-branch revert inserts a new DAG row and leaves `memories` tracking main.
@@ -167,7 +169,7 @@ contest output.
 - `GET /v1/memories/{id}/commits/{commit}` — one visible commit by hash.
 - `GET /v1/memories/{id}/branches` — branch list. Non-root callers do not see branches whose head snapshot is invisible; corrupt heads are omitted and logged.
 - `POST /v1/memories/{id}/branch` — create a branch from main HEAD or a specified commit. The handler locks the parent memory row with `FOR SHARE` and uses `ON CONFLICT DO NOTHING RETURNING`; duplicate branch names return `409`.
-- `POST /v1/memories/{id}/merge` — merge source branch into target branch. Latest-wins is implemented; manual strategy returns not-implemented. Merge commits copy content/provenance from source and tenancy from target, and branch writers serialize on `_branch_advisory_lock_key` (`api/handlers/dag.py:21-40`).
+- `POST /v1/memories/{id}/merge` — merge source branch into target branch. Latest-wins is implemented; manual strategy returns not-implemented. Merge commits copy content/provenance from source and tenancy from target, and branch writers serialize on `_branch_advisory_lock_key` (`mnemos/api/routes/dag.py`).
 
 See `ANTI_MEMORY_POISONING.md` for the rationale and drift-detection
 workflow.
@@ -192,6 +194,20 @@ standard across memory and entity surfaces in v3.2-v3.5.
 
 ## Consultations (GRAEAE)
 
+`ConsultationRequest.mode` is a literal string. The seven accepted modes are:
+
+| Mode | Type | Meaning |
+|---|---|---|
+| `auto` | routing strategy | Use the engine default for the task type. |
+| `local` | routing strategy | Prefer local/self-hosted muses. |
+| `external` | routing strategy | Prefer external provider muses. |
+| `all` | routing strategy | Fan out to every available muse. |
+| `single` | reasoning shape | Select one highest-weighted muse for a fast or low-cost answer. |
+| `debate` | reasoning shape | Run a two-round multi-muse debate and synthesize the result. |
+| `majority` | reasoning shape | Query up to three muses and report whether quorum was reached. |
+
+Unknown modes are rejected by request validation with HTTP 422.
+
 ### POST /v1/consultations
 
 Run a multi-LLM consensus consultation. Writes a tamper-evident audit row.
@@ -201,10 +217,20 @@ Run a multi-LLM consensus consultation. Writes a tamper-evident audit row.
 {
   "prompt": "Design a microservices architecture.",
   "task_type": "architecture_design",
-  "mode": "auto",
+  "mode": "debate",
   "context": "optional context to prepend",
-  "inject_memories": true
+  "limit_chars": 12000,
+  "format": "full",
+  "models": ["openai/gpt-5.2-chat-latest"],
+  "providers": null,
+  "tier": null
 }
+```
+
+Schema summary:
+
+```python
+mode: Literal["auto", "local", "external", "all", "single", "debate", "majority"] = "auto"
 ```
 
 **Response** includes: `id`, `consensus_response`, `consensus_score`,
@@ -279,7 +305,7 @@ Stateful multi-turn chat with memory injection at turn boundaries.
 
 ## MORPHEUS
 
-Dream-state generation is operator-triggered and append-only in v3.5.x.
+Dream-state generation is operator-triggered and append-only in v4.0.
 Generated memories are tagged with `morpheus_run_id`; rollback deletes
 generated memories for that run.
 
@@ -359,8 +385,8 @@ MNEMOS Portability Format (MPF) is the native import/export envelope.
   `preserve_owner=true` is for authoritative restore/migration; non-root
   imports are scoped to the caller's owner+namespace.
 
-CLI helpers: `tools/memory_export.py`, `tools/memory_import.py`, and
-`tools/mpf_validate.py`.
+CLI helpers: `mnemos export`, `mnemos import`, `mnemos validate-mpf`, and the
+modules under `mnemos/tools/`.
 
 ---
 

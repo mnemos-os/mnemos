@@ -76,6 +76,14 @@ PRs without DCO sign-off on every commit will be asked to amend
 
 - Use a feature branch for non-trivial changes.
 - Keep commits focused and reviewable; split large changes.
+- Install from source through the v4 package entry points:
+
+```bash
+python -m pip install -e ".[dev,sqlite]"
+mnemos install --profile dev
+mnemos serve --profile dev
+```
+
 - Run the default test suite before opening a PR:
 
 ```bash
@@ -91,6 +99,35 @@ ruff check . --extend-exclude .venv-ci
 - For changes touching tenancy, DAG history, triggers, import/export, or
   auth, include focused regression tests and document the expected
   operator behavior for 404 vs 409 vs 403 outcomes.
+
+### Building single-binary artifacts
+
+The v4.0 binary release is built with PyInstaller. Use the `build` extra from a
+clean checkout on the target platform:
+
+```bash
+python -m pip install -e ".[build]"
+bash scripts/build-binary.sh
+```
+
+PyInstaller does not cross-compile these artifacts. Build linux-x86_64,
+linux-aarch64, and macos-aarch64 on matching hosts.
+
+### Multi-worker development
+
+The `dev` and `edge` profiles are intentionally single-worker SQLite profiles.
+For multi-worker work, use the `server` profile with Redis-backed shared state:
+
+```bash
+export MNEMOS_PROFILE=server
+export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
+export MNEMOS_WORKERS=2
+mnemos serve --profile server
+```
+
+If `MNEMOS_WORKERS > 1` with `RATE_LIMIT_STORAGE_URI=memory://`, startup logs a
+warning because circuit-breaker, rate-limit, and concurrency state are only
+process-local.
 
 ## Guidelines
 

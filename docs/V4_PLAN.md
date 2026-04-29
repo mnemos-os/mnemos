@@ -1,8 +1,31 @@
 # MNEMOS v4.0 Plan — ETLANTIS Universe Consolidation + GPU Stack
 
-**Status:** Architecture specification (target: ships after v3.6 GA)
-**Position in roadmap:** Forward-looking v4 architecture plan after the v3.5.x hardening release and planned v3.6 work; opens horizontal scaling + GPU integration.
-**Theme:** *Structural refactoring + GPU-backed AI infrastructure + unified ETLANTIS Universe.*
+**STATUS: SHIPPED v4.0.0 on 2026-04-29.**
+**Position in roadmap:** Historical v4 planning record. Tracks 5, 5b, and 8
+shipped in v4.0.0; the body is preserved as planning context, not current
+commitment.
+**Theme:** *Structural refactoring + multi-backend persistence + horizontal scaling.*
+
+## 0. Shipped / Deferred Summary
+
+Shipped in v4.0.0:
+
+- ✅ Track 5: API/package consolidation into the coherent `mnemos/` package,
+  with 7 import-linter contracts enforcing architecture.
+- ✅ Track 5b: persistence abstraction, Postgres + SQLite backends, `server` /
+  `edge` / `dev` profiles, and PyInstaller single-binary distribution.
+- ✅ Track 8: Redis-backed horizontal scaling primitives and removal of the
+  production `workers=1` pin.
+- ✅ Unified `mnemos` CLI and Pydantic Settings singleton.
+
+Deferred / reframed after the 2026-04-29 v4.0 ship decision:
+
+- 🔵 Track 3 IRIS operations discovery: v4.1/v5.0 timeframe.
+- 🔵 Track 6 connectors gallery expansion: v4.1.
+- 🔵 Track 7 MCP-MD LF AI & Data standardization: v5.0+ foundation-tier work.
+- 🔵 KRONOS/GPU-stack integration, hosted MNEMOS Cloud, Rust rewrites, web UX,
+  and mobile clients: v4.1/v5.0+ depending on product pressure. Rust rewrites
+  are explicitly deferred per user direction on 2026-04-29.
 
 ---
 
@@ -20,7 +43,7 @@ Post-v4.0, MNEMOS is production-ready for enterprise deployment; v5.0 pivots to 
 
 ---
 
-## 2. Track 5: API consolidation pass
+## 2. Track 5: API consolidation pass — SHIPPED in v4.0.0
 
 ### 2.1 `api/security.py` — unified authorization
 
@@ -158,9 +181,11 @@ contracts = [
 
 ---
 
-## 3. Track 7: MCP-MD v1.0 stabilization + Linux Foundation AI & Data proposal track
+## 3. Track 7: MCP-MD v1.0 stabilization + Linux Foundation AI & Data proposal track — DEFERRED to v5.0+
 
-**Strategic context:** This assumes MCP-MD (MCP Model Discovery) and IRIS have shipped before v4.0. They did not ship in v3.5.0 or v3.5.1; treat this section as conditional forward-looking scope.
+**Strategic context:** This assumed MCP-MD (MCP Model Discovery) and IRIS would
+ship before v4.0. They did not. Treat this section as a v5.0+ foundation-tier
+standardization record.
 
 **v4.0 deliverables:**
 
@@ -189,9 +214,11 @@ The proposal follows LF's standard Sandbox project intake — no expedited track
 
 ---
 
-## 3. Track 3: IRIS expansion to full ETLANTIS operations discovery
+## 3. Track 3: IRIS expansion to full ETLANTIS operations discovery — DEFERRED to v4.1/v5.0
 
-**Strategic context:** Once IRIS exists for model discovery (capability-based selection of PANTHEON models), v4.0 generalizes IRIS to expose **all ETLANTIS operations** — not just models, but also compression engines, dream-state generators, time-series forecasters, etc. Agents query IRIS for "show me anomaly detectors with <3s latency" or "which clustering algorithm is most memory-efficient?" instead of hardcoding operation names.
+**Strategic context:** Once IRIS exists for model discovery (capability-based
+selection of PANTHEON models), later releases can generalize IRIS to expose
+operations beyond models. This did not ship in v4.0.
 
 ### 3.1 Extend IRIS tools + resources beyond models
 
@@ -225,7 +252,7 @@ This is the single source of truth for IRIS's operations discovery. Each subsyst
 
 ---
 
-## 3.3 SQLite "lite" profile (persistence abstraction first)
+## 3.3 SQLite "lite" profile (persistence abstraction first) — SHIPPED in v4.0.0
 
 ### 3.1 Persistence abstraction layer
 
@@ -302,7 +329,7 @@ pyinstaller --onefile mnemos-cli.spec
 
 ---
 
-## 4. Track 6: Surface integrations + MCP consolidation
+## 4. Track 6: Surface integrations + MCP consolidation — PARTIAL, remainder v4.1
 
 ### 4.1 MCP consolidation (unified tool source + IRIS integration)
 
@@ -718,18 +745,18 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 
 ---
 
-## 11. Effort estimate
+## 11. Effort estimate (historical)
 
 | Work stream | Effort (days) | Dependencies |
 |---|---|---|
-| Track 5: API consolidation | 7–8 | None (can start immediately) |
-| **Track 3: IRIS operations discovery expansion** | **4–5** | **None (can start in parallel with Track 5)** |
-| Track 5b: Persistence abstraction + SQLite | 8–10 | None (can start immediately) |
-| **Track 6: MCP consolidation (unified MNEMOS + IRIS server)** | **3** | **IRIS expansion (§3.1–3.2) should be complete before consolidation** |
-| Track 6b: Connectors gallery | 7–10 | MCP consolidation first, then connectors in parallel |
-| KRONOS / Tesseract GPU stack (with IRIS integration) | 5–6 | IRIS expansion (so health state flows to discovery) |
+| Track 5: API consolidation | 7–8 | ✅ shipped in v4.0.0 |
+| Track 3: IRIS operations discovery expansion | 4–5 | 🔵 deferred to v4.1/v5.0 |
+| Track 5b: Persistence abstraction + SQLite | 8–10 | ✅ shipped in v4.0.0 |
+| Track 6: MCP consolidation (unified MNEMOS + IRIS server) | 3 | 🔵 non-IRIS MCP surface shipped; IRIS consolidation deferred |
+| Track 6b: Connectors gallery | 7–10 | 🔵 v4.1 |
+| KRONOS / Tesseract GPU stack (with IRIS integration) | 5–6 | 🔵 deferred |
 | Security + compliance (token rotation, GDPR, audits) | 6–7 | Consolidation items first (so we know where security logic lives) |
-| Horizontal scaling (Redis) | 3–4 | Consolidation first |
+| Horizontal scaling (Redis) | 3–4 | ✅ shipped in v4.0.0 |
 | Docs + governance | 9 | All other items mostly done |
 
 **Total:** ~55–70 days focused work. **Calendar:** 7–9 weeks (2 dev-weeks/person in parallel). **Team:** 1–2 engineers.
@@ -738,30 +765,26 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 
 ---
 
-## 12. Success criteria
+## 12. v4.0.0 Success Criteria
 
-- ✅ All 9 handler files use centralized `api/security.py`, `api/pool.py`, `api/ids.py`.
-- ✅ **IRIS operations discovery** operational: agents query IRIS for compression engines, dream generators, anomaly detectors, forecasters + models; health state synchronized across subsystems.
-- ✅ **Unified MCP server** (`pantheon-mnemos`) serves both memory operations + discovery tools; separate IRIS server deprecated.
-- ✅ SQLite persistence layer works end-to-end (create memory → search → archive → restore on SQLite and Postgres).
-- ✅ Single-binary MNEMOS-CLI executable ships.
-- ✅ **IRIS adoption ecosystem:** Hermes, Continue, AutoGPT, CrewAI all ship with IRIS pre-configured (config-only; no code donations).
-- ✅ `docs/connectors/` covers 8+ surfaces with working smoke tests; includes IRIS discovery examples.
-- ✅ KRONOS (Tesseract) deployed; anomaly detection + forecasting producing actionable alerts; alerts reflected in IRIS health state.
-- ✅ Token rotation + revocation working; GDPR wipe path tested.
-- ✅ MCP tool surface audit clean (Codex adversarial review passed; includes discovery tools).
-- ✅ Horizontal scaling validated: 3-worker MNEMOS setup using Redis for shared state; load-test passes.
-- ✅ All docs (SECURITY.md, GOVERNANCE.md, CONTRIBUTING.md, PROJECT_POSTURE.md, IRIS_DISCOVERY.md, compression semantics, CHARON trust) published.
+- ✅ Codebase lives under coherent `mnemos/` package boundaries.
+- ✅ Persistence abstraction works with Postgres and SQLite.
+- ✅ `server`, `edge`, and `dev` profiles are selectable through settings or CLI.
+- ✅ Single-binary artifacts build for the official v4.0 matrix.
+- ✅ MCP memory tool surface remains unified across stdio and HTTP/SSE.
+- ✅ Horizontal scaling primitives use Redis when configured; in-process fallback warns for multi-worker.
+- ✅ Seven import-linter contracts enforce the package architecture.
+- 🔵 Connector gallery, IRIS, KRONOS, GDPR wipe path, and foundation-standardization work are explicitly deferred.
 
 ---
 
 ## 13. Post-v4.0 vision (v5.0+)
 
-**Once v4.0 GA lands:**
+**After v4.0 GA:**
 
 1. **Foundation visibility work** — academic papers on MNEMOS memory architecture + APOLLO compression (target: NeurIPS 2027, ICML workshops).
 2. **Sustained-quality upstream contributions** — small, high-value patches to MemPalace, Cognee, Graphiti, langgraph.
-3. **Rust ports** — `mnemos-rs` (same API, native performance).
+3. **Rust ports** — `mnemos-rs` and selected hot-path rewrites are deferred until the Python v4 architecture has production soak.
 4. **ETLANTIS Universe federation demo** — zeroclaw + zterm + MNEMOS + nclawzero agents sharing memory across system boundaries.
 5. **Foundation exploration** — once multi-implementer adoption is established, scope conversations with senior LF AI & Data practitioners about MNEMOS or MCP-MD as a potential LF-hosted project. No fast-track sought.
 
@@ -778,9 +801,9 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 | CHARON | ferryman | cross-system portability | ✅ v0.2 |
 | GRAEAE | gray sisters | multi-LLM consensus | ✅ core |
 | PANTHEON | temple of all gods | unified LLM gateway | 🔵 prerequisite / planned |
-| IRIS | messenger of the gods | MCP discovery + capability-based selection (models + all ETLANTIS ops) | 🔵 planned expansion |
-| KRONOS | titan of time | time-series anomaly + forecasting | ✅ Tesseract integrated |
-| PERSEPHONE | queen of the underworld | archival subsystem | ✅ v3.6 |
+| IRIS | messenger of the gods | MCP discovery + capability-based selection (models + all ETLANTIS ops) | 🔵 deferred to v4.1/v5.0 |
+| KRONOS | titan of time | time-series anomaly + forecasting | 🔵 deferred |
+| PERSEPHONE | queen of the underworld | archival subsystem | 🔵 deferred |
 
 ---
 
@@ -788,7 +811,10 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 
 - **v3.5 shipped reality:** audit hardening, uniform tenancy, webhook retry/outbox discipline, MCP registry parity, faithful OpenAI compatibility, streaming-replication doctrine, compression cleanup, and documentation triage in v3.5.1. PANTHEON/IRIS and APOLLO EXTRACT did not ship in v3.5.x.
 - **v3.6 charter:** CONSOLIDATE, PERSEPHONE, APOLLO S-IVB phases 3–4, IRIS second-wave adoption.
-- **v4.0 plan:** API consolidation, IRIS operations discovery expansion, unified MCP server, KRONOS integration.
+- **v4.0 shipped reality:** package/API consolidation, persistence abstraction,
+  SQLite profile, single-binary distribution, multi-worker Redis support, and
+  architectural enforcement. IRIS operations discovery, connector gallery
+  expansion, MCP-MD LF work, and KRONOS integration moved beyond v4.0.
 - **ROADMAP.md:** Full history + audit log.
 - **Existing docs:** PANTHEON.md, IRIS_DISCOVERY.md (new v4.0), DREAM_STATE_DESIGN.md, MEMORY_EXPORT_FORMAT.md, SPECIFICATION.md.
 - **ETLANTIS Universe repos:** zeroclaw, zterm, nclawzero, meta-nclawzero, pi-gen-nclawzero.

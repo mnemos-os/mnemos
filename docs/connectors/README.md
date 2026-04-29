@@ -6,8 +6,8 @@
 > Codex CLI). Defaults are off; configuration is opt-in; surface area is
 > intentionally narrow. APIs may change between minor releases without a
 > deprecation cycle until the surface is promoted to `stable` in a later
-> release. v3.5.0 shipped stdio/HTTP registry parity, but remote connector
-> packaging remains experimental.
+> release. v4.0.0 keeps stdio/HTTP registry parity in the `mnemos.mcp`
+> package, but broad remote connector packaging remains experimental.
 
 ## Audience
 
@@ -68,13 +68,12 @@ register it as a Custom Connector, paste the bearer token. See:
 
 ### Mobile / laptop tether to a home or SOHO MNEMOS
 
-The "MNEMOS Lite" laptop edition (planned v4.0) runs a single-tenant
-SQLite-backed MNEMOS locally and tethers to your authoritative
+The v4 `edge` profile runs a single-tenant SQLite-backed MNEMOS locally and
+tethers to your authoritative
 MNEMOS on a server via federation. Same MCP surface, offline-tolerant,
-conflict resolution via the existing version DAG. Until lite ships,
-power users use SSH port-forwarding or Tailscale to point a local
-agent at a remote MNEMOS — the MCP server doesn't care which transport
-delivers the bytes.
+conflict resolution via the existing version DAG. Power users can also use SSH
+port-forwarding or Tailscale to point a local agent at a remote MNEMOS; the MCP
+server does not care which transport delivers the bytes.
 
 ## Why we publish these as experimental
 
@@ -88,7 +87,7 @@ Three reasons:
    2026 building an installer-app for the consumer market — that's a
    different product with a different operations footprint. The
    connectors targeting that market (a hosted SaaS, a Tauri desktop
-   app) aren't on the roadmap. See `ROADMAP.md` for the v4.x charter.
+   app) are v5.0+ framing, not v4.0 scope. See `ROADMAP.md`.
 3. **We are not trying to displace MemPalace, OpenWebUI, Mem0, Letta,
    Graphiti, or Cognee**. Each of those serves a real audience well.
    MNEMOS exists for users who outgrew them or whose workload —
@@ -154,8 +153,8 @@ open to them. Public evidence:
 - **MemPalace, Mem0, Letta, Graphiti, Cognee**: bug reports and
   goodwill PRs as we encounter issues testing the CHARON adapters
   against real instances. The first wave of upstream MemPalace
-  contributions and KNOSSOS bridge RFC re-engagement is deferred after
-  v3.5.0. See `ROADMAP.md`.
+  contributions and KNOSSOS bridge RFC re-engagement remain staged work. See
+  `ROADMAP.md`.
 
 We'll grow this list as PRs land. The principle is simple: when
 KNOSSOS or CHARON adapters surface bugs in upstream memory systems,
