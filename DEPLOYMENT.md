@@ -436,6 +436,10 @@ curl -X GET http://localhost:5002/v1/providers/health \
   -H "Authorization: Bearer $MNEMOS_API_KEY"
 ```
 
+Consultation mode selection should match the task risk: use `single` for fast
+low-stakes checks, `auto` or `all` for general reasoning, `majority` for binary
+decisions where disagreement matters, and `debate` for high-stakes design calls.
+
 ### OpenAI-Compatible Gateway
 ```bash
 # POST /v1/chat/completions - OpenAI-compatible (with auto memory injection)

@@ -1,15 +1,27 @@
 """Pydantic models for MNEMOS API."""
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
 
+ConsultationMode = Literal["auto", "local", "external", "all", "single", "debate", "majority"]
+SUPPORTED_CONSULTATION_MODES: tuple[str, ...] = (
+    "auto",
+    "local",
+    "external",
+    "all",
+    "single",
+    "debate",
+    "majority",
+)
+
+
 class ConsultationRequest(BaseModel):
     prompt: str
-    task_type: Optional[str] = "reasoning"
+    task_type: str = "reasoning"
     context: Optional[str] = None
-    mode: Optional[str] = "auto"
+    mode: ConsultationMode = "auto"
     limit_chars: Optional[int] = None
     format: Optional[str] = "full"
 
@@ -364,6 +376,11 @@ class ConsultationResponse(BaseModel):
     latency_ms: Optional[float] = None
     mode: str
     timestamp: str
+    round_1: Optional[Dict[str, Any]] = None
+    round_2: Optional[Dict[str, Any]] = None
+    quorum_reached: Optional[bool] = None
+    quorum_threshold: Optional[float] = None
+    similarity_pairs: Optional[Dict[str, float]] = None
 
 
 class ConsultationArtifact(BaseModel):

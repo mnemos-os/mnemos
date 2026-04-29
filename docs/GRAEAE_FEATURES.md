@@ -41,6 +41,21 @@ these guards to shared/external coordination is future horizontal-scaling work.
   `GET /v1/providers/recommend` — provider inventory, status, and cost-aware
   recommendation.
 
+## Consultation Modes
+
+`POST /v1/consultations` accepts seven modes. Unknown modes are rejected by
+request validation with HTTP 422.
+
+| Mode | Shape | Semantics |
+|---|---|---|
+| `auto` | Routing strategy | Use the engine's default routing for the task type. |
+| `local` | Routing strategy | Force local-only muses where configured. |
+| `external` | Routing strategy | Force external commercial muses where configured. |
+| `all` | Routing strategy | Fan out to every available muse. |
+| `single` | Reasoning shape | Pick exactly one highest-weighted muse; use for fast, low-stakes, or cost-floor consultations. |
+| `debate` | Reasoning shape | Run a two-round cross-muse argument: round 1 fans out, round 2 gives each muse the others' responses for refinement. |
+| `majority` | Reasoning shape | Query up to three muses and report whether pairwise similarity reached the quorum threshold. If quorum is missed, responses still return with `quorum_reached: false`. |
+
 OpenAI-compatible access is separate but uses the same routing engine:
 `POST /v1/chat/completions`, `GET /v1/models`, and `GET /v1/models/{model_id}`.
 In v3.5.x, generation controls propagate when the selected provider supports

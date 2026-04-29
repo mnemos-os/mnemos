@@ -14,7 +14,7 @@ pytestmark = [
 
 
 class _FakeGraeae:
-    async def consult(self, prompt: str, task_type: str | None, selection=None):
+    async def consult(self, prompt: str, task_type: str | None, selection=None, mode: str = "auto"):
         return {
             "all_responses": {
                 "openai": {

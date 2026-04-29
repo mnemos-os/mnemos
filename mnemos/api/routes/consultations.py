@@ -20,6 +20,7 @@ from mnemos.domain.models import (
     ConsultationArtifact,
     ConsultationRequest,
     ConsultationResponse,
+    SUPPORTED_CONSULTATION_MODES,
 )
 
 logger = logging.getLogger(__name__)
@@ -308,6 +309,19 @@ def _extract_memory_ids(result: dict) -> List[str]:
     return memory_ids
 
 
+def _require_non_empty_consultation_result(result: object, mode: str) -> dict:
+    """Fail loudly instead of letting an empty engine result serialize as success."""
+    if not isinstance(result, dict) or not result:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "GRAEAE consultation returned an empty result "
+                f"for mode={mode!r}; refusing to return HTTP 200 with an empty body."
+            ),
+        )
+    return result
+
+
 # ── Consultation endpoint ─────────────────────────────────────────────────────
 
 @router.post("/consultations", response_model=ConsultationResponse)
@@ -339,8 +353,9 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         )
 
         result = await engine.consult(
-            body.prompt, body.task_type, selection=selection,
+            body.prompt, body.task_type, selection=selection, mode=body.mode,
         )
+        result = _require_non_empty_consultation_result(result, body.mode)
 
         if body.limit_chars and result.get("all_responses"):
             for provider, resp in result["all_responses"].items():
@@ -398,7 +413,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                             winning_muse,
                             engine_cost,
                             engine_latency_ms,
-                            body.mode or "auto",
+                            body.mode,
                             user.user_id,
                             user.namespace,
                         )
@@ -456,8 +471,13 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             winning_muse=result.get("winning_muse"),
             cost=result.get("cost"),
             latency_ms=result.get("latency_ms"),
-            mode=body.mode or "auto",
+            mode=body.mode,
             timestamp=result.get("timestamp", ""),
+            round_1=result.get("round_1"),
+            round_2=result.get("round_2"),
+            quorum_reached=result.get("quorum_reached"),
+            quorum_threshold=result.get("quorum_threshold"),
+            similarity_pairs=result.get("similarity_pairs"),
         )
 
     except HTTPException:
@@ -745,14 +765,46 @@ async def list_muses(_: UserContext = Depends(get_current_user)):
 
 @router.get("/consultations/modes")
 async def list_modes(_: UserContext = Depends(get_current_user)):
-    """List supported consultation routing modes."""
+    """List supported consultation routing and reasoning-shape modes."""
     return {
         "modes": [
-            {"name": "auto",     "description": "engine picks based on task_type"},
-            {"name": "local",    "description": "force local-only muses (no commercial APIs)"},
-            {"name": "external", "description": "force external commercial muses"},
-            {"name": "all",      "description": "fan out to every available muse"},
-        ]
+            {
+                "name": "auto",
+                "description": "engine picks the default routing strategy based on task_type",
+            },
+            {
+                "name": "local",
+                "description": "force local-only muses where configured (no commercial APIs)",
+            },
+            {
+                "name": "external",
+                "description": "force external commercial muses where configured",
+            },
+            {
+                "name": "all",
+                "description": "fan out to every available muse",
+            },
+            {
+                "name": "single",
+                "description": "pick exactly one highest-weighted muse; fastest and lowest-cost path",
+            },
+            {
+                "name": "debate",
+                "description": "run a two-round cross-muse debate and return the refined round",
+            },
+            {
+                "name": "majority",
+                "description": "fan out to up to three muses and report whether quorum agreement was reached",
+            },
+        ],
+        "validation": {
+            "supported": list(SUPPORTED_CONSULTATION_MODES),
+            "unknown_mode_status": 422,
+            "unknown_mode_detail": (
+                "The request schema validates mode with a Pydantic Literal; "
+                "unknown modes are rejected before business logic runs."
+            ),
+        },
     }
 
 

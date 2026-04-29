@@ -33,10 +33,13 @@ Reliability stack (innermost to outermost):
 import asyncio
 import json
 import logging
+import math
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from difflib import SequenceMatcher
+from itertools import combinations
 from typing import Any, Dict, Optional
 
 import httpx
@@ -587,6 +590,7 @@ class GraeaeEngine:
         task_type: str = "reasoning",
         timeout: int = 180,
         selection: Optional[Dict[str, Optional[str]]] = None,
+        mode: str = "auto",
     ) -> Dict:
         """Query eligible providers in parallel and return all responses.
 
@@ -601,6 +605,21 @@ class GraeaeEngine:
         registered provider is considered (current auto-lineup).
         """
         task_type = task_type or "reasoning"
+        mode = mode or "auto"
+        if mode == "single":
+            return await self.route_single(
+                prompt, task_type, timeout=timeout, selection=selection,
+            )
+        if mode == "debate":
+            return await self.route_debate(
+                prompt, task_type, timeout=timeout, selection=selection,
+            )
+        if mode == "majority":
+            return await self.route_majority(
+                prompt, task_type, timeout=timeout, selection=selection,
+            )
+        if mode not in {"auto", "local", "external", "all"}:
+            raise ValueError(f"unsupported consultation mode {mode!r}")
 
         # ── Cache check ──────────────────────────────────────────────────────
         # Include the selection (or lack thereof) in the cache key so a
@@ -611,7 +630,7 @@ class GraeaeEngine:
         cached = self._cache.get(prompt, cache_key_task)
         if cached is not None:
             logger.info(f"[GRAEAE] cache hit (task_type={cache_key_task})")
-            return {"all_responses": cached, "cache_hit": True}
+            return {"all_responses": cached, "cache_hit": True, **_compute_consensus(cached)}
 
         concurrency = self._get_concurrency()
 
@@ -714,6 +733,189 @@ class GraeaeEngine:
         # aspirational.
         consensus = _compute_consensus(all_responses)
         return {"all_responses": all_responses, **consensus}
+
+    async def route_single(
+        self,
+        prompt: str,
+        task_type: str = "reasoning",
+        timeout: int = 180,
+        selection: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict:
+        """Run exactly one highest-weighted muse for the task."""
+        lineup = await self._ranked_lineup(
+            task_type=task_type, limit=1, selection=selection,
+        )
+        if not lineup:
+            return {"all_responses": {}, "error": "no providers available", **_compute_consensus({})}
+        return await self.consult(
+            prompt, task_type, timeout=timeout, selection=lineup, mode="all",
+        )
+
+    async def route_debate(
+        self,
+        prompt: str,
+        task_type: str = "reasoning",
+        timeout: int = 180,
+        rounds: int = 2,
+        selection: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict:
+        """Run a two-round cross-muse debate and return refined responses."""
+        lineup = await self._ranked_lineup(
+            task_type=task_type, limit=3, selection=selection,
+        )
+        if not lineup:
+            empty = _compute_consensus({})
+            return {
+                "all_responses": {},
+                "round_1": {},
+                "round_2": {},
+                "error": "no providers available",
+                **empty,
+            }
+
+        round_1 = await self.consult(
+            prompt, task_type, timeout=timeout, selection=lineup, mode="all",
+        )
+        round_1_responses = round_1.get("all_responses", {})
+        if rounds < 2:
+            return {
+                "all_responses": round_1_responses,
+                "round_1": round_1_responses,
+                "round_2": {},
+                **_compute_consensus(round_1_responses),
+            }
+
+        round_2_responses: Dict[str, Dict] = {}
+        for provider_name, model_override in lineup.items():
+            refine_prompt = _debate_refinement_prompt(
+                prompt=prompt,
+                current_muse=provider_name,
+                round_1_responses=round_1_responses,
+            )
+            refined = await self.consult(
+                refine_prompt,
+                task_type,
+                timeout=timeout,
+                selection={provider_name: model_override},
+                mode="all",
+            )
+            round_2_responses[provider_name] = (
+                refined.get("all_responses", {}).get(provider_name)
+                or _unavailable(self.providers[provider_name]["model"])
+            )
+
+        consensus = _compute_consensus(round_2_responses)
+        return {
+            "all_responses": round_2_responses,
+            "round_1": round_1_responses,
+            "round_2": round_2_responses,
+            **consensus,
+            "cost": float(round_1.get("cost", 0.0) or 0.0) + float(consensus.get("cost", 0.0) or 0.0),
+            "latency_ms": int(round_1.get("latency_ms", 0) or 0) + int(consensus.get("latency_ms", 0) or 0),
+        }
+
+    async def route_majority(
+        self,
+        prompt: str,
+        task_type: str = "reasoning",
+        timeout: int = 180,
+        quorum: float = 0.66,
+        selection: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict:
+        """Run up to three muses and report quorum agreement."""
+        lineup = await self._ranked_lineup(
+            task_type=task_type, limit=3, selection=selection,
+        )
+        result = await self.consult(
+            prompt, task_type, timeout=timeout, selection=lineup or selection, mode="all",
+        )
+        all_responses = result.get("all_responses", {})
+        quorum_result = _compute_quorum(all_responses, quorum)
+        consensus = _compute_consensus(all_responses)
+        consensus["consensus_score"] = quorum_result["consensus_score"]
+        if quorum_result["quorum_reached"] and quorum_result["quorum_muses"]:
+            winning_muse = max(
+                quorum_result["quorum_muses"],
+                key=lambda name: all_responses[name].get("final_score", 0.0),
+            )
+            consensus["winning_muse"] = winning_muse
+            consensus["consensus_response"] = all_responses[winning_muse].get("response_text", "")
+
+        return {
+            **result,
+            **consensus,
+            "quorum_reached": quorum_result["quorum_reached"],
+            "quorum_threshold": quorum,
+            "similarity_pairs": quorum_result["similarity_pairs"],
+        }
+
+    async def _ranked_lineup(
+        self,
+        task_type: str,
+        limit: int,
+        selection: Optional[Dict[str, Optional[str]]] = None,
+    ) -> Dict[str, Optional[str]]:
+        """Pick the highest-weighted providers, preferring model_registry weights."""
+        del task_type  # model_registry stores graeae_weight globally today.
+        candidates = [
+            name for name in (selection.keys() if selection is not None else self.providers.keys())
+            if name in self.providers
+        ]
+        if not candidates:
+            return {}
+
+        ranked: list[tuple[str, Optional[str], float]] = []
+        try:
+            import mnemos.core.lifecycle as _lc
+
+            if _lc._pool:
+                registry_names = [
+                    _REGISTRY_MAP.get(name, {}).get("registry_provider", name)
+                    for name in candidates
+                ]
+                registry_to_graeae = {
+                    cfg["registry_provider"]: name
+                    for name, cfg in _REGISTRY_MAP.items()
+                }
+                async with _lc._pool.acquire() as conn:
+                    rows = await conn.fetch(
+                        """
+                        SELECT provider, model_id, graeae_weight
+                        FROM model_registry
+                        WHERE provider = ANY($1::text[])
+                          AND available = true
+                          AND deprecated = false
+                        ORDER BY graeae_weight DESC NULLS LAST
+                        """,
+                        registry_names,
+                    )
+                seen: set[str] = set()
+                for row in rows:
+                    registry_provider = _row_get(row, "provider")
+                    name = registry_to_graeae.get(registry_provider, registry_provider)
+                    if name not in candidates or name in seen:
+                        continue
+                    model_override = selection.get(name) if selection else None
+                    ranked.append((
+                        name,
+                        model_override or _row_get(row, "model_id"),
+                        float(_row_get(row, "graeae_weight", self.providers[name].get("weight", 0.0)) or 0.0),
+                    ))
+                    seen.add(name)
+        except Exception as exc:
+            logger.debug("[GRAEAE] model_registry ranking unavailable: %s", exc)
+
+        ranked_names = {name for name, _, _ in ranked}
+        for name in candidates:
+            if name in ranked_names:
+                continue
+            ranked.append((
+                name,
+                selection.get(name) if selection else None,
+                float(self.providers[name].get("weight", 0.0) or 0.0),
+            ))
+        ranked.sort(key=lambda item: item[2], reverse=True)
+        return {name: model_override for name, model_override, _ in ranked[:limit]}
 
     async def route(
         self,
@@ -1349,6 +1551,107 @@ def _compute_consensus(all_responses: Dict[str, Dict]) -> Dict:
         "winning_muse": winner_name,
         "cost": total_cost,
         "latency_ms": max_latency,
+    }
+
+
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    if hasattr(row, "get"):
+        return row.get(key, default)
+    try:
+        return row[key]
+    except (KeyError, TypeError):
+        return default
+
+
+def _debate_refinement_prompt(
+    prompt: str,
+    current_muse: str,
+    round_1_responses: Dict[str, Dict],
+) -> str:
+    others: list[str] = []
+    for name, response in round_1_responses.items():
+        if name == current_muse:
+            continue
+        text = str(response.get("response_text") or "").strip()
+        if text:
+            others.append(f"{name}: {text}")
+    context = "\n\n".join(others) if others else "No other round-1 responses were available."
+    return (
+        "Original consultation prompt:\n"
+        f"{prompt}\n\n"
+        "Round 1 responses from the other muses:\n"
+        f"{context}\n\n"
+        "Refine your answer. Address useful objections, keep what still holds, "
+        "and be explicit where you disagree."
+    )
+
+
+def _text_similarity(left: str, right: str) -> float:
+    left = " ".join(left.lower().split())
+    right = " ".join(right.lower().split())
+    if not left or not right:
+        return 0.0
+    return float(SequenceMatcher(None, left, right).ratio())
+
+
+def _compute_quorum(all_responses: Dict[str, Dict], quorum: float) -> Dict[str, Any]:
+    successes = {
+        name: str(resp.get("response_text") or "").strip()
+        for name, resp in all_responses.items()
+        if resp.get("status") == "success" and str(resp.get("response_text") or "").strip()
+    }
+    if len(successes) < 2:
+        return {
+            "quorum_reached": False,
+            "quorum_muses": [],
+            "consensus_score": 0.0,
+            "similarity_pairs": {},
+        }
+
+    parent = {name: name for name in successes}
+
+    def find(name: str) -> str:
+        while parent[name] != name:
+            parent[name] = parent[parent[name]]
+            name = parent[name]
+        return name
+
+    def union(left: str, right: str) -> None:
+        left_root = find(left)
+        right_root = find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+
+    similarity_pairs: dict[str, float] = {}
+    best_score = 0.0
+    for left, right in combinations(successes, 2):
+        score = _text_similarity(successes[left], successes[right])
+        similarity_pairs[f"{left}:{right}"] = round(score, 4)
+        best_score = max(best_score, score)
+        if score >= quorum:
+            union(left, right)
+
+    components: dict[str, list[str]] = {}
+    for name in successes:
+        components.setdefault(find(name), []).append(name)
+    quorum_size = max(2, math.ceil(quorum * len(successes)))
+    quorum_muses = max(components.values(), key=len)
+    quorum_reached = len(quorum_muses) >= quorum_size
+
+    if quorum_reached and len(quorum_muses) > 1:
+        component_scores = [
+            similarity_pairs.get(f"{left}:{right}", similarity_pairs.get(f"{right}:{left}", 0.0))
+            for left, right in combinations(quorum_muses, 2)
+        ]
+        consensus_score = max(component_scores) if component_scores else best_score
+    else:
+        consensus_score = min(best_score, max(0.0, quorum - 0.01))
+
+    return {
+        "quorum_reached": quorum_reached,
+        "quorum_muses": quorum_muses if quorum_reached else [],
+        "consensus_score": round(float(consensus_score), 4),
+        "similarity_pairs": similarity_pairs,
     }
 
 
