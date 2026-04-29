@@ -8,6 +8,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
 
 [database]
+backend = "postgres"        # postgres for server, sqlite for edge/dev
+sqlite_path = "~/.mnemos/mnemos.db"
 host = "localhost"
 port = 5432
 database = "mnemos"
@@ -197,13 +199,14 @@ audit_logging = true
 semantic_search = true
 
 # ── Deployment profile ─────────────────────────────────────────────────────────
-# personal  — single user, no auth, no RLS
-# team      — multi-user, bearer auth, RLS enabled
-# enterprise — team + namespace isolation
+# server — Postgres + Redis production deployment
+# edge   — SQLite all-in-one laptop/Pi/edge deployment
+# dev    — SQLite + debug logging for local development
+# legacy personal resolves to edge
 [deployment]
-profile = "personal"
+profile = "server"
 
-# ── Auth (personal profile: disabled by default) ───────────────────────────────
+# ── Auth (edge/dev profiles: disabled by default) ──────────────────────────────
 [auth]
 enabled = true          # Enable bearer token auth; create root key with: python3 install.py
 personal_user_id = "default"

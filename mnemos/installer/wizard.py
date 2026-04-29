@@ -14,12 +14,13 @@ from .detect import SystemInfo, check_port_free
 
 @dataclass
 class Config:
-    profile: str = "personal"       # 'personal', 'team', 'enterprise'
+    profile: str = "edge"           # 'server', 'edge', 'dev'
     db_host: str = "localhost"
     db_port: int = 5432
     db_name: str = "mnemos"
     db_user: str = "mnemos_user"
     db_password: str = ""
+    sqlite_path: str = "~/.mnemos/mnemos.db"
     listen_port: int = 5002
     service_user: str = "mnemos"
     auth_enabled: bool = False       # False for personal
@@ -96,7 +97,11 @@ def _section(title: str) -> None:
     print(f"\n--- {title} ---")
 
 
-def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
+def _profile_uses_sqlite(profile: str) -> bool:
+    return profile in {"edge", "dev"}
+
+
+def run_wizard(info: SystemInfo, existing_config: dict = None, selected_profile: str | None = None) -> Config:
     """Run the interactive installation wizard and return a Config."""
     cfg = Config()
 
@@ -117,53 +122,57 @@ def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
     # ------------------------------------------------------------------ #
     _section("Deployment Profile")
     print("  Profiles:")
-    print("    personal   — single user, no auth, simple setup")
-    print("    team       — multi-user, API key auth, row-level security")
-    print("    enterprise — team + advanced auditing and RBAC")
+    print("    server — Postgres + Redis + multi-worker production deployment")
+    print("    edge   — SQLite + single-worker laptop/Pi/edge appliance")
+    print("    dev    — SQLite + debug logging for local development")
 
-    while True:
-        raw = _prompt("Select profile", default="personal")
-        if raw in ("personal", "team", "enterprise"):
-            cfg.profile = raw
-            break
-        print("  Choose: personal, team, or enterprise.")
+    if selected_profile:
+        cfg.profile = selected_profile
+    else:
+        while True:
+            raw = _prompt("Select profile", default="edge")
+            if raw == "personal":
+                raw = "edge"
+            if raw in ("server", "edge", "dev"):
+                cfg.profile = raw
+                break
+            print("  Choose: server, edge, or dev. Legacy personal maps to edge.")
 
-    cfg.auth_enabled = cfg.profile in ("team", "enterprise")
-    cfg.rls_enabled = cfg.profile == "enterprise"
+    cfg.auth_enabled = False
+    cfg.rls_enabled = False
 
     # ------------------------------------------------------------------ #
     # 2. Database
     # ------------------------------------------------------------------ #
     _section("Database Configuration")
 
-    if cfg.profile == "personal":
-        cfg.create_new_db = _prompt_bool(
-            "Create a new PostgreSQL database (No = use existing)?", default=True
-        )
+    if _profile_uses_sqlite(cfg.profile):
+        cfg.create_new_db = True
+        cfg.sqlite_path = _prompt("SQLite database path", default=cfg.sqlite_path)
     else:
         cfg.create_new_db = _prompt_bool("Create a new PostgreSQL database?", default=True)
 
-    cfg.db_host = _prompt("Database host", default="localhost")
-    cfg.db_port = _prompt_int("Database port", default=5432)
-    cfg.db_name = _prompt("Database name", default="mnemos")
-    cfg.db_user = _prompt("Database user", default="mnemos_user")
+        cfg.db_host = _prompt("Database host", default="localhost")
+        cfg.db_port = _prompt_int("Database port", default=5432)
+        cfg.db_name = _prompt("Database name", default="mnemos")
+        cfg.db_user = _prompt("Database user", default="mnemos_user")
 
-    if cfg.create_new_db:
-        offer_generate = _prompt_bool("Generate a random database password?", default=True)
-        if offer_generate:
-            cfg.db_password = _generate_password()
-            print(f"  Generated password: {cfg.db_password}")
-            print("  (Save this — it will be written to /etc/mnemos/mnemos.env)")
+        if cfg.create_new_db:
+            offer_generate = _prompt_bool("Generate a random database password?", default=True)
+            if offer_generate:
+                cfg.db_password = _generate_password()
+                print(f"  Generated password: {cfg.db_password}")
+                print("  (Save this — it will be written to /etc/mnemos/mnemos.env)")
+            else:
+                while True:
+                    pw = getpass.getpass("  Database password: ")
+                    pw2 = getpass.getpass("  Confirm password: ")
+                    if pw == pw2 and pw:
+                        cfg.db_password = pw
+                        break
+                    print("  Passwords do not match or are empty. Try again.")
         else:
-            while True:
-                pw = getpass.getpass("  Database password: ")
-                pw2 = getpass.getpass("  Confirm password: ")
-                if pw == pw2 and pw:
-                    cfg.db_password = pw
-                    break
-                print("  Passwords do not match or are empty. Try again.")
-    else:
-        cfg.db_password = getpass.getpass("  Database password: ")
+            cfg.db_password = getpass.getpass("  Database password: ")
 
     # ------------------------------------------------------------------ #
     # 3. Listen port
@@ -196,7 +205,7 @@ def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
     _section("GRAEAE Provider API Keys (optional)")
 
     configure_providers = False
-    if cfg.profile == "personal":
+    if cfg.profile in {"edge", "dev"}:
         configure_providers = _prompt_bool(
             "Configure LLM provider API keys for GRAEAE reasoning?", default=False
         )
@@ -247,8 +256,11 @@ def run_wizard(info: SystemInfo, existing_config: dict = None) -> Config:
     # ------------------------------------------------------------------ #
     _section("Confirm Configuration")
     print(f"  Profile:         {cfg.profile}")
-    print(f"  Database:        postgresql://{cfg.db_user}@{cfg.db_host}:{cfg.db_port}/{cfg.db_name}")
-    print(f"  Create new DB:   {cfg.create_new_db}")
+    if _profile_uses_sqlite(cfg.profile):
+        print(f"  Database:        sqlite:///{cfg.sqlite_path}")
+    else:
+        print(f"  Database:        postgresql://{cfg.db_user}@{cfg.db_host}:{cfg.db_port}/{cfg.db_name}")
+        print(f"  Create new DB:   {cfg.create_new_db}")
     print(f"  Listen port:     {cfg.listen_port}")
     print(f"  Service user:    {cfg.service_user}")
     print(f"  Auth enabled:    {cfg.auth_enabled}")

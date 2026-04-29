@@ -48,6 +48,10 @@ def _run(
         return 1, "", str(exc)
 
 
+def _profile_uses_sqlite(profile: str) -> bool:
+    return profile in {"edge", "dev"}
+
+
 def _psql_superuser(sql: str, dbname: str = "postgres", timeout: int = 30) -> tuple[int, str, str]:
     """Run SQL as the postgres superuser via sudo."""
     return _run(
@@ -68,6 +72,9 @@ def _psql_superuser_file(filepath: str, dbname: str, timeout: int = 120) -> tupl
 
 def verify_connection(config: Config) -> bool:
     """Verify we can connect to the target database."""
+    if _profile_uses_sqlite(config.profile):
+        return Path(config.sqlite_path).expanduser().exists()
+
     env = os.environ.copy()
     env["PGPASSWORD"] = config.db_password
 
@@ -111,6 +118,32 @@ def verify_connection(config: Config) -> bool:
         pass
 
     return False
+
+
+def setup_sqlite_database(config: Config) -> bool:
+    """Create and migrate the SQLite database through the SQLite backend."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from mnemos.persistence.sqlite import SqliteBackend
+
+    db_path = Path(config.sqlite_path).expanduser()
+    print(f"[db] Initializing SQLite database at {db_path}...")
+
+    async def _setup() -> bool:
+        backend = SqliteBackend(db_path, SimpleNamespace())
+        try:
+            await backend.open()
+            print(f"[db] SQLite database ready. sqlite-vec loaded: {backend.vec_loaded}")
+            return True
+        finally:
+            await backend.close()
+
+    try:
+        return asyncio.run(_setup())
+    except Exception as exc:
+        print(f"[db] ERROR initializing SQLite database: {exc}", file=sys.stderr)
+        return False
 
 
 def pgvector_installed(config: Config) -> bool:

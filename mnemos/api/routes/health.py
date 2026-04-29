@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
+from mnemos.core.config import get_settings
 from mnemos.domain.models import HealthResponse, StatsResponse
 
 logger = logging.getLogger(__name__)
@@ -25,6 +26,8 @@ async def health_check() -> HealthResponse:
             db_ok = True
         except Exception as e:
             logger.warning(f"[HEALTH] DB probe failed: {e}")
+    elif _lc._persistence_backend is not None:
+        db_ok = True
 
     # Get worker status
     worker_status = _lc._worker_status.get("distillation_worker", "unknown")
@@ -35,6 +38,7 @@ async def health_check() -> HealthResponse:
         database_connected=db_ok,
         version=_MNEMOS_VERSION,
         distillation_worker=worker_status,
+        profile=get_settings().profile,
     )
 
 

@@ -24,7 +24,7 @@ You can treat MNEMOS like a memory storage provider if you want — `POST /v1/me
 
 **What it is, concretely:**
 
-- A FastAPI service (port 5002), PostgreSQL + pgvector backed. Python 3.11+. Apache-2.0.
+- A FastAPI service (port 5002), with `server` (Postgres + Redis), `edge` (SQLite), and `dev` (SQLite + debug logging) deployment profiles. Python 3.11+. Apache-2.0.
 - A single `/v1/*` REST surface covering memories, consultations, providers, sessions, webhooks, federation, and an OpenAI-compatible chat-completions gateway.
 - A multi-LLM consensus reasoning layer (GRAEAE) that distributes one prompt across multiple providers, scores the responses, and writes a tamper-evident SHA-256 hash-chained audit entry — every time.
 - Git-like DAG versioning on memory: `log`, `branch`, `merge`, `revert`. Every mutation snapshots. In v3.5.x, history reads are filtered per snapshot and branch writers refuse cross-memory parent edges.
@@ -59,7 +59,7 @@ Current MCP tools come from one registry shared by stdio and HTTP/SSE: `search_m
 
 The integrations bundle under [`integrations/`](./integrations/) is the living inventory. New integrations ship as SKILL.md + MCP config + enforcement snippet per framework, plus idempotent install/uninstall scripts where the target framework supports them.
 
-MNEMOS runs as a network service — you deploy it once, alongside PostgreSQL and Redis, and every agent in your stack shares the same memory kernel over REST. It is not a desktop library, not an in-process helper, not a framework you import. Different form factor, different user, and specifically not a replacement for projects like MemPalace that serve the desktop / single-user case well.
+MNEMOS runs as a network service. In the `server` profile you deploy it alongside PostgreSQL and Redis so every agent in your stack shares the same memory kernel over REST; in the `edge` profile it runs as an all-in-one SQLite-backed node for laptops, Pi-class systems, and phone-adjacent installs. It is not an in-process helper or a framework you import.
 
 ---
 
@@ -224,15 +224,18 @@ Each memory carries full ownership and LLM provenance. Since v3.2, tenancy is tw
 - `source_session` — session ID at time of creation
 - `source_agent` — agent name or identifier
 
-**Row Level Security** is defined in PostgreSQL but inactive for personal installs. Team/enterprise installs activate it via `install.py`, which enforces per-row access at the database layer. The application layer mirrors the RLS read contract so personal-mode and RLS-backed installs behave consistently. v3.5.x closes task #25 with `db/migrations_v3_5_rls_group_select_unix_bits.sql`: `read_visibility_predicate` and the `mnemos_group_select` RLS policy now use identical Unix group-bit math, `((permission_mode / 10) % 10) >= 4`.
+**Row Level Security** is defined in PostgreSQL and remains opt-in for multi-user server deployments. The application layer mirrors the RLS read contract so SQLite/edge installs and RLS-backed server installs behave consistently. v3.5.x closes task #25 with `db/migrations_v3_5_rls_group_select_unix_bits.sql`: `read_visibility_predicate` and the `mnemos_group_select` RLS policy now use identical Unix group-bit math, `((permission_mode / 10) % 10) >= 4`.
 
-**Deployment profiles** — selected at install time via `python install.py`:
+**Deployment topologies** — selected with `mnemos install --profile ...`,
+`mnemos serve --profile ...`, or `MNEMOS_PROFILE`:
 
-| Profile | Auth | RLS | Use case |
-|---------|------|-----|---------|
-| Personal | off | off | Single developer, localhost |
-| Team | API key | on | 2–20 users, shared PostgreSQL |
-| Enterprise | API key | on | 20+ users, full namespace isolation |
+| Profile | Backend | Shared state | Use case |
+|---------|---------|--------------|----------|
+| `server` | PostgreSQL | Redis | Production service, shared agents, multi-worker capable |
+| `edge` | SQLite | In-process | Laptop, Pi/edge appliance, Consumer MNEMOS, Termux on S21 |
+| `dev` | SQLite | In-process | Local development with debug logging |
+
+`personal` is the legacy v3.x profile name and now resolves to `edge`.
 
 Search hits update recall telemetry in the background: `recall_count` increments and `last_recalled_at` is set for the returned memory IDs. The counters are observability and future archival input, not authorization state; failures are logged and do not block the user-visible search response.
 
@@ -596,7 +599,7 @@ knowledge_graph
 
 ## Quick start
 
-### Personal install (Docker Compose)
+### Edge install (Docker Compose)
 
 ```bash
 git clone <your-repo-url>
@@ -613,8 +616,8 @@ git clone <your-repo-url>
 cd mnemos
 pip install -r requirements.txt
 python install.py
-# Prompts for: deployment profile, database connection, provider API keys
-# Writes config.toml, runs migrations, creates root API key (team/enterprise)
+# Prompts for: server, edge, or dev profile; database path/connection; provider API keys
+# Writes config.toml and initializes SQLite or Postgres as appropriate
 ```
 
 ### Manual database setup (if not using install.py)

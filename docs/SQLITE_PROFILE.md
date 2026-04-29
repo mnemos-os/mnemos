@@ -6,6 +6,9 @@ the same persistence interface as `PostgresBackend`, but uses SQLite storage,
 FTS5, JSON1-compatible JSON text, and `sqlite-vec` when the extension is
 available.
 
+For profile selection and the server/edge/dev deployment matrix, start with
+the "Choose Your Profile" section in [`DEPLOYMENT.md`](../DEPLOYMENT.md#choose-your-profile).
+
 ## When To Use It
 
 Use SQLite when you want a local MNEMOS node with minimal operational surface:
@@ -56,21 +59,28 @@ Install the optional dependencies:
 pip install "mnemos-os[sqlite]"
 ```
 
-Select SQLite explicitly:
+Prefer the profile flag:
+
+```bash
+mnemos serve --profile edge
+mnemos serve --profile dev
+```
+
+Select SQLite explicitly when you need to override the profile default:
 
 ```bash
 MNEMOS_PERSISTENCE_BACKEND=sqlite
-MNEMOS_SQLITE_PATH=/var/lib/mnemos/mnemos.sqlite3
+MNEMOS_SQLITE_PATH=/var/lib/mnemos/mnemos.db
 ```
 
 Or use URI auto-detection:
 
 ```bash
 MNEMOS_PERSISTENCE_BACKEND=auto
-MNEMOS_DATABASE_URL=sqlite:////var/lib/mnemos/mnemos.sqlite3
+MNEMOS_DATABASE_URL=sqlite:////var/lib/mnemos/mnemos.db
 ```
 
-Postgres remains the default backend.
+The legacy `personal` profile name resolves to `edge`.
 
 ## Operational Notes
 

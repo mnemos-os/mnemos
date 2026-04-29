@@ -12,6 +12,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Optional, Protocol
 from urllib.parse import urlparse
 
@@ -222,33 +223,92 @@ def _select_persistence_backend(settings) -> str:
     database_settings = getattr(settings, "database", None)
     if database_settings is None:
         return "postgres"
+    explicit_database_fields = _explicit_fields(settings, "database")
     configured = getattr(database_settings, "backend", "auto").strip().lower()
-    database_url = getattr(database_settings, "url", "").strip().lower()
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip().lower()
+        if database_url and field_name in explicit_database_fields:
+            url_backend = _backend_from_database_url(database_url)
+            return url_backend or "postgres"
+
+    if "backend" in explicit_database_fields and configured != "auto":
+        return _normalize_backend_name(configured)
+    if _has_explicit_postgres_connection_config(settings):
+        return "postgres"
+    if configured != "auto":
+        return _normalize_backend_name(configured)
+
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip().lower()
+        url_backend = _backend_from_database_url(database_url)
+        if url_backend is not None:
+            return url_backend
+
+    profile = getattr(settings, "profile", getattr(getattr(settings, "server", None), "profile", "server"))
+    if profile in {"edge", "dev"}:
+        return "sqlite"
+    return "postgres"
+
+
+def _normalize_backend_name(configured: str) -> str:
     if configured in {"postgres", "postgresql", "pg"}:
         return "postgres"
     if configured in {"sqlite", "sqlite3"}:
         return "sqlite"
     if configured == "auto":
-        if database_url.startswith("sqlite:"):
-            return "sqlite"
-        if database_url.startswith(("postgres:", "postgresql:")):
-            return "postgres"
-        return "postgres"
+        return "auto"
     raise ValueError(
-        "Unsupported persistence backend "
-        f"{settings.database.backend!r}; expected postgres, sqlite, or auto"
+        f"Unsupported persistence backend {configured!r}; expected postgres, sqlite, or auto"
     )
+
+
+def _backend_from_database_url(database_url: str) -> str | None:
+    if database_url.startswith("sqlite:"):
+        return "sqlite"
+    if database_url.startswith(("postgres:", "postgresql:")):
+        return "postgres"
+    return None
+
+
+def _explicit_fields(settings, group: str) -> set[str]:
+    explicit_fields = getattr(settings, "explicit_fields", None)
+    if callable(explicit_fields):
+        return explicit_fields(group)
+    return set()
+
+
+def _has_explicit_postgres_connection_config(settings) -> bool:
+    explicit_database_fields = _explicit_fields(settings, "database")
+    return bool(explicit_database_fields & {"host", "port", "database", "user"})
+
+
+def _database_dsn_from_settings(settings) -> str:
+    database_settings = getattr(settings, "database", None)
+    if database_settings is None:
+        return ""
+    for field_name in ("dsn", "url"):
+        database_url = getattr(database_settings, field_name, "").strip()
+        if database_url.startswith(("postgres:", "postgresql:")):
+            return database_url
+    return ""
 
 
 def _sqlite_path_from_settings(settings):
     database_settings = getattr(settings, "database", None)
-    database_url = getattr(database_settings, "url", "").strip() if database_settings is not None else ""
-    if database_url.startswith("sqlite:"):
+    database_urls = []
+    if database_settings is not None:
+        database_urls = [
+            getattr(database_settings, "dsn", "").strip(),
+            getattr(database_settings, "url", "").strip(),
+        ]
+    for database_url in database_urls:
+        if not database_url.startswith("sqlite:"):
+            continue
         parsed = urlparse(database_url)
         if parsed.path in {"", "/:memory:"}:
             return parsed.netloc or ":memory:"
         return parsed.path
-    return getattr(database_settings, "sqlite_path", "mnemos.sqlite3")
+    return Path(getattr(database_settings, "sqlite_path", "~/.mnemos/mnemos.db")).expanduser()
 
 
 def _load_config() -> dict:
@@ -374,15 +434,22 @@ async def lifespan(app):
             app.state.persistence_backend = _persistence_backend
             logger.info("SQLite persistence backend initialized (%s)", sqlite_path)
         else:
-            _pool = await asyncpg.create_pool(
-                user=PG_CONFIG['user'],
-                password=PG_CONFIG['password'],
-                database=PG_CONFIG['database'],
-                host=PG_CONFIG['host'],
-                port=PG_CONFIG['port'],
-                min_size=PG_CONFIG['pool_min_size'],
-                max_size=PG_CONFIG['pool_max_size'],
-            )
+            database_dsn = _database_dsn_from_settings(settings)
+            pool_kwargs = {
+                "min_size": PG_CONFIG["pool_min_size"],
+                "max_size": PG_CONFIG["pool_max_size"],
+            }
+            if database_dsn:
+                _pool = await asyncpg.create_pool(database_dsn, **pool_kwargs)
+            else:
+                _pool = await asyncpg.create_pool(
+                    user=PG_CONFIG["user"],
+                    password=PG_CONFIG["password"],
+                    database=PG_CONFIG["database"],
+                    host=PG_CONFIG["host"],
+                    port=PG_CONFIG["port"],
+                    **pool_kwargs,
+                )
             _pool_manager = PoolManager(_pool)
             _persistence_backend = _build_postgres_backend(_pool, settings)
             app.state.pool = _pool   # auth.py reads this via request.app.state.pool

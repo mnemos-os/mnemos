@@ -15,8 +15,51 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, Field, field_validator, model_validator
+from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
+    "server": {
+        "backend": "postgres",
+        "rate_limit_storage": "redis://localhost:6379/1",
+        "workers": 1,
+        "graeae_mode_default": "auto",
+        "log_level": "INFO",
+        "compression_workers": 4,
+    },
+    "edge": {
+        "backend": "sqlite",
+        "rate_limit_storage": "memory://",
+        "workers": 1,
+        "graeae_mode_default": "single",
+        "log_level": "INFO",
+        "compression_workers": 1,
+    },
+    "dev": {
+        "backend": "sqlite",
+        "rate_limit_storage": "memory://",
+        "workers": 1,
+        "graeae_mode_default": "auto",
+        "log_level": "DEBUG",
+        "compression_workers": 1,
+        "loose_timeouts": True,
+    },
+}
+
+PROFILE_ALIASES = {
+    "personal": "edge",
+}
+
+_PROFILE_DEFAULT_TARGETS = {
+    "backend": ("database", "backend"),
+    "rate_limit_storage": ("rate_limit", "storage_uri"),
+    "workers": ("server", "workers"),
+    "graeae_mode_default": ("graeae", "mode_default"),
+    "log_level": ("logging", "level"),
+    "compression_workers": ("compression", "workers"),
+    "loose_timeouts": ("runtime", "loose_timeouts"),
+}
 
 
 def _config_model_config(*, env_prefix: str = "", extra: str = "ignore") -> SettingsConfigDict:
@@ -34,12 +77,16 @@ class _DatabaseSettings(BaseSettings):
         "auto",
         validation_alias=AliasChoices("MNEMOS_PERSISTENCE_BACKEND", "PERSISTENCE_BACKEND", "PG_BACKEND"),
     )
+    dsn: str = Field(
+        "",
+        validation_alias=AliasChoices("MNEMOS_DATABASE_DSN", "DATABASE_DSN", "PG_DSN"),
+    )
     url: str = Field(
         "",
         validation_alias=AliasChoices("MNEMOS_DATABASE_URL", "DATABASE_URL", "PG_URL"),
     )
     sqlite_path: Path = Field(
-        Path("mnemos.sqlite3"),
+        default_factory=lambda: (Path.home() / ".mnemos" / "mnemos.db"),
         validation_alias=AliasChoices("MNEMOS_SQLITE_PATH", "SQLITE_DB_PATH", "PG_SQLITE_PATH"),
     )
     host: str = "localhost"
@@ -50,11 +97,17 @@ class _DatabaseSettings(BaseSettings):
     pool_min_size: int = Field(5, validation_alias="PG_POOL_MIN")
     pool_max_size: int = Field(20, validation_alias="PG_POOL_MAX")
 
+    @field_validator("sqlite_path", mode="before")
+    @classmethod
+    def _expand_sqlite_path(cls, raw: Any) -> Path:
+        return Path(raw).expanduser()
+
 
 class _GraeaeSettings(BaseSettings):
     model_config = _config_model_config(extra="allow")
 
     providers: dict[str, Any] = Field(default_factory=dict)
+    mode_default: str = Field("auto", validation_alias="GRAEAE_MODE_DEFAULT")
     providers_enabled: str = Field("together,groq,openai,anthropic", validation_alias="GRAEAE_PROVIDERS")
     consensus_mode: bool = Field(True, validation_alias="GRAEAE_CONSENSUS_MODE")
     consensus_quorum_size: int = Field(3, validation_alias="GRAEAE_CONSENSUS_QUORUM_SIZE")
@@ -223,6 +276,7 @@ class _ObservabilitySettings(BaseSettings):
 class _CompressionSettings(BaseSettings):
     model_config = _config_model_config()
 
+    workers: int = Field(1, validation_alias="MNEMOS_COMPRESSION_WORKERS")
     contest_enabled: bool = Field(True, validation_alias="MNEMOS_CONTEST_ENABLED")
     contest_min_content_length: int = Field(0, validation_alias="MNEMOS_CONTEST_MIN_CONTENT_LENGTH")
     contest_stale_threshold_secs: int = Field(600, validation_alias="MNEMOS_CONTEST_STALE_THRESHOLD_SECS")
@@ -272,6 +326,7 @@ class _RuntimeSettings(BaseSettings):
 
     worker_shutdown_cancel_seconds: float = Field(10.0, validation_alias="WORKER_SHUTDOWN_CANCEL_SECONDS")
     pool_acquire_timeout: float = Field(10.0, validation_alias="MNEMOS_POOL_ACQUIRE_TIMEOUT")
+    loose_timeouts: bool = Field(False, validation_alias="MNEMOS_LOOSE_TIMEOUTS")
 
 
 class _ToolSettings(BaseSettings):
@@ -284,8 +339,20 @@ class _ToolSettings(BaseSettings):
     falkordb_password: str | None = Field(None, validation_alias="FALKORDB_PASSWORD")
 
 
+class _LoggingSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    level: str = Field("INFO", validation_alias="MNEMOS_LOG_LEVEL")
+    format: str = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    file: str = "/tmp/mnemos.log"
+    max_bytes: int = 10_485_760
+    backup_count: int = 5
+
+
 class Settings(BaseSettings):
     model_config = _config_model_config()
+
+    _explicit_fields: dict[str, set[str]] = PrivateAttr(default_factory=dict)
 
     database: _DatabaseSettings
     graeae: _GraeaeSettings
@@ -302,6 +369,18 @@ class Settings(BaseSettings):
     oauth: _OAuthSettings
     runtime: _RuntimeSettings
     tools: _ToolSettings
+    logging: _LoggingSettings
+
+    @property
+    def profile(self) -> str:
+        return self.server.profile
+
+    @property
+    def log_level(self) -> str:
+        return self.logging.level
+
+    def explicit_fields(self, group: str) -> set[str]:
+        return set(self._explicit_fields.get(group, set()))
 
 
 _settings: Settings | None = None
@@ -317,28 +396,100 @@ def get_settings() -> Settings:
     return _settings
 
 
+def normalize_profile(raw_profile: str | None) -> str:
+    """Return the canonical deployment profile name.
+
+    ``personal`` was the v3.x single-user profile name. In v4 it is an alias
+    for the all-in-one ``edge`` profile.
+    """
+    profile = (raw_profile or "personal").strip().lower()
+    profile = PROFILE_ALIASES.get(profile, profile)
+    if profile not in PROFILE_DEFAULTS:
+        valid = ", ".join(PROFILE_DEFAULTS)
+        raise ValueError(
+            f"Unsupported MNEMOS profile {raw_profile!r}; expected one of: {valid}. "
+            "Legacy profile 'personal' is now an alias for 'edge'."
+        )
+    return profile
+
+
 def _build_settings() -> Settings:
     toml_config = _load_toml()
     server_toml = _toml_section(toml_config, "server")
     server = _ServerSettings(**server_toml)
+    server.profile = normalize_profile(_profile_from_sources(toml_config, server_toml, server))
     server.base_configured = "MNEMOS_BASE" in os.environ or "base" in server_toml
-    return Settings(
-        database=_DatabaseSettings(**_toml_section(toml_config, "database")),
-        graeae=_GraeaeSettings(**_toml_section(toml_config, "graeae")),
-        server=server,
-        webhook=_WebhookSettings(**_toml_section(toml_config, "webhook")),
-        providers=_ProviderSettings(**_toml_section(toml_config, "providers")),
-        mcp=_MCPSettings(**_toml_section(toml_config, "mcp")),
-        rate_limit=_RateLimitSettings(**_toml_section(toml_config, "rate_limit")),
-        resilience=_ResilienceSettings(**_toml_section(toml_config, "resilience")),
-        observability=_ObservabilitySettings(**_toml_section(toml_config, "observability")),
-        compression=_CompressionSettings(**_toml_section(toml_config, "compression")),
-        morpheus=_MorpheusSettings(**_toml_section(toml_config, "morpheus")),
-        federation=_FederationSettings(**_toml_section(toml_config, "federation")),
-        oauth=_OAuthSettings(**_toml_section(toml_config, "oauth")),
-        runtime=_RuntimeSettings(**_toml_section(toml_config, "runtime")),
-        tools=_ToolSettings(**_toml_section(toml_config, "tools")),
+    groups = {
+        "database": _DatabaseSettings(**_toml_section(toml_config, "database")),
+        "graeae": _GraeaeSettings(**_toml_section(toml_config, "graeae")),
+        "server": server,
+        "webhook": _WebhookSettings(**_toml_section(toml_config, "webhook")),
+        "providers": _ProviderSettings(**_toml_section(toml_config, "providers")),
+        "mcp": _MCPSettings(**_toml_section(toml_config, "mcp")),
+        "rate_limit": _RateLimitSettings(**_toml_section(toml_config, "rate_limit")),
+        "resilience": _ResilienceSettings(**_toml_section(toml_config, "resilience")),
+        "observability": _ObservabilitySettings(**_toml_section(toml_config, "observability")),
+        "compression": _CompressionSettings(**_toml_section(toml_config, "compression")),
+        "morpheus": _MorpheusSettings(**_toml_section(toml_config, "morpheus")),
+        "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
+        "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
+        "runtime": _RuntimeSettings(**_toml_section(toml_config, "runtime")),
+        "tools": _ToolSettings(**_toml_section(toml_config, "tools")),
+        "logging": _LoggingSettings(**_toml_section(toml_config, "logging")),
+    }
+    settings = Settings(
+        database=groups["database"],
+        graeae=groups["graeae"],
+        server=groups["server"],
+        webhook=groups["webhook"],
+        providers=groups["providers"],
+        mcp=groups["mcp"],
+        rate_limit=groups["rate_limit"],
+        resilience=groups["resilience"],
+        observability=groups["observability"],
+        compression=groups["compression"],
+        morpheus=groups["morpheus"],
+        federation=groups["federation"],
+        oauth=groups["oauth"],
+        runtime=groups["runtime"],
+        tools=groups["tools"],
+        logging=groups["logging"],
     )
+    settings._explicit_fields = {
+        group_name: set(group.model_fields_set)
+        for group_name, group in groups.items()
+        if isinstance(group, BaseSettings)
+    }
+    _apply_profile_defaults(settings)
+    return settings
+
+
+def _profile_from_sources(
+    toml_config: dict[str, Any],
+    server_toml: dict[str, Any],
+    server: _ServerSettings,
+) -> str:
+    override = os.environ.get("MNEMOS_PROFILE_OVERRIDE", "").strip()
+    if override:
+        return override
+    if "profile" in server_toml:
+        return str(server_toml["profile"])
+    deployment_toml = _toml_section(toml_config, "deployment")
+    if "profile" in deployment_toml:
+        return str(deployment_toml["profile"])
+    return server.profile
+
+
+def _apply_profile_defaults(settings: Settings) -> None:
+    profile_defaults = PROFILE_DEFAULTS[settings.profile]
+    for profile_key, value in profile_defaults.items():
+        target = _PROFILE_DEFAULT_TARGETS.get(profile_key)
+        if target is None:
+            continue
+        group_name, field_name = target
+        if field_name in settings.explicit_fields(group_name):
+            continue
+        setattr(getattr(settings, group_name), field_name, value)
 
 
 def _load_toml() -> dict[str, Any]:
@@ -385,15 +536,21 @@ def _sync_compat_exports(settings: Settings) -> None:
     GRAEAE_CONFIG.update(settings.graeae.model_dump(mode="python"))
 
 
+def reload_settings() -> Settings:
+    """Rebuild the settings singleton after changing env/config inputs."""
+    global _settings
+    _settings = _build_settings()
+    _sync_compat_exports(_settings)
+    return _settings
+
+
 def _reset_settings_for_tests() -> None:
     """Clear the singleton and refresh compatibility dicts.
 
     This is intentionally not used by application code. It exists so tests can
     exercise environment/config-file overrides without process isolation.
     """
-    global _settings
-    _settings = None
-    _sync_compat_exports(get_settings())
+    reload_settings()
 
 
 _sync_compat_exports(get_settings())
