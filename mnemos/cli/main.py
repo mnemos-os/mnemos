@@ -57,17 +57,26 @@ def _patch_typer_click_compat() -> None:
         original_option_init = TyperOption.__init__
 
         if not getattr(TyperOption.__init__, "_mnemos_click_compat", False):
+            sig = inspect.signature(original_option_init)
+            params = sig.parameters
+            accepts_var_kwargs = any(
+                param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()
+            )
+            accepted_names = set(params.keys())
 
             def option_init(self: Any, **kwargs: Any) -> None:
                 if kwargs.get("is_flag") is True and kwargs.get("flag_value") is None:
                     kwargs["type"] = None
-                    kwargs["flag_value"] = True
+                    if accepts_var_kwargs or "flag_value" in accepted_names:
+                        kwargs["flag_value"] = True
                 if (
                     kwargs.get("is_flag") is None
                     and kwargs.get("flag_value") is None
                     and not kwargs.get("count", False)
                 ):
                     kwargs["is_flag"] = False
+                if not accepts_var_kwargs:
+                    kwargs = {key: value for key, value in kwargs.items() if key in accepted_names}
                 original_option_init(self, **kwargs)
 
             option_init._mnemos_click_compat = True
@@ -151,6 +160,28 @@ serve_app = typer.Typer(
     no_args_is_help=False,
 )
 worker_app = typer.Typer(help="Run MNEMOS background workers.", no_args_is_help=True)
+
+
+def _version_option_callback(value: bool) -> None:
+    if not value:
+        return
+    from mnemos._version import __version__
+
+    typer.echo(__version__)
+    raise typer.Exit()
+
+
+@app.callback()
+def cli(
+    version: bool = typer.Option(
+        False,
+        "--version",
+        callback=_version_option_callback,
+        is_eager=True,
+        help="Print the installed MNEMOS version.",
+    ),
+) -> None:
+    """Unified MNEMOS command line interface."""
 
 
 @contextmanager
