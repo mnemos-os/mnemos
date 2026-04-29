@@ -409,10 +409,10 @@ async def lifespan(app):
     # Webhook retry repair + delivery recovery workers. Repair owns its own
     # startup burst and periodic cadence, independent of slow webhook sends.
     if _pool:
-        from mnemos.webhooks.dispatcher import (  # noqa: WPS433
+        from mnemos.webhooks import (  # noqa: WPS433
             delivery_worker_loop as _webhook_delivery,
         )
-        from mnemos.webhooks.dispatcher import (
+        from mnemos.webhooks import (
             repair_worker_loop as _webhook_repair,
         )
         logger.info('Launching webhook retry repair worker')
