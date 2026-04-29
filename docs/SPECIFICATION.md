@@ -34,9 +34,9 @@ correlation / Prometheus / OpenTelemetry / opt-in structured logs),
 and an OpenAI-compatible gateway that injects compressed memory
 context on the fly.
 
-Apache-2.0. Horizontal scaling of process-local reliability primitives
-remains future work; run one API worker unless the relevant state has
-been externalized.
+Apache-2.0. MNEMOS runs single-worker by default; horizontal scaling is
+supported when Redis backs shared rate-limit and circuit-breaker state.
+See `docs/SCALING.md`.
 
 ## 2. System Scope
 
@@ -81,9 +81,9 @@ been externalized.
 
 ### 2.2 Explicitly out of scope at v3.5.x
 
-- Horizontal scaling past `workers=1`. GRAEAE reliability primitives
-  (circuit breakers, rate limiters, concurrency guards) are
-  process-local singletons; shared-state refactor remains future work.
+- Published multi-worker throughput guarantees. Redis-backed reliability
+  primitives support multi-worker operation, but measured load-test ceilings
+  remain TODO.
 - Full per-memory deletion-log / GDPR wipe subsystem. v3.5 keeps DELETE
   tombstone snapshots live in the version DAG, but it does not add a separate
   deletion-log table.
@@ -725,13 +725,22 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
 - Compression contest throughput depends on APOLLO fallback/judge use;
   ARTEMIS and APOLLO schema matches are CPU-cheap.
 
-### 11.3 Horizontal scaling
+### 11.3 Throughput baseline (Redis multi-worker)
 
-**Currently pinned to `workers=1`.** GRAEAE circuit breakers, rate
-limiters, dispatch semaphores, and recovery workers are in-process state.
-Moving them to shared/external coordination is v4 work.
+Redis-backed multi-worker mode is supported for shared rate-limit and
+circuit-breaker state. Measured multi-worker throughput numbers are not yet
+published.
 
-### 11.4 Backup / restore
+TODO: add load-test results for 2-worker and 3-worker deployments with Redis.
+
+### 11.4 Horizontal scaling
+
+Single-worker remains the default. Multi-worker is supported with Redis via
+`RATE_LIMIT_STORAGE_URI=redis://host:6379/1`; in-process `memory://` fallback
+logs a startup warning when `MNEMOS_WORKERS > 1` because rate-limit and
+circuit-breaker state can drift between processes.
+
+### 11.5 Backup / restore
 
 - `pg_dump` + rolling storage (see `tools/backup/`).
 - MPF v0.1 `/v1/export` endpoint for portable snapshots (not a

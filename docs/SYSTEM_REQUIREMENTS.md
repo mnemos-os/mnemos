@@ -54,9 +54,9 @@ for production ingest.
   - **Sufficient**: any CUDA-capable GPU with enough VRAM to load
     the chosen embedding/LLM model. The default models (see
     `CLAUDE.md` at the repo root) fit on 8 GB.
-* **Ancillary**: Redis/memcached NOT required — the contest
-  path is single-worker per the DEPLOYMENT scaling note. Multi-worker
-  coordination is v3.2.
+* **Ancillary**: Redis is not required for the default single-worker
+  deployment. Redis is required for multi-worker shared rate-limit and
+  circuit-breaker state; see `docs/SCALING.md`.
 
 ## Workstation tier — full feature set, CPU-only acceptable
 

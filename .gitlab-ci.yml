@@ -203,6 +203,80 @@ test:integration:
     - if: $CI_COMMIT_BRANCH == "master"
     - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
 
+test:multi-worker:
+  stage: test
+  image: docker:24
+  services:
+    - name: docker:24-dind
+      alias: docker
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    COMPOSE_PROJECT_NAME: mnemos-mw-$CI_PIPELINE_ID
+    POSTGRES_PASSWORD: mnemos_local
+  before_script: []
+  script:
+    - |
+      cat > docker-compose.multi-worker.ci.yml <<'YAML'
+      services:
+        redis:
+          image: redis:7-alpine
+          healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 2s
+            timeout: 2s
+            retries: 30
+
+        mnemos:
+          command: ["mnemos", "serve", "--host", "0.0.0.0", "--workers", "2"]
+          environment:
+            RATE_LIMIT_STORAGE_URI: redis://redis:6379/1
+            MNEMOS_WORKERS: "2"
+            WEBHOOK_ALLOW_PRIVATE_HOSTS: "true"
+            PG_POOL_MIN: "1"
+            PG_POOL_MAX: "8"
+          depends_on:
+            redis:
+              condition: service_healthy
+
+        smoke:
+          image: curlimages/curl:8.10.1
+          entrypoint: ["/bin/sh", "-lc"]
+          depends_on:
+            mnemos:
+              condition: service_started
+      YAML
+    - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml up -d --build redis mnemos
+    - |
+      docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml run --rm smoke '
+        set -eu
+        ready=0
+        for _i in $(seq 1 60); do
+          if curl -fsS http://mnemos:5002/health >/tmp/health.json; then
+            ready=1
+            break
+          fi
+          sleep 2
+        done
+        test "$ready" = "1"
+        curl -fsS -X POST http://mnemos:5002/v1/memories \
+          -H "Content-Type: application/json" \
+          -d "{\"content\":\"multi-worker smoke memory\",\"category\":\"ci\"}" \
+          >/tmp/memory.json
+        curl -fsS "http://mnemos:5002/v1/memories?limit=5" >/tmp/memories.json
+        curl -fsS -X POST http://mnemos:5002/v1/webhooks \
+          -H "Content-Type: application/json" \
+          -d "{\"url\":\"http://127.0.0.1:9/webhook\",\"events\":[\"memory.created\"],\"description\":\"multi-worker smoke\"}" \
+          >/tmp/webhook.json
+      '
+    - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml logs --no-color mnemos
+  after_script:
+    - docker compose -f docker-compose.yml -f docker-compose.multi-worker.ci.yml down -v --remove-orphans || true
+  allow_failure: true
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 # ---- build -------------------------------------------------------------
 
 build:docker:

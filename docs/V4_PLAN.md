@@ -582,30 +582,35 @@ pyinstaller --onefile mnemos-cli.spec
 
 ---
 
-## 8. Horizontal scaling
+## 8. Horizontal scaling - shipped (v4.0 C.1 + C.2)
 
 ### 8.1 GRAEAE breaker + rate-limit state → Redis
 
-**Current state:** GRAEAE's circuit breaker + in-process semaphores are singletons (only work with `workers=1` in `api_server.py`).
+**Shipped state:** GRAEAE's circuit breaker, rate limiter, and concurrency guard
+have Redis-backed implementations with in-process fallback. The `workers=1`
+operational pin has been removed; multi-worker startup warns when Redis is not
+configured.
 
 **What ships:**
-- `api/resilience.py:RedisCircuitBreaker` — circuit breaker backed by Redis.
-- `api/resilience.py:RedisRateLimiter` — token bucket backed by Redis.
-- MNEMOS startup checks: if Redis available, use it; else fall back to in-process (with warning).
+- `mnemos/core/resilience.py:RedisCircuitBreaker` - circuit breaker backed by Redis.
+- `mnemos/core/resilience.py:RedisRateLimiter` - token bucket backed by Redis.
+- `mnemos/core/resilience.py:RedisConcurrencyLimiter` - Redis slot leases for shared concurrency limits.
+- MNEMOS startup checks: if Redis available, use it; else fall back to in-process and warn when workers > 1.
 
 **Benefit:** Deploy multiple MNEMOS API workers; they coordinate breaker + rate-limit state via Redis.
 
 **Affected files:**
-- New: `api/resilience.py` (Redis-backed primitives).
-- Modified: `api/rate_limit.py` (use RedisRateLimiter), `api/models.py` (use RedisCircuitBreaker for GRAEAE calls).
-- Modified: `api_server.py` — remove `workers=1` constraint; document Redis requirement for horizontal scaling.
+- Modified: `mnemos/core/resilience.py` (Redis-backed primitives).
+- Modified: `mnemos/core/lifecycle.py` (Redis client ownership + multi-worker warning).
+- Modified: `mnemos/cli/main.py`, `mnemos/api/main.py` - remove `workers=1` pin.
+- New: `docs/SCALING.md` - Redis-backed multi-worker deployment doctrine.
 
-**Effort:** 3 days (Redis integration, testing on multi-worker setup).
+**Effort:** shipped across v4.0 C.1 + C.2.
 
 ### 8.2 Documented scaling playbooks
 
 **Deliverables:**
-- `docs/SCALING.md` — how to run MNEMOS on Kubernetes / docker-compose at scale.
+- `docs/SCALING.md` - how to run MNEMOS on Kubernetes / docker-compose at scale.
 - Example: 3x API workers + 1x distillation worker + 1x morpheus worker + Postgres + Redis on k8s.
 - Helm values file: `deploy/mnemos-k8s/values.yaml`.
 
