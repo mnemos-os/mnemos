@@ -21,6 +21,7 @@ from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 from mnemos.core.config import PG_CONFIG
+from mnemos.core.pool import PoolManager
 from mnemos.domain.graeae.engine import get_graeae_engine  # noqa: F401 — re-exported for handlers
 from mnemos.domain.models import MemoryItem
 
@@ -168,6 +169,7 @@ _EMBED_TIMEOUT = float(os.getenv('INFERENCE_EMBED_TIMEOUT', '10'))
 
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
+_pool_manager: Optional[PoolManager] = None
 _cache: Optional[aioredis.Redis] = None
 _rls_enabled: bool = False   # set from config at startup; read by handlers
 
@@ -321,7 +323,7 @@ async def _run_distillation_worker():
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
-    global _pool, _cache, _rls_enabled, _worker_status
+    global _pool, _pool_manager, _cache, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
@@ -336,7 +338,9 @@ async def lifespan(app):
             min_size=PG_CONFIG['pool_min_size'],
             max_size=PG_CONFIG['pool_max_size'],
         )
+        _pool_manager = PoolManager(_pool)
         app.state.pool = _pool   # auth.py reads this via request.app.state.pool
+        app.state.pool_manager = _pool_manager
         logger.info(
             f"asyncpg connection pool initialized "
             f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
@@ -460,6 +464,7 @@ async def lifespan(app):
     if _pool:
         await _pool.close()
         logger.info("DB pool closed")
+    _pool_manager = None
     if _cache:
         await _cache.aclose()
         logger.info("Redis cache closed")
@@ -494,6 +499,16 @@ async def _get_db():
     if not _pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     return _pool.acquire()
+
+
+def get_pool_manager() -> PoolManager:
+    """Return the lifecycle-owned pool manager singleton."""
+    global _pool_manager
+    if _pool_manager is None or (_pool is not None and _pool_manager.pool is not _pool):
+        if not _pool:
+            raise HTTPException(status_code=503, detail="Database pool not available")
+        _pool_manager = PoolManager(_pool)
+    return _pool_manager
 
 
 _MEMORY_COLS = (

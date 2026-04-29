@@ -65,7 +65,7 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
         except ValueError:
             raise HTTPException(status_code=422, detail="valid_until must be ISO8601")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().transactional() as conn:
         if req.memory_id:
             # Cross-tenant memory_id references are rejected: a triple's
             # memory_id must point at a memory the caller can see. We
@@ -138,7 +138,7 @@ async def list_triples(
 
     where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             f"SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples {where} ORDER BY created DESC "
             f"LIMIT ${idx} OFFSET ${idx + 1}",
@@ -157,7 +157,7 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
     """Get all triples for a subject ordered by valid_from (chronological history)."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if is_root(user):
             rows = await conn.fetch(
                 "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 ORDER BY valid_from ASC LIMIT $2",
@@ -190,7 +190,7 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().transactional() as conn:
         row = await conn.fetchrow(
             "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
             triple_id,
@@ -215,7 +215,7 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
 async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_user)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().transactional() as conn:
         row = await conn.fetchrow(
             "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
             triple_id,

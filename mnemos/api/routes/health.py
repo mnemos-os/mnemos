@@ -20,7 +20,7 @@ async def health_check() -> HealthResponse:
     db_ok = False
     if _lc._pool:
         try:
-            async with _lc._pool.acquire() as conn:
+            async with _lc.get_pool_manager().acquire() as conn:
                 await conn.execute("SELECT 1")
             db_ok = True
         except Exception as e:
@@ -59,7 +59,7 @@ async def get_stats() -> StatsResponse:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             total = await conn.fetchval('SELECT COUNT(*) FROM memories')
             # Federation-aware split: native rows have federation_source
             # NULL; pulled rows carry the peer name there. memories_by_peer

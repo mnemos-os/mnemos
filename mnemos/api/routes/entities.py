@@ -49,7 +49,7 @@ async def create_entity(
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
         entity_id = str(uuid.uuid4())
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().transactional() as conn:
             row = await conn.fetchrow(
                 '''INSERT INTO entities (id, owner_id, namespace, entity_type, name, description, metadata)
                    VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)
@@ -85,7 +85,7 @@ async def list_entities(
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             if entity_type and search:
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
@@ -123,7 +123,7 @@ async def list_entities(
 async def get_entity(entity_id: str, user: UserContext = Depends(get_current_user)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
         row = await conn.fetchrow(
             '''SELECT id::text, entity_type, name, description, metadata,
@@ -153,7 +153,7 @@ async def update_entity(
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().transactional() as conn:
             # Re-assert owner + namespace in the UPDATE so concurrent tenancy
             # changes between the probe and write cannot land on the wrong row.
             owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
@@ -200,7 +200,7 @@ async def link_entities(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().transactional() as conn:
             owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
             related_owner, related_namespace = await assert_owned_context(conn, "entities", req.related_id, user)
             # Link A->B
@@ -239,7 +239,7 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     try:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().transactional() as conn:
             owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
             # Remove from other entities' arrays (caller's own only; root clears all)
             if is_root(user):
@@ -274,7 +274,7 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
 async def get_related_entities(entity_id: str, user: UserContext = Depends(get_current_user)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         target_owner, target_ns = await assert_owned_context(conn, "entities", entity_id, user)
         entity = await conn.fetchrow(
             '''SELECT related_entities FROM entities
@@ -286,7 +286,7 @@ async def get_related_entities(entity_id: str, user: UserContext = Depends(get_c
     related_ids = entity['related_entities'] or []
     if not related_ids:
         return {"related": []}
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         # Only surface related entities visible to the caller (same owner, or root).
         if is_root(user):
             rows = await conn.fetch(
