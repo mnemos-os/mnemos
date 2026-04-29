@@ -62,9 +62,9 @@ registry. Multiple GPU-consuming paths sharing the same
 (and any other GPU-consuming path) that the endpoint is unresponsive
 without each having to time out independently.
 
-For v3.2 horizontal-scaling work, the registry becomes a Redis-backed
-shared-state singleton. v3.1 is single-worker per the DEPLOYMENT.md
-scaling note; process-local state is correct for the constraint.
+The deployment is single-process by default; multi-worker is safe with
+Redis-backed shared state since v4.0. Process-local fallback remains
+available for the default single-worker shape.
 """
 
 from __future__ import annotations
@@ -89,7 +89,7 @@ class CircuitState(str, Enum):
 class GuardConfig:
     """Tunables for a GPUGuard.
 
-    Defaults are conservative for the single-worker v3.1 deployment:
+    Defaults are conservative for the single-process default deployment:
     three consecutive failures open the circuit for 30 seconds. Operators
     who run against flaky remote endpoints can relax these; operators
     who want stricter failure isolation can tighten them.

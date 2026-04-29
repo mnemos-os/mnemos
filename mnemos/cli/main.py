@@ -328,29 +328,21 @@ def serve(
     ctx: typer.Context,
     host: str = typer.Option("0.0.0.0", "--host", help="API bind address.", is_flag=False),
     port: int = typer.Option(5002, "--port", help="API listen port.", is_flag=False),
-    workers: int = typer.Option(
-        1,
+    workers: Optional[int] = typer.Option(
+        None,
         "--workers",
         is_flag=False,
-        help=(
-            "Uvicorn worker count. Values above 1 are not recommended until "
-            "the Phase C Redis primitives land."
-        ),
+        help="Uvicorn worker count. Defaults to MNEMOS_WORKERS (1).",
     ),
 ) -> None:
     """Run the MNEMOS FastAPI server."""
     if ctx.invoked_subcommand is not None:
         return
 
-    if workers > 1:
-        typer.echo(
-            "WARNING: workers > 1 is not recommended until v4.0 Phase C lands shared Redis primitives.",
-            err=True,
-        )
-
     import uvicorn
 
-    uvicorn.run("mnemos.api.main:app", host=host, port=port, workers=workers)
+    worker_count = workers if workers is not None else get_settings().server.workers
+    uvicorn.run("mnemos.api.main:app", host=host, port=port, workers=worker_count)
 
 
 @serve_app.command("mcp-stdio")

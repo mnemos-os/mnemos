@@ -254,10 +254,11 @@ if _document_import_available:
 
 if __name__ == "__main__":
     import uvicorn
-    # workers=1 is required: GRAEAE circuit breakers, rate limiters, and semaphores
-    # are in-process state. Multiple workers each get their own copy and will not
-    # share limits. Use MNEMOS_PORT env var to override (default: 5002).
+
+    # Multi-worker is supported when Redis backs the shared resilience
+    # primitives. In-process fallback remains available and logs a startup
+    # warning when MNEMOS_WORKERS > 1 with RATE_LIMIT_STORAGE_URI=memory://.
     settings = get_settings().server
     port = settings.port
     host = settings.bind
-    uvicorn.run(app, host=host, port=port, workers=1)
+    uvicorn.run("mnemos.api.main:app", host=host, port=port, workers=settings.workers)

@@ -259,6 +259,20 @@ def _peer_url_looks_same_lan(url: str) -> bool:
     return peer_ip.is_private or peer_ip.is_loopback or peer_ip.is_link_local
 
 
+def _warn_if_multi_worker_without_redis(settings) -> None:
+    """Warn when multi-worker mode is using per-process resilience state."""
+    workers = getattr(settings.server, "workers", 1)
+    storage_uri = settings.rate_limit.storage_uri.strip().lower()
+    if workers > 1 and storage_uri == "memory://":
+        logger.warning(
+            "MNEMOS is starting with workers=%d and RATE_LIMIT_STORAGE_URI=memory://; "
+            "multi-worker without Redis will produce drift in rate limit and "
+            "circuit breaker state. Set RATE_LIMIT_STORAGE_URI=redis://host:6379/1 "
+            "for shared state.",
+            workers,
+        )
+
+
 async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
     configured_peer_urls = _configured_federation_peer_urls()
     db_peer_urls: list[str] = []
@@ -291,6 +305,7 @@ async def lifespan(app):
 
     config = _load_config()
     settings = get_settings()
+    _warn_if_multi_worker_without_redis(settings)
 
     try:
         _pool = await asyncpg.create_pool(

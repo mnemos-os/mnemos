@@ -636,10 +636,9 @@ python api_server.py        # MNEMOS on port 5002
 curl http://localhost:5002/health
 ```
 
-MNEMOS v3.5 runs single-worker by design. In-process state (rate limiter,
-dispatch semaphores, recovery worker) is not yet externalized. Horizontal
-scaling is on the v4 roadmap. Operators wanting throughput should scale memory
-size + DB; do not increase workers.
+MNEMOS runs single-worker by default with `RATE_LIMIT_STORAGE_URI=memory://`.
+Horizontal scaling is supported when Redis backs shared rate-limit and
+circuit-breaker state; see `docs/SCALING.md`.
 
 ---
 
