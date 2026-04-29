@@ -213,21 +213,27 @@ async def test_phase_cluster_groups_similar_vectors():
 async def test_phase_cluster_threshold_separation(monkeypatch):
     """A threshold raised above the actual similarity should split a
     cluster that would otherwise merge."""
-    monkeypatch.setenv("MNEMOS_MORPHEUS_CLUSTER_THRESHOLD", "0.999")
-    run_row = {
-        "cluster_min_size": 1,
-        "window_started_at": "2026-04-25T00:00:00",
-        "window_ended_at": "2026-04-25T23:59:59",
-        "namespace": None,
-    }
-    rows = [
-        _row("mem_a", [1.0, 0.0]),
-        _row("mem_b", [0.9, 0.4]),  # cosine ~0.91 — under 0.999
-    ]
-    conn = _MockConn(fetchrow_result=run_row, fetch_result=rows)
-    pool = _MockPool(conn)
+    from mnemos.core import config
 
-    n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000002")
+    with monkeypatch.context() as scoped:
+        scoped.setenv("MNEMOS_MORPHEUS_CLUSTER_THRESHOLD", "0.999")
+        config._reset_settings_for_tests()
+        run_row = {
+            "cluster_min_size": 1,
+            "window_started_at": "2026-04-25T00:00:00",
+            "window_ended_at": "2026-04-25T23:59:59",
+            "namespace": None,
+        }
+        rows = [
+            _row("mem_a", [1.0, 0.0]),
+            _row("mem_b", [0.9, 0.4]),  # cosine ~0.91 — under 0.999
+        ]
+        conn = _MockConn(fetchrow_result=run_row, fetch_result=rows)
+        pool = _MockPool(conn)
+
+        n = await phase_cluster(pool, "00000000-0000-0000-0000-000000000002")
+
+    config._reset_settings_for_tests()
 
     # Both survive (min_size=1) but as separate clusters.
     assert n == 2

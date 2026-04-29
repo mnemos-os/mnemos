@@ -20,7 +20,7 @@ import redis.asyncio as aioredis
 from fastapi import HTTPException
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from mnemos.core.config import PG_CONFIG
+from mnemos.core.config import PG_CONFIG, get_settings
 from mnemos.core.pool import PoolManager
 
 logger = logging.getLogger(__name__)
@@ -30,20 +30,11 @@ logger = logging.getLogger(__name__)
 _background_tasks: set = set()
 _worker_tasks: set = set()
 _delivery_attempt_tasks: set = set()
-_WORKER_SHUTDOWN_CANCEL_SECONDS = float(os.getenv("WORKER_SHUTDOWN_CANCEL_SECONDS", "10.0"))
+_WORKER_SHUTDOWN_CANCEL_SECONDS = get_settings().runtime.worker_shutdown_cancel_seconds
 _FINAL_CANCEL_WAIT_SECONDS = 5.0
 
 
-def _default_webhook_shutdown_drain_seconds() -> float:
-    dns_timeout = float(os.getenv("WEBHOOK_DNS_TIMEOUT", "10.0"))
-    http_timeout = float(os.getenv("WEBHOOK_HTTP_TIMEOUT", "10.0"))
-    default_lease = max(90, int(dns_timeout + http_timeout + 30))
-    return float(os.getenv("WEBHOOK_LEASE_SECONDS", str(default_lease)))
-
-
-WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(
-    os.getenv("WEBHOOK_SHUTDOWN_DRAIN_SECONDS", str(_default_webhook_shutdown_drain_seconds()))
-)
+WEBHOOK_SHUTDOWN_DRAIN_SECONDS = float(get_settings().webhook.shutdown_drain_seconds)
 
 # Worker health tracking
 _worker_status: dict = {
@@ -193,9 +184,10 @@ async def _drain_delivery_attempt_tasks() -> None:
 #
 # Canonical env vars are INFERENCE_EMBED_* so embedding config is not
 # tied to any one inference server implementation.
-_EMBED_HOST = os.getenv('INFERENCE_EMBED_HOST', 'http://localhost:11434')
-_EMBED_MODEL = os.getenv('INFERENCE_EMBED_MODEL', 'nomic-embed-text')
-_EMBED_TIMEOUT = float(os.getenv('INFERENCE_EMBED_TIMEOUT', '10'))
+_PROVIDER_SETTINGS = get_settings().providers
+_EMBED_HOST = _PROVIDER_SETTINGS.inference_embed_host
+_EMBED_MODEL = _PROVIDER_SETTINGS.inference_embed_model
+_EMBED_TIMEOUT = _PROVIDER_SETTINGS.inference_embed_timeout
 
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
@@ -220,12 +212,8 @@ def _load_config() -> dict:
     return {}
 
 
-def _env_flag_enabled(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _configured_federation_peer_urls_from_env() -> list[str]:
-    raw = os.getenv("MNEMOS_FEDERATION_PEERS", "").strip()
+def _configured_federation_peer_urls() -> list[str]:
+    raw = get_settings().federation.peers.strip()
     if not raw:
         return []
 
@@ -271,7 +259,7 @@ def _peer_url_looks_same_lan(url: str) -> bool:
 
 
 async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
-    env_peer_urls = _configured_federation_peer_urls_from_env()
+    configured_peer_urls = _configured_federation_peer_urls()
     db_peer_urls: list[str] = []
     try:
         async with pool.acquire() as conn:
@@ -280,10 +268,10 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
     except Exception as exc:
         logger.debug("federation startup guidance skipped DB peer scan: %s", exc)
 
-    if _env_flag_enabled("MNEMOS_FEDERATION_ENABLED") and not env_peer_urls and not db_peer_urls:
+    if get_settings().federation.enabled and not configured_peer_urls and not db_peer_urls:
         logger.info("federation enabled but no peers configured — federation pulls and exports are inactive.")
 
-    for peer_url in [*env_peer_urls, *db_peer_urls]:
+    for peer_url in [*configured_peer_urls, *db_peer_urls]:
         if _peer_url_looks_same_lan(peer_url):
             logger.warning(
                 "federation peer %s appears to be same-LAN; for single-site HA, "
@@ -364,7 +352,7 @@ async def lifespan(app):
 
     await _log_federation_startup_guidance(_pool)
 
-    _redis_url = os.getenv("MNEMOS_REDIS_URL") or os.getenv("REDIS_URL") or "redis://localhost:6379"
+    _redis_url = get_settings().server.redis_url
     try:
         _cache = aioredis.from_url(_redis_url, decode_responses=True)
         await _cache.ping()

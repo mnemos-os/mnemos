@@ -30,7 +30,6 @@ import argparse
 import asyncio
 import hashlib
 import logging
-import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -45,6 +44,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
 from starlette.routing import Mount, Route
 
+from mnemos.core.config import get_settings
 # Reuse the exact same Server instance + tool registrations from
 # the stdio entry point. Importing for the side effect of having
 # tools registered against `app`.
@@ -85,7 +85,8 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
     If the MCP bearer token must differ from the backend API key:
       MNEMOS_MCP_TOKENS=user1:mcp_token1:api_key1
     """
-    raw_map = os.getenv("MNEMOS_MCP_TOKENS", "").strip()
+    settings = get_settings()
+    raw_map = settings.mcp.tokens.strip()
     if raw_map:
         principals: dict[str, MCPClientPrincipal] = {}
         for item in raw_map.split(","):
@@ -114,7 +115,7 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
 
     # Required bearer token. We refuse to start without one because
     # this edge exposes full memory write access.
-    tok = os.getenv("MNEMOS_MCP_TOKEN", "").strip()
+    tok = settings.mcp.token.strip()
     if not tok:
         _fatal_auth_config(
             "FATAL: MNEMOS_MCP_TOKEN must be set. Refusing to expose the\n"
@@ -132,7 +133,7 @@ def _load_token_principals() -> dict[str, MCPClientPrincipal]:
     return {
         tok: MCPClientPrincipal(
             user_id=None,
-            api_key=os.getenv("MNEMOS_API_KEY", "").strip() or None,
+            api_key=settings.server.api_key.strip() or None,
         )
     }
 
@@ -369,8 +370,7 @@ def main() -> None:
 
     logger.info("MNEMOS MCP HTTP/SSE listening on %s:%d", args.host, args.port)
     logger.info("Bearer principals configured (count=%d)", len(TOKEN_PRINCIPALS))
-    logger.info("MNEMOS backend: %s", os.getenv("MNEMOS_BASE",
-                                                 "http://localhost:5002"))
+    logger.info("MNEMOS backend: %s", get_settings().server.base)
     uvicorn.run(starlette_app, host=args.host, port=args.port,
                 log_level="info", access_log=False)
 

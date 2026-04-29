@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
@@ -21,6 +20,7 @@ from uuid import UUID
 import asyncpg
 import numpy as np
 
+from mnemos.core.config import get_settings
 from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
@@ -246,7 +246,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
     key "clusters" so phase_synthesise can consume them without a
     separate table.
     """
-    threshold = float(os.getenv("MNEMOS_MORPHEUS_CLUSTER_THRESHOLD", "0.85"))
+    threshold = get_settings().morpheus.cluster_threshold
 
     async with pool.acquire() as conn:
         run_row = await conn.fetchrow(
@@ -351,9 +351,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
     All inserts are append-only and tagged with morpheus_run_id, so
     rollback_run() can DELETE WHERE morpheus_run_id=$1 to undo.
     """
-    use_llm = os.getenv("MNEMOS_MORPHEUS_USE_LLM", "false").lower() in (
-        "true", "1", "yes",
-    )
+    use_llm = get_settings().morpheus.use_llm
 
     async with pool.acquire() as conn:
         config_raw = await conn.fetchval(

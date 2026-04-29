@@ -12,7 +12,6 @@ Route-specific limits (e.g. on `/v1/consultations`) are applied via
 `@limiter.limit()` in the relevant handler.
 """
 import logging
-import os
 
 from slowapi import Limiter, _rate_limit_exceeded_handler  # noqa: F401 — re-exported
 from slowapi.errors import RateLimitExceeded  # noqa: F401
@@ -20,12 +19,15 @@ from slowapi.middleware import SlowAPIMiddleware  # noqa: F401
 from slowapi.util import get_remote_address
 from starlette.requests import Request
 
+from mnemos.core.config import get_settings
+
 logger = logging.getLogger(__name__)
 
-RATE_LIMIT_ENABLED = os.getenv("RATE_LIMIT_ENABLED", "true").lower() == "true"
-RATE_LIMIT_DEFAULT = os.getenv("RATE_LIMIT_DEFAULT", "300/minute")
-RATE_LIMIT_STORAGE = os.getenv("RATE_LIMIT_STORAGE_URI", "memory://")
-RATE_LIMIT_TRUST_PROXY = os.getenv("RATE_LIMIT_TRUST_PROXY", "false").lower() == "true"
+_RATE_LIMIT_SETTINGS = get_settings().rate_limit
+RATE_LIMIT_ENABLED = _RATE_LIMIT_SETTINGS.enabled
+RATE_LIMIT_DEFAULT = _RATE_LIMIT_SETTINGS.default
+RATE_LIMIT_STORAGE = _RATE_LIMIT_SETTINGS.storage
+RATE_LIMIT_TRUST_PROXY = _RATE_LIMIT_SETTINGS.trust_proxy
 
 
 def _client_ip(request: Request) -> str:

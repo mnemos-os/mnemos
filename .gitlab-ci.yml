@@ -53,6 +53,22 @@ lint:import-linter:
     - if: $CI_PIPELINE_SOURCE == "merge_request_event"
     - if: $CI_COMMIT_BRANCH
 
+lint:env-discipline:
+  stage: lint
+  script:
+    - |
+      # Runtime environment reads must route through mnemos/core/config.py.
+      # Allowed exceptions:
+      #   - mnemos/installer/* runs before package configuration exists.
+      #   - tests/* may set process environment for test isolation (outside mnemos/).
+      if grep -RInE '(^|[^[:alnum:]_])_?os\.(environ|getenv)' mnemos --exclude-dir=installer | grep -v '^mnemos/core/config.py:'; then
+        echo "Forbidden os.environ/os.getenv usage outside mnemos/core/config.py or mnemos/installer/."
+        exit 1
+      fi
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
 # ---- test --------------------------------------------------------------
 
 test:unit:

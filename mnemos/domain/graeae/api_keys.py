@@ -34,15 +34,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from mnemos.core.config import get_settings
 
-_SEARCH_PATHS = [
-    os.getenv("MNEMOS_KEYS_PATH", ""),
-    os.path.expanduser("~/.config/mnemos/api_keys.json"),
-]
+logger = logging.getLogger(__name__)
 
 # Canonical names in the key file may differ from GRAEAE provider names.
 _PROVIDER_ALIASES: dict[str, str] = {
@@ -66,10 +62,19 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
 }
 
 
+def _search_paths() -> list[Path]:
+    settings = get_settings().providers
+    paths: list[Path] = []
+    if settings.keys_path is not None:
+        paths.append(settings.keys_path.expanduser())
+    paths.append(settings.api_keys_file.expanduser())
+    return paths
+
+
 def _find_key_file() -> Path | None:
-    for p in _SEARCH_PATHS:
-        if p and Path(p).exists():
-            return Path(p)
+    for path in _search_paths():
+        if path.exists():
+            return path
     return None
 
 
@@ -88,7 +93,7 @@ def load_provider_registry() -> dict:
             "[GRAEAE] no Provider Registry File found in search paths (%s); "
             "falling back to per-provider environment variables "
             "(OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)",
-            [p for p in _SEARCH_PATHS if p],
+            [str(path) for path in _search_paths()],
         )
         return {}
     try:
@@ -141,7 +146,7 @@ def get_key(provider: str) -> str:
 
     env_var = _PROVIDER_ENV_VARS.get(canonical)
     if env_var:
-        env_val = os.getenv(env_var, "").strip()
+        env_val = get_settings().providers.api_key_for(canonical).strip()
         if env_val:
             return env_val
 
