@@ -158,9 +158,44 @@ class _RateLimitSettings(BaseSettings):
 
     enabled: bool = Field(True, validation_alias="RATE_LIMIT_ENABLED")
     default: str = Field("300/minute", validation_alias="RATE_LIMIT_DEFAULT")
-    storage: str = Field("memory://", validation_alias=AliasChoices("RATE_LIMIT_STORAGE", "RATE_LIMIT_STORAGE_URI"))
+    storage_uri: str = Field(
+        "memory://",
+        validation_alias=AliasChoices("RATE_LIMIT_STORAGE_URI", "RATE_LIMIT_STORAGE", "storage"),
+    )
     trust_proxy: bool = Field(False, validation_alias="RATE_LIMIT_TRUST_PROXY")
     per_minute: int = Field(60, validation_alias=AliasChoices("MNEMOS_RATE_LIMIT_PER_MINUTE", "RATE_LIMIT_PER_MINUTE"))
+
+    @property
+    def storage(self) -> str:
+        """Backward-compatible alias for older internal callers."""
+        return self.storage_uri
+
+
+class _ResilienceSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    circuit_breaker_redis_prefix: str = Field(
+        "mnemos:cb:",
+        validation_alias=AliasChoices(
+            "MNEMOS_RESILIENCE_CIRCUIT_BREAKER_REDIS_PREFIX",
+            "MNEMOS_CIRCUIT_BREAKER_REDIS_PREFIX",
+        ),
+    )
+    rate_limiter_redis_prefix: str = Field(
+        "mnemos:rl:",
+        validation_alias=AliasChoices(
+            "MNEMOS_RESILIENCE_RATE_LIMITER_REDIS_PREFIX",
+            "MNEMOS_RATE_LIMITER_REDIS_PREFIX",
+        ),
+    )
+    concurrency_redis_prefix: str = Field(
+        "mnemos:conc:",
+        validation_alias=AliasChoices(
+            "MNEMOS_RESILIENCE_CONCURRENCY_REDIS_PREFIX",
+            "MNEMOS_CONCURRENCY_REDIS_PREFIX",
+        ),
+    )
+    fallback_warning: bool = Field(True, validation_alias="MNEMOS_RESILIENCE_FALLBACK_WARNING")
 
 
 class _ObservabilitySettings(BaseSettings):
@@ -247,6 +282,7 @@ class Settings(BaseSettings):
     providers: _ProviderSettings
     mcp: _MCPSettings
     rate_limit: _RateLimitSettings
+    resilience: _ResilienceSettings
     observability: _ObservabilitySettings
     compression: _CompressionSettings
     morpheus: _MorpheusSettings
@@ -282,6 +318,7 @@ def _build_settings() -> Settings:
         providers=_ProviderSettings(**_toml_section(toml_config, "providers")),
         mcp=_MCPSettings(**_toml_section(toml_config, "mcp")),
         rate_limit=_RateLimitSettings(**_toml_section(toml_config, "rate_limit")),
+        resilience=_ResilienceSettings(**_toml_section(toml_config, "resilience")),
         observability=_ObservabilitySettings(**_toml_section(toml_config, "observability")),
         compression=_CompressionSettings(**_toml_section(toml_config, "compression")),
         morpheus=_MorpheusSettings(**_toml_section(toml_config, "morpheus")),

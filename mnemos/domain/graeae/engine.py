@@ -41,7 +41,14 @@ from typing import Any, Dict, Optional
 
 import httpx
 
+from mnemos.core.config import get_settings
 from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
+from mnemos.core.resilience import (
+    call_maybe_async,
+    make_circuit_breaker_pool,
+    make_concurrency_limiter,
+    make_rate_limiter_pool,
+)
 from mnemos.domain.graeae.api_keys import _PROVIDER_ENV_VARS, get_key
 
 
@@ -51,10 +58,7 @@ def _env_var_hint(key_name: str) -> str:
     messages so the hint is actionable."""
     return _PROVIDER_ENV_VARS.get(key_name, f"<{key_name.upper()}_API_KEY>")
 from mnemos.domain.graeae._cache import ResponseCache
-from mnemos.domain.graeae._circuit_breaker import CircuitBreakerPool
-from mnemos.domain.graeae._concurrency import ConcurrencyLimiterPool
 from mnemos.domain.graeae._quality import QualityTracker
-from mnemos.domain.graeae._rate_limiter import RateLimiterPool
 from mnemos.domain.graeae.elo_sync import get_elo_weights
 
 logger = logging.getLogger(__name__)
@@ -446,16 +450,21 @@ class GraeaeEngine:
 
         # Reliability stack — instantiated here; _concurrency lazily initialised
         # on first consult() call because asyncio.Semaphore needs a running loop.
-        self._circuit_breakers = CircuitBreakerPool(failure_threshold=5, cooldown_seconds=300)
-        self._rate_limiters = RateLimiterPool()
+        self._settings = get_settings()
+        self._circuit_breakers = make_circuit_breaker_pool(
+            self._settings,
+            failure_threshold=5,
+            cooldown_seconds=300,
+        )
+        self._rate_limiters = make_rate_limiter_pool(self._settings)
         self._quality = QualityTracker({p: cfg["weight"] for p, cfg in self.providers.items()})
         self._cache = ResponseCache(ttl_seconds=3600, max_entries=500)
-        self._concurrency: Optional[ConcurrencyLimiterPool] = None
+        self._concurrency: Optional[Any] = None
 
-    def _get_concurrency(self) -> ConcurrencyLimiterPool:
+    def _get_concurrency(self) -> Any:
         """Lazy-init concurrency pool (requires running event loop)."""
         if self._concurrency is None:
-            self._concurrency = ConcurrencyLimiterPool()
+            self._concurrency = make_concurrency_limiter(self._settings)
         return self._concurrency
 
     async def _get_client(self) -> httpx.AsyncClient:
@@ -623,11 +632,11 @@ class GraeaeEngine:
         active: list[str] = []
         skipped: list[str] = []
         for name in candidate_providers:
-            if not self._circuit_breakers.is_allowed(name):
+            if not await call_maybe_async(self._circuit_breakers.is_allowed, name):
                 skipped.append(name)
-            elif not self._rate_limiters.is_allowed(name):
+            elif not await call_maybe_async(self._rate_limiters.is_allowed, name):
                 skipped.append(name)
-            elif not await concurrency.acquire(name):
+            elif not await call_maybe_async(concurrency.acquire, name):
                 skipped.append(name)
             else:
                 active.append(name)
@@ -669,9 +678,9 @@ class GraeaeEngine:
         all_responses: Dict = {}
 
         for name, result in zip(active, results):
-            concurrency.release(name)
+            await call_maybe_async(concurrency.release, name)
             if isinstance(result, Exception):
-                self._circuit_breakers.record_failure(name)
+                await call_maybe_async(self._circuit_breakers.record_failure, name)
                 self._quality.record_failure(name)
                 err_msg = f"{type(result).__name__}: {str(result)[:400]}"
                 logger.warning(f"[GRAEAE] muse {name} failed: {err_msg}")
@@ -684,7 +693,7 @@ class GraeaeEngine:
                     "final_score": 0.0,
                 }
             else:
-                self._circuit_breakers.record_success(name)
+                await call_maybe_async(self._circuit_breakers.record_success, name)
                 self._quality.record_success(name, result.get("latency_ms", 0))
                 result["final_score"] = self._quality.dynamic_weight(name)
                 all_responses[name] = result
@@ -783,20 +792,20 @@ class GraeaeEngine:
         # v3.2 reliability gate: circuit-breaker → rate-limiter →
         # concurrency. Mirrors the consult() eligibility loop so
         # gateway traffic is first-class not second-class.
-        if not self._circuit_breakers.is_allowed(provider):
+        if not await call_maybe_async(self._circuit_breakers.is_allowed, provider):
             logger.info("[GRAEAE] route(%s) refused: circuit open", provider)
             return _unavailable(
                 provider_config["model"],
                 error=f"provider '{provider}' circuit open",
             )
-        if not self._rate_limiters.is_allowed(provider):
+        if not await call_maybe_async(self._rate_limiters.is_allowed, provider):
             logger.info("[GRAEAE] route(%s) refused: rate limited", provider)
             return _unavailable(
                 provider_config["model"],
                 error=f"provider '{provider}' rate-limited",
             )
         concurrency = self._get_concurrency()
-        if not await concurrency.acquire(provider):
+        if not await call_maybe_async(concurrency.acquire, provider):
             logger.info("[GRAEAE] route(%s) refused: concurrency saturated", provider)
             return _unavailable(
                 provider_config["model"],
@@ -822,7 +831,7 @@ class GraeaeEngine:
                 # Record the failure against the breaker so repeated
                 # gateway-path failures actually trip it, and quality
                 # tracker so the weight reflects reality.
-                self._circuit_breakers.record_failure(provider)
+                await call_maybe_async(self._circuit_breakers.record_failure, provider)
                 self._quality.record_failure(provider)
                 logger.error(f"[GRAEAE] route({provider}) failed: {e}")
                 return _unavailable(
@@ -832,14 +841,14 @@ class GraeaeEngine:
             # Success path — credit the breaker + quality tracker so
             # the gateway's successes count toward reopening a
             # half-open circuit, not just consultations' successes.
-            self._circuit_breakers.record_success(provider)
+            await call_maybe_async(self._circuit_breakers.record_success, provider)
             self._quality.record_success(provider, result.get("latency_ms", 0))
             logger.debug(
                 f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
             )
             return result
         finally:
-            concurrency.release(provider)
+            await call_maybe_async(concurrency.release, provider)
 
     async def route_stream(
         self,
@@ -873,12 +882,12 @@ class GraeaeEngine:
                 f"(key_name={provider_config['key_name']})"
             )
 
-        if not self._circuit_breakers.is_allowed(provider):
+        if not await call_maybe_async(self._circuit_breakers.is_allowed, provider):
             raise RuntimeError(f"provider '{provider}' circuit open")
-        if not self._rate_limiters.is_allowed(provider):
+        if not await call_maybe_async(self._rate_limiters.is_allowed, provider):
             raise RuntimeError(f"provider '{provider}' rate-limited")
         concurrency = self._get_concurrency()
-        if not await concurrency.acquire(provider):
+        if not await call_maybe_async(concurrency.acquire, provider):
             raise RuntimeError(f"provider '{provider}' concurrency saturated")
 
         try:
@@ -937,14 +946,14 @@ class GraeaeEngine:
                             finish_reason = _normalize_gemini_finish_reason(finish_reason)
                         yield {"index": 0, "finish_reason": finish_reason}
             except Exception:
-                self._circuit_breakers.record_failure(provider)
+                await call_maybe_async(self._circuit_breakers.record_failure, provider)
                 self._quality.record_failure(provider)
                 raise
             else:
-                self._circuit_breakers.record_success(provider)
+                await call_maybe_async(self._circuit_breakers.record_success, provider)
                 self._quality.record_success(provider, 0)
         finally:
-            concurrency.release(provider)
+            await call_maybe_async(concurrency.release, provider)
 
     async def _query_provider(
         self, provider_name: str, prompt: str, task_type: str, timeout: int,
