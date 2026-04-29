@@ -1,0 +1,4 @@
+-- SQLite mirror for v3.5 succeeded-terminal webhook guard.
+-- PostgreSQL uses a trigger. The SQLite profile enforces this in
+-- mnemos.webhooks.finalize because SQLite deployments are single-process or
+-- use serialized writes through the backend mutex.

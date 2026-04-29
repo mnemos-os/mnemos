@@ -26,6 +26,20 @@ from mnemos.persistence.postgres import (
     PostgresVersionRepository,
     PostgresWebhookRepository,
 )
+from mnemos.persistence.sqlite import (
+    SQLITE_MIGRATION_FILES,
+    SqliteBackend,
+    SqliteBranchRepository,
+    SqliteCompressionRepository,
+    SqliteConsultationAuditRepository,
+    SqliteFederationRepository,
+    SqliteKGRepository,
+    SqliteMemoryRepository,
+    SqliteStateRepository,
+    SqliteTransaction,
+    SqliteVersionRepository,
+    SqliteWebhookRepository,
+)
 from mnemos.persistence.types import ModelRecommendation
 
 __all__ = [
@@ -48,6 +62,18 @@ __all__ = [
     "PostgresTransaction",
     "PostgresVersionRepository",
     "PostgresWebhookRepository",
+    "SQLITE_MIGRATION_FILES",
+    "SqliteBackend",
+    "SqliteBranchRepository",
+    "SqliteCompressionRepository",
+    "SqliteConsultationAuditRepository",
+    "SqliteFederationRepository",
+    "SqliteKGRepository",
+    "SqliteMemoryRepository",
+    "SqliteStateRepository",
+    "SqliteTransaction",
+    "SqliteVersionRepository",
+    "SqliteWebhookRepository",
     "StateRepository",
     "Transaction",
     "VersionRepository",

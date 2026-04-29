@@ -1,0 +1,3 @@
+-- SQLite mirror for group read visibility bit semantics.
+-- SQLite has no RLS. The application predicate extracts Unix-style group bits
+-- with ((permission_mode / 10) % 10) exactly like the PostgreSQL policy.
