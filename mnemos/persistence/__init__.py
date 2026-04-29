@@ -1,0 +1,55 @@
+"""Persistence abstraction public API."""
+
+from mnemos.persistence.base import (
+    BranchRepository,
+    CompressionRepository,
+    ConsultationAuditRepository,
+    FederationRepository,
+    KGRepository,
+    MemoryRepository,
+    PersistenceBackend,
+    StateRepository,
+    Transaction,
+    VersionRepository,
+    WebhookRepository,
+)
+from mnemos.persistence.postgres import (
+    PostgresBackend,
+    PostgresBranchRepository,
+    PostgresCompressionRepository,
+    PostgresConsultationAuditRepository,
+    PostgresFederationRepository,
+    PostgresKGRepository,
+    PostgresMemoryRepository,
+    PostgresStateRepository,
+    PostgresTransaction,
+    PostgresVersionRepository,
+    PostgresWebhookRepository,
+)
+from mnemos.persistence.types import ModelRecommendation
+
+__all__ = [
+    "BranchRepository",
+    "CompressionRepository",
+    "ConsultationAuditRepository",
+    "FederationRepository",
+    "KGRepository",
+    "MemoryRepository",
+    "ModelRecommendation",
+    "PersistenceBackend",
+    "PostgresBackend",
+    "PostgresBranchRepository",
+    "PostgresCompressionRepository",
+    "PostgresConsultationAuditRepository",
+    "PostgresFederationRepository",
+    "PostgresKGRepository",
+    "PostgresMemoryRepository",
+    "PostgresStateRepository",
+    "PostgresTransaction",
+    "PostgresVersionRepository",
+    "PostgresWebhookRepository",
+    "StateRepository",
+    "Transaction",
+    "VersionRepository",
+    "WebhookRepository",
+]

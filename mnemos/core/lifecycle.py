@@ -1,5 +1,6 @@
 """Shared globals, lifespan, and DB/cache helpers for MNEMOS API."""
 import hashlib
+import importlib
 import ipaddress
 import json
 import logging
@@ -11,7 +12,7 @@ try:
 except ModuleNotFoundError:
     import tomli as tomllib
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import Optional, Protocol
 from urllib.parse import urlparse
 
 import asyncpg
@@ -24,6 +25,11 @@ from mnemos.core.config import PG_CONFIG, get_settings
 from mnemos.core.pool import PoolManager
 
 logger = logging.getLogger(__name__)
+
+
+class PersistenceBackend(Protocol):
+    async def close(self) -> None:
+        ...
 
 # Background task registries — keep finite webhook sends out of the cancel-first
 # worker pool so graceful shutdown can let them finalize their leases.
@@ -192,9 +198,16 @@ _EMBED_TIMEOUT = _PROVIDER_SETTINGS.inference_embed_timeout
 # ── Singleton globals ────────────────────────────────────────────────────────
 _pool: Optional[asyncpg.Pool] = None
 _pool_manager: Optional[PoolManager] = None
+_persistence_backend: PersistenceBackend | None = None
 _cache: Optional[aioredis.Redis] = None
 _redis_client: Optional[aioredis.Redis] = None
 _rls_enabled: bool = False   # set from config at startup; read by handlers
+
+
+def _build_postgres_backend(pool, settings):
+    """Build the current persistence backend without a static core -> db edge."""
+    postgres_module = importlib.import_module("mnemos.persistence.postgres")
+    return postgres_module.PostgresBackend(pool, settings)
 
 
 def _load_config() -> dict:
@@ -300,7 +313,7 @@ async def _log_federation_startup_guidance(pool: asyncpg.Pool) -> None:
 @asynccontextmanager
 async def lifespan(app):
     """FastAPI lifespan: initialize and teardown DB pool, Redis, and workers."""
-    global _pool, _pool_manager, _cache, _redis_client, _rls_enabled, _worker_status
+    global _pool, _pool_manager, _persistence_backend, _cache, _redis_client, _rls_enabled, _worker_status
     logger.info("Starting MNEMOS API Server v3.0.0 (gateway + sessions + DAG + workers)")
 
     config = _load_config()
@@ -318,8 +331,10 @@ async def lifespan(app):
             max_size=PG_CONFIG['pool_max_size'],
         )
         _pool_manager = PoolManager(_pool)
+        _persistence_backend = _build_postgres_backend(_pool, settings)
         app.state.pool = _pool   # auth.py reads this via request.app.state.pool
         app.state.pool_manager = _pool_manager
+        app.state.persistence_backend = _persistence_backend
         logger.info(
             f"asyncpg connection pool initialized "
             f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
@@ -455,9 +470,14 @@ async def lifespan(app):
         timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
     )
 
-    if _pool:
+    if _persistence_backend is not None:
+        await _persistence_backend.close()
+        logger.info("Persistence backend closed")
+    elif _pool:
         await _pool.close()
         logger.info("DB pool closed")
+    _persistence_backend = None
+    _pool = None
     _pool_manager = None
     if _redis_client:
         await _redis_client.aclose()
@@ -507,6 +527,13 @@ def get_pool_manager() -> PoolManager:
             raise HTTPException(status_code=503, detail="Database pool not available")
         _pool_manager = PoolManager(_pool)
     return _pool_manager
+
+
+def get_persistence_backend() -> PersistenceBackend:
+    """Return the lifecycle-owned persistence backend singleton."""
+    if _persistence_backend is None:
+        raise HTTPException(status_code=503, detail="Persistence backend not available")
+    return _persistence_backend
 
 
 def get_redis_client() -> Optional[aioredis.Redis]:
