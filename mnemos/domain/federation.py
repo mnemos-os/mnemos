@@ -628,9 +628,9 @@ async def pull_memory_by_id(
     namespace_filter: Optional[List[str]],
     category_filter: Optional[List[str]],
 ) -> List[Dict[str, Any]]:
-    """Fetch one authorized memory through the federation feed path."""
-    url = base_url.rstrip("/") + "/v1/federation/feed"
-    params: Dict[str, Any] = {"since": memory_id, "limit": 1}
+    """Fetch one authorized memory through the explicit federation by-id path."""
+    url = base_url.rstrip("/") + f"/v1/federation/memory/{memory_id}"
+    params: Dict[str, Any] = {}
     if namespace_filter:
         params["namespace"] = ",".join(namespace_filter)
     if category_filter:
@@ -643,10 +643,13 @@ async def pull_memory_by_id(
             raise RuntimeError("federation auth token rejected (401)")
         if r.status_code == 403:
             raise RuntimeError("federation auth insufficient role (403)")
+        if r.status_code == 404:
+            return []
         r.raise_for_status()
         body = r.json()
-    memories = body.get("memories", []) or []
-    return [mem for mem in memories if isinstance(mem, dict) and mem.get("id") == memory_id]
+    if isinstance(body, dict) and body.get("id") == memory_id:
+        return [body]
+    return []
 
 
 async def _store_memories(

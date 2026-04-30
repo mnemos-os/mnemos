@@ -120,32 +120,39 @@ async def _connect(settings: Settings):
     return nc.jetstream()
 
 
+def _node_durable() -> str:
+    """Per-node durable name. The audit-fix queue-group attempt
+    (`js.subscribe(durable=..., queue=..., config=DeliverGroup)`)
+    is rejected by JetStream/nats-py 2.6 even when the consumer
+    config declares a matching deliver_group. The proper path
+    likely needs `js.add_consumer + js.pull_subscribe` (or
+    bind_subscribe) instead of subscribe(); deferred.
+
+    Per-node durables mean each node receives every nudge and
+    races for the Postgres SKIP LOCKED claim — wasteful but
+    correct. Audit Finding 5 stays open with this caveat.
+    """
+    from mnemos.nats.client import get_node_name
+    safe = get_node_name().replace(".", "_").replace("-", "_") or "node"
+    return f"{DURABLE}_{safe}"
+
+
 async def _subscribe(js: Any):
-    durable = DURABLE
+    durable = _node_durable()
     try:
         from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
 
-        try:
-            config = ConsumerConfig(
-                durable_name=durable,
-                deliver_group=QUEUE_GROUP,
-                deliver_policy=DeliverPolicy.NEW,
-                ack_policy=AckPolicy.EXPLICIT,
-            )
-        except TypeError:
-            config = ConsumerConfig(
-                durable_name=durable,
-                deliver_policy=DeliverPolicy.NEW,
-                ack_policy=AckPolicy.EXPLICIT,
-            )
-            setattr(config, "deliver_group", QUEUE_GROUP)
+        config = ConsumerConfig(
+            durable_name=durable,
+            deliver_policy=DeliverPolicy.NEW,
+            ack_policy=AckPolicy.EXPLICIT,
+        )
     except ImportError:
         config = None
 
     return await js.subscribe(
         SUBJECT,
         durable=durable,
-        queue=QUEUE_GROUP,
         stream=STREAM,
         config=config,
     )

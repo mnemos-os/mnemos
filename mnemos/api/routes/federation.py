@@ -78,6 +78,40 @@ def _to_peer(row) -> FederationPeer:
     )
 
 
+def _memory_item_from_row(row) -> MemoryItem:
+    return MemoryItem(
+        id=row["id"],
+        content=row["content"],
+        category=row["category"],
+        subcategory=row["subcategory"],
+        created=row["created"].isoformat(),
+        updated=row["updated"].isoformat() if row["updated"] else None,
+        metadata=(
+            json.loads(row["metadata"])
+            if isinstance(row["metadata"], str)
+            else (dict(row["metadata"]) if row["metadata"] else None)
+        ),
+        quality_rating=row["quality_rating"],
+        verbatim_content=row["verbatim_content"],
+        owner_id=row["owner_id"],
+        namespace=row["namespace"],
+        permission_mode=row["permission_mode"],
+        source_model=row["source_model"],
+        source_provider=row["source_provider"],
+        source_session=row["source_session"],
+        source_agent=row["source_agent"],
+    )
+
+
+def _federation_visibility_filters() -> list[str]:
+    # Match `/feed`: only local, explicitly world-readable memories are visible
+    # to federation peers.
+    return [
+        "m.federation_source IS NULL",
+        "(m.permission_mode % 10) >= 4",
+    ]
+
+
 # ── Schema discovery (peers query this before deciding to sync) ──────────────
 
 
@@ -371,19 +405,13 @@ async def federation_feed(
 
     since_ts: Optional[datetime] = None
     since_id: Optional[str] = None
-    exact_memory_id: Optional[str] = None
     if since:
         try:
             cursor = _fed._decode_feed_cursor(since)
         except ValueError:
-            if since.startswith(("mem_", "mnemos_")):
-                cursor = None
-                exact_memory_id = since
-            else:
-                raise HTTPException(status_code=400, detail="invalid federation cursor")
-        if cursor is not None:
-            since_ts = _fed._cursor_timestamp_for_db(cursor.updated)
-            since_id = cursor.memory_id
+            raise HTTPException(status_code=400, detail="invalid federation cursor")
+        since_ts = _fed._cursor_timestamp_for_db(cursor.updated)
+        since_id = cursor.memory_id
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
@@ -399,15 +427,9 @@ async def federation_feed(
     #
     # `federation_source IS NULL` prevents loops (don't re-export memories
     # we ourselves pulled from another peer).
-    query_parts = [
-        "m.federation_source IS NULL",
-        "(m.permission_mode % 10) >= 4",
-    ]
+    query_parts = _federation_visibility_filters()
     args: list = []
-    if exact_memory_id is not None:
-        args.append(exact_memory_id)
-        query_parts.append(f"m.id = ${len(args)}")
-    elif since_ts is not None:
+    if since_ts is not None:
         args.append(since_ts)
         since_updated_arg = len(args)
         args.append(since_id)
@@ -444,27 +466,7 @@ async def federation_feed(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    memories = [
-        MemoryItem(
-            id=r["id"],
-            content=r["content"],
-            category=r["category"],
-            subcategory=r["subcategory"],
-            created=r["created"].isoformat(),
-            updated=r["updated"].isoformat() if r["updated"] else None,
-            metadata=(json.loads(r["metadata"]) if isinstance(r["metadata"], str) else (dict(r["metadata"]) if r["metadata"] else None)),
-            quality_rating=r["quality_rating"],
-            verbatim_content=r["verbatim_content"],
-            owner_id=r["owner_id"],
-            namespace=r["namespace"],
-            permission_mode=r["permission_mode"],
-            source_model=r["source_model"],
-            source_provider=r["source_provider"],
-            source_session=r["source_session"],
-            source_agent=r["source_agent"],
-        )
-        for r in rows
-    ]
+    memories = [_memory_item_from_row(r) for r in rows]
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(rows[-1]["updated"], rows[-1]["id"])
     else:
@@ -475,3 +477,46 @@ async def federation_feed(
         next_cursor=next_cursor,
         has_more=has_more,
     )
+
+
+@router.get("/memory/{memory_id}", response_model=MemoryItem)
+async def federation_memory(
+    memory_id: str,
+    _: UserContext = Depends(_require_federation_role),
+    namespace: Optional[str] = Query(None, description="Comma-separated namespace filter"),
+    category: Optional[str] = Query(None, description="Comma-separated category filter"),
+):
+    """Serve one visible memory for a remote peer. Requires role='federation' or 'root'."""
+    if not _lc._pool:
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
+    categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
+
+    query_parts = _federation_visibility_filters()
+    args: list = [memory_id]
+    query_parts.append("m.id = $1")
+    if namespaces:
+        args.append(namespaces)
+        query_parts.append(f"m.namespace = ANY(${len(args)})")
+    if categories:
+        args.append(categories)
+        query_parts.append(f"m.category = ANY(${len(args)})")
+    where_clause = " AND ".join(query_parts)
+
+    async with _lc.get_pool_manager().acquire() as conn:
+        row = await conn.fetchrow(
+            f"""
+            SELECT id, content, category, subcategory, metadata, quality_rating,
+                   verbatim_content, owner_id, namespace, permission_mode,
+                   source_model, source_provider, source_session, source_agent,
+                   created, updated
+            FROM memories m
+            WHERE {where_clause}
+            """,
+            *args,
+        )
+
+    if row is None:
+        raise HTTPException(status_code=404, detail="memory not found")
+    return _memory_item_from_row(row)

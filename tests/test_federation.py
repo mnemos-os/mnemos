@@ -55,6 +55,22 @@ class _FeedConnection:
             ]
         return rows[:limit]
 
+    async def fetchrow(self, query: str, *args):
+        self.queries.append(query)
+        self.calls.append(args)
+        rows = self.rows
+        if "m.id = $1" in query:
+            rows = [r for r in rows if r["id"] == args[0]]
+        next_arg = 1
+        if "m.namespace = ANY" in query:
+            namespaces = args[next_arg]
+            next_arg += 1
+            rows = [r for r in rows if r["namespace"] in namespaces]
+        if "m.category = ANY" in query:
+            categories = args[next_arg]
+            rows = [r for r in rows if r["category"] in categories]
+        return rows[0] if rows else None
+
 
 class _FeedAcquire:
     def __init__(self, conn: _FeedConnection):
@@ -116,6 +132,11 @@ class TestFederationWiring:
         import mnemos.api.main as api_server
         paths = {r.path for r in api_server.app.routes}
         assert "/v1/federation/feed" in paths
+
+    def test_memory_route_exists(self):
+        import mnemos.api.main as api_server
+        paths = {r.path for r in api_server.app.routes}
+        assert "/v1/federation/memory/{memory_id}" in paths
 
 
 # ── Identifier convention ────────────────────────────────────────────────────
@@ -300,6 +321,55 @@ class TestFederationFeedCursor:
         sql = " ".join(pool.conn.queries[-1].split())
         assert "(m.updated > $1 OR (m.updated = $1 AND m.id > $2))" in sql
         assert "ORDER BY m.updated ASC, m.id ASC" in sql
+
+
+class TestFederationMemoryEndpoint:
+    @pytest.mark.asyncio
+    async def test_returns_visible_memory_by_id(self, monkeypatch):
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+
+        row = _feed_row("mem_visible", datetime(2026, 4, 27, 12, 0, 0))
+        row["namespace"] = "shared"
+        pool = _FeedPool([row])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        response = await handler.federation_memory(
+            "mem_visible",
+            None,
+            namespace="shared",
+            category=None,
+        )
+
+        assert response.id == "mem_visible"
+        assert response.content == "content mem_visible"
+        sql = " ".join(pool.conn.queries[-1].split())
+        assert "m.federation_source IS NULL" in sql
+        assert "(m.permission_mode % 10) >= 4" in sql
+        assert "m.id = $1" in sql
+        assert "m.namespace = ANY($2)" in sql
+
+    @pytest.mark.asyncio
+    async def test_returns_404_when_memory_filtered_out(self, monkeypatch):
+        from fastapi import HTTPException
+
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+
+        row = _feed_row("mem_hidden", datetime(2026, 4, 27, 12, 0, 0))
+        row["namespace"] = "private"
+        pool = _FeedPool([row])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        with pytest.raises(HTTPException) as exc:
+            await handler.federation_memory(
+                "mem_hidden",
+                None,
+                namespace="shared",
+                category=None,
+            )
+
+        assert exc.value.status_code == 404
 
 
 # ── Peer name validation (format checked at DB layer) ────────────────────────

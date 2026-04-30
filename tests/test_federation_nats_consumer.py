@@ -7,6 +7,7 @@ import json
 import pytest
 
 from mnemos.core import config
+from mnemos.domain import federation as federation_domain
 from mnemos.federation import nats_consumer as consumer
 
 pytestmark = pytest.mark.asyncio
@@ -114,6 +115,39 @@ async def test_consumer_fetches_body_from_authorized_feed_before_store():
     await consumer.handle_message(pool, _peer(), msg, store=store, fetch=fetch)
 
     assert calls == [(pool.conn, "pythia", fetched)]
+
+
+async def test_consumer_fetches_memory_by_id_before_store(monkeypatch):
+    pool = _FakePool()
+    msg = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_x"})
+    body = {"id": "mem_x", "content": "remote note", "category": "facts"}
+    calls = []
+
+    async def pull_memory_by_id(base_url, auth_token, memory_id, namespace_filter, category_filter):
+        assert base_url == "https://proteus.example"
+        assert auth_token == "feed-token"
+        assert memory_id == "mem_x"
+        assert namespace_filter == ["shared"]
+        assert category_filter == ["facts"]
+        return [body]
+
+    async def store(conn, peer_name, memories):
+        calls.append((conn, peer_name, memories))
+        return (1, 0)
+
+    peer = consumer.FederationNatsPeer(
+        name="proteus",
+        nats_url="nats://example:4222",
+        base_url="https://proteus.example",
+        auth_token="feed-token",
+        namespace_filter=("shared",),
+        category_filter=("facts",),
+    )
+    monkeypatch.setattr(consumer, "pull_memory_by_id", pull_memory_by_id)
+
+    await consumer.handle_message(pool, peer, msg, store=store)
+
+    assert calls == [(pool.conn, "proteus", [body])]
 
 
 async def test_self_loop_event_is_skipped_and_remote_event_is_processed(monkeypatch):
@@ -248,7 +282,7 @@ async def test_transient_store_error_is_not_acked(monkeypatch):
     assert msg.acked is False
 
 
-async def test_fetch_authorized_memories_uses_federation_feed(monkeypatch):
+async def test_fetch_authorized_memories_uses_federation_memory_endpoint(monkeypatch):
     peer = consumer.FederationNatsPeer(
         name="pythia",
         nats_url="nats://example:4222",
@@ -267,3 +301,50 @@ async def test_fetch_authorized_memories_uses_federation_feed(monkeypatch):
 
     assert await consumer._fetch_authorized_memories(peer, "mem_1") == [{"id": "mem_1"}]
     assert calls == [("https://peer.example", "feed-token", "mem_1", ["shared"], ["facts"])]
+
+
+async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
+    calls = []
+
+    class _Response:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"id": "mem_1", "content": "ok"}
+
+    class _Client:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, params, headers):
+            calls.append((url, params, headers, self.kwargs))
+            return _Response()
+
+    monkeypatch.setattr(federation_domain.httpx, "AsyncClient", _Client)
+
+    memories = await federation_domain.pull_memory_by_id(
+        "https://peer.example/",
+        "feed-token",
+        "mem_1",
+        ["shared"],
+        ["facts"],
+    )
+
+    assert memories == [{"id": "mem_1", "content": "ok"}]
+    assert calls == [
+        (
+            "https://peer.example/v1/federation/memory/mem_1",
+            {"namespace": "shared", "category": "facts"},
+            {"Authorization": "Bearer feed-token"},
+            {"timeout": federation_domain.FEDERATION_HTTP_TIMEOUT},
+        )
+    ]

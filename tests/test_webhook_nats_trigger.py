@@ -147,12 +147,12 @@ async def test_stream_subscription_declared_with_right_subject():
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.webhook.delivery.queued.>"
     assert kwargs["stream"] == "MNEMOS_WEBHOOK"
-    assert kwargs["durable"] == "mnemos_webhook_delivery_trigger"
-    assert kwargs["queue"] == "mnemos_webhook_delivery_workers"
+    # Per-node durable, no queue group — see _node_durable docstring.
+    assert kwargs["durable"].startswith("mnemos_webhook_delivery_trigger_")
+    assert "queue" not in kwargs
     config_obj = kwargs["config"]
     if config_obj is not None:
         assert "NEW" in str(getattr(config_obj, "deliver_policy", "NEW"))
-        assert getattr(config_obj, "deliver_group", None) == "mnemos_webhook_delivery_workers"
 
 
 async def test_transient_handle_error_is_not_acked(monkeypatch):
