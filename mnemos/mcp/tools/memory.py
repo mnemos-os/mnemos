@@ -33,6 +33,7 @@ async def tool_update_memory(
     category: str | None = None,
     subcategory: str | None = None,
     metadata: dict[str, Any] | None = None,
+    permission_mode: int | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
@@ -41,6 +42,7 @@ async def tool_update_memory(
         "category": category,
         "subcategory": subcategory,
         "metadata": metadata,
+        "permission_mode": permission_mode,
     }.items():
         if value is not None:
             body[key] = value
@@ -59,6 +61,7 @@ async def tool_create_memory(
     category: str = "facts",
     subcategory: str | None = None,
     metadata: dict[str, Any] | None = None,
+    permission_mode: int | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {"content": content, "category": category}
@@ -66,6 +69,8 @@ async def tool_create_memory(
         body["subcategory"] = subcategory
     if metadata:
         body["metadata"] = metadata
+    if permission_mode is not None:
+        body["permission_mode"] = permission_mode
     return await _rest_post("/v1/memories", body)
 
 
@@ -132,6 +137,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "category": {"type": "string", "description": "New category"},
             "subcategory": {"type": "string", "description": "New subcategory"},
             "metadata": {"type": "object", "description": "New metadata (replaces existing)"},
+            "permission_mode": {"type": "integer", "description": "Unix-style octal permission digits, e.g. 600 or 644"},
         },
         ["memory_id"],
         tool_update_memory,
@@ -149,6 +155,7 @@ TOOLS: dict[str, dict[str, Any]] = {
             "category": {"type": "string", "default": "facts"},
             "subcategory": {"type": "string"},
             "metadata": {"type": "object"},
+            "permission_mode": {"type": "integer", "description": "Unix-style octal permission digits, e.g. 600 or 644"},
         },
         ["content"],
         tool_create_memory,

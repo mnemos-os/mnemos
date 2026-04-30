@@ -88,6 +88,17 @@ def _backend_or_503():
     return backend
 
 
+def _validate_permission_mode(value: int | None, *, default: int | None = None) -> int | None:
+    """Validate Unix-style octal permission digits stored as an integer."""
+    if value is None:
+        return default
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise HTTPException(status_code=422, detail="permission_mode must be an integer")
+    if value < 0 or value > 777 or any(digit not in "01234567" for digit in str(value)):
+        raise HTTPException(status_code=422, detail="permission_mode must be octal-style 0-777")
+    return value
+
+
 def _read_visibility_for(user: UserContext, *, namespace: str) -> VisibilityFilter:
     """Read-path visibility for an already-resolved namespace.
 
@@ -652,6 +663,7 @@ async def create_memory(
         raise HTTPException(status_code=403, detail="namespace override requires root")
     owner_id = request.owner_id or user.user_id
     namespace = request.namespace or user.namespace
+    permission_mode = _validate_permission_mode(request.permission_mode, default=600)
 
     metadata_json = json.dumps(request.metadata or {"source": request.source})
     delivery_ids: list[str] = []
@@ -672,7 +684,7 @@ async def create_memory(
                 quality_rating=75,
                 owner_id=owner_id,
                 namespace=namespace,
-                permission_mode=600,
+                permission_mode=permission_mode,
                 source_model=request.source_model,
                 source_provider=request.source_provider,
                 source_session=request.source_session,
@@ -762,6 +774,11 @@ async def bulk_create_memories(
         if mem.namespace and mem.namespace != user.namespace and user.role != "root":
             errors.append(f"[{i}] namespace override requires root")
             continue
+        try:
+            permission_mode = _validate_permission_mode(mem.permission_mode, default=600)
+        except HTTPException as exc:
+            errors.append(f"[{i}] {exc.detail}")
+            continue
         mid = new_memory_id()
         verbatim = (
             mem.verbatim_content
@@ -783,7 +800,7 @@ async def bulk_create_memories(
                     quality_rating=75,
                     owner_id=owner_id,
                     namespace=namespace,
-                    permission_mode=600,
+                    permission_mode=permission_mode,
                     source_model=mem.source_model,
                     source_provider=mem.source_provider,
                     source_session=mem.source_session,
@@ -854,6 +871,8 @@ async def update_memory(
         updates["metadata"] = json.dumps(request.metadata)
     if request.verbatim_content is not None:
         updates["verbatim_content"] = request.verbatim_content
+    if request.permission_mode is not None:
+        updates["permission_mode"] = _validate_permission_mode(request.permission_mode)
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
 

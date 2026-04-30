@@ -2,7 +2,7 @@
 import json
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt
 
 
 ConsultationMode = Literal["auto", "local", "external", "all", "single", "debate", "majority"]
@@ -74,7 +74,7 @@ class MemoryItem(BaseModel):
     owner_id: Optional[str] = None
     group_id: Optional[str] = None
     namespace: Optional[str] = None
-    permission_mode: Optional[int] = None
+    permission_mode: Optional[StrictInt] = None
     source_model: Optional[str] = None
     source_provider: Optional[str] = None
     source_session: Optional[str] = None
@@ -147,6 +147,7 @@ class MemoryCreateRequest(BaseModel):
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
     verbatim_content: Optional[str] = None
+    permission_mode: Optional[StrictInt] = None
     # v1 provenance + ownership (optional admin overrides; default to caller context)
     owner_id: Optional[str] = None
     namespace: Optional[str] = None
@@ -164,6 +165,7 @@ class MemoryUpdateRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = None
     quality_rating: Optional[int] = None
     verbatim_content: Optional[str] = None  # original uncompressed content
+    permission_mode: Optional[StrictInt] = None
 
 
 class BulkCreateRequest(BaseModel):
