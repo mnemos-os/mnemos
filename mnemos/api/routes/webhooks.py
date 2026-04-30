@@ -87,7 +87,7 @@ async def create_webhook(
             )
     namespace = request.namespace or user.namespace or "default"
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO webhook_subscriptions
@@ -134,7 +134,7 @@ async def list_webhooks(
     # (no owner / namespace filter) so ops can audit cross-tenant.
     is_root = user.role == "root"
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if is_root:
             where = "" if include_revoked else "WHERE NOT revoked"
             rows = await conn.fetch(
@@ -187,7 +187,7 @@ async def get_webhook(
     # Root reads any webhook.
     is_root = user.role == "root"
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if is_root:
             row = await conn.fetchrow(
                 """
@@ -227,7 +227,7 @@ async def revoke_webhook(
     # can revoke any webhook.
     is_root = user.role == "root"
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if is_root:
             row = await conn.fetchrow(
                 """
@@ -269,7 +269,7 @@ async def list_deliveries(
     # v3.2 Tier 3: subscription must belong to caller's owner AND
     # namespace. Root bypasses both.
     is_root = user.role == "root"
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if is_root:
             sub = await conn.fetchrow(
                 "SELECT id FROM webhook_subscriptions WHERE id=$1::uuid",

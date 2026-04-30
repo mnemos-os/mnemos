@@ -3,10 +3,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import ssl
 import uuid
 from typing import Any, Awaitable, Optional
 
 import asyncpg
+import httpcore
+from httpcore._backends.auto import AutoBackend
 import httpx
 
 from mnemos.webhooks import validation as webhook_validation
@@ -17,6 +20,68 @@ from ._signing import _sign
 from .types import _ClaimedDelivery, _DeliveryResult, _LeaseExpiredBeforeSend, _PostHeaderDeliveryResult
 
 logger = logging.getLogger(__name__)
+
+
+class _PinnedDNSBackend(httpcore.AsyncNetworkBackend):
+    """httpcore network backend that pins one hostname to a validated IP."""
+
+    def __init__(self, hostname: str, resolved_ip: str):
+        self._hostname = hostname.lower().rstrip(".")
+        self._resolved_ip = resolved_ip
+        self._backend = AutoBackend()
+
+    async def connect_tcp(
+        self,
+        host: str,
+        port: int,
+        timeout: float | None = None,
+        local_address: str | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        target_host = self._resolved_ip if host.lower().rstrip(".") == self._hostname else host
+        return await self._backend.connect_tcp(
+            host=target_host,
+            port=port,
+            timeout=timeout,
+            local_address=local_address,
+            socket_options=socket_options,
+        )
+
+    async def connect_unix_socket(
+        self,
+        path: str,
+        timeout: float | None = None,
+        socket_options: Any = None,
+    ) -> httpcore.AsyncNetworkStream:
+        return await self._backend.connect_unix_socket(
+            path=path,
+            timeout=timeout,
+            socket_options=socket_options,
+        )
+
+    async def sleep(self, seconds: float) -> None:
+        await self._backend.sleep(seconds)
+
+
+class PinnedDNSAsyncHTTPTransport(httpx.AsyncHTTPTransport):
+    """HTTPX transport whose resolver cannot rebind after URL validation."""
+
+    def __init__(self, *, hostname: str, resolved_ip: str, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        pool = self._pool
+        self._pool = httpcore.AsyncConnectionPool(
+            ssl_context=getattr(pool, "_ssl_context", ssl.create_default_context()),
+            max_connections=getattr(pool, "_max_connections", 100),
+            max_keepalive_connections=getattr(pool, "_max_keepalive_connections", 20),
+            keepalive_expiry=getattr(pool, "_keepalive_expiry", 5.0),
+            http1=getattr(pool, "_http1", True),
+            http2=getattr(pool, "_http2", False),
+            retries=getattr(pool, "_retries", 0),
+            local_address=getattr(pool, "_local_address", None),
+            uds=getattr(pool, "_uds", None),
+            socket_options=getattr(pool, "_socket_options", None),
+            network_backend=_PinnedDNSBackend(hostname, resolved_ip),
+        )
 
 
 async def _attempt_delivery(
@@ -116,7 +181,7 @@ async def _send_claimed_delivery_within_deadline(
     header_deadline = loop.time() + send_window_seconds
 
     try:
-        await asyncio.wait_for(
+        validated_url = await asyncio.wait_for(
             webhook_validation.validate_webhook_url(delivery["url"]),
             timeout=_remaining_timeout_seconds(header_deadline),
         )
@@ -125,7 +190,15 @@ async def _send_claimed_delivery_within_deadline(
     except Exception as e:
         return _DeliveryResult(succeeded=False, error=f"url-rejected: {type(e).__name__}: {e}")
 
-    client_cm = httpx.AsyncClient(timeout=webhook_types.DELIVERY_TIMEOUT, follow_redirects=False)
+    transport = PinnedDNSAsyncHTTPTransport(
+        hostname=validated_url.hostname,
+        resolved_ip=validated_url.resolved_ip,
+    )
+    client_cm = httpx.AsyncClient(
+        timeout=webhook_types.DELIVERY_TIMEOUT,
+        follow_redirects=False,
+        transport=transport,
+    )
     client = None
     stream_cm = None
     try:

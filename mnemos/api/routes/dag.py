@@ -16,6 +16,9 @@ from pydantic import BaseModel
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.routes._postgres_only import _require_postgres_backend
+from mnemos.api.routes.memories import _schedule_outbox_deliveries
+from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 
 
 def _branch_advisory_lock_key(memory_id: str, branch: str, _hashlib_mod=None) -> int:
@@ -40,14 +43,11 @@ def _branch_advisory_lock_key(memory_id: str, branch: str, _hashlib_mod=None) ->
     return key
 
 
-async def _assert_memory_access(conn, memory_id: str, user: UserContext) -> None:
-    """Ensure the caller can read/modify this memory. Raises 404 otherwise.
+async def _assert_memory_writable(conn, memory_id: str, user: UserContext) -> None:
+    """Ensure the caller can modify this memory. Raises 404 otherwise.
 
-    Root can access any memory; non-root callers are scoped to both their
-    owner_id AND their namespace — matching the two-dimensional tenancy
-    gate that list/get/search/KG handlers apply (v3.1.2 Tier 3). We
-    return 404 (not 403) to avoid leaking existence of memories belonging
-    to other tenants.
+    Root can access any memory; non-root writers are scoped to exact
+    owner_id AND namespace. We return 404 to avoid leaking existence.
     """
     row = await conn.fetchrow(
         "SELECT owner_id, namespace FROM memories WHERE id = $1", memory_id,
@@ -58,6 +58,38 @@ async def _assert_memory_access(conn, memory_id: str, user: UserContext) -> None
         row["owner_id"] != user.user_id
         or row["namespace"] != user.namespace
     ):
+        raise HTTPException(status_code=404, detail="Memory not found")
+
+
+async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> None:
+    """Ensure DAG read endpoints match memory read visibility semantics."""
+    if user.role == "root":
+        row = await conn.fetchrow("SELECT 1 FROM memories WHERE id = $1", memory_id)
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        return
+
+    visibility = VisibilityFilter.for_read(user, namespace=user.namespace)
+    if visibility.scope == VisibilityScope.ROOT_BYPASS:
+        row = await conn.fetchrow("SELECT 1 FROM memories WHERE id = $1", memory_id)
+    else:
+        row = await conn.fetchrow(
+            """
+            SELECT 1 FROM memories
+            WHERE id = $1
+              AND namespace = $2
+              AND (
+                    owner_id = $3
+                 OR (permission_mode % 10) >= 4
+                 OR ((permission_mode / 10) % 10) >= 4 AND group_id = ANY($4::text[])
+              )
+            """,
+            memory_id,
+            visibility.namespace,
+            visibility.user_id,
+            list(visibility.group_ids),
+        )
+    if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
 
 logger = logging.getLogger(__name__)
@@ -130,7 +162,7 @@ async def get_memory_log(
 
     try:
         async with pool.acquire() as conn:
-            await _assert_memory_access(conn, memory_id, user)
+            await _assert_memory_readable(conn, memory_id, user)
             # Recursive CTE: walk from HEAD backward through parent_version_id.
             # Carries owner_id/namespace/permission_mode and the actual parent
             # identity through both arms so the post-walk filter can drop
@@ -261,7 +293,7 @@ async def get_memory_branches(
 
     try:
         async with pool.acquire() as conn:
-            await _assert_memory_access(conn, memory_id, user)
+            await _assert_memory_readable(conn, memory_id, user)
             # Scope the JOIN by memory_id too — a stale/corrupt
             # branch row pointing at another memory's version_id
             # would otherwise leak that other memory's commit_hash
@@ -350,7 +382,7 @@ async def create_branch(
     try:
         async with pool.acquire() as conn:
             async with conn.transaction():
-                await _assert_memory_access(conn, memory_id, user)
+                await _assert_memory_writable(conn, memory_id, user)
                 # The preflight check above is not authoritative for the
                 # write: lock and re-check the live memory row in the same
                 # transaction that resolves the start commit and inserts the
@@ -476,7 +508,7 @@ async def get_commit(
 
     try:
         async with pool.acquire() as conn:
-            await _assert_memory_access(conn, memory_id, user)
+            await _assert_memory_readable(conn, memory_id, user)
             # Per-snapshot tenancy gate (slice 2 round 15). The
             # live-memory check above is necessary but not sufficient
             # — a snapshot taken when the row was private must remain
@@ -566,398 +598,235 @@ async def merge_branch(
     target_branch: str = Query("main"),
     user: UserContext = Depends(get_current_user),
 ):
-    """Merge source_branch into target_branch.
-
-    Strategy 'latest-wins' takes source_branch HEAD content.
-    Strategy 'manual' requires manual conflict resolution (not implemented yet).
-    """
-    pool = _require_pool()
-
+    """Merge source_branch into target_branch."""
+    _require_pool()
+    backend = _require_postgres_backend()
     if request.strategy not in ("latest-wins", "manual"):
         raise HTTPException(status_code=400, detail="Invalid merge strategy")
 
-    # Pre-compute advisory lock key from (memory_id, target_branch) so all
-    # DAG writers (merge AND revert) serialize on the same branch.
-    # Round-26: previous prefix "dag-merge" was merge-specific and didn't
-    # collide with revert's locks; a feature-branch revert could orphan
-    # a concurrent merge into the same branch (or vice versa). Generic
-    # "dag-branch" prefix means both paths compute the same key for the
-    # same (memory_id, branch) and pg_advisory_xact_lock serializes
-    # them. The revert path in api/handlers/versions.py uses an
-    # identical key.
     import hashlib as _hashlib
-    _lock_key = _branch_advisory_lock_key(memory_id, target_branch, _hashlib)
+
+    lock_key = _branch_advisory_lock_key(memory_id, target_branch, _hashlib)
+    delivery_ids: list[str] = []
+    live_tracks_target = False
+    merge_hash: str | None = None
+    source_head = None
+    merge_owner_id = user.user_id
+    merge_namespace = user.namespace
 
     try:
-        async with pool.acquire() as conn:
-            await _assert_memory_access(conn, memory_id, user)
-            async with conn.transaction():
-                # Lock acquisition order: advisory FIRST, row lock
-                # SECOND. Both DAG writers (merge_branch + feature-
-                # branch revert) follow this order so they can't
-                # deadlock against each other.
-                await conn.execute("SELECT pg_advisory_xact_lock($1)", _lock_key)
+        async with backend.transactional() as tx:
+            conn = tx.conn
+            await _assert_memory_writable(conn, memory_id, user)
+            await conn.execute("SELECT pg_advisory_xact_lock($1)", lock_key)
 
-                if request.strategy == "manual":
-                    return MergeResult(
-                        success=False,
-                        message="Manual merge strategy not yet implemented",
-                    )
+            if request.strategy == "manual":
+                return MergeResult(success=False, message="Manual merge strategy not yet implemented")
 
-                # latest-wins from here. Acquire the row lock + read
-                # both source_head and target_head UNDER the lock so
-                # neither can race a concurrent writer (rounds 28,
-                # 29, 30). The advisory lock above also serializes
-                # against other DAG writers on the same branch.
-                # Pull versioned fields from the live row including
-                # tenancy fields (round 33). The drift guard before
-                # the destructive UPDATE compares ALL of the
-                # trigger's versioned fields — content / category /
-                # subcategory / metadata / verbatim_content PLUS
-                # owner_id / namespace / permission_mode. Otherwise
-                # a permission-mode drift between live (private) and
-                # target_head (public) would let us publish a public
-                # version-log entry whose content is currently held
-                # private in `memories`.
-                if user.role == "root":
-                    live = await conn.fetchrow(
-                        "SELECT id, owner_id, namespace, permission_mode, "
-                        "content, category, subcategory, metadata, "
-                        "verbatim_content "
-                        "FROM memories WHERE id = $1 FOR UPDATE",
-                        memory_id,
-                    )
-                else:
-                    live = await conn.fetchrow(
-                        "SELECT id, owner_id, namespace, permission_mode, "
-                        "content, category, subcategory, metadata, "
-                        "verbatim_content "
-                        "FROM memories WHERE id = $1 "
-                        "AND owner_id = $2 AND namespace = $3 FOR UPDATE",
-                        memory_id, user.user_id, user.namespace,
-                    )
-                if live is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Memory {memory_id} not found",
-                    )
-
-                # Per-snapshot tenancy on source_head — caller must
-                # be allowed to read the source snapshot directly
-                # via get_commit before merge can copy its content.
-                # Pull source_* provenance fields (round 18). Now
-                # under the row lock so source_head can't drift
-                # mid-transaction (round 30).
-                if user.role == "root":
-                    source_head = await conn.fetchrow(
-                        """
-                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
-                               mv.category, mv.subcategory, mv.metadata,
-                               mv.verbatim_content,
-                               mv.source_model, mv.source_provider,
-                               mv.source_session, mv.source_agent
-                        FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                        WHERE mv.memory_id = $1 AND mb.name = $2
-                        """,
-                        memory_id, request.source_branch,
-                    )
-                else:
-                    from mnemos.core.visibility import version_visibility_predicate
-                    vis_clause, vis_params = version_visibility_predicate(
-                        user.user_id, start_param_idx=3, table_alias="mv",
-                    )
-                    ns_ph = f"${len(vis_params) + 3}"
-                    source_head = await conn.fetchrow(
-                        f"""
-                        SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
-                               mv.category, mv.subcategory, mv.metadata,
-                               mv.verbatim_content,
-                               mv.source_model, mv.source_provider,
-                               mv.source_session, mv.source_agent
-                        FROM memory_versions mv
-                        INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
-                        WHERE mv.memory_id = $1 AND mb.name = $2
-                          AND {vis_clause} AND mv.namespace = {ns_ph}
-                        """,
-                        memory_id, request.source_branch,
-                        *vis_params, user.namespace,
-                    )
-                if not source_head:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Source branch '{request.source_branch}' not found",
-                    )
-
-                # target_head also under the lock. Lock the branch
-                # row first, then gate the resolved HEAD snapshot
-                # before copying its tenancy into the merge commit.
-                # Reading it AFTER FOR UPDATE on memories serializes
-                # against update_memory and main-revert's row-level
-                # locks (round 28). source vs target both freshly
-                # read at the same serialization point.
-                target_branch_row = await conn.fetchrow(
-                    "SELECT head_version_id FROM memory_branches "
-                    "WHERE memory_id = $1 AND name = $2 FOR UPDATE",
-                    memory_id, target_branch,
+            if user.role == "root":
+                live = await conn.fetchrow(
+                    "SELECT id, owner_id, namespace, permission_mode, content, category, "
+                    "subcategory, metadata, verbatim_content FROM memories WHERE id = $1 FOR UPDATE",
+                    memory_id,
                 )
+            else:
+                live = await conn.fetchrow(
+                    "SELECT id, owner_id, namespace, permission_mode, content, category, "
+                    "subcategory, metadata, verbatim_content FROM memories "
+                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3 FOR UPDATE",
+                    memory_id,
+                    user.user_id,
+                    user.namespace,
+                )
+            if live is None:
+                raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
+
+            if user.role == "root":
+                source_head = await conn.fetchrow(
+                    """
+                    SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
+                           mv.category, mv.subcategory, mv.metadata, mv.verbatim_content,
+                           mv.source_model, mv.source_provider, mv.source_session, mv.source_agent
+                    FROM memory_versions mv
+                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                    WHERE mv.memory_id = $1 AND mb.name = $2
+                    """,
+                    memory_id,
+                    request.source_branch,
+                )
+            else:
+                from mnemos.core.visibility import version_visibility_predicate
+
+                vis_clause, vis_params = version_visibility_predicate(
+                    user.user_id,
+                    start_param_idx=3,
+                    table_alias="mv",
+                )
+                ns_ph = f"${len(vis_params) + 3}"
+                source_head = await conn.fetchrow(
+                    f"""
+                    SELECT mv.id, mv.commit_hash, mv.content, mv.version_num,
+                           mv.category, mv.subcategory, mv.metadata, mv.verbatim_content,
+                           mv.source_model, mv.source_provider, mv.source_session, mv.source_agent
+                    FROM memory_versions mv
+                    INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
+                    WHERE mv.memory_id = $1 AND mb.name = $2
+                      AND {vis_clause} AND mv.namespace = {ns_ph}
+                    """,
+                    memory_id,
+                    request.source_branch,
+                    *vis_params,
+                    user.namespace,
+                )
+            if not source_head:
+                raise HTTPException(status_code=404, detail=f"Source branch '{request.source_branch}' not found")
+
+            target_branch_row = await conn.fetchrow(
+                "SELECT head_version_id FROM memory_branches WHERE memory_id = $1 AND name = $2 FOR UPDATE",
+                memory_id,
+                target_branch,
+            )
+            if target_branch_row is None or target_branch_row["head_version_id"] is None:
+                raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
+            target_head_id = target_branch_row["head_version_id"]
+
+            from mnemos.core.visibility import _assert_target_head_visible
+
+            await _assert_target_head_visible(
+                conn,
+                target_head_id,
+                user,
+                f"Target branch '{target_branch}' not found",
+            )
+            target_head = await conn.fetchrow(
+                """
+                SELECT id, version_num, commit_hash, content, category, subcategory,
+                       metadata, verbatim_content, owner_id, namespace, permission_mode
+                FROM memory_versions
+                WHERE id = $1 AND memory_id = $2
+                """,
+                target_head_id,
+                memory_id,
+            )
+            if not target_head:
+                raise HTTPException(status_code=404, detail=f"Target branch '{target_branch}' not found")
+
+            if (
+                source_head["content"] == target_head["content"]
+                and source_head["category"] == target_head["category"]
+                and source_head["subcategory"] == target_head["subcategory"]
+                and source_head["metadata"] == target_head["metadata"]
+                and source_head["verbatim_content"] == target_head["verbatim_content"]
+            ):
+                return MergeResult(
+                    success=False,
+                    new_commit_hash=target_head["commit_hash"],
+                    message=(
+                        f"Source branch '{request.source_branch}' has no versioned changes vs "
+                        f"'{target_branch}'; no merge commit created"
+                    ),
+                )
+
+            merge_owner_id = live["owner_id"]
+            merge_namespace = live["namespace"]
+            live_tracks_target = target_branch == "main"
+
+            import hashlib as _hashlib_local
+            import time as _time_local
+
+            next_version = target_head["version_num"] + 1
+            merge_hash = _hashlib_local.sha256(
+                f"{memory_id}|{next_version}|{source_head['content']}|"
+                f"merge-{request.source_branch}->{target_branch}-{int(_time_local.time() * 1_000_000)}".encode()
+            ).hexdigest()
+
+            meta_val = source_head["metadata"]
+            if isinstance(meta_val, str):
+                meta_str = meta_val
+            elif meta_val is not None:
+                import json as _json
+
+                meta_str = _json.dumps(dict(meta_val))
+            else:
+                meta_str = "{}"
+
+            new_version_id = await conn.fetchval(
+                """
+                INSERT INTO memory_versions (
+                    memory_id, version_num, content, category, subcategory,
+                    metadata, verbatim_content, owner_id, namespace, permission_mode,
+                    source_model, source_provider, source_session, source_agent,
+                    branch, commit_hash, parent_version_id, snapshot_by, change_type
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9, $10,
+                    $11, $12, $13, $14, $15, $16, $17, $18, 'update'
+                )
+                RETURNING id
+                """,
+                memory_id,
+                next_version,
+                source_head["content"],
+                source_head["category"],
+                source_head["subcategory"],
+                meta_str,
+                source_head["verbatim_content"],
+                target_head["owner_id"],
+                target_head["namespace"],
+                target_head["permission_mode"],
+                source_head["source_model"],
+                source_head["source_provider"],
+                source_head["source_session"],
+                source_head["source_agent"],
+                target_branch,
+                merge_hash,
+                target_head["id"],
+                user.user_id,
+            )
+            await conn.execute(
+                "UPDATE memory_branches SET head_version_id = $1 WHERE memory_id = $2 AND name = $3",
+                new_version_id,
+                memory_id,
+                target_branch,
+            )
+
+            if live_tracks_target:
                 if (
-                    target_branch_row is None
-                    or target_branch_row["head_version_id"] is None
+                    live["content"] != target_head["content"]
+                    or live["category"] != target_head["category"]
+                    or live["subcategory"] != target_head["subcategory"]
+                    or live["metadata"] != target_head["metadata"]
+                    or live["verbatim_content"] != target_head["verbatim_content"]
+                    or live["owner_id"] != target_head["owner_id"]
+                    or live["namespace"] != target_head["namespace"]
+                    or live["permission_mode"] != target_head["permission_mode"]
                 ):
                     raise HTTPException(
-                        status_code=404,
-                        detail=f"Target branch '{target_branch}' not found",
+                        status_code=409,
+                        detail="Live memory row has drifted from main HEAD; manual reconciliation required before merge into main",
                     )
-                target_head_id = target_branch_row["head_version_id"]
-                from mnemos.core.visibility import _assert_target_head_visible
-                await _assert_target_head_visible(
-                    conn,
-                    target_head_id,
-                    user,
-                    f"Target branch '{target_branch}' not found",
-                )
-                target_head = await conn.fetchrow(
+                await conn.execute("SELECT set_config('mnemos.suppress_version_snapshot', '1', true)")
+                await conn.execute(
                     """
-                    SELECT id, version_num, commit_hash,
-                           content, category, subcategory,
-                           metadata, verbatim_content,
-                           owner_id, namespace, permission_mode
-                    FROM memory_versions
-                    WHERE id = $1 AND memory_id = $2
+                    UPDATE memories SET
+                        content = $1, category = $2, subcategory = $3,
+                        metadata = $4::jsonb, verbatim_content = $5,
+                        source_model = $6, source_provider = $7,
+                        source_session = $8, source_agent = $9, updated = NOW()
+                    WHERE id = $10
                     """,
-                    target_head_id, memory_id,
-                )
-                if not target_head:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"Target branch '{target_branch}' not found",
-                    )
-
-                # latest-wins continues here — manual already
-                # returned at the top after lock acquisition.
-
-                # Authoritative no-op check (round-29 fix). Run
-                # this AFTER acquiring the row lock and re-reading
-                # target_head so the decision reflects the current
-                # state of main, not a pre-lock snapshot. Compare
-                # ALL of the trigger's versioned fields (round-23
-                # extended this from content-only to the full
-                # set: content / category / subcategory /
-                # metadata / verbatim_content).
-                if (source_head["content"] == target_head["content"]
-                        and source_head["category"] == target_head["category"]
-                        and source_head["subcategory"] == target_head["subcategory"]
-                        and source_head["metadata"] == target_head["metadata"]
-                        and source_head["verbatim_content"] == target_head["verbatim_content"]):
-                    logger.info(
-                        f"[DAG] Merge no-op (locked): "
-                        f"{request.source_branch} -> {target_branch} for "
-                        f"{memory_id} (versioned fields identical at "
-                        f"locked target_head)"
-                    )
-                    return MergeResult(
-                        success=False,
-                        new_commit_hash=target_head["commit_hash"],
-                        message=(
-                            f"Source branch '{request.source_branch}' has "
-                            f"no versioned changes vs '{target_branch}'; "
-                            f"no merge commit created"
-                        ),
-                    )
-
-                merge_owner_id = live["owner_id"]
-                merge_namespace = live["namespace"]
-                # Materialized-branch identity is determined by
-                # NAME, not by content equality. The MNEMOS
-                # convention is `memories` always tracks 'main':
-                # v1 of every memory is created on 'main' by
-                # the trigger; update_memory writes via the
-                # trigger with mnemos.current_branch GUC default
-                # 'main'. Feature branches diverge in
-                # memory_versions / memory_branches but never in
-                # `memories`. So the live row is updated only
-                # when target_branch is 'main'. Earlier rounds
-                # tried to infer this from content equality
-                # (round 22) and full versioned-field equality
-                # (round 23); both are false-positive on
-                # newly-branched-from-main memories where the
-                # branch initially points at the same versioned
-                # state as main.
-                live_tracks_target = (target_branch == "main")
-
-                # Compute merge commit_hash. Same shape as the
-                # mnemos_version_snapshot trigger
-                # (sha256 over id|version|content|now) so the
-                # commit identity is consistent regardless of
-                # whether the trigger or this handler created it.
-                import hashlib as _hashlib_local
-                next_version = target_head["version_num"] + 1
-                merge_hash = _hashlib_local.sha256(
-                    f"{memory_id}|{next_version}|{source_head['content']}|"
-                    f"merge-{request.source_branch}->{target_branch}-{int(__import__('time').time() * 1_000_000)}"
-                    .encode()
-                ).hexdigest()
-
-                meta_val = source_head["metadata"]
-                if isinstance(meta_val, str):
-                    meta_str = meta_val
-                elif meta_val is not None:
-                    import json as _json
-                    meta_str = _json.dumps(dict(meta_val))
-                else:
-                    meta_str = "{}"
-
-                # Explicit INSERT into memory_versions for the
-                # merge commit. Pulls owner_id/namespace/
-                # permission_mode from the source snapshot
-                # (per slice-2 round-15 source-head visibility
-                # gate), copies content + provenance from SOURCE,
-                # but tenancy fields (owner_id / namespace /
-                # permission_mode) from TARGET. Round-33 fix: the
-                # earlier code copied tenancy from the source
-                # snapshot, which let merging from a public branch
-                # (forked while public) into a now-private main
-                # publish content under the source's stale public
-                # permission_mode. Tenancy must follow the target
-                # branch so the new commit's visibility matches
-                # what the destination actually owns.
-                # change_type='update' (the v2 CHECK constraint
-                # doesn't allow 'merge'; see migration_v2_versioning).
-                new_version_id = await conn.fetchval(
-                    """
-                    INSERT INTO memory_versions (
-                        memory_id, version_num, content, category, subcategory,
-                        metadata, verbatim_content,
-                        owner_id, namespace, permission_mode,
-                        source_model, source_provider, source_session, source_agent,
-                        branch, commit_hash, parent_version_id,
-                        snapshot_by, change_type
-                    ) VALUES (
-                        $1, $2, $3, $4, $5,
-                        $6::jsonb, $7,
-                        $8, $9, $10,
-                        $11, $12, $13, $14,
-                        $15, $16, $17, $18, 'update'
-                    )
-                    RETURNING id
-                    """,
-                    memory_id, next_version,
-                    source_head["content"], source_head["category"],
+                    source_head["content"],
+                    source_head["category"],
                     source_head["subcategory"],
-                    meta_str, source_head["verbatim_content"],
-                    target_head["owner_id"], target_head["namespace"],
-                    target_head["permission_mode"],
+                    meta_str,
+                    source_head["verbatim_content"],
                     source_head["source_model"],
                     source_head["source_provider"],
                     source_head["source_session"],
                     source_head["source_agent"],
-                    target_branch, merge_hash, target_head["id"],
-                    user.user_id,
+                    memory_id,
                 )
-
-                # Advance the target branch HEAD pointer.
-                await conn.execute(
-                    "UPDATE memory_branches SET head_version_id = $1 "
-                    "WHERE memory_id = $2 AND name = $3",
-                    new_version_id, memory_id, target_branch,
-                )
-
-                # If the live row was tracking target_branch
-                # (its content matched target_head's), advance
-                # the live row too so the live-row/HEAD invariant
-                # holds for the now-materialized branch.
-                # Suppress the version-snapshot trigger here so
-                # we don't double-version (we already did the
-                # explicit INSERT above). Use the existing
-                # mnemos.suppress_version_snapshot GUC which the
-                # trigger consults via its WHEN clause (per
-                # migrations_charon_trigger_guard).
-                if live_tracks_target:
-                    # Drift guard (rounds 32 + 33). Compare ALL of
-                    # the trigger's versioned fields between live
-                    # and target_head — content + category +
-                    # subcategory + metadata + verbatim_content
-                    # PLUS owner_id, namespace, permission_mode.
-                    # Tenancy drift would be especially dangerous:
-                    # if main was made private (mode 600) but the
-                    # version log still shows public (mode 644),
-                    # merging would publish a public commit whose
-                    # content the live row holds privately.
-                    if (live["content"] != target_head["content"]
-                            or live["category"] != target_head["category"]
-                            or live["subcategory"] != target_head["subcategory"]
-                            or live["metadata"] != target_head["metadata"]
-                            or live["verbatim_content"] != target_head["verbatim_content"]
-                            or live["owner_id"] != target_head["owner_id"]
-                            or live["namespace"] != target_head["namespace"]
-                            or live["permission_mode"] != target_head["permission_mode"]):
-                        logger.error(
-                            f"[DAG] Merge aborted: live memory row for "
-                            f"{memory_id} has drifted from main HEAD "
-                            f"({target_head['commit_hash'][:12]}). Refusing "
-                            f"to overwrite live state silently. Operator "
-                            f"must reconcile via revert or update before "
-                            f"this merge can run."
-                        )
-                        raise HTTPException(
-                            status_code=409,
-                            detail=(
-                                f"Live memory row has drifted from main "
-                                f"HEAD; manual reconciliation required "
-                                f"before merge into main"
-                            ),
-                        )
-                    await conn.execute(
-                        "SELECT set_config('mnemos.suppress_version_snapshot', '1', true)"
-                    )
-                    await conn.execute(
-                        """
-                        UPDATE memories SET
-                            content = $1, category = $2, subcategory = $3,
-                            metadata = $4::jsonb, verbatim_content = $5,
-                            source_model = $6, source_provider = $7,
-                            source_session = $8, source_agent = $9,
-                            updated = NOW()
-                        WHERE id = $10
-                        """,
-                        source_head["content"], source_head["category"],
-                        source_head["subcategory"],
-                        meta_str, source_head["verbatim_content"],
-                        source_head["source_model"],
-                        source_head["source_provider"],
-                        source_head["source_session"],
-                        source_head["source_agent"],
-                        memory_id,
-                    )
-
-        # Cache invalidation + memory.updated webhook ONLY when the
-        # live row was actually mutated. Branch-only merges (where
-        # live_tracks_target was False) advanced memory_branches
-        # HEAD but left `memories` untouched — the live state did
-        # NOT change, so /memories/search results don't need
-        # invalidation and external subscribers must not be told
-        # the live row was updated. Cross-branch merges are pure
-        # DAG-level operations that callers monitor via the version/
-        # log endpoints, not memory.updated webhooks (round-23
-        # finding).
-        if live_tracks_target:
-            if _lc._cache:
-                try:
-                    await _lc._cache.delete("stats:global")
-                    try:
-                        async for _k in _lc._cache.scan_iter(
-                            match="mnemos:search:*", count=500,
-                        ):
-                            await _lc._cache.delete(_k)
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
-
-            try:
-                from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-                await _dispatch_webhook(
+                delivery_ids = await backend.webhooks.dispatch_event(
+                    tx,
                     "memory.updated",
                     {
                         "memory_id": memory_id,
@@ -972,15 +841,23 @@ async def merge_branch(
                     owner_id=merge_owner_id,
                     namespace=merge_namespace,
                 )
-            except Exception:
-                logger.warning(
-                    "webhook dispatch failed for memory.updated %s",
-                    memory_id, exc_info=True,
-                )
+
+        if live_tracks_target:
+            if _lc._cache:
+                try:
+                    await _lc._cache.delete("stats:global")
+                    try:
+                        async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                            await _lc._cache.delete(key)
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+            _schedule_outbox_deliveries(delivery_ids)
 
         logger.info(
-            f"[DAG] Merged {request.source_branch} -> {target_branch} "
-            f"for {memory_id} (merge_hash={merge_hash[:12] if merge_hash else '?'}...)"
+            f"[DAG] Merged {request.source_branch} -> {target_branch} for {memory_id} "
+            f"(merge_hash={merge_hash[:12] if merge_hash else '?'}...)"
         )
         return MergeResult(
             success=True,

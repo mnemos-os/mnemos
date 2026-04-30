@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 import ipaddress
 import socket
 from typing import List, Union
@@ -30,6 +31,14 @@ _BLOCKED_METADATA_HOSTS = frozenset({
 _IPAddress = Union[ipaddress.IPv4Address, ipaddress.IPv6Address]
 
 
+@dataclass(frozen=True)
+class ValidatedWebhookURL:
+    url: str
+    hostname: str
+    port: int
+    resolved_ip: str
+
+
 def _is_blocked_ip(ip: _IPAddress) -> bool:
     """SSRF defense: block loopback, private, link-local, multicast, reserved."""
     return (
@@ -49,7 +58,11 @@ async def _resolve_addrs(host: str) -> List[str]:
     return [info[4][0] for info in infos]
 
 
-async def validate_webhook_url(url: str) -> None:
+async def validate_webhook_url(
+    url: str,
+    *,
+    allow_private: bool | None = None,
+) -> ValidatedWebhookURL:
     """Validate a webhook URL: scheme + host not pointing at internal services."""
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https"):
@@ -61,14 +74,18 @@ async def validate_webhook_url(url: str) -> None:
     if host.lower() in _BLOCKED_METADATA_HOSTS:
         raise HTTPException(status_code=422, detail="url host is not permitted")
 
-    if _WEBHOOK_ALLOW_PRIVATE:
-        return
+    allow_private_hosts = _WEBHOOK_ALLOW_PRIVATE if allow_private is None else allow_private
 
     try:
         ip = ipaddress.ip_address(host)
-        if _is_blocked_ip(ip):
+        if not allow_private_hosts and _is_blocked_ip(ip):
             raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
-        return
+        return ValidatedWebhookURL(
+            url=url,
+            hostname=host,
+            port=parsed.port or (443 if parsed.scheme == "https" else 80),
+            resolved_ip=str(ip),
+        )
     except ValueError:
         pass
 
@@ -76,10 +93,21 @@ async def validate_webhook_url(url: str) -> None:
         addrs = await _resolve_addrs(host)
     except (socket.gaierror, OSError):
         raise HTTPException(status_code=422, detail="url host could not be resolved")
+    first_validated_addr: str | None = None
     for addr in addrs:
         try:
             ip = ipaddress.ip_address(addr)
         except ValueError:
             continue
-        if _is_blocked_ip(ip):
+        if not allow_private_hosts and _is_blocked_ip(ip):
             raise HTTPException(status_code=422, detail="url host resolves to a non-routable address")
+        if first_validated_addr is None:
+            first_validated_addr = str(ip)
+    if first_validated_addr is None:
+        raise HTTPException(status_code=422, detail="url host could not be resolved")
+    return ValidatedWebhookURL(
+        url=url,
+        hostname=host,
+        port=parsed.port or (443 if parsed.scheme == "https" else 80),
+        resolved_ip=first_validated_addr,
+    )

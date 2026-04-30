@@ -123,12 +123,16 @@ async def federation_schema(
 # ── Admin: peer CRUD ─────────────────────────────────────────────────────────
 
 
-def _validate_peer_base_url(base_url: str) -> None:
-    """Require https:// for peer base URLs. Set FEDERATION_ALLOW_INSECURE=true
+async def _validate_peer_base_url(base_url: str) -> None:
+    """Require https:// and reject SSRF targets for peer base URLs. Set FEDERATION_ALLOW_INSECURE=true
     to permit http:// (lab/local testing only — the peer auth token ships
     in clear over HTTP)."""
     from urllib.parse import urlparse
     from mnemos.core.config import get_settings
+    from mnemos.webhooks.validation import validate_webhook_url
+
+    settings = get_settings().federation
+    await validate_webhook_url(base_url, allow_private=settings.allow_private)
     allow_insecure = get_settings().federation.allow_insecure
     parsed = urlparse(base_url)
     if parsed.scheme == "https":
@@ -152,7 +156,7 @@ async def register_peer(
     _: UserContext = Depends(require_root),
 ):
     """Register a remote peer to pull from."""
-    _validate_peer_base_url(request.base_url)
+    await _validate_peer_base_url(request.base_url)
     if request.compat_mode not in ("strict", "permissive"):
         raise HTTPException(
             status_code=422,
@@ -161,7 +165,7 @@ async def register_peer(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO federation_peers
@@ -186,7 +190,7 @@ async def register_peer(
 async def list_peers(_: UserContext = Depends(require_root)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch("SELECT * FROM federation_peers ORDER BY name")
     peers = [_to_peer(r) for r in rows]
     return FederationPeerListResponse(count=len(peers), peers=peers)
@@ -197,7 +201,7 @@ async def get_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM federation_peers WHERE id = $1::uuid", peer_id,
         )
@@ -219,7 +223,7 @@ async def update_peer(
     if not updates:
         raise HTTPException(status_code=422, detail="no fields to update")
     if "base_url" in updates:
-        _validate_peer_base_url(updates["base_url"])
+        await _validate_peer_base_url(updates["base_url"])
     if "compat_mode" in updates and updates["compat_mode"] not in ("strict", "permissive"):
         raise HTTPException(
             status_code=422,
@@ -237,7 +241,7 @@ async def update_peer(
         raise HTTPException(status_code=422, detail=f"unknown fields: {sorted(bad)}")
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
     set_clauses.append("updated=NOW()")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             f"UPDATE federation_peers SET {', '.join(set_clauses)} "
             f"WHERE id=$1::uuid RETURNING *",
@@ -253,7 +257,7 @@ async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
             "DELETE FROM federation_peers WHERE id = $1::uuid", peer_id,
         )
@@ -304,7 +308,7 @@ async def peer_sync_log(
     peer_id = parse_uuid_or_404(peer_id, "peer")
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT id::text, started_at, finished_at, memories_pulled,
@@ -338,7 +342,7 @@ async def peer_sync_log(
 async def federation_status(_: UserContext = Depends(require_root)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch("SELECT * FROM federation_peers ORDER BY name")
     peers = [_to_peer(r) for r in rows]
     return FederationStatusResponse(
@@ -414,7 +418,7 @@ async def federation_feed(
     args.append(limit + 1)   # request one extra to detect has_more
     where_clause = " AND ".join(query_parts)
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             f"""
             SELECT id, content, category, subcategory, metadata, quality_rating,

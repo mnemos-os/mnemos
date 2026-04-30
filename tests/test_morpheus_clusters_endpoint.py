@@ -19,13 +19,15 @@ from fastapi import HTTPException
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext
 from mnemos.api.routes.morpheus import list_clusters
+from mnemos.persistence.postgres import PostgresBackend
+from types import SimpleNamespace
 
 
 def _user() -> UserContext:
     return UserContext(
         user_id="u_test",
         group_ids=[],
-        role="user",
+        role="root",
         namespace="default",
         authenticated=True,
     )
@@ -84,6 +86,8 @@ def stub_pool(monkeypatch):
     def install(conn: _Conn):
         pool = _Pool(conn)
         monkeypatch.setattr(_lc, "_pool", pool)
+        monkeypatch.setattr(_lc, "_pool_manager", None)
+        monkeypatch.setattr(_lc, "_persistence_backend", PostgresBackend(pool, SimpleNamespace()))
         holder["conn"] = conn
         holder["pool"] = pool
         return pool

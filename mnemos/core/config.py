@@ -27,6 +27,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "graeae_mode_default": "auto",
         "log_level": "INFO",
         "compression_workers": 4,
+        "auth_enabled": True,
     },
     "edge": {
         "backend": "sqlite",
@@ -35,6 +36,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "graeae_mode_default": "single",
         "log_level": "INFO",
         "compression_workers": 1,
+        "auth_enabled": False,
     },
     "dev": {
         "backend": "sqlite",
@@ -44,6 +46,7 @@ PROFILE_DEFAULTS: dict[str, dict[str, Any]] = {
         "log_level": "DEBUG",
         "compression_workers": 1,
         "loose_timeouts": True,
+        "auth_enabled": False,
     },
 }
 
@@ -59,6 +62,7 @@ _PROFILE_DEFAULT_TARGETS = {
     "log_level": ("logging", "level"),
     "compression_workers": ("compression", "workers"),
     "loose_timeouts": ("runtime", "loose_timeouts"),
+    "auth_enabled": ("auth", "enabled"),
 }
 
 
@@ -313,12 +317,21 @@ class _FederationSettings(BaseSettings):
     enabled: bool = Field(False, validation_alias="MNEMOS_FEDERATION_ENABLED")
     peers: str = Field("", validation_alias="MNEMOS_FEDERATION_PEERS")
     allow_insecure: bool = Field(False, validation_alias="FEDERATION_ALLOW_INSECURE")
+    allow_private: bool = Field(False, validation_alias="FEDERATION_ALLOW_PRIVATE")
 
 
 class _OAuthSettings(BaseSettings):
     model_config = _config_model_config()
 
     trust_proxy: bool = Field(False, validation_alias="OAUTH_TRUST_PROXY")
+
+
+class _AuthSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    enabled: bool = Field(False, validation_alias="MNEMOS_AUTH_ENABLED")
+    default_namespace: str = Field("default", validation_alias="MNEMOS_DEFAULT_NAMESPACE")
+    personal_user_id: str = Field("default", validation_alias="MNEMOS_PERSONAL_USER_ID")
 
 
 class _RuntimeSettings(BaseSettings):
@@ -367,6 +380,7 @@ class Settings(BaseSettings):
     morpheus: _MorpheusSettings
     federation: _FederationSettings
     oauth: _OAuthSettings
+    auth: _AuthSettings
     runtime: _RuntimeSettings
     tools: _ToolSettings
     logging: _LoggingSettings
@@ -433,6 +447,7 @@ def _build_settings() -> Settings:
         "morpheus": _MorpheusSettings(**_toml_section(toml_config, "morpheus")),
         "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
         "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
+        "auth": _AuthSettings(**_toml_section(toml_config, "auth")),
         "runtime": _RuntimeSettings(**_toml_section(toml_config, "runtime")),
         "tools": _ToolSettings(**_toml_section(toml_config, "tools")),
         "logging": _LoggingSettings(**_toml_section(toml_config, "logging")),
@@ -451,6 +466,7 @@ def _build_settings() -> Settings:
         morpheus=groups["morpheus"],
         federation=groups["federation"],
         oauth=groups["oauth"],
+        auth=groups["auth"],
         runtime=groups["runtime"],
         tools=groups["tools"],
         logging=groups["logging"],

@@ -465,7 +465,7 @@ async def lifespan(app):
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
     if _auth_configurer is not None:
-        _auth_configurer(config.get("auth", {}))
+        _auth_configurer(None)
 
     if settings.rate_limit.storage_uri.startswith(("redis://", "rediss://")):
         try:

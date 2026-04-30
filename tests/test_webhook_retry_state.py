@@ -943,8 +943,16 @@ async def _install(monkeypatch, rows: list[dict[str, Any]], statuses: list[int])
     conn = _FakeWebhookConn(store)
     monkeypatch.setattr(lifecycle, "_pool", pool)
 
-    async def _accept_url(url: str) -> None:
-        return None
+    async def _accept_url(url: str) -> webhook_validation.ValidatedWebhookURL:
+        from urllib.parse import urlparse
+
+        parsed = urlparse(url)
+        return webhook_validation.ValidatedWebhookURL(
+            url=url,
+            hostname=parsed.hostname or "example.test",
+            port=parsed.port or (443 if parsed.scheme == "https" else 80),
+            resolved_ip="203.0.113.1",
+        )
 
     http_factory = _HTTPClientFactory(statuses)
     monkeypatch.setattr(webhook_validation, "validate_webhook_url", _accept_url)
@@ -3095,7 +3103,7 @@ def test_failure_finalize_source_shape_requires_live_owned_attempt():
 def test_lifecycle_shutdown_tracks_workers_and_delivery_attempts_separately():
     repo_root = Path(__file__).resolve().parents[1]
     lifecycle_source = (repo_root / "mnemos" / "core" / "lifecycle.py").read_text()
-    dispatcher_source = _webhook_module_source("outbox", "workers")
+    dispatcher_source = _webhook_module_source("dispatcher", "outbox", "workers")
     workers_source = _webhook_module_source("workers")
     recover_source = workers_source[
         workers_source.index("async def _recover_due_deliveries"):

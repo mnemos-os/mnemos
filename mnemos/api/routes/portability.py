@@ -50,7 +50,7 @@ async def export_memories(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         return await _export_memories(
             conn,
             user=user,
@@ -73,7 +73,7 @@ async def import_memories(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         return await _import_memories(
             conn,
             envelope=envelope,

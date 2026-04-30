@@ -686,18 +686,27 @@ class GraeaeEngine:
                 if override and name in self.providers:
                     overrides[name] = override
         tasks = [
-            self._query_provider(
+            asyncio.create_task(self._query_provider(
                 name, prompt, task_type, timeout,
                 model_override=overrides.get(name),
-            )
+            ))
             for name in active
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            raise
+        finally:
+            for name in active:
+                await call_maybe_async(concurrency.release, name)
 
         all_responses: Dict = {}
 
         for name, result in zip(active, results):
-            await call_maybe_async(concurrency.release, name)
             if isinstance(result, Exception):
                 await call_maybe_async(self._circuit_breakers.record_failure, name)
                 self._quality.record_failure(name)
@@ -1743,6 +1752,22 @@ _PROBE_MAX_CANDIDATES = 6
 _RISERS_MAX = 3
 
 
+def _is_reasoning_variant(model_id: str) -> bool:
+    """True if ``model_id`` is a 'reasoning' SKU.
+
+    Reasoning variants emit provider-specific reasoning blocks alongside
+    the user-facing answer — e.g. xAI Grok-reasoning appends
+    ``\\confidence{N}``; OpenAI o1 emits hidden chain-of-thought tokens
+    that bleed through some adapters. The non-reasoning sibling
+    (``...-non-reasoning`` or unsuffixed) returns clean text, which is
+    what downstream consumers (consensus scoring, OpenAI-compat gateway,
+    auto-context injection) expect. Prefer non-reasoning when both are
+    available.
+    """
+    lower = model_id.lower()
+    return lower.endswith("-reasoning") and not lower.endswith("-non-reasoning")
+
+
 async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) -> list[str]:
     """Return model_ids ordered by selection priority (best first).
 
@@ -1757,7 +1782,15 @@ async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) ->
         the primary family is unhealthy.
 
     Within each stage, ties break by version tuple DESC, arena_score DESC,
-    last_synced DESC, len(model_id) ASC (prefer canonical short names).
+    last_synced DESC, **non-reasoning preferred over reasoning variants**,
+    len(model_id) ASC (prefer canonical short names).
+
+    The non-reasoning tiebreak was added in v4.1.2 after xAI split
+    grok-4-1-fast into reasoning + non-reasoning SKUs with identical
+    family/version/weight; the prior ``len()``-only tiebreak accidentally
+    promoted ``grok-4.20-0309-reasoning`` (27 chars) over
+    ``grok-4.20-0309-non-reasoning`` (31 chars), so every consultation
+    came back tagged ``\\confidence{N}`` instead of clean text.
     """
     rows = await conn.fetch(
         """
@@ -1798,6 +1831,7 @@ async def _ranked_candidates(conn, registry_provider: str, prefer: list[str]) ->
             tuple(-x for x in a["version"]),
             -a["arena"],
             -a["synced"],
+            _is_reasoning_variant(a["mid"]),  # False (0) before True (1)
             len(a["mid"]),
         )
 

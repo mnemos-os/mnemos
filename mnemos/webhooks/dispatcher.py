@@ -32,7 +32,7 @@ async def dispatch(
     conn: Optional[asyncpg.Connection] = None,
     owner_id: Optional[str] = None,
     namespace: Optional[str] = None,
-) -> None:
+) -> list[str]:
     """Fan out an event to all matching subscriptions.
 
     Records a `webhook_deliveries` row per subscription, then schedules each
@@ -54,28 +54,33 @@ async def dispatch(
         raise TypeError("dispatch expects dispatch(event_type, payload, *, conn=conn)")
 
     if target_conn is not None:
-        await _dispatch_on_conn(
+        return await _dispatch_on_conn(
             target_conn,
             resolved_event_type,
             resolved_payload,
             owner_id=owner_id,
             namespace=namespace,
         )
-        return
 
     from mnemos.core.lifecycle import _pool as lifecycle_pool  # noqa: WPS433
     if not lifecycle_pool:
         logger.warning("webhook dispatcher: no DB pool - skipping event %s", resolved_event_type)
-        return
+        return []
 
     async with lifecycle_pool.acquire() as acquired_conn:
-        await _dispatch_on_conn(
+        delivery_ids = await _dispatch_on_conn(
             acquired_conn,
             resolved_event_type,
             resolved_payload,
             owner_id=owner_id,
             namespace=namespace,
         )
+    from mnemos.core.lifecycle import _schedule_delivery_attempt  # noqa: WPS433
+    from .sender import _attempt_delivery
+
+    for delivery_id in delivery_ids:
+        _schedule_delivery_attempt(_attempt_delivery(str(delivery_id)))
+    return delivery_ids
 
 
 async def _dispatch_on_conn(
@@ -85,9 +90,9 @@ async def _dispatch_on_conn(
     *,
     owner_id: Optional[str] = None,
     namespace: Optional[str] = None,
-) -> None:
+) -> list[str]:
     """Insert delivery intents using an already-selected connection."""
-    await _outbox_dispatch_on_conn(
+    return await _outbox_dispatch_on_conn(
         conn,
         event_type,
         payload,

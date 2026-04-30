@@ -73,7 +73,7 @@ async def recommend_model(
 
     try:
         # Query model registry for candidates
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             # Map task types to required capabilities
             capability_map = {
                 "code_generation": ["coding"],

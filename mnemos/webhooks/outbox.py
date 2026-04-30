@@ -45,11 +45,11 @@ async def _dispatch_on_conn(
     *,
     owner_id: Optional[str] = None,
     namespace: Optional[str] = None,
-) -> None:
+) -> list[str]:
     """Insert delivery intents using an already-selected connection."""
     subs = await _matching_subscriptions(conn, event_type, owner_id, namespace)
     if not subs:
-        return
+        return []
 
     body = json.dumps({
         "event": event_type,
@@ -58,6 +58,7 @@ async def _dispatch_on_conn(
     }, separators=(",", ":"), sort_keys=True)
     body_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
 
+    delivery_ids: list[str] = []
     for sub in subs:
         delivery_id = await conn.fetchval(
             """
@@ -68,9 +69,5 @@ async def _dispatch_on_conn(
             """,
             sub["id"], event_type, body, body_hash, webhook_types.NEW_CODE_WRITER_REVISION,
         )
-        # Schedule the send via the lifecycle-tracked delivery registry
-        # so graceful shutdown lets in-flight attempts finalize. Import lazily to avoid
-        # circular imports at module load time.
-        from mnemos.core.lifecycle import _schedule_delivery_attempt  # noqa: WPS433
-        from .sender import _attempt_delivery
-        _schedule_delivery_attempt(_attempt_delivery(str(delivery_id)))
+        delivery_ids.append(str(delivery_id))
+    return delivery_ids

@@ -28,6 +28,14 @@ router = APIRouter(prefix="/v1", tags=["consultations"])
 
 _GENESIS_HASH = hashlib.sha256(b"MNEMOS_AUDIT_GENESIS_v3").hexdigest()
 
+
+def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
+    if not delivery_ids:
+        return
+    from mnemos.api.routes.memories import _schedule_outbox_deliveries as _schedule
+
+    _schedule(delivery_ids)
+
 # ── Custom Query selection (v3.2) ─────────────────────────────────────────────
 
 _VALID_TIERS = {"frontier", "premium", "budget"}
@@ -104,7 +112,7 @@ async def _tier_lineup(tier: str) -> dict:
             ),
         )
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(sql, *params)
     # Translate registry provider → GRAEAE engine provider key
     # (`anthropic` → `claude` etc.) so consult()'s selection filter
@@ -121,7 +129,7 @@ async def _resolve_models(model_ids: List[str]) -> dict:
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             """
             SELECT provider, model_id
@@ -370,6 +378,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
 
         consultation_id = None
         memory_ids = _extract_memory_ids(result)
+        delivery_ids: list[str] = []
         if _lc._pool and result.get("all_responses"):
             # Persistence reads consensus fields FROM THE ENGINE return
             # dict instead of re-deriving them locally. The engine's
@@ -398,41 +407,58 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
             # abort the consultation row: tamper-evidence requires that a
             # committed consultation implies a committed audit chain link.
             try:
-                async with _lc._pool.acquire() as conn:
-                    async with conn.transaction():
-                        row = await conn.fetchrow(
-                            """INSERT INTO graeae_consultations
-                                (prompt, task_type, consensus_response, consensus_score,
-                                 winning_muse, cost, latency_ms, mode, owner_id, namespace)
-                               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-                               RETURNING id""",
-                            body.prompt,
-                            body.task_type,
-                            consensus_response[:500],
-                            consensus_score,
-                            winning_muse,
-                            engine_cost,
-                            engine_latency_ms,
-                            body.mode,
-                            user.user_id,
-                            user.namespace,
-                        )
-                        consultation_id = row["id"] if row else None
+                backend = _lc._persistence_backend
+                if backend is None:
+                    raise RuntimeError("Persistence backend not available")
+                async with backend.transactional() as tx:
+                    conn = tx.conn
+                    row = await conn.fetchrow(
+                        """INSERT INTO graeae_consultations
+                            (prompt, task_type, consensus_response, consensus_score,
+                             winning_muse, cost, latency_ms, mode, owner_id, namespace)
+                           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+                           RETURNING id""",
+                        body.prompt,
+                        body.task_type,
+                        consensus_response[:500],
+                        consensus_score,
+                        winning_muse,
+                        engine_cost,
+                        engine_latency_ms,
+                        body.mode,
+                        user.user_id,
+                        user.namespace,
+                    )
+                    consultation_id = row["id"] if row else None
 
-                        await _write_audit_entry_on_conn(
-                            conn=conn,
-                            consultation_id=consultation_id,
-                            prompt=body.prompt,
-                            response=consensus_response,
-                            task_type=body.task_type or "reasoning",
-                            provider=winning_muse,
-                            quality_score=consensus_score,
-                        )
-                        await _write_memory_refs_on_conn(
-                            conn=conn,
-                            consultation_id=consultation_id,
-                            memory_ids=memory_ids,
-                        )
+                    await _write_audit_entry_on_conn(
+                        conn=conn,
+                        consultation_id=consultation_id,
+                        prompt=body.prompt,
+                        response=consensus_response,
+                        task_type=body.task_type or "reasoning",
+                        provider=winning_muse,
+                        quality_score=consensus_score,
+                    )
+                    await _write_memory_refs_on_conn(
+                        conn=conn,
+                        consultation_id=consultation_id,
+                        memory_ids=memory_ids,
+                    )
+                    delivery_ids = await backend.webhooks.dispatch_event(
+                        tx,
+                        "consultation.completed",
+                        {
+                            "consultation_id": str(consultation_id),
+                            "task_type": body.task_type,
+                            "winning_muse": result.get("winning_muse"),
+                            "consensus_score": result.get("consensus_score"),
+                            "owner_id": user.user_id,
+                            "namespace": user.namespace,
+                        },
+                        owner_id=user.user_id,
+                        namespace=user.namespace,
+                    )
             except HTTPException:
                 raise
             except Exception as e:
@@ -442,24 +468,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                     detail="Consultation persistence failed; audit trail is required.",
                 )
 
-        try:
-            from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-            if _lc._pool and consultation_id is not None:
-                await _dispatch_webhook(
-                    "consultation.completed",
-                    {
-                        "consultation_id": str(consultation_id),
-                        "task_type": body.task_type,
-                        "winning_muse": result.get("winning_muse"),
-                        "consensus_score": result.get("consensus_score"),
-                        "owner_id": user.user_id,
-                        "namespace": user.namespace,
-                    },
-                    owner_id=user.user_id,
-                    namespace=user.namespace,
-                )
-        except Exception:
-            logger.warning("webhook dispatch failed for consultation.completed %s", consultation_id, exc_info=True)
+        _schedule_outbox_deliveries(delivery_ids)
 
         return ConsultationResponse(
             # asyncpg returns UUID columns as uuid.UUID objects, not strings.
@@ -507,7 +516,7 @@ async def list_audit_log(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_ns = scope_namespace(user, namespace)
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         root = is_root(user)
         if root and namespace is None:
             rows = await conn.fetch(
@@ -584,7 +593,7 @@ async def verify_audit_chain(
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_ns = scope_namespace(user, namespace)
     verify_global_chain = is_root(user) and namespace is None
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if verify_global_chain:
             rows = await conn.fetch(
                 "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
@@ -826,7 +835,7 @@ async def get_consultation(
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_ns = scope_namespace(user, namespace)
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if is_root(user) and namespace is None:
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
@@ -877,7 +886,7 @@ async def get_consultation_artifacts(
         raise HTTPException(status_code=503, detail="Database pool not available")
     target_ns = scope_namespace(user, namespace)
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         # Get consultation — scoped to caller unless root.
         if is_root(user) and namespace is None:
             consultation = await conn.fetchrow(

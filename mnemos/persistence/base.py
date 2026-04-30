@@ -5,10 +5,43 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from typing import Any, AsyncContextManager, Protocol, runtime_checkable
 
 from mnemos.core.auth_context import UserContext
 from mnemos.persistence.types import Row
+from mnemos.persistence.visibility import VisibilityFilter
+
+
+class DuplicateMemoryError(ValueError):
+    """Raised when an explicit memory id already exists."""
+
+
+@dataclass(frozen=True)
+class MemoryStatsRow:
+    """Backend-neutral aggregate snapshot for ``GET /stats``.
+
+    One round-trip per backend. ``avg_quality_rating`` is ``None`` when
+    no scored rows exist; the handler picks the published default.
+    """
+
+    total_memories: int
+    native_memories: int
+    federated_memories: int
+    memories_by_peer: dict[str, int] = field(default_factory=dict)
+    memories_by_category: dict[str, int] = field(default_factory=dict)
+    memories_by_subcategory: dict[str, dict[str, int]] = field(default_factory=dict)
+    avg_quality_rating: float | None = None
+
+
+@dataclass(frozen=True)
+class CompressionStatsRow:
+    """Backend-neutral aggregate snapshot for the compression slice of
+    ``GET /stats``."""
+
+    total_compressions: int
+    average_compression_ratio: float | None
+    unreviewed_compressions: int
 
 
 @runtime_checkable
@@ -110,6 +143,7 @@ class MemoryRepository(ABC):
         source_provider: str | None,
         source_session: str | None,
         source_agent: str | None,
+        verbatim_content: str | None,
         created: Any,
         updated: Any,
     ) -> str:
@@ -139,6 +173,126 @@ class MemoryRepository(ABC):
         user: Any,
         limit: int = 5,
     ) -> list[dict[str, Any]]:
+        ...
+
+    # --- v4.1 handler-through-backend surface ---------------------------------
+
+    @abstractmethod
+    async def list_memories(
+        self,
+        tx: Transaction,
+        *,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> tuple[list[Row], int]:
+        """List memories under the given visibility filter, ordered
+        ``created DESC``.
+
+        Returns ``(rows, total_count)`` where ``total_count`` is the
+        ``COUNT(*)`` over the same predicate (pre-LIMIT/OFFSET) so the
+        handler can populate paged response totals without a second
+        round-trip.
+        """
+        ...
+
+    @abstractmethod
+    async def get_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """Fetch a memory by id, applying the visibility filter.
+
+        Returns ``None`` when the memory does not exist OR when the
+        filter excludes it. The 404-vs-403 distinction is intentionally
+        collapsed at this layer to keep cross-tenant existence
+        invisible; the handler returns 404 for both.
+        """
+        ...
+
+    @abstractmethod
+    async def update_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        fields: dict[str, Any],
+    ) -> Row | None:
+        """Apply ``fields`` patch to a memory. Returns the updated row,
+        or ``None`` if the memory does not exist or the filter excludes
+        it. Mutation paths use ``VisibilityScope.OWN_ONLY`` — non-owner
+        callers cannot edit a row they merely have read access to via
+        group/world bits.
+
+        ``fields`` keys are validated and translated by the handler;
+        the repository assumes they map cleanly to memory columns.
+        """
+        ...
+
+    @abstractmethod
+    async def delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """Delete a memory if it exists and the filter admits.
+
+        Returns the deleted row metadata if a row was deleted. Non-owner
+        callers see ``None`` even for memories they could otherwise read.
+        """
+        ...
+
+    @abstractmethod
+    async def semantic_search(
+        self,
+        tx: Transaction,
+        *,
+        embedding: Sequence[float],
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
+    ) -> list[Row]:
+        """Vector search over memory embeddings, applying visibility.
+
+        Returns full memory rows (not the join-only shape used by the
+        legacy SQLite helper), so the handler can hand them straight to
+        ``row_to_memory`` without a second fetch.
+        """
+        ...
+
+    @abstractmethod
+    async def fts_search(
+        self,
+        tx: Transaction,
+        *,
+        query: str,
+        limit: int,
+        visibility: VisibilityFilter,
+        category: str | None = None,
+        subcategory: str | None = None,
+        source_provider: str | None = None,
+        source_model: str | None = None,
+        source_agent: str | None = None,
+    ) -> list[Row]:
+        """Full-text search over memory content, applying visibility."""
+        ...
+
+    @abstractmethod
+    async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
+        """Aggregate counters used by ``GET /stats``. System-level view
+        with no visibility filter — only operators reach this path."""
         ...
 
 
@@ -328,12 +482,46 @@ class CompressionRepository(ABC):
     async def fetch_compressed_variant_by_memory_id(self, tx: Transaction, memory_id: str) -> Row | None:
         ...
 
+    @abstractmethod
+    async def gather_stats(self, tx: Transaction) -> CompressionStatsRow:
+        """Aggregate compression counters used by ``GET /stats``."""
+        ...
+
 
 class WebhookRepository(ABC):
     """Webhook persistence surface.
 
-    Webhook SQL has not been extracted into mnemos/db repositories in D.1.
+    The v4.0 webhook outbox contract requires that every event-producing
+    write commit a ``webhook_attempts`` row in the same database
+    transaction as the triggering data write. ``enqueue_webhook_attempt``
+    is the backend-neutral entry point for that — both backends
+    implement it so handlers can preserve the transactional outbox
+    property without reaching into ``mnemos.webhooks`` from inside a
+    repository (forbidden by the persistence-no-upward-deps contract).
     """
+
+    @abstractmethod
+    async def dispatch_event(
+        self,
+        tx: Transaction,
+        event_type: str,
+        payload: dict[str, Any],
+        *,
+        owner_id: str | None = None,
+        namespace: str | None = None,
+    ) -> list[str]:
+        """Append ``webhook_deliveries`` rows for every matching
+        subscription, inside ``tx``, and return their delivery IDs.
+
+        Both backends must atomically commit these rows alongside the
+        triggering data write — that is the v4.0 outbox contract. The
+        delivery worker reads the queue separately and performs the
+        HTTP send; this method never dispatches over HTTP, despite the
+        legacy name. The returned IDs let callers schedule the delivery
+        attempt via ``mnemos.core.lifecycle._schedule_delivery_attempt``
+        once the outer transaction has committed.
+        """
+        ...
 
 
 class ConsultationAuditRepository(ABC):

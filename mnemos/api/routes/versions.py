@@ -150,7 +150,7 @@ async def list_versions(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
         # Per-snapshot tenancy: filter the version rows by THEIR own
         # owner/namespace/permission_mode, not the live memory's.
@@ -200,7 +200,7 @@ async def get_version(
     """Retrieve memory content at a specific version on a branch."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
         if is_root(user):
             row = await conn.fetchrow(
@@ -249,7 +249,7 @@ async def diff_versions(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
         if is_root(user):
             rows = await conn.fetch(
@@ -306,7 +306,7 @@ async def revert_memory(
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         # Tenancy gate first — fail-closed before any version SELECT.
         await _assert_memory_readable(conn, memory_id, user)
 

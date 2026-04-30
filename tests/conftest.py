@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Any
+import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -98,7 +99,12 @@ class FakeConnection:
 
     async def execute(self, query: str, *args):
         compact = " ".join(query.split())
-        if compact.startswith("SELECT pg_advisory_xact_lock") or compact == "SELECT 1":
+        if (
+            compact.startswith("SELECT pg_advisory_xact_lock")
+            or compact == "SELECT 1"
+            or compact in {"BEGIN", "COMMIT", "ROLLBACK"}
+            or compact.startswith("BEGIN ")
+        ):
             return "SELECT 1"
 
         if compact.startswith("INSERT INTO memories "):
@@ -114,6 +120,13 @@ class FakeConnection:
 
         if compact.startswith("INSERT INTO memory_versions "):
             return "INSERT 0 1"
+
+        if compact.startswith("UPDATE entities"):
+            return "UPDATE 1"
+
+        if compact.startswith("DELETE FROM entities"):
+            self.state["entities"].pop(args[0], None)
+            return "DELETE 1"
 
         if compact.startswith("INSERT INTO consultation_memory_refs "):
             consultation_id, memory_id = args[:2]
@@ -204,18 +217,54 @@ class FakeConnection:
             self.state["consultations"][consultation_id] = record
             return {"id": consultation_id}
 
+        if compact.startswith("INSERT INTO entities"):
+            entity_id = args[0]
+            metadata = args[6] if len(args) > 6 else {}
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            record = {
+                "id": entity_id,
+                "owner_id": args[1],
+                "namespace": args[2],
+                "entity_type": args[3],
+                "name": args[4],
+                "description": args[5],
+                "metadata": metadata,
+                "related_entities": [],
+                "created": _utcnow(),
+                "updated": _utcnow(),
+            }
+            self.state["entities"][entity_id] = record
+            return record
+
         if "SELECT id, prompt, task_type, consensus_response" in compact:
             consultation = self.state["consultations"].get(args[0])
             if "AND owner_id = $2" in compact and (
                 not consultation or consultation.get("owner_id") != args[1]
             ):
                 return None
+            if "AND namespace = $2" in compact and (
+                not consultation or consultation.get("namespace") != args[1]
+            ):
+                return None
+            if "AND owner_id = $2 AND namespace = $3" in compact and (
+                not consultation
+                or consultation.get("owner_id") != args[1]
+                or consultation.get("namespace") != args[2]
+            ):
+                return None
             return consultation
 
-        if "SELECT id, created FROM graeae_consultations WHERE id = $1" in compact:
+        if "SELECT id, created FROM graeae_consultations" in compact:
             consultation = self.state["consultations"].get(args[0])
-            if "AND owner_id = $2" in compact and (
-                not consultation or consultation.get("owner_id") != args[1]
+            if "AND namespace = $2" in compact and (
+                not consultation or consultation.get("namespace") != args[1]
+            ):
+                return None
+            if "AND owner_id = $2 AND namespace = $3" in compact and (
+                not consultation
+                or consultation.get("owner_id") != args[1]
+                or consultation.get("namespace") != args[2]
             ):
                 return None
             if not consultation:
@@ -236,6 +285,42 @@ class FakeConnection:
         if "SELECT id FROM memories WHERE id=$1" in compact:
             memory = self.state["memories"].get(args[0])
             return {"id": memory["id"]} if memory else None
+
+        if compact.startswith("SELECT 1 FROM memories WHERE id = $1"):
+            memory = self.state["memories"].get(args[0])
+            if not memory:
+                return None
+            if "namespace = $2" in compact and memory.get("namespace") != args[1]:
+                return None
+            if "owner_id = $2" in compact and memory.get("owner_id") not in (args[1], None):
+                return None
+            if "owner_id = $3" in compact:
+                owner_id = args[2]
+                groups = set(args[3] or []) if len(args) > 3 else set()
+                mode = int(memory.get("permission_mode") or 0)
+                if not (
+                    memory.get("owner_id") == owner_id
+                    or mode % 10 >= 4
+                    or ((mode // 10) % 10 >= 4 and memory.get("group_id") in groups)
+                ):
+                    return None
+            return {"ok": 1}
+
+        if compact.startswith("SELECT owner_id, namespace FROM entities WHERE id"):
+            entity = self.state["entities"].get(args[0])
+            if not entity:
+                return None
+            return {"owner_id": entity.get("owner_id"), "namespace": entity.get("namespace")}
+
+        if "FROM entities WHERE id" in compact:
+            entity = self.state["entities"].get(args[0])
+            if not entity:
+                return None
+            if "owner_id = $2" in compact and entity.get("owner_id") != args[1]:
+                return None
+            if "namespace = $3" in compact and entity.get("namespace") != args[2]:
+                return None
+            return entity
 
         # owner + namespace check used by DAG _assert_memory_access
         # (v3.1.2 Tier 3 follow-up extended this to two-dimensional tenancy)
@@ -359,6 +444,16 @@ class FakeConnection:
         if "FROM model_registry" in compact:
             return list(self.state["model_registry"])
 
+        if "FROM entities" in compact:
+            rows = list(self.state["entities"].values())
+            if "owner_id=$1" in compact:
+                rows = [r for r in rows if r.get("owner_id") == args[0]]
+            if "namespace=$2" in compact:
+                rows = [r for r in rows if r.get("namespace") == args[1]]
+            if "entity_type=$3" in compact:
+                rows = [r for r in rows if r.get("entity_type") == args[2]]
+            return rows
+
         if "FROM memories" in compact:
             memories = list(self.state["memories"].values())
             if "to_tsvector" in compact or "content ILIKE" in compact:
@@ -410,6 +505,7 @@ class FakePool:
             "consultations": {},
             "audit_log": [],
             "memory_refs": [],
+            "entities": {},
             "model_registry": [
                 {
                     "provider": "openai",
@@ -481,6 +577,57 @@ def mock_graeae_engine():
     return engine
 
 
+@pytest.fixture(autouse=True)
+def _postgres_backend_for_direct_postgres_tests(request, monkeypatch):
+    """Direct entity route tests install only a pool-shaped fake.
+
+    Keep the Postgres-only gate aligned with the shared client fixture while
+    preserving those tests' local connection spy for SQL assertions.
+    """
+    if request.node.path.name not in {
+        "test_webhooks_entities_namespace.py",
+        "test_branch_visibility.py",
+    }:
+        return
+    import mnemos.core.lifecycle as lc
+    from tests._fake_backend import FakePoolBackedBackend
+
+    monkeypatch.setattr(lc, "_persistence_backend", FakePoolBackedBackend(None))
+
+
+@pytest.fixture(autouse=True)
+def _patch_direct_dag_visibility_fakes(request, monkeypatch):
+    """Teach narrow DAG test fakes the current readable-memory probe."""
+    if request.node.path.name not in {
+        "test_dag_cross_memory.py",
+        "test_dag_visibility_gap.py",
+        "test_branch_visibility.py",
+    }:
+        return
+    classes = []
+    for name in dir(request.module):
+        obj = getattr(request.module, name)
+        if isinstance(obj, type) and hasattr(obj, "fetchrow"):
+            classes.append(obj)
+    for cls in classes:
+        if getattr(cls, "_mnemos_visibility_patch", False):
+            continue
+        original = cls.fetchrow
+
+        async def fetchrow(self, sql: str, *args, _original=original):
+            compact = " ".join(sql.split())
+            if (
+                compact.startswith("SELECT 1 FROM memories WHERE id = $1")
+                and "FOR SHARE" not in compact
+                and "owner_id = $2" not in compact
+            ):
+                return {"ok": 1}
+            return await _original(self, sql, *args)
+
+        monkeypatch.setattr(cls, "fetchrow", fetchrow)
+        monkeypatch.setattr(cls, "_mnemos_visibility_patch", True, raising=False)
+
+
 @pytest_asyncio.fixture
 async def client(monkeypatch, db_pool: FakePool, mock_graeae_engine):
     """Create an in-process AsyncClient bound to the FastAPI app."""
@@ -490,7 +637,10 @@ async def client(monkeypatch, db_pool: FakePool, mock_graeae_engine):
     from mnemos.api.main import app
 
     configure_auth({"enabled": False})
+    from tests._fake_backend import FakePoolBackedBackend
+
     monkeypatch.setattr(lc, "_pool", db_pool)
+    monkeypatch.setattr(lc, "_persistence_backend", FakePoolBackedBackend(db_pool))
     monkeypatch.setattr(lc, "_cache", None)
     monkeypatch.setattr(lc, "_worker_status", {"distillation_worker": "idle"})
     monkeypatch.setattr(graeae_engine, "get_graeae_engine", lambda: mock_graeae_engine)

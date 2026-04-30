@@ -101,15 +101,22 @@ def test_gateway_uses_variant_content_when_available(monkeypatch):
 
 def test_search_large_results_do_not_probe_legacy_backend(monkeypatch):
     """Large search result sets keep the normal response shape without
-    probing the removed DISTILLATION_BACKEND/OLLAMA_HOST path."""
-    import mnemos.core.lifecycle as lc
+    probing the removed DISTILLATION_BACKEND/OLLAMA_HOST path.
+
+    Slice 1d migrated search dispatch to ``backend.memories.fts_search``;
+    the test uses the FakeBackend test helper to feed a configured row
+    set and asserts the response shape — no SQL-shape coupling.
+    """
     from mnemos.api.routes import memories
     from mnemos.domain.models import MemorySearchRequest
+
+    from tests._fake_backend import install_fake_backend
 
     async def _noop_recall_bump(_ids):
         return None
 
-    conn = _Conn(rows=[
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("fts_search", [
         {
             "id": "mem_big",
             "content": "x" * (51 * 1024),
@@ -131,9 +138,6 @@ def test_search_large_results_do_not_probe_legacy_backend(monkeypatch):
             "source_agent": None,
         },
     ])
-    _install(monkeypatch, conn)
-    monkeypatch.setattr(lc, "_cache", None)
-    monkeypatch.setattr(lc, "_rls_enabled", False)
     monkeypatch.setattr(memories, "_bump_recall_counters", _noop_recall_bump)
 
     req = MemorySearchRequest(query="needle", limit=1)

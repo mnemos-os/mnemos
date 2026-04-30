@@ -15,12 +15,17 @@ from pydantic import BaseModel
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.core.security import assert_owned_context, is_root, scope_namespace, scope_owner
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["entities"])
 
 from mnemos.domain.memory_categorization.constants import ENTITY_TYPES
+
+
+def _require_entities_backend() -> None:
+    _require_postgres_backend()
 
 
 class EntityCreateRequest(BaseModel):
@@ -45,8 +50,7 @@ async def create_entity(
 ):
     if req.entity_type not in ENTITY_TYPES:
         raise HTTPException(status_code=400, detail=f"entity_type must be one of: {ENTITY_TYPES}")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     try:
         entity_id = str(uuid.uuid4())
         async with _lc.get_pool_manager().transactional() as conn:
@@ -80,8 +84,7 @@ async def list_entities(
     (owner_id, namespace) slice. Root may pass ?owner_id= and/or
     ?namespace= to target another tenant for audit/support.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
@@ -121,8 +124,7 @@ async def list_entities(
 
 @router.get("/entities/{entity_id}")
 async def get_entity(entity_id: str, user: UserContext = Depends(get_current_user)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     async with _lc.get_pool_manager().acquire() as conn:
         owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
         row = await conn.fetchrow(
@@ -143,8 +145,7 @@ async def update_entity(
     req: EntityUpdateRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     updates = {}
     if req.description is not None:
         updates['description'] = req.description
@@ -197,8 +198,7 @@ async def link_entities(
 
     Both entities must be owned by the caller (or caller must be root).
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     try:
         async with _lc.get_pool_manager().transactional() as conn:
             owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
@@ -236,8 +236,7 @@ async def link_entities(
 
 @router.delete("/entities/{entity_id}", status_code=204)
 async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_user)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     try:
         async with _lc.get_pool_manager().transactional() as conn:
             owner, namespace = await assert_owned_context(conn, "entities", entity_id, user)
@@ -272,8 +271,7 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
 
 @router.get("/entities/{entity_id}/related")
 async def get_related_entities(entity_id: str, user: UserContext = Depends(get_current_user)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_entities_backend()
     async with _lc.get_pool_manager().acquire() as conn:
         target_owner, target_ns = await assert_owned_context(conn, "entities", entity_id, user)
         entity = await conn.fetchrow(

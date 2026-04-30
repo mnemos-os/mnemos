@@ -13,6 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.core.security import scope_namespace
 from mnemos.domain.openai_compat.router import search_memory_context as _search_mnemos_context
 from mnemos.domain.openai_compat.providers import _route_to_provider
@@ -31,8 +32,12 @@ router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 
 def _require_pool():
+    _require_postgres_backend()
     if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+        raise HTTPException(
+            status_code=503,
+            detail="this endpoint requires a Postgres backend (server profile)",
+        )
     return _lc._pool
 
 @router.post("", response_model=SessionResponse)

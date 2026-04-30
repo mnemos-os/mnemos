@@ -1,16 +1,33 @@
-"""Memory create and webhook outbox rows share one transaction."""
+"""Memory create and webhook outbox enqueue share one transaction.
+
+The v4.0 outbox claim: a memory.created webhook delivery row is
+inserted in the same database transaction as the memory itself —
+neither commits without the other. Slice 1d migrated the create
+handler to dispatch through ``backend.memories.insert_memory`` +
+``backend.webhooks.dispatch_event`` inside one
+``backend.transactional()`` block, and HTTP delivery scheduling
+fires only after the transaction commits.
+
+These tests replace the legacy asyncpg-shaped conn mocks with a
+fake backend that tracks commits / rollbacks. The atomicity
+contract is asserted at the backend boundary: when dispatch_event
+raises, the create handler propagates a 500 AND the
+``transactional()`` context counted a rollback rather than a commit.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Any
+import inspect
 
 import pytest
 from fastapi import HTTPException
 
 from mnemos.api.dependencies import UserContext
+from mnemos.api.routes import consultations, dag
 from mnemos.api.routes import memories
 from mnemos.domain.models import MemoryCreateRequest
+
+from tests._fake_backend import install_fake_backend
 
 pytestmark = pytest.mark.asyncio
 
@@ -25,175 +42,75 @@ def _user() -> UserContext:
     )
 
 
-class _Txn:
-    def __init__(self, conn: "_OutboxConn"):
-        self.conn = conn
-
-    async def __aenter__(self):
-        self.conn._begin()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        if exc_type is None:
-            self.conn._commit()
-        else:
-            self.conn._rollback()
-        return False
-
-
-class _OutboxConn:
-    def __init__(self, *, fail_delivery_insert: bool = False):
-        self.fail_delivery_insert = fail_delivery_insert
-        self.memories: list[dict[str, Any]] = []
-        self.deliveries: list[dict[str, Any]] = []
-        self._staged_memories: list[dict[str, Any]] | None = None
-        self._staged_deliveries: list[dict[str, Any]] | None = None
-        self.commits = 0
-        self.rollbacks = 0
-
-    def transaction(self):
-        return _Txn(self)
-
-    def _begin(self) -> None:
-        if self._staged_memories is not None:
-            raise AssertionError("nested transaction not expected in this test")
-        self._staged_memories = []
-        self._staged_deliveries = []
-
-    def _commit(self) -> None:
-        self.memories.extend(self._staged_memories or [])
-        self.deliveries.extend(self._staged_deliveries or [])
-        self._staged_memories = None
-        self._staged_deliveries = None
-        self.commits += 1
-
-    def _rollback(self) -> None:
-        self._staged_memories = None
-        self._staged_deliveries = None
-        self.rollbacks += 1
-
-    async def execute(self, sql: str, *args):
-        compact = " ".join(sql.split())
-        if compact.startswith("INSERT INTO memories "):
-            row = {
-                "id": args[0],
-                "content": args[1],
-                "category": args[2],
-                "subcategory": args[3],
-                "metadata": args[4],
-                "quality_rating": 75,
-                "verbatim_content": args[5],
-                "owner_id": args[6],
-                "group_id": None,
-                "namespace": args[7],
-                "permission_mode": args[8],
-                "source_model": args[9],
-                "source_provider": args[10],
-                "source_session": args[11],
-                "source_agent": args[12],
-                "compressed_content": None,
-                "created": datetime.now(timezone.utc),
-                "updated": datetime.now(timezone.utc),
-            }
-            target = self._staged_memories if self._staged_memories is not None else self.memories
-            target.append(row)
-            return "INSERT 0 1"
-        return "OK"
-
-    async def fetch(self, sql: str, *args):
-        if "FROM webhook_subscriptions" in sql:
-            return [
-                {
-                    "id": "sub_1",
-                    "url": "https://example.test/hook",
-                    "events": ["memory.created"],
-                    "secret": "secret",
-                    "owner_id": "alice",
-                    "namespace": "alice-ns",
-                }
-            ]
-        return []
-
-    async def fetchrow(self, sql: str, *args):
-        if "FROM memories WHERE id=$1" in sql:
-            memory_id = args[0]
-            rows = list(self.memories)
-            if self._staged_memories is not None:
-                rows.extend(self._staged_memories)
-            return next(row for row in rows if row["id"] == memory_id)
-        return None
-
-    async def fetchval(self, sql: str, *args):
-        if "INSERT INTO webhook_deliveries" in sql:
-            if self.fail_delivery_insert:
-                raise RuntimeError("delivery insert failed")
-            delivery_id = f"delivery_{len(self.deliveries) + 1}"
-            row = {
-                "id": delivery_id,
-                "subscription_id": args[0],
-                "event_type": args[1],
-                "payload": args[2],
-                "payload_hash": args[3],
-                "writer_revision": args[4],
-            }
-            target = (
-                self._staged_deliveries
-                if self._staged_deliveries is not None
-                else self.deliveries
-            )
-            target.append(row)
-            return delivery_id
-        return None
-
-
-class _Acquire:
-    def __init__(self, conn: _OutboxConn):
-        self.conn = conn
-
-    async def __aenter__(self):
-        return self.conn
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-
-class _Pool:
-    def __init__(self, conn: _OutboxConn):
-        self.conn = conn
-
-    def acquire(self):
-        return _Acquire(self.conn)
-
-
-def _install(monkeypatch: pytest.MonkeyPatch, conn: _OutboxConn) -> None:
-    import mnemos.core.lifecycle as lc
-
-    monkeypatch.setattr(memories._lc, "_pool", _Pool(conn))
-    monkeypatch.setattr(memories._lc, "_cache", None)
-    monkeypatch.setattr(memories._lc, "_rls_enabled", False)
-    monkeypatch.setattr(lc, "_schedule_delivery_attempt", lambda coro: coro.close())
+def _memory_row(memory_id: str = "mem_test") -> dict:
+    return {
+        "id": memory_id,
+        "content": "remember this",
+        "category": "facts",
+        "subcategory": None,
+        "metadata": {},
+        "quality_rating": 75,
+        "verbatim_content": "remember this",
+        "owner_id": "alice",
+        "group_id": None,
+        "namespace": "alice-ns",
+        "permission_mode": 600,
+        "source_model": None,
+        "source_provider": None,
+        "source_session": None,
+        "source_agent": None,
+        "compressed_content": None,
+        "created": "2026-04-29T12:00:00",
+        "updated": "2026-04-29T12:00:00",
+    }
 
 
 async def test_memory_create_commits_memory_and_webhook_delivery(monkeypatch):
-    conn = _OutboxConn()
-    _install(monkeypatch, conn)
+    """Successful create: insert_memory + dispatch_event both fire in
+    the same transactional() block, the txn commits, and HTTP delivery
+    is scheduled for the returned delivery_ids."""
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("get_memory", _memory_row())
+    backend.webhooks.configure_delivery_ids(["delivery_1"])
+
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        memories,
+        "_schedule_outbox_deliveries",
+        lambda ids: scheduled.extend(ids),
+    )
 
     response = await memories.create_memory(
         MemoryCreateRequest(content="remember this", category="facts"),
         user=_user(),
     )
 
-    assert response.id == conn.memories[0]["id"]
-    assert len(conn.memories) == 1
-    assert len(conn.deliveries) == 1
-    assert conn.deliveries[0]["event_type"] == "memory.created"
-    assert conn.commits == 1
-    assert conn.rollbacks == 0
+    assert response.id == "mem_test"
+    insert_calls = [c for c in backend.memories.calls if c[0] == "insert_memory"]
+    assert len(insert_calls) == 1
+    dispatch_calls = backend.webhooks.calls
+    assert len(dispatch_calls) == 1
+    assert dispatch_calls[0][1]["event_type"] == "memory.created"
+    assert backend.commits == 1
+    assert backend.rollbacks == 0
+    # Delivery scheduling fires AFTER the commit, so the captured ids
+    # equal what dispatch_event returned.
+    assert scheduled == ["delivery_1"]
 
 
 async def test_webhook_delivery_failure_rolls_back_memory_insert(monkeypatch):
-    conn = _OutboxConn(fail_delivery_insert=True)
-    _install(monkeypatch, conn)
+    """Failure in dispatch_event tears down the transaction. The
+    backend records a rollback (not a commit), and the handler
+    surfaces 500 — preserving the v4.0 outbox-atomicity contract."""
+    backend = install_fake_backend(monkeypatch)
+    backend.webhooks.configure_raise(RuntimeError("delivery insert failed"))
+
+    scheduled: list[str] = []
+    monkeypatch.setattr(
+        memories,
+        "_schedule_outbox_deliveries",
+        lambda ids: scheduled.extend(ids),
+    )
 
     with pytest.raises(HTTPException) as exc:
         await memories.create_memory(
@@ -202,7 +119,19 @@ async def test_webhook_delivery_failure_rolls_back_memory_insert(monkeypatch):
         )
 
     assert exc.value.status_code == 500
-    assert conn.memories == []
-    assert conn.deliveries == []
-    assert conn.commits == 0
-    assert conn.rollbacks == 1
+    # insert_memory still ran (it's in the same tx that rolled back) —
+    # what matters is the txn rolled back rather than committed.
+    assert backend.commits == 0
+    assert backend.rollbacks == 1
+    # Nothing scheduled when the txn rolled back.
+    assert scheduled == []
+
+
+def test_consultations_and_dag_use_backend_outbox_dispatch():
+    consultation_source = inspect.getsource(consultations.consult_graeae)
+    dag_source = inspect.getsource(dag.merge_branch)
+
+    assert "backend.webhooks.dispatch_event" in consultation_source
+    assert "backend.webhooks.dispatch_event" in dag_source
+    assert "mnemos.webhooks.dispatcher" not in inspect.getsource(consultations)
+    assert "mnemos.webhooks.dispatcher" not in inspect.getsource(dag)

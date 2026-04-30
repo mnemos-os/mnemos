@@ -5,6 +5,7 @@ from typer.testing import CliRunner
 
 from mnemos._version import __version__
 from mnemos.cli import main as cli_main
+from mnemos.core import config as core_config
 
 
 runner = CliRunner()
@@ -92,7 +93,7 @@ def test_validate_mpf_dispatches_to_validator(monkeypatch: pytest.MonkeyPatch) -
     assert calls == [("mnemos.tools.mpf_validate", ["--file", "memory.mpf"])]
 
 
-def test_export_dispatches_to_memory_export(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_export_dispatches_to_memory_export(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     calls = []
 
     def fake_run_module_main(module: str, argv: list[str], **_kwargs) -> None:
@@ -100,6 +101,8 @@ def test_export_dispatches_to_memory_export(monkeypatch: pytest.MonkeyPatch) -> 
 
     monkeypatch.delenv("MNEMOS_BASE", raising=False)
     monkeypatch.delenv("MNEMOS_API_KEY", raising=False)
+    monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
+    core_config.reload_settings()
     monkeypatch.setattr(cli_main, "_run_module_main", fake_run_module_main)
 
     result = runner.invoke(
@@ -116,7 +119,7 @@ def test_export_dispatches_to_memory_export(monkeypatch: pytest.MonkeyPatch) -> 
     ]
 
 
-def test_mpf_import_dispatches_to_memory_import(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mpf_import_dispatches_to_memory_import(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     calls = []
 
     def fake_run_module_main(module: str, argv: list[str], **_kwargs) -> None:
@@ -124,6 +127,8 @@ def test_mpf_import_dispatches_to_memory_import(monkeypatch: pytest.MonkeyPatch)
 
     monkeypatch.delenv("MNEMOS_BASE", raising=False)
     monkeypatch.delenv("MNEMOS_API_KEY", raising=False)
+    monkeypatch.setenv("MNEMOS_CONFIG_PATH", str(tmp_path / "missing.toml"))
+    core_config.reload_settings()
     monkeypatch.setattr(cli_main, "_run_module_main", fake_run_module_main)
 
     result = runner.invoke(

@@ -23,12 +23,19 @@ PERSONAL_SINGLETON: "Optional[UserContext]" = None   # set by configure_auth(); 
 _bearer = HTTPBearer(auto_error=False)
 
 
-def configure_auth(config: dict) -> None:
+def configure_auth(config: dict | None = None) -> None:
     """Called once at startup from lifecycle lifespan."""
+    from mnemos.core.config import get_settings
+
     global _auth_enabled, _default_namespace, _personal_user_id, PERSONAL_SINGLETON
-    _auth_enabled = config.get("enabled", False)
-    _default_namespace = config.get("default_namespace", "default")
-    _personal_user_id = config.get("personal_user_id", "default")
+    settings = get_settings().auth
+    if config is None:
+        config = {}
+        _auth_enabled = settings.enabled
+    else:
+        _auth_enabled = config.get("enabled", settings.enabled)
+    _default_namespace = config.get("default_namespace", settings.default_namespace)
+    _personal_user_id = config.get("personal_user_id", settings.personal_user_id)
     PERSONAL_SINGLETON = UserContext(
         user_id=_personal_user_id,
         group_ids=[],

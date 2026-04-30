@@ -41,7 +41,7 @@ async def create_user(
             status_code=422,
             detail="role must be 'user', 'root', or 'federation'",
         )
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         existing = await conn.fetchrow("SELECT id FROM users WHERE id=$1", request.id)
         if existing:
             raise HTTPException(status_code=409, detail=f"User '{request.id}' already exists")
@@ -67,7 +67,7 @@ async def list_users(_: UserContext = Depends(require_root)):
     """List all users."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, display_name, email, role, namespace, created_at "
             "FROM users ORDER BY created_at"
@@ -97,7 +97,7 @@ async def create_api_key(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
         if not user:
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -143,7 +143,7 @@ async def list_api_keys(
     """List API keys for user_id (no raw key in response)."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
         if not user:
             raise HTTPException(status_code=404, detail=f"User '{user_id}' not found")
@@ -174,7 +174,7 @@ async def revoke_api_key(
     """Revoke an API key by ID (soft-delete: sets revoked=true)."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
             "UPDATE api_keys SET revoked=true WHERE id=$1::uuid AND NOT revoked",
             key_id,
@@ -222,7 +222,7 @@ async def create_oauth_provider(
             status_code=422,
             detail="authorize_url and token_url required when kind='oauth2'",
         )
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             """
             INSERT INTO oauth_providers
@@ -243,7 +243,7 @@ async def create_oauth_provider(
 async def list_oauth_providers(_: UserContext = Depends(require_root)):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch("SELECT * FROM oauth_providers ORDER BY name")
     items = [_to_provider_admin(r) for r in rows]
     return OAuthProviderAdminListResponse(count=len(items), providers=items)
@@ -262,7 +262,7 @@ async def update_oauth_provider(
         raise HTTPException(status_code=422, detail="No fields to update")
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
     set_clauses.append("updated=NOW()")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             f"UPDATE oauth_providers SET {', '.join(set_clauses)} "
             f"WHERE name=$1 RETURNING *",
@@ -280,7 +280,7 @@ async def delete_oauth_provider(
 ):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
             "DELETE FROM oauth_providers WHERE name=$1", name,
         )
@@ -296,7 +296,7 @@ async def list_oauth_identities(
     """List OAuth identities. Filter by user_id optional."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if user_id:
             rows = await conn.fetch(
                 "SELECT id::text, user_id, provider, external_id, email, "
@@ -394,7 +394,7 @@ async def compression_enqueue(
             detail=f"scoring_profile must be one of {sorted(_VALID_PROFILES)}",
         )
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         async with conn.transaction():
             # Pull (id, owner_id) so the queue row carries the memory's
             # REAL owner instead of a blanket 'default'. On multi-user
@@ -519,7 +519,7 @@ async def compression_enqueue_all(
         f"LIMIT ${limit_idx}"
     )
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(sql, *params)
         # asyncpg returns "INSERT 0 <n>" — parse the row count
         try:

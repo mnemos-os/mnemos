@@ -215,6 +215,7 @@ async def insert_memory(
     source_provider: Optional[str],
     source_session: Optional[str],
     source_agent: Optional[str],
+    verbatim_content: Optional[str],
     created,
     updated,
 ) -> str:
@@ -222,15 +223,15 @@ async def insert_memory(
         """
         INSERT INTO memories (
             id, content, category, subcategory, metadata,
-            quality_rating, owner_id, namespace, permission_mode,
+            quality_rating, verbatim_content, owner_id, namespace, permission_mode,
             source_model, source_provider, source_session, source_agent,
             created, updated
         )
         VALUES (
             $1, $2, $3, $4, $5::jsonb,
-            $6, $7, $8, $9,
-            $10, $11, $12, $13,
-            COALESCE($14, NOW()), COALESCE($15, NOW())
+            $6, $7, $8, $9, $10,
+            $11, $12, $13, $14,
+            COALESCE($15, NOW()), COALESCE($16, NOW())
         )
         ON CONFLICT (id) DO NOTHING
         """,
@@ -240,6 +241,7 @@ async def insert_memory(
         subcategory,
         metadata_json,
         quality_rating,
+        verbatim_content,
         owner_id,
         namespace,
         permission_mode,

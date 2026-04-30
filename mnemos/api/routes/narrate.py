@@ -107,7 +107,7 @@ async def narrate(
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         memory_row = await _fetch_memory(conn, memory_id, user)
         if memory_row is None:
             raise HTTPException(status_code=404, detail="Memory not found")

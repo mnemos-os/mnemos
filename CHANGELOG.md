@@ -2,6 +2,55 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [4.1.3] — 2026-04-29
+
+Corpus-review hardening release.
+
+### Fixed
+
+- Pinned webhook delivery DNS resolution from validation through HTTP connect to close DNS-rebinding SSRF.
+- Moved consultation completion and DAG live-merge webhooks into the transactional outbox path, with delivery scheduled only after commit.
+- Released GRAEAE provider concurrency slots in `finally` during cancelled fan-out.
+- Marked sessions, entities, state, and MORPHEUS HTTP routes as Postgres-only on edge profiles with explicit 503 responses.
+- Restricted MORPHEUS run telemetry reads to root/operator callers.
+- Migrated route-level asyncpg acquires to `PoolManager.acquire()`.
+- Aligned DAG read preflight with memory read visibility while keeping branch/merge writes strict-owner scoped.
+- Applied webhook SSRF URL validation to federation peers; private peer URLs require `FEDERATION_ALLOW_PRIVATE=true`.
+- Added typed `AuthSettings` and server-profile fail-closed auth defaults via `MNEMOS_AUTH_ENABLED`.
+- Made SQLite duplicate explicit memory IDs raise `DuplicateMemoryError` instead of silently succeeding.
+
+## [4.1.2] — 2026-04-29
+
+GRAEAE provider-routing fix + container-env operations standard.
+
+### Fixed
+
+- `mnemos.domain.graeae.engine._ranked_candidates` tiebreak ordering
+  added an explicit non-reasoning preference between `last_synced` and
+  `len(model_id)`. Before this fix, the `len()` fallback accidentally
+  promoted `-reasoning` SKUs (shorter names) over `-non-reasoning`
+  siblings of equal weight/version, so xAI Grok consultations came
+  back tagged with `\confidence{N}` blocks instead of clean text.
+  Provider helper `_is_reasoning_variant(model_id)` formalizes the
+  classification.
+- New regression suite at `tests/test_graeae_ranked_candidates.py`
+  covers the helper + the tiebreak ordering.
+
+### Operational
+
+- v4.x container env standard documented: every `mnemos serve`
+  container MUST mount `~/.api_keys_master.json` →
+  `/etc/mnemos/api_keys.json` (read-only) AND set
+  `MNEMOS_KEYS_PATH=/etc/mnemos/api_keys.json`. The v4.1.1 cutover
+  surfaced that without these, GRAEAE quietly falls back to
+  empty-key/no-provider state and every consultation 401s.
+- Pre-existing reasoning-variant rows in `model_registry` should be
+  marked `deprecated=true` for Grok-family providers via:
+  `UPDATE model_registry SET deprecated = true WHERE provider = 'xai'
+   AND model_id ~ '-reasoning$' AND model_id NOT LIKE '%non-reasoning'`.
+  v4.1.2 fleet rollout includes this UPDATE on PYTHIA + CERBERUS
+  before container restart.
+
 ## [4.0.0] — 2026-04-29
 
 Major refactor + multi-backend persistence + multi-worker support release.

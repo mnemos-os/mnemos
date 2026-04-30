@@ -34,7 +34,7 @@ async def list_providers_public():
     """List enabled providers for a login UI. No secrets returned."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             "SELECT name, display_name, kind, enabled "
             "FROM oauth_providers WHERE enabled=TRUE "
@@ -57,7 +57,7 @@ async def _load_provider(name: str):
     """Fetch an enabled provider row, else 404."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
             "       authorize_url, token_url, userinfo_url, enabled "
@@ -89,7 +89,7 @@ async def oauth_callback(provider: str, request: Request):
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         try:
             user_id, identity_id, claims = await _oauth.finish_login(
                 request, provider_row, conn,
@@ -157,7 +157,7 @@ async def oauth_logout(
         raise HTTPException(status_code=503, detail="Database pool not available")
 
     sessions_revoked = 0
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         if all_devices:
             sessions_revoked = await _oauth.revoke_all_sessions(conn, user.user_id)
         else:
@@ -189,7 +189,7 @@ async def oauth_me(
     auth_method = "personal" if not user.authenticated else "api_key"
 
     if cookie_session and _lc._pool:
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT identity_id::text AS identity_id FROM oauth_sessions "
                 "WHERE session_id=$1 AND NOT revoked",

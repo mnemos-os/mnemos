@@ -218,7 +218,7 @@ async def import_memories_from_document(
     memory_ids = []
     errors = []
 
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         for chunk in chunks:
             try:
                 memory_id = new_memory_id()

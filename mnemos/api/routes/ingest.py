@@ -44,7 +44,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
     stored_ids = []
     try:
         data = request.raw_data
-        async with _lc._pool.acquire() as conn:
+        async with _lc.get_pool_manager().acquire() as conn:
             async with _rls_context(conn, user):
                 async with conn.transaction():
                     for key, fallback_key, item_type, label, category in (

@@ -23,7 +23,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as _lc
-from mnemos.api.dependencies import UserContext, get_current_user, require_root
+from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.domain.morpheus.runner import rollback_run, run_dream
 
 logger = logging.getLogger(__name__)
@@ -113,15 +114,14 @@ def _row_to_run(r) -> MorpheusRun:
 async def list_runs(
     limit: int = Query(50, ge=1, le=500),
     status: Optional[str] = Query(None, pattern=r"^(running|success|failed|rolled_back)$"),
-    _: UserContext = Depends(get_current_user),
+    _: UserContext = Depends(require_root),
 ):
     """List MORPHEUS runs newest-first.
 
-    Visible to any authenticated user — runs are operator-side telemetry,
-    not user-content.
+    Operator-only telemetry endpoint. Returned rows can include tenant
+    namespaces, configs, errors, and synthesized memory IDs.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_postgres_backend()
     where = ""
     args: list = []
     if status:
@@ -136,16 +136,16 @@ async def list_runs(
         f"FROM morpheus_runs{where} "
         f"ORDER BY started_at DESC LIMIT ${len(args)}"
     )
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(sql, *args)
     return MorpheusRunList(count=len(rows), runs=[_row_to_run(r) for r in rows])
 
 
 @router.get("/v1/morpheus/runs/{run_id}", response_model=MorpheusRun)
-async def get_run(run_id: str, _: UserContext = Depends(get_current_user)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+async def get_run(run_id: str, _: UserContext = Depends(require_root)):
+    """Return one MORPHEUS run. Operator-only telemetry."""
+    _require_postgres_backend()
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
@@ -163,8 +163,10 @@ async def get_run(run_id: str, _: UserContext = Depends(get_current_user)):
     "/v1/morpheus/runs/{run_id}/clusters",
     response_model=MorpheusClusterList,
 )
-async def list_clusters(run_id: str, _: UserContext = Depends(get_current_user)):
+async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
     """Read out the cluster grouping a MORPHEUS run produced.
+
+    Operator-only telemetry: cluster members expose raw memory IDs.
 
     Slice 2's phase_cluster persists clusters to morpheus_runs.config
     under the "clusters" key as a JSONB list of
@@ -176,9 +178,8 @@ async def list_clusters(run_id: str, _: UserContext = Depends(get_current_user))
     the run never reached the cluster phase or produced zero clusters
     above cluster_min_size.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    _require_postgres_backend()
+    async with _lc.get_pool_manager().acquire() as conn:
         config_raw = await conn.fetchval(
             "SELECT config FROM morpheus_runs WHERE id=$1::uuid", run_id,
         )
@@ -240,8 +241,7 @@ async def trigger_run(
     task with the caller polling /v1/morpheus/runs/{id}. Slice 1's
     runner is a no-op so this returns near-instantly.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    _require_postgres_backend()
     run_id = await run_dream(
         _lc._pool,
         triggered_by="api",
@@ -250,7 +250,7 @@ async def trigger_run(
         config=request.config,
         namespace=request.namespace,
     )
-    async with _lc._pool.acquire() as conn:
+    async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
@@ -273,9 +273,8 @@ async def rollback(
     `memories_deleted: 0` and leaves the run status at 'rolled_back'.
     Returns 404 if the run_id doesn't exist.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    async with _lc._pool.acquire() as conn:
+    _require_postgres_backend()
+    async with _lc.get_pool_manager().acquire() as conn:
         existing = await conn.fetchval(
             "SELECT id FROM morpheus_runs WHERE id=$1::uuid", run_id,
         )
