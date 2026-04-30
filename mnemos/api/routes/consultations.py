@@ -471,6 +471,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
         _schedule_outbox_deliveries(delivery_ids)
         if consultation_id is not None:
             from mnemos.nats import publish_event as _nats_publish_event
+            from mnemos.nats.client import get_node_name as _nats_get_node_name
             safe_ns = (user.namespace or "default").replace(".", "_")
             await _nats_publish_event(
                 f"mnemos.consultation.completed.{safe_ns}",
@@ -482,6 +483,7 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                     "consensus_score": result.get("consensus_score"),
                     "namespace": user.namespace,
                     "user_id": user.user_id,
+                    "source_node": _nats_get_node_name(),
                 },
                 msg_id=f"{consultation_id}.completed",
             )

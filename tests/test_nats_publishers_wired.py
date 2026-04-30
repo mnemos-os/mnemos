@@ -12,6 +12,8 @@ from tests._fake_backend import install_fake_backend
 
 pytestmark = pytest.mark.asyncio
 
+NODE_NAME = "test-node"
+
 
 def _alice(namespace: str = "alice.ns") -> UserContext:
     return UserContext(
@@ -44,6 +46,7 @@ def publish_mock(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     mock = AsyncMock()
     monkeypatch.setattr("mnemos.nats.publisher.publish_event", mock)
     monkeypatch.setattr("mnemos.nats.publish_event", mock)
+    monkeypatch.setattr("mnemos.nats.client.get_node_name", lambda: NODE_NAME)
     return mock
 
 
@@ -71,6 +74,39 @@ def _memory_row(memory_id: str = "mem_1") -> dict:
     }
 
 
+async def test_create_memory_publishes_memory_created(
+    client,
+    auth_headers: dict[str, str],
+    current_user_override,
+    publish_mock: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = install_fake_backend(monkeypatch)
+    monkeypatch.setattr("mnemos.api.routes.memories.new_memory_id", lambda: "mem_create")
+    backend.memories.configure_return("get_memory", _memory_row("mem_create"))
+
+    resp = await client.post(
+        "/v1/memories",
+        json={"content": "remember this", "category": "facts"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    publish_mock.assert_awaited_once()
+    subject, payload = publish_mock.await_args.args
+    assert subject == "mnemos.memory.created.alice_ns"
+    assert payload == {
+        "memory_id": "mem_create",
+        "category": "facts",
+        "subcategory": None,
+        "content": "remember this",
+        "owner_id": "alice",
+        "namespace": "alice.ns",
+        "source_node": NODE_NAME,
+    }
+    assert publish_mock.await_args.kwargs["msg_id"] == "mem_create.created"
+
+
 async def test_bulk_create_publishes_memory_created_per_success(
     client,
     auth_headers: dict[str, str],
@@ -93,6 +129,10 @@ async def test_bulk_create_publishes_memory_created_per_success(
         "mnemos.memory.created.alice_ns",
     ]
     memory_ids = resp.json()["memory_ids"]
+    assert [call.args[1]["source_node"] for call in publish_mock.await_args_list] == [
+        NODE_NAME,
+        NODE_NAME,
+    ]
     assert [call.kwargs["msg_id"] for call in publish_mock.await_args_list] == [
         f"{memory_ids[0]}.created",
         f"{memory_ids[1]}.created",
@@ -124,6 +164,7 @@ async def test_update_memory_publishes_memory_updated(
         "namespace": "alice.ns",
         "owner_id": "alice",
         "category": "facts",
+        "source_node": NODE_NAME,
     }
     assert publish_mock.await_args.kwargs["msg_id"].startswith("mem_update.updated.")
 
@@ -143,7 +184,12 @@ async def test_delete_memory_publishes_memory_deleted(
     assert resp.status_code == 204, resp.text
     publish_mock.assert_awaited_once_with(
         "mnemos.memory.deleted.alice_ns",
-        {"memory_id": "mem_delete", "namespace": "alice.ns", "owner_id": "alice"},
+        {
+            "memory_id": "mem_delete",
+            "namespace": "alice.ns",
+            "owner_id": "alice",
+            "source_node": NODE_NAME,
+        },
         msg_id="mem_delete.deleted",
     )
 
@@ -173,6 +219,7 @@ async def test_consultation_publishes_completed(
         "consensus_score": 0.95,
         "namespace": "alice.ns",
         "user_id": "alice",
+        "source_node": NODE_NAME,
     }
     assert publish_mock.await_args.kwargs["msg_id"] == f"{consultation_id}.completed"
 
@@ -203,5 +250,6 @@ async def test_webhook_create_publishes_subscription_created(
         "event_types": ["memory.created"],
         "namespace": "alice.ns",
         "owner_id": "alice",
+        "source_node": NODE_NAME,
     }
     assert publish_mock.await_args.kwargs["msg_id"] == f"webhook.{webhook_id}.subscription.created"

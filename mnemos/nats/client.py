@@ -4,6 +4,10 @@ Single process-global JetStream context. Lifecycle bootstrap calls
 ``connect_nats`` on startup; routes that publish events look up the
 context via ``get_jetstream``.
 
+All publish payloads carry ``source_node`` metadata. Loop prevention is the
+consumer's responsibility: consumers must skip events whose ``source_node``
+matches the local node name.
+
 Stream declarations live here (alongside the connection) because the
 shape of subjects + retention is part of the bus contract: bumping
 either is a coordinated change with consumers.
@@ -12,7 +16,10 @@ either is a coordinated change with consumers.
 from __future__ import annotations
 
 import logging
+import socket
 from typing import Optional
+
+from mnemos.core.config import get_settings
 
 logger = logging.getLogger("mnemos.nats")
 
@@ -22,6 +29,16 @@ _jetstream = None  # type: ignore[assignment]
 def get_jetstream():
     """Return the live JetStream context, or None if NATS is disabled."""
     return _jetstream
+
+
+def get_node_name() -> str:
+    """Return the resolved local NATS node name."""
+    settings = get_settings()
+    node_name = settings.nats.node_name.strip()
+    if not node_name:
+        node_name = socket.gethostname()
+        settings.nats.node_name = node_name
+    return node_name
 
 
 async def connect_nats(url: Optional[str], token: Optional[str]):

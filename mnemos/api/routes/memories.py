@@ -221,10 +221,11 @@ async def _insert_memory_with_created_webhook(
     # v4.2 NATS additive emit. Best-effort — silent skip when broker
     # unreachable. Webhooks outbox above is the durable path.
     from mnemos.nats import publish_event as _nats_publish_event
+    from mnemos.nats.client import get_node_name as _nats_get_node_name
     safe_ns = (namespace or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.memory.created.{safe_ns}",
-        event_payload,
+        {**event_payload, "source_node": _nats_get_node_name()},
         msg_id=f"{mem_id}.created",
     )
 
@@ -718,6 +719,7 @@ async def create_memory(
     # v4.2 NATS additive emit. Best-effort — silent skip when broker
     # unreachable. Webhooks outbox above is the durable path.
     from mnemos.nats import publish_event as _nats_publish_event
+    from mnemos.nats.client import get_node_name as _nats_get_node_name
     safe_ns = (namespace or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.memory.created.{safe_ns}",
@@ -728,6 +730,7 @@ async def create_memory(
             "content": request.content,
             "owner_id": owner_id,
             "namespace": namespace,
+            "source_node": _nats_get_node_name(),
         },
         msg_id=f"{mem_id}.created",
     )
@@ -818,11 +821,13 @@ async def bulk_create_memories(
         delivery_ids.extend(item_delivery_ids)
     _schedule_outbox_deliveries(delivery_ids)
     from mnemos.nats import publish_event as _nats_publish_event
+    from mnemos.nats.client import get_node_name as _nats_get_node_name
+    source_node = _nats_get_node_name()
     for event in nats_created_events:
         safe_ns = (event["namespace"] or "default").replace(".", "_")
         await _nats_publish_event(
             f"mnemos.memory.created.{safe_ns}",
-            event,
+            {**event, "source_node": source_node},
             msg_id=f"{event['memory_id']}.created",
         )
     await _invalidate_caches_after_mutation()
@@ -903,6 +908,7 @@ async def update_memory(
         updated_suffix = str(int(time.time() * 1000))
     namespace = row["namespace"]
     from mnemos.nats import publish_event as _nats_publish_event
+    from mnemos.nats.client import get_node_name as _nats_get_node_name
     safe_ns = (namespace or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.memory.updated.{safe_ns}",
@@ -911,6 +917,7 @@ async def update_memory(
             "namespace": namespace,
             "owner_id": row["owner_id"],
             "category": row["category"],
+            "source_node": _nats_get_node_name(),
         },
         msg_id=f"{memory_id}.updated.{updated_suffix}",
     )
@@ -966,6 +973,7 @@ async def delete_memory(
     _schedule_outbox_deliveries(delivery_ids)
     namespace = row["namespace"]
     from mnemos.nats import publish_event as _nats_publish_event
+    from mnemos.nats.client import get_node_name as _nats_get_node_name
     safe_ns = (namespace or "default").replace(".", "_")
     await _nats_publish_event(
         f"mnemos.memory.deleted.{safe_ns}",
@@ -973,6 +981,7 @@ async def delete_memory(
             "memory_id": row["id"],
             "namespace": namespace,
             "owner_id": row["owner_id"],
+            "source_node": _nats_get_node_name(),
         },
         msg_id=f"{row['id']}.deleted",
     )

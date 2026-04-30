@@ -378,6 +378,7 @@ class _NatsSettings(BaseSettings):
 
     url: str | None = Field(None, validation_alias="MNEMOS_NATS_URL")
     token: str | None = Field(None, validation_alias="MNEMOS_NATS_TOKEN")
+    node_name: str = Field("", validation_alias="MNEMOS_NODE_NAME")
 
 
 class Settings(BaseSettings):

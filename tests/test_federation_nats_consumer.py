@@ -137,6 +137,42 @@ async def test_consumer_reads_message_and_calls_store_with_federation_shape():
     ]
 
 
+async def test_self_loop_event_is_skipped_and_remote_event_is_processed(monkeypatch):
+    monkeypatch.setattr(consumer, "get_node_name", lambda: "pythia")
+    pool = _FakePool()
+    calls = []
+
+    async def store(conn, peer_name, memories):
+        calls.append((conn, peer_name, memories))
+        return (1, 0)
+
+    await consumer.handle_message(
+        pool,
+        _peer(),
+        _FakeMsg(
+            "mnemos.memory.created.default",
+            {"memory_id": "mem_self", "content": "self", "source_node": "pythia"},
+        ),
+        store=store,
+    )
+    assert calls == []
+
+    await consumer.handle_message(
+        pool,
+        _peer(),
+        _FakeMsg(
+            "mnemos.memory.created.default",
+            {"memory_id": "mem_remote", "content": "remote", "source_node": "proteus"},
+        ),
+        store=store,
+    )
+
+    assert len(calls) == 1
+    assert calls[0][0] is pool.conn
+    assert calls[0][1] == "pythia"
+    assert calls[0][2][0]["id"] == "mem_remote"
+
+
 async def test_hard_fault_on_single_bad_event_does_not_kill_loop(monkeypatch):
     pool = _FakePool()
     bad = _FakeMsg("mnemos.memory.created.default", b"not json")

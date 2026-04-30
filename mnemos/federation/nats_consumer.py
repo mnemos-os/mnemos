@@ -19,6 +19,7 @@ import asyncpg
 
 from mnemos.core.config import Settings, get_settings
 from mnemos.domain.federation import FEDERATION_ID_PREFIX, _store_memories
+from mnemos.nats.client import get_node_name
 
 logger = logging.getLogger("mnemos.federation.nats_consumer")
 
@@ -134,6 +135,15 @@ async def handle_message(
     delete = delete or delete_federated_memory
     subject = getattr(msg, "subject", "")
     payload = _decode_payload(getattr(msg, "data", b""))
+    source_node = payload.get("source_node")
+    if source_node == get_node_name():
+        logger.debug(
+            "skipped self-loop event peer=%s subject=%s source_node=%s",
+            peer.name,
+            subject,
+            source_node,
+        )
+        return
     memory_id = _memory_id(payload)
     logger.debug(
         "federation nats received peer=%s subject=%s memory_id=%s",
