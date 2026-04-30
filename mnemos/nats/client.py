@@ -70,25 +70,39 @@ async def ensure_streams(js) -> None:
 
     # nats-py StreamConfig expects max_age + duplicate_window in
     # seconds (it multiplies by 1e9 internally to nanoseconds).
-    streams = [
-        StreamConfig(
-            name="MNEMOS_MEMORY",
-            subjects=["mnemos.memory.>"],
+    def _stream_config(name: str, subjects: list[str], max_bytes: int = 10 * 1024**3):
+        return StreamConfig(
+            name=name,
+            subjects=subjects,
             retention=RetentionPolicy.LIMITS,
             storage=StorageType.FILE,
             max_age=30 * 24 * 60 * 60,  # 30 days in seconds
-            max_bytes=10 * 1024**3,
+            max_bytes=max_bytes,
             duplicate_window=2 * 60,  # 2 minute dedup window
-        ),
+        )
+
+    streams = [
+        _stream_config("MNEMOS_MEMORY", ["mnemos.memory.>"]),
+        _stream_config("MNEMOS_CONSULTATION", ["mnemos.consultation.>"]),
+        _stream_config("MNEMOS_WEBHOOK", ["mnemos.webhook.>"]),
     ]
     for cfg in streams:
         try:
             await js.add_stream(config=cfg)
             logger.info("NATS stream %s declared", cfg.name)
         except Exception as exc:
+            msg = str(exc)
+            if "10047" in msg or "insufficient storage resources" in msg.lower():
+                try:
+                    fallback = _stream_config(cfg.name, list(cfg.subjects), 1024**3)
+                    await js.add_stream(config=fallback)
+                    logger.info("NATS stream %s declared with 1GB max_bytes", cfg.name)
+                    continue
+                except Exception as fallback_exc:
+                    exc = fallback_exc
+                    msg = str(fallback_exc)
             # add_stream is idempotent for matching configs; mismatched
             # configs raise. Log and continue — operator must intervene.
-            msg = str(exc)
             if "already in use" in msg or "stream name already" in msg.lower():
                 logger.debug("NATS stream %s already exists", cfg.name)
             else:

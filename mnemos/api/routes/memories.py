@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -745,6 +746,7 @@ async def bulk_create_memories(
     created_ids: list[str] = []
     errors: list[str] = []
     delivery_ids: list[str] = []
+    nats_created_events: list[dict] = []
     for i, mem in enumerate(request.memories):
         if not mem.content.strip():
             errors.append(f"[{i}] content is empty")
@@ -803,8 +805,26 @@ async def bulk_create_memories(
             errors.append(f"[{i}] {e}")
             continue
         created_ids.append(mid)
+        nats_created_events.append(
+            {
+                "memory_id": mid,
+                "category": mem.category,
+                "subcategory": mem.subcategory,
+                "content": mem.content,
+                "owner_id": owner_id,
+                "namespace": namespace,
+            }
+        )
         delivery_ids.extend(item_delivery_ids)
     _schedule_outbox_deliveries(delivery_ids)
+    from mnemos.nats import publish_event as _nats_publish_event
+    for event in nats_created_events:
+        safe_ns = (event["namespace"] or "default").replace(".", "_")
+        await _nats_publish_event(
+            f"mnemos.memory.created.{safe_ns}",
+            event,
+            msg_id=f"{event['memory_id']}.created",
+        )
     await _invalidate_caches_after_mutation()
     return BulkCreateResponse(created=len(created_ids), memory_ids=created_ids, errors=errors)
 
@@ -873,6 +893,27 @@ async def update_memory(
     except HTTPException:
         raise
     _schedule_outbox_deliveries(delivery_ids)
+    try:
+        updated_at = row["updated"]
+    except (KeyError, TypeError):
+        updated_at = None
+    if hasattr(updated_at, "isoformat"):
+        updated_suffix = updated_at.isoformat()
+    else:
+        updated_suffix = str(int(time.time() * 1000))
+    namespace = row["namespace"]
+    from mnemos.nats import publish_event as _nats_publish_event
+    safe_ns = (namespace or "default").replace(".", "_")
+    await _nats_publish_event(
+        f"mnemos.memory.updated.{safe_ns}",
+        {
+            "memory_id": memory_id,
+            "namespace": namespace,
+            "owner_id": row["owner_id"],
+            "category": row["category"],
+        },
+        msg_id=f"{memory_id}.updated.{updated_suffix}",
+    )
     await _invalidate_caches_after_mutation()
     return _row_to_memory(row)
 
@@ -923,6 +964,18 @@ async def delete_memory(
     except HTTPException:
         raise
     _schedule_outbox_deliveries(delivery_ids)
+    namespace = row["namespace"]
+    from mnemos.nats import publish_event as _nats_publish_event
+    safe_ns = (namespace or "default").replace(".", "_")
+    await _nats_publish_event(
+        f"mnemos.memory.deleted.{safe_ns}",
+        {
+            "memory_id": row["id"],
+            "namespace": namespace,
+            "owner_id": row["owner_id"],
+        },
+        msg_id=f"{row['id']}.deleted",
+    )
     await _invalidate_caches_after_mutation()
 
 

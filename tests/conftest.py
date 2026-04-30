@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from uuid import uuid4
 from typing import Any
 import json
 from unittest.mock import AsyncMock, MagicMock
@@ -197,6 +198,23 @@ class FakeConnection:
 
     async def fetchrow(self, query: str, *args):
         compact = " ".join(query.split())
+
+        if compact.startswith("INSERT INTO webhook_subscriptions"):
+            webhook_id = str(uuid4())
+            record = {
+                "id": webhook_id,
+                "url": args[0],
+                "events": list(args[1]),
+                "secret": args[2],
+                "description": args[3],
+                "owner_id": args[4],
+                "namespace": args[5],
+                "created": _utcnow(),
+                "revoked": False,
+                "revoked_at": None,
+            }
+            self.state.setdefault("webhook_subscriptions", {})[webhook_id] = record
+            return record
 
         if compact.startswith("INSERT INTO graeae_consultations"):
             consultation_id = f"consult-{len(self.state['consultations']) + 1}"
@@ -506,6 +524,7 @@ class FakePool:
             "audit_log": [],
             "memory_refs": [],
             "entities": {},
+            "webhook_subscriptions": {},
             "model_registry": [
                 {
                     "provider": "openai",

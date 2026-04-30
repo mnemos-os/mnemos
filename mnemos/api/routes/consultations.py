@@ -469,6 +469,22 @@ async def consult_graeae(request: Request, body: ConsultationRequest, user: User
                 )
 
         _schedule_outbox_deliveries(delivery_ids)
+        if consultation_id is not None:
+            from mnemos.nats import publish_event as _nats_publish_event
+            safe_ns = (user.namespace or "default").replace(".", "_")
+            await _nats_publish_event(
+                f"mnemos.consultation.completed.{safe_ns}",
+                {
+                    "consultation_id": str(consultation_id),
+                    "task_type": body.task_type,
+                    "mode": body.mode,
+                    "winning_muse": result.get("winning_muse"),
+                    "consensus_score": result.get("consensus_score"),
+                    "namespace": user.namespace,
+                    "user_id": user.user_id,
+                },
+                msg_id=f"{consultation_id}.completed",
+            )
 
         return ConsultationResponse(
             # asyncpg returns UUID columns as uuid.UUID objects, not strings.

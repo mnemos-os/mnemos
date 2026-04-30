@@ -108,8 +108,23 @@ async def create_webhook(
         row["id"], user.user_id, list(row["events"]),
     )
 
+    webhook_id = str(row["id"])
+    from mnemos.nats import publish_event as _nats_publish_event
+    safe_ns = (row["namespace"] or "default").replace(".", "_")
+    await _nats_publish_event(
+        f"mnemos.webhook.subscription.created.{safe_ns}",
+        {
+            "webhook_id": webhook_id,
+            "url": row["url"],
+            "event_types": list(row["events"]),
+            "namespace": row["namespace"],
+            "owner_id": row["owner_id"],
+        },
+        msg_id=f"webhook.{webhook_id}.subscription.created",
+    )
+
     return WebhookCreateResponse(
-        id=str(row["id"]),
+        id=webhook_id,
         url=row["url"],
         events=list(row["events"]),
         description=row["description"],
