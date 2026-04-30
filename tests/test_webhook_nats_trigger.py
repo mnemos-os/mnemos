@@ -147,7 +147,10 @@ async def test_stream_subscription_declared_with_right_subject():
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.webhook.delivery.queued.>"
     assert kwargs["stream"] == "MNEMOS_WEBHOOK"
-    assert kwargs["durable"] == "mnemos_webhook_delivery_trigger"
+    # Durable name is per-node so multiple nodes on the same NATS
+    # broker each get their own subscription instead of competing
+    # for the same durable consumer (which JetStream rejects).
+    assert kwargs["durable"].startswith("mnemos_webhook_delivery_trigger_")
     # No queue param: Postgres SKIP LOCKED handles cross-worker
     # serialization; queue group on JS would need DeliverGroup on the
     # consumer config, which 10110-fails with our durable shape.

@@ -118,12 +118,25 @@ async def _connect(settings: Settings):
     return nc.jetstream()
 
 
+def _node_durable() -> str:
+    """Per-node durable name. Multi-node deploys share the broker but
+    each node needs its OWN durable consumer — JetStream rejects a
+    second bind on the same durable. Suffix with the node name so
+    pythia, proteus, etc. each get a private subscription on the
+    shared `mnemos.webhook.delivery.queued.>` subject.
+    """
+    from mnemos.nats.client import get_node_name
+    safe = get_node_name().replace(".", "_").replace("-", "_") or "node"
+    return f"{DURABLE}_{safe}"
+
+
 async def _subscribe(js: Any):
+    durable = _node_durable()
     try:
         from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
 
         config = ConsumerConfig(
-            durable_name=DURABLE,
+            durable_name=durable,
             deliver_policy=DeliverPolicy.NEW,
             ack_policy=AckPolicy.EXPLICIT,
         )
@@ -137,7 +150,7 @@ async def _subscribe(js: Any):
     # races to claim, only one wins.
     return await js.subscribe(
         SUBJECT,
-        durable=DURABLE,
+        durable=durable,
         stream=STREAM,
         config=config,
     )
