@@ -24,11 +24,17 @@ from mnemos.core.config import get_settings
 logger = logging.getLogger("mnemos.nats")
 
 _jetstream = None  # type: ignore[assignment]
+_publishing_enabled = False
 
 
 def get_jetstream():
     """Return the live JetStream context, or None if NATS is disabled."""
     return _jetstream
+
+
+def publishing_enabled() -> bool:
+    """Return whether startup verified all required streams for publishing."""
+    return _jetstream is not None and _publishing_enabled
 
 
 def get_node_name() -> str:
@@ -43,7 +49,9 @@ def get_node_name() -> str:
 
 async def connect_nats(url: Optional[str], token: Optional[str]):
     """Open a NATS connection + JetStream context. Returns None on failure."""
-    global _jetstream
+    global _jetstream, _publishing_enabled
+    _jetstream = None
+    _publishing_enabled = False
     if not url:
         logger.info("NATS disabled (MNEMOS_NATS_URL unset)")
         return None
@@ -63,13 +71,20 @@ async def connect_nats(url: Optional[str], token: Optional[str]):
         logger.warning("NATS connect to %s failed: %s — publishing disabled", url, exc)
         return None
 
-    await ensure_streams(js)
+    streams_ready = await ensure_streams(js)
+    if not streams_ready:
+        logger.error(
+            "NATS connected to %s but required streams were not verified; publishing disabled",
+            url,
+        )
+        return None
     _jetstream = js
+    _publishing_enabled = True
     logger.info("NATS connected to %s, JetStream context ready", url)
     return js
 
 
-async def ensure_streams(js) -> None:
+async def ensure_streams(js) -> bool:
     """Idempotently declare the streams we publish to.
 
     Subjects:
@@ -83,7 +98,8 @@ async def ensure_streams(js) -> None:
     try:
         from nats.js.api import StreamConfig, RetentionPolicy, StorageType  # type: ignore
     except ImportError:
-        return
+        logger.error("nats-py JetStream API unavailable; NATS publishing disabled")
+        return False
 
     # nats-py StreamConfig expects max_age + duplicate_window in
     # seconds (it multiplies by 1e9 internally to nanoseconds).
@@ -123,4 +139,6 @@ async def ensure_streams(js) -> None:
             if "already in use" in msg or "stream name already" in msg.lower():
                 logger.debug("NATS stream %s already exists", cfg.name)
             else:
-                logger.warning("NATS stream %s declaration error: %s", cfg.name, exc)
+                logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
+                return False
+    return True

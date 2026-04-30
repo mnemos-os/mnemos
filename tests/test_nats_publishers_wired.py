@@ -97,11 +97,8 @@ async def test_create_memory_publishes_memory_created(
     assert subject == "mnemos.memory.created.alice_ns"
     assert payload == {
         "memory_id": "mem_create",
-        "category": "facts",
-        "subcategory": None,
-        "content": "remember this",
-        "owner_id": "alice",
         "namespace": "alice.ns",
+        "category": "facts",
         "source_node": NODE_NAME,
     }
     assert publish_mock.await_args.kwargs["msg_id"] == "mem_create.created"
@@ -129,10 +126,10 @@ async def test_bulk_create_publishes_memory_created_per_success(
         "mnemos.memory.created.alice_ns",
     ]
     memory_ids = resp.json()["memory_ids"]
-    assert [call.args[1]["source_node"] for call in publish_mock.await_args_list] == [
-        NODE_NAME,
-        NODE_NAME,
-    ]
+    for call in publish_mock.await_args_list:
+        assert set(call.args[1]) == {"memory_id", "namespace", "category", "source_node"}
+        assert call.args[1]["namespace"] == "alice.ns"
+        assert call.args[1]["source_node"] == NODE_NAME
     assert [call.kwargs["msg_id"] for call in publish_mock.await_args_list] == [
         f"{memory_ids[0]}.created",
         f"{memory_ids[1]}.created",
@@ -162,7 +159,6 @@ async def test_update_memory_publishes_memory_updated(
     assert payload == {
         "memory_id": "mem_update",
         "namespace": "alice.ns",
-        "owner_id": "alice",
         "category": "facts",
         "source_node": NODE_NAME,
     }
@@ -187,7 +183,7 @@ async def test_delete_memory_publishes_memory_deleted(
         {
             "memory_id": "mem_delete",
             "namespace": "alice.ns",
-            "owner_id": "alice",
+            "category": "facts",
             "source_node": NODE_NAME,
         },
         msg_id="mem_delete.deleted",

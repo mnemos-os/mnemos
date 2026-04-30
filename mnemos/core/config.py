@@ -316,6 +316,10 @@ class _FederationNatsPeerSettings(BaseModel):
     name: str
     nats_url: str
     nats_token: str | None = None
+    base_url: str | None = None
+    auth_token: str | None = None
+    namespace_filter: list[str] | None = None
+    category_filter: list[str] | None = None
     subjects: list[str] = Field(default_factory=lambda: ["mnemos.memory.>"])
 
 

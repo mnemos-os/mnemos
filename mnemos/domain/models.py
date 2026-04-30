@@ -55,6 +55,7 @@ class HealthResponse(BaseModel):
     version: str
     profile: str = "edge"
     distillation_worker: Optional[str] = None  # idle, healthy, error, disabled, unavailable
+    nats_publishing_enabled: bool = False
 
 
 class MemoryItem(BaseModel):

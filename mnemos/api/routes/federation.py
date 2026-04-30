@@ -371,11 +371,16 @@ async def federation_feed(
 
     since_ts: Optional[datetime] = None
     since_id: Optional[str] = None
+    exact_memory_id: Optional[str] = None
     if since:
         try:
             cursor = _fed._decode_feed_cursor(since)
         except ValueError:
-            raise HTTPException(status_code=400, detail="invalid federation cursor")
+            if since.startswith(("mem_", "mnemos_")):
+                cursor = None
+                exact_memory_id = since
+            else:
+                raise HTTPException(status_code=400, detail="invalid federation cursor")
         if cursor is not None:
             since_ts = _fed._cursor_timestamp_for_db(cursor.updated)
             since_id = cursor.memory_id
@@ -399,7 +404,10 @@ async def federation_feed(
         "(m.permission_mode % 10) >= 4",
     ]
     args: list = []
-    if since_ts is not None:
+    if exact_memory_id is not None:
+        args.append(exact_memory_id)
+        query_parts.append(f"m.id = ${len(args)}")
+    elif since_ts is not None:
         args.append(since_ts)
         since_updated_arg = len(args)
         args.append(since_id)

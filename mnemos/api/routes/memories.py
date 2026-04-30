@@ -36,6 +36,7 @@ from mnemos.domain.models import (
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
+NatsPublishIntent = tuple[str, dict, str]
 
 
 @asynccontextmanager
@@ -218,18 +219,22 @@ async def _insert_memory_with_created_webhook(
         namespace=namespace,
     )
 
-    # v4.2 NATS additive emit. Best-effort — silent skip when broker
-    # unreachable. Webhooks outbox above is the durable path.
-    from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
     safe_ns = (namespace or "default").replace(".", "_")
-    await _nats_publish_event(
-        f"mnemos.memory.created.{safe_ns}",
-        {**event_payload, "source_node": _nats_get_node_name()},
-        msg_id=f"{mem_id}.created",
-    )
+    nats_intents: list[NatsPublishIntent] = [
+        (
+            f"mnemos.memory.created.{safe_ns}",
+            {
+                "memory_id": mem_id,
+                "namespace": namespace,
+                "category": category,
+                "source_node": _nats_get_node_name(),
+            },
+            f"{mem_id}.created",
+        )
+    ]
 
-    return row
+    return nats_intents
 
 
 async def _bump_recall_counters(memory_ids: list) -> None:
@@ -725,11 +730,8 @@ async def create_memory(
         f"mnemos.memory.created.{safe_ns}",
         {
             "memory_id": mem_id,
-            "category": request.category,
-            "subcategory": request.subcategory,
-            "content": request.content,
-            "owner_id": owner_id,
             "namespace": namespace,
+            "category": request.category,
             "source_node": _nats_get_node_name(),
         },
         msg_id=f"{mem_id}.created",
@@ -811,11 +813,8 @@ async def bulk_create_memories(
         nats_created_events.append(
             {
                 "memory_id": mid,
-                "category": mem.category,
-                "subcategory": mem.subcategory,
-                "content": mem.content,
-                "owner_id": owner_id,
                 "namespace": namespace,
+                "category": mem.category,
             }
         )
         delivery_ids.extend(item_delivery_ids)
@@ -915,7 +914,6 @@ async def update_memory(
         {
             "memory_id": memory_id,
             "namespace": namespace,
-            "owner_id": row["owner_id"],
             "category": row["category"],
             "source_node": _nats_get_node_name(),
         },
@@ -980,7 +978,7 @@ async def delete_memory(
         {
             "memory_id": row["id"],
             "namespace": namespace,
-            "owner_id": row["owner_id"],
+            "category": row["category"],
             "source_node": _nats_get_node_name(),
         },
         msg_id=f"{row['id']}.deleted",

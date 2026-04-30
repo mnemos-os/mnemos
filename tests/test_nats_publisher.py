@@ -6,6 +6,8 @@ a silent no-op.
 """
 
 import asyncio
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -17,6 +19,7 @@ from mnemos.nats.publisher import publish_event
 def _no_jetstream(monkeypatch):
     """Force the publisher to see a None JetStream context."""
     monkeypatch.setattr(nats_client, "_jetstream", None)
+    monkeypatch.setattr(nats_client, "_publishing_enabled", False)
 
 
 def test_publish_event_silent_when_disabled(caplog):
@@ -51,3 +54,48 @@ def test_connect_nats_returns_none_when_url_missing():
     """connect_nats(None, None) is a no-op returning None."""
     result = asyncio.run(nats_client.connect_nats(None, None))
     assert result is None
+
+
+def test_connect_nats_disables_publishing_when_streams_not_verified(monkeypatch):
+    class _NC:
+        def jetstream(self):
+            return object()
+
+    async def connect(**kwargs):
+        return _NC()
+
+    async def ensure_streams(js):
+        return False
+
+    monkeypatch.setitem(sys.modules, "nats", SimpleNamespace(connect=connect))
+    monkeypatch.setattr(nats_client, "ensure_streams", ensure_streams)
+
+    result = asyncio.run(nats_client.connect_nats("nats://example:4222", None))
+
+    assert result is None
+    assert nats_client.get_jetstream() is None
+    assert nats_client.publishing_enabled() is False
+
+
+def test_connect_nats_enables_publishing_only_after_streams_verified(monkeypatch):
+    js = object()
+
+    class _NC:
+        def jetstream(self):
+            return js
+
+    async def connect(**kwargs):
+        return _NC()
+
+    async def ensure_streams(js_arg):
+        assert js_arg is js
+        return True
+
+    monkeypatch.setitem(sys.modules, "nats", SimpleNamespace(connect=connect))
+    monkeypatch.setattr(nats_client, "ensure_streams", ensure_streams)
+
+    result = asyncio.run(nats_client.connect_nats("nats://example:4222", None))
+
+    assert result is js
+    assert nats_client.get_jetstream() is js
+    assert nats_client.publishing_enabled() is True

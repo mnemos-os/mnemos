@@ -135,7 +135,7 @@ async def test_bad_shape_message_logs_skips_and_does_not_kill_loop(monkeypatch, 
     assert good_calls == ["good_delivery"]
     assert bad.acked is True
     assert good.acked is True
-    assert "webhook nats trigger skipped invalid payload" in caplog.text
+    assert "webhook nats trigger poison message" in caplog.text
 
 
 async def test_stream_subscription_declared_with_right_subject():
@@ -147,14 +147,25 @@ async def test_stream_subscription_declared_with_right_subject():
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.webhook.delivery.queued.>"
     assert kwargs["stream"] == "MNEMOS_WEBHOOK"
-    # Durable name is per-node so multiple nodes on the same NATS
-    # broker each get their own subscription instead of competing
-    # for the same durable consumer (which JetStream rejects).
-    assert kwargs["durable"].startswith("mnemos_webhook_delivery_trigger_")
-    # No queue param: Postgres SKIP LOCKED handles cross-worker
-    # serialization; queue group on JS would need DeliverGroup on the
-    # consumer config, which 10110-fails with our durable shape.
-    assert "queue" not in kwargs
+    assert kwargs["durable"] == "mnemos_webhook_delivery_trigger"
+    assert kwargs["queue"] == "mnemos_webhook_delivery_workers"
     config_obj = kwargs["config"]
     if config_obj is not None:
         assert "NEW" in str(getattr(config_obj, "deliver_policy", "NEW"))
+        assert getattr(config_obj, "deliver_group", None) == "mnemos_webhook_delivery_workers"
+
+
+async def test_transient_handle_error_is_not_acked(monkeypatch):
+    msg = _FakeMsg("mnemos.webhook.delivery.queued.default", _payload("retry_delivery"))
+    sub = _FakeSubscription([msg])
+
+    async def handle_message(pool, msg_arg):
+        raise RuntimeError("db unavailable")
+
+    monkeypatch.setattr(trigger, "handle_message", handle_message)
+    task = asyncio.create_task(trigger._consume_subscription(object(), sub))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert msg.acked is False

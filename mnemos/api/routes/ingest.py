@@ -45,6 +45,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
     try:
         data = request.raw_data
         async with _lc.get_pool_manager().acquire() as conn:
+            nats_intents = []
             async with _rls_context(conn, user):
                 async with conn.transaction():
                     for key, fallback_key, item_type, label, category in (
@@ -72,7 +73,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                             "item_count": len(items),
                             "item_type": item_type,
                         }
-                        await _insert_memory_with_created_webhook(
+                        nats_intents.extend(await _insert_memory_with_created_webhook(
                             conn=conn,
                             mem_id=mem_id,
                             content=content,
@@ -87,8 +88,12 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                             source_provider=request.source,
                             source_session=request.session_id,
                             source_agent=request.agent_id,
-                        )
+                        ))
                         stored_ids.append(mem_id)
+
+        from mnemos.nats import publish_event as _nats_publish_event
+        for subject, payload, msg_id in nats_intents:
+            await _nats_publish_event(subject, payload, msg_id=msg_id)
 
         if _lc._cache:
             try:

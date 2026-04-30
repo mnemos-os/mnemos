@@ -15,6 +15,7 @@ logger = logging.getLogger("mnemos.webhooks.nats_trigger")
 SUBJECT = "mnemos.webhook.delivery.queued.>"
 STREAM = "MNEMOS_WEBHOOK"
 DURABLE = "mnemos_webhook_delivery_trigger"
+QUEUE_GROUP = "mnemos_webhook_delivery_workers"
 
 
 async def consumer_loop(
@@ -61,12 +62,7 @@ async def handle_message(
     """Schedule an immediate delivery attempt for one queued webhook event."""
     payload = _decode_payload(getattr(msg, "data", b""))
     if not _valid_payload(payload):
-        logger.warning(
-            "webhook nats trigger skipped invalid payload subject=%s payload=%r",
-            getattr(msg, "subject", ""),
-            payload,
-        )
-        return
+        raise PoisonMessageError(f"missing required fields payload={payload!r}")
 
     delivery_id = str(payload["delivery_id"])
     attempt = attempt or _attempt_delivery
@@ -94,15 +90,21 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
         try:
             msg = await sub.next_msg(timeout=1)
             await handle_message(pool, msg)
+            await _ack(msg)
         except asyncio.CancelledError:
             raise
+        except PoisonMessageError as exc:
+            logger.warning(
+                "webhook nats trigger poison message subject=%s detail=%s",
+                getattr(msg, "subject", "?"),
+                exc,
+            )
+            if msg is not None:
+                await _ack(msg)
         except Exception as exc:
             if _is_timeout(exc):
                 continue
             logger.exception("webhook nats trigger event error: %s", exc)
-        finally:
-            if msg is not None:
-                await _ack(msg)
 
 
 async def _connect(settings: Settings):
@@ -118,52 +120,52 @@ async def _connect(settings: Settings):
     return nc.jetstream()
 
 
-def _node_durable() -> str:
-    """Per-node durable name. Multi-node deploys share the broker but
-    each node needs its OWN durable consumer — JetStream rejects a
-    second bind on the same durable. Suffix with the node name so
-    pythia, proteus, etc. each get a private subscription on the
-    shared `mnemos.webhook.delivery.queued.>` subject.
-    """
-    from mnemos.nats.client import get_node_name
-    safe = get_node_name().replace(".", "_").replace("-", "_") or "node"
-    return f"{DURABLE}_{safe}"
-
-
 async def _subscribe(js: Any):
-    durable = _node_durable()
+    durable = DURABLE
     try:
         from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
 
-        config = ConsumerConfig(
-            durable_name=durable,
-            deliver_policy=DeliverPolicy.NEW,
-            ack_policy=AckPolicy.EXPLICIT,
-        )
+        try:
+            config = ConsumerConfig(
+                durable_name=durable,
+                deliver_group=QUEUE_GROUP,
+                deliver_policy=DeliverPolicy.NEW,
+                ack_policy=AckPolicy.EXPLICIT,
+            )
+        except TypeError:
+            config = ConsumerConfig(
+                durable_name=durable,
+                deliver_policy=DeliverPolicy.NEW,
+                ack_policy=AckPolicy.EXPLICIT,
+            )
+            setattr(config, "deliver_group", QUEUE_GROUP)
     except ImportError:
         config = None
 
-    # Postgres SELECT FOR UPDATE SKIP LOCKED already serializes
-    # delivery claims across workers; a NATS queue group adds no
-    # correctness value and complicates DeliverGroup setup on the
-    # durable consumer. Single subscription per node — every worker
-    # races to claim, only one wins.
     return await js.subscribe(
         SUBJECT,
         durable=durable,
+        queue=QUEUE_GROUP,
         stream=STREAM,
         config=config,
     )
 
 
+class PoisonMessageError(ValueError):
+    """A malformed message that cannot succeed on redelivery."""
+
+
 def _decode_payload(data: bytes | bytearray | memoryview | str) -> dict[str, Any]:
-    if isinstance(data, str):
-        raw = data
-    else:
-        raw = bytes(data).decode("utf-8")
-    payload = json.loads(raw)
+    try:
+        if isinstance(data, str):
+            raw = data
+        else:
+            raw = bytes(data).decode("utf-8")
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PoisonMessageError("webhook nats trigger payload is not valid JSON") from exc
     if not isinstance(payload, dict):
-        raise ValueError("webhook nats trigger payload must be a JSON object")
+        raise PoisonMessageError("webhook nats trigger payload must be a JSON object")
     return payload
 
 

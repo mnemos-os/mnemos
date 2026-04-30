@@ -93,48 +93,27 @@ async def test_consumer_ignores_empty_federation_nats_peers(monkeypatch):
         config._reset_settings_for_tests()
 
 
-async def test_consumer_reads_message_and_calls_store_with_federation_shape():
+async def test_consumer_fetches_body_from_authorized_feed_before_store():
     pool = _FakePool()
     msg = _FakeMsg(
         "mnemos.memory.created.default",
-        {
-            "memory_id": "mem_123",
-            "content": "remote note",
-            "category": "facts",
-            "subcategory": "systems",
-            "namespace": "upstream.ns",
-            "metadata": {"k": "v"},
-            "updated": "2026-04-30T12:00:00Z",
-        },
+        {"memory_id": "mem_123", "category": "facts", "namespace": "upstream.ns"},
     )
+    fetched = [{"id": "mem_123", "content": "remote note", "category": "facts"}]
     calls = []
+
+    async def fetch(peer, memory_id):
+        assert peer.name == "pythia"
+        assert memory_id == "mem_123"
+        return fetched
 
     async def store(conn, peer_name, memories):
         calls.append((conn, peer_name, memories))
         return (1, 0)
 
-    await consumer.handle_message(pool, _peer(), msg, store=store)
+    await consumer.handle_message(pool, _peer(), msg, store=store, fetch=fetch)
 
-    assert calls[0][0] is pool.conn
-    assert calls[0][1] == "pythia"
-    assert calls[0][2] == [
-        {
-            "id": "mem_123",
-            "content": "remote note",
-            "verbatim_content": "remote note",
-            "category": "facts",
-            "subcategory": "systems",
-            "namespace": "upstream.ns",
-            "quality_rating": 75,
-            "metadata": {"k": "v", "fed_origin": "pythia"},
-            "source_model": None,
-            "source_provider": None,
-            "source_session": None,
-            "source_agent": "federation-nats",
-            "created": None,
-            "updated": "2026-04-30T12:00:00Z",
-        }
-    ]
+    assert calls == [(pool.conn, "pythia", fetched)]
 
 
 async def test_self_loop_event_is_skipped_and_remote_event_is_processed(monkeypatch):
@@ -162,9 +141,10 @@ async def test_self_loop_event_is_skipped_and_remote_event_is_processed(monkeypa
         _peer(),
         _FakeMsg(
             "mnemos.memory.created.default",
-            {"memory_id": "mem_remote", "content": "remote", "source_node": "proteus"},
+            {"memory_id": "mem_remote", "source_node": "proteus"},
         ),
         store=store,
+        fetch=lambda peer, memory_id: _async_list([{"id": memory_id, "content": "remote"}]),
     )
 
     assert len(calls) == 1
@@ -173,7 +153,7 @@ async def test_self_loop_event_is_skipped_and_remote_event_is_processed(monkeypa
     assert calls[0][2][0]["id"] == "mem_remote"
 
 
-async def test_hard_fault_on_single_bad_event_does_not_kill_loop(monkeypatch):
+async def test_poison_event_is_acked_and_does_not_kill_loop(monkeypatch):
     pool = _FakePool()
     bad = _FakeMsg("mnemos.memory.created.default", b"not json")
     good = _FakeMsg("mnemos.memory.updated.default", {"memory_id": "mem_good", "content": "ok"})
@@ -186,8 +166,11 @@ async def test_hard_fault_on_single_bad_event_does_not_kill_loop(monkeypatch):
 
     original_handle_message = consumer.handle_message
 
+    async def fetch(peer_arg, memory_id):
+        return [{"id": memory_id, "content": "ok"}]
+
     async def handle_message(pool_arg, peer_arg, msg_arg):
-        await original_handle_message(pool_arg, peer_arg, msg_arg, store=store)
+        await original_handle_message(pool_arg, peer_arg, msg_arg, store=store, fetch=fetch)
 
     monkeypatch.setattr(consumer, "handle_message", handle_message)
     task = asyncio.create_task(consumer._consume_subscription(pool, _peer(), sub))
@@ -234,3 +217,53 @@ async def test_fake_jetstream_subscription_uses_deliver_policy_new_shape():
     config_obj = kwargs["config"]
     if config_obj is not None:
         assert "NEW" in str(getattr(config_obj, "deliver_policy", "NEW"))
+
+
+async def _async_list(value):
+    return value
+
+
+async def test_transient_store_error_is_not_acked(monkeypatch):
+    pool = _FakePool()
+    msg = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_retry"})
+    sub = _FakeSubscription([msg])
+
+    async def fetch(peer, memory_id):
+        return [{"id": memory_id, "content": "retry me"}]
+
+    async def store(conn, peer_name, memories):
+        raise RuntimeError("db unavailable")
+
+    original_handle_message = consumer.handle_message
+
+    async def handle_message(pool_arg, peer_arg, msg_arg):
+        await original_handle_message(pool_arg, peer_arg, msg_arg, store=store, fetch=fetch)
+
+    monkeypatch.setattr(consumer, "handle_message", handle_message)
+    task = asyncio.create_task(consumer._consume_subscription(pool, _peer(), sub))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert msg.acked is False
+
+
+async def test_fetch_authorized_memories_uses_federation_feed(monkeypatch):
+    peer = consumer.FederationNatsPeer(
+        name="pythia",
+        nats_url="nats://example:4222",
+        base_url="https://peer.example",
+        auth_token="feed-token",
+        namespace_filter=("shared",),
+        category_filter=("facts",),
+    )
+    calls = []
+
+    async def pull(base_url, auth_token, memory_id, namespace_filter, category_filter):
+        calls.append((base_url, auth_token, memory_id, namespace_filter, category_filter))
+        return [{"id": memory_id}]
+
+    monkeypatch.setattr(consumer, "pull_memory_by_id", pull)
+
+    assert await consumer._fetch_authorized_memories(peer, "mem_1") == [{"id": "mem_1"}]
+    assert calls == [("https://peer.example", "feed-token", "mem_1", ["shared"], ["facts"])]

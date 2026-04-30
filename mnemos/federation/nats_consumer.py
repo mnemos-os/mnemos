@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 import asyncpg
 
 from mnemos.core.config import Settings, get_settings
-from mnemos.domain.federation import FEDERATION_ID_PREFIX, _store_memories
+from mnemos.domain.federation import FEDERATION_ID_PREFIX, _store_memories, pull_memory_by_id
 from mnemos.nats.client import get_node_name
 
 logger = logging.getLogger("mnemos.federation.nats_consumer")
@@ -37,6 +37,10 @@ class FederationNatsPeer:
     nats_url: str
     nats_token: str | None = None
     subjects: tuple[str, ...] = DEFAULT_SUBJECTS
+    base_url: str | None = None
+    auth_token: str | None = None
+    namespace_filter: tuple[str, ...] | None = None
+    category_filter: tuple[str, ...] | None = None
 
 
 def configured_nats_peers(settings: Settings | None = None) -> list[FederationNatsPeer]:
@@ -57,6 +61,10 @@ def configured_nats_peers(settings: Settings | None = None) -> list[FederationNa
                 nats_url=url,
                 nats_token=raw.nats_token,
                 subjects=expanded or DEFAULT_SUBJECTS,
+                base_url=raw.base_url,
+                auth_token=raw.auth_token,
+                namespace_filter=tuple(raw.namespace_filter) if raw.namespace_filter else None,
+                category_filter=tuple(raw.category_filter) if raw.category_filter else None,
             )
         )
     return peers
@@ -130,6 +138,7 @@ async def handle_message(
     *,
     store: Callable[[Any, str, list[dict[str, Any]]], Awaitable[tuple[int, int]]] = _store_memories,
     delete: Callable[[asyncpg.Pool, str, str], Awaitable[int]] | None = None,
+    fetch: Callable[[FederationNatsPeer, str], Awaitable[list[dict[str, Any]]]] | None = None,
 ) -> None:
     """Apply a single NATS memory event to local federation storage."""
     delete = delete or delete_federated_memory
@@ -153,15 +162,42 @@ async def handle_message(
     )
 
     if not memory_id:
-        raise ValueError("federation nats event missing memory_id")
+        raise PoisonMessageError("federation nats event missing memory_id")
 
     if _is_deleted_subject(subject):
         await delete(pool, peer.name, memory_id)
         return
 
-    memory = _memory_from_event(payload, peer.name, memory_id)
+    fetch = fetch or _fetch_authorized_memories
+    memories = await fetch(peer, memory_id)
+    if not memories:
+        logger.info(
+            "federation nats peer=%s memory_id=%s not returned by authorized feed",
+            peer.name,
+            memory_id,
+        )
+        return
     async with pool.acquire() as conn:
-        await store(conn, peer.name, [memory])
+        await store(conn, peer.name, memories)
+
+
+async def _fetch_authorized_memories(
+    peer: FederationNatsPeer,
+    memory_id: str,
+) -> list[dict[str, Any]]:
+    if not peer.base_url or not peer.auth_token:
+        logger.warning(
+            "federation nats peer=%s missing base_url/auth_token; nudge ignored until HTTP poll",
+            peer.name,
+        )
+        return []
+    return await pull_memory_by_id(
+        peer.base_url,
+        peer.auth_token,
+        memory_id,
+        list(peer.namespace_filter) if peer.namespace_filter else None,
+        list(peer.category_filter) if peer.category_filter else None,
+    )
 
 
 async def delete_federated_memory(pool: asyncpg.Pool, peer_name: str, memory_id: str) -> int:
@@ -259,6 +295,7 @@ async def _consume_subscription(pool: asyncpg.Pool, peer: FederationNatsPeer, su
         try:
             msg = await sub.next_msg(timeout=1)
             await handle_message(pool, peer, msg)
+            await _ack(msg)
             received += 1
             if received % 100 == 0:
                 logger.info(
@@ -269,13 +306,19 @@ async def _consume_subscription(pool: asyncpg.Pool, peer: FederationNatsPeer, su
                 )
         except asyncio.CancelledError:
             raise
+        except PoisonMessageError as exc:
+            logger.warning(
+                "federation nats peer=%s poison message subject=%s detail=%s",
+                peer.name,
+                getattr(msg, "subject", "?"),
+                exc,
+            )
+            if msg is not None:
+                await _ack(msg)
         except Exception as exc:
             if _is_timeout(exc):
                 continue
             logger.exception("federation nats peer=%s event error: %s", peer.name, exc)
-        finally:
-            if msg is not None:
-                await _ack(msg)
 
 
 async def _ack(msg: Any) -> None:
@@ -287,14 +330,21 @@ async def _ack(msg: Any) -> None:
         await result
 
 
+class PoisonMessageError(ValueError):
+    """A malformed message that cannot succeed on redelivery."""
+
+
 def _decode_payload(data: bytes | bytearray | memoryview | str) -> dict[str, Any]:
-    if isinstance(data, str):
-        raw = data
-    else:
-        raw = bytes(data).decode("utf-8")
-    payload = json.loads(raw)
+    try:
+        if isinstance(data, str):
+            raw = data
+        else:
+            raw = bytes(data).decode("utf-8")
+        payload = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PoisonMessageError("federation nats payload is not valid JSON") from exc
     if not isinstance(payload, dict):
-        raise ValueError("federation nats payload must be a JSON object")
+        raise PoisonMessageError("federation nats payload must be a JSON object")
     return payload
 
 

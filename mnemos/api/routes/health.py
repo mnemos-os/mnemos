@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 import mnemos.core.lifecycle as _lc
 from mnemos._version import __version__ as _MNEMOS_VERSION
 from mnemos.core.config import get_settings
+from mnemos.nats.client import publishing_enabled
 from mnemos.domain.models import HealthResponse, StatsResponse
 
 logger = logging.getLogger(__name__)
@@ -38,6 +39,7 @@ async def health_check() -> HealthResponse:
         version=_MNEMOS_VERSION,
         distillation_worker=worker_status,
         profile=get_settings().profile,
+        nats_publishing_enabled=publishing_enabled(),
     )
 
 

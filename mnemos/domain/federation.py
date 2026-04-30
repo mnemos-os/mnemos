@@ -621,6 +621,34 @@ async def _pull_batch(
     return memories, next_cursor, has_more
 
 
+async def pull_memory_by_id(
+    base_url: str,
+    auth_token: str,
+    memory_id: str,
+    namespace_filter: Optional[List[str]],
+    category_filter: Optional[List[str]],
+) -> List[Dict[str, Any]]:
+    """Fetch one authorized memory through the federation feed path."""
+    url = base_url.rstrip("/") + "/v1/federation/feed"
+    params: Dict[str, Any] = {"since": memory_id, "limit": 1}
+    if namespace_filter:
+        params["namespace"] = ",".join(namespace_filter)
+    if category_filter:
+        params["category"] = ",".join(category_filter)
+    headers = {"Authorization": f"Bearer {auth_token}"}
+
+    async with httpx.AsyncClient(timeout=FEDERATION_HTTP_TIMEOUT) as client:
+        r = await client.get(url, params=params, headers=headers)
+        if r.status_code == 401:
+            raise RuntimeError("federation auth token rejected (401)")
+        if r.status_code == 403:
+            raise RuntimeError("federation auth insufficient role (403)")
+        r.raise_for_status()
+        body = r.json()
+    memories = body.get("memories", []) or []
+    return [mem for mem in memories if isinstance(mem, dict) and mem.get("id") == memory_id]
+
+
 async def _store_memories(
     conn: asyncpg.Connection,
     peer_name: str,

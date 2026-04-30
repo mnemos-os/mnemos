@@ -31,6 +31,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -69,14 +70,23 @@ logger = logging.getLogger(__name__)
 
 
 HTTP_TOOL_REGISTRY = TOOL_REGISTRY
-DEFAULT_NATS_SSE_SUBJECT = "mnemos.>"
+DEFAULT_NATS_SSE_SUBJECT = "mnemos.*.*.default"
 NATS_SSE_PATH = "/mcp/events/stream"
+NATS_SSE_QUEUE_MAXSIZE = 256
+NATS_SSE_MAX_CONSECUTIVE_DROPS = 1000
 
 
 @dataclass(frozen=True)
 class MCPClientPrincipal:
     user_id: str | None
     api_key: str | None
+
+
+@dataclass(frozen=True)
+class MCPUserContext:
+    user_id: str | None
+    role: str
+    namespace: str
 
 
 def _fatal_auth_config(message: str) -> None:
@@ -349,20 +359,87 @@ async def handle_sse(request):
         reset_mcp_backend_context(context_tokens)
 
 
-def _parse_nats_sse_subjects(request) -> list[str]:
-    raw = request.query_params.get("subjects") if hasattr(request, "query_params") else None
-    if not raw:
-        return [DEFAULT_NATS_SSE_SUBJECT]
-    subjects = [part.strip() for part in raw.split(",") if part.strip()]
-    if not subjects:
-        return [DEFAULT_NATS_SSE_SUBJECT]
-    invalid = [
-        subject for subject in subjects
-        if not subject.startswith("mnemos.") or any(ch.isspace() for ch in subject)
-    ]
-    if invalid:
-        raise ValueError(f"invalid NATS subject filter: {invalid[0]}")
-    return subjects
+_principal_context_cache: dict[str, MCPUserContext] = {}
+
+
+def _query_value(request, name: str, default: str) -> str:
+    params = getattr(request, "query_params", {})
+    value = params.get(name, default) if params is not None else default
+    return value or default
+
+
+def _safe_subject_token(value: str, *, label: str) -> str:
+    if value == "*":
+        return value
+    if not value.replace("_", "").replace("-", "").isalnum():
+        raise ValueError(f"invalid NATS {label}: {value}")
+    return value
+
+
+def _safe_namespace(namespace: str | None) -> str:
+    return (namespace or "default").replace(".", "_")
+
+
+def _is_operator_context(context: MCPUserContext) -> bool:
+    return context.role in {"root", "operator"}
+
+
+async def _resolve_mcp_user_context(request) -> MCPUserContext:
+    principal = getattr(getattr(request, "state", None), "mnemos_mcp_principal", None)
+    principal_id = getattr(getattr(request, "state", None), "mnemos_mcp_principal_id", None)
+    if principal_id and principal_id in _principal_context_cache:
+        return _principal_context_cache[principal_id]
+
+    if principal is not None and principal.api_key:
+        try:
+            import httpx
+
+            base = get_settings().server.base.rstrip("/")
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    f"{base}/auth/oauth/me",
+                    headers={"Authorization": f"Bearer {principal.api_key}"},
+                )
+            response.raise_for_status()
+            body = response.json()
+            context = MCPUserContext(
+                user_id=body.get("user_id") or principal.user_id,
+                role=body.get("role") or "user",
+                namespace=body.get("namespace") or principal.user_id or "default",
+            )
+            if principal_id:
+                _principal_context_cache[principal_id] = context
+            return context
+        except Exception as exc:
+            logger.warning("MCP NATS SSE principal context lookup failed: %s", exc)
+
+    context = MCPUserContext(
+        user_id=getattr(principal, "user_id", None),
+        role="user",
+        namespace=getattr(principal, "user_id", None) or "default",
+    )
+    if principal_id:
+        _principal_context_cache[principal_id] = context
+    return context
+
+
+def _parse_nats_sse_subjects(request, context: MCPUserContext) -> list[str]:
+    if _is_operator_context(context):
+        raw = request.query_params.get("subjects") if hasattr(request, "query_params") else None
+        if raw:
+            subjects = [part.strip() for part in raw.split(",") if part.strip()]
+            invalid = [
+                subject for subject in subjects
+                if not subject.startswith("mnemos.") or any(ch.isspace() for ch in subject)
+            ]
+            if invalid:
+                raise ValueError(f"invalid NATS subject filter: {invalid[0]}")
+            if subjects:
+                return subjects
+
+    event_class = _safe_subject_token(_query_value(request, "event_class", "*"), label="event_class")
+    event_action = _safe_subject_token(_query_value(request, "event_action", "*"), label="event_action")
+    return [f"mnemos.{event_class}.{event_action}.{_safe_namespace(context.namespace)}"]
 
 
 def _sse_frame(event: str, data: str) -> bytes:
@@ -377,6 +454,30 @@ def _nats_msg_data(msg: Any) -> str:
     if isinstance(data, str):
         return data
     return bytes(data).decode("utf-8", errors="replace")
+
+
+def _nats_sse_raw_enabled() -> bool:
+    return os.getenv("MNEMOS_MCP_NATS_RAW", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _nats_sse_data(msg: Any) -> str:
+    raw = _nats_msg_data(msg)
+    if _nats_sse_raw_enabled():
+        return raw
+    try:
+        payload = json.loads(raw)
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    summary = {
+        "subject": getattr(msg, "subject", "mnemos.event"),
+        "memory_id": payload.get("memory_id") or payload.get("id"),
+        "namespace": payload.get("namespace"),
+        "category": payload.get("category"),
+        "source_node": payload.get("source_node"),
+    }
+    return json.dumps({k: v for k, v in summary.items() if v is not None})
 
 
 async def _subscribe_nats_sse_subject(js: Any, subject: str) -> Any:
@@ -413,22 +514,40 @@ async def _unsubscribe_nats_sse(sub: Any) -> None:
 
 
 async def _nats_sse_event_source(subscriptions: list[Any]):
-    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue(maxsize=NATS_SSE_QUEUE_MAXSIZE)
+    dropped_total = 0
+
+    def enqueue(kind: str, item: Any) -> int:
+        nonlocal dropped_total
+        try:
+            queue.put_nowait((kind, item))
+            return dropped_total
+        except asyncio.QueueFull:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            dropped_total += 1
+            queue.put_nowait((kind, item))
+            return dropped_total
 
     async def pump(sub: Any) -> None:
         while True:
             try:
                 msg = await sub.next_msg(timeout=1)
-                await queue.put(("message", msg))
+                dropped = enqueue("message", msg)
+                if dropped:
+                    enqueue("dropped", dropped)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
                 if _is_nats_sse_timeout(exc):
                     continue
-                await queue.put(("error", exc))
+                enqueue("error", exc)
                 return
 
     tasks = [asyncio.create_task(pump(sub)) for sub in subscriptions]
+    consecutive_drops = 0
     try:
         while True:
             kind, item = await queue.get()
@@ -439,7 +558,15 @@ async def _nats_sse_event_source(subscriptions: list[Any]):
                     json.dumps({"error": "nats_connection_lost", "detail": str(item)}),
                 )
                 return
-            yield _sse_frame(getattr(item, "subject", "mnemos.event"), _nats_msg_data(item))
+            if kind == "dropped":
+                consecutive_drops += 1
+                yield _sse_frame("dropped", json.dumps({"count": item}))
+                if consecutive_drops >= NATS_SSE_MAX_CONSECUTIVE_DROPS:
+                    yield _sse_frame("error", json.dumps({"reason": "lagging"}))
+                    return
+                continue
+            consecutive_drops = 0
+            yield _sse_frame(getattr(item, "subject", "mnemos.event"), _nats_sse_data(item))
     finally:
         for task in tasks:
             task.cancel()
@@ -460,7 +587,8 @@ async def handle_nats_event_stream(request):
         return PlainTextResponse("streaming responses unavailable", status_code=503)
 
     try:
-        subjects = _parse_nats_sse_subjects(request)
+        context = await _resolve_mcp_user_context(request)
+        subjects = _parse_nats_sse_subjects(request, context)
     except ValueError as exc:
         return PlainTextResponse(str(exc), status_code=400)
 
