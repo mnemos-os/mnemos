@@ -24,21 +24,23 @@ def _validate_identifier(value: str, name: str = "identifier") -> str:
 def _run(
     cmd: list[str],
     timeout: int = 60,
-    input_text: str = None,
-    env: dict = None,
+    input_text: str | None = None,
+    env: dict | None = None,
+    input: str | None = None,
 ) -> tuple[int, str, str]:
     """Run a command, return (returncode, stdout, stderr). Never raises."""
     import os as _os
     merged_env = _os.environ.copy()
     if env:
         merged_env.update(env)
+    stdin_text = input if input is not None else input_text
     try:
         r = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
             timeout=timeout,
-            input=input_text,
+            input=stdin_text,
             env=merged_env,
         )
         return r.returncode, r.stdout.strip(), r.stderr.strip()
@@ -63,10 +65,13 @@ def _psql_superuser(sql: str, dbname: str = "postgres", timeout: int = 30) -> tu
 
 def _psql_superuser_file(filepath: str, dbname: str, timeout: int = 120) -> tuple[int, str, str]:
     """Run a SQL file as postgres superuser."""
+    with open(filepath, encoding="utf-8") as f:
+        sql = f.read()
     return _run(
-        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-f", filepath,
+        ["sudo", "-u", "postgres", "psql", "-d", dbname, "-f", "-",
          "--no-password"],
         timeout=timeout,
+        input=sql,
     )
 
 
