@@ -15,7 +15,7 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
-from pydantic import AliasChoices, Field, PrivateAttr, field_validator, model_validator
+from pydantic import AliasChoices, BaseModel, Field, PrivateAttr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -311,11 +311,22 @@ class _MorpheusSettings(BaseSettings):
     use_llm: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_USE_LLM")
 
 
+class _FederationNatsPeerSettings(BaseModel):
+    name: str
+    nats_url: str
+    nats_token: str | None = None
+    subjects: list[str] = Field(default_factory=lambda: ["mnemos.memory.>"])
+
+
 class _FederationSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_FEDERATION_ENABLED")
     peers: str = Field("", validation_alias="MNEMOS_FEDERATION_PEERS")
+    nats_peers: list[_FederationNatsPeerSettings] = Field(
+        default_factory=list,
+        validation_alias="MNEMOS_FEDERATION_NATS_PEERS",
+    )
     allow_insecure: bool = Field(False, validation_alias="FEDERATION_ALLOW_INSECURE")
     allow_private: bool = Field(False, validation_alias="FEDERATION_ALLOW_PRIVATE")
 

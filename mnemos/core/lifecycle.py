@@ -585,6 +585,21 @@ async def lifespan(app):
     except Exception:
         logger.exception("[NATS] startup hook failed; publishing disabled")
 
+    # Federation NATS push consumers (v4.2 slice 2). Optional and additive:
+    # HTTP federation polling remains active for backfill and safety.
+    if _pool:
+        try:
+            from mnemos.federation.nats_consumer import (
+                configured_nats_peers as _configured_nats_peers,
+                consumer_loop as _federation_nats_consumer_loop,
+            )
+
+            for _peer in _configured_nats_peers(settings):
+                logger.info("Launching federation nats consumer for peer %s", _peer.name)
+                _schedule_worker(_federation_nats_consumer_loop(_pool, _peer))
+        except Exception:
+            logger.exception("[NATS] federation consumer startup hook failed")
+
     yield
 
     await _cancel_tracked_tasks(

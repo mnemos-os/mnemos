@@ -1,0 +1,337 @@
+"""NATS JetStream push consumer for federation memory events.
+
+This is an additive fast path beside the existing HTTP federation pull worker.
+Consumers subscribe with ``DeliverPolicy.NEW`` so process startup does not replay
+the full retained stream backlog. Operators can still use the HTTP poll path for
+backfill or repair if a peer was offline.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import re
+from dataclasses import dataclass
+from typing import Any, Awaitable, Callable, Iterable, Mapping
+
+import asyncpg
+
+from mnemos.core.config import Settings, get_settings
+from mnemos.domain.federation import FEDERATION_ID_PREFIX, _store_memories
+
+logger = logging.getLogger("mnemos.federation.nats_consumer")
+
+DEFAULT_SUBJECTS = (
+    "mnemos.memory.created.>",
+    "mnemos.memory.updated.>",
+    "mnemos.memory.deleted.>",
+)
+MEMORY_STREAM = "MNEMOS_MEMORY"
+
+
+@dataclass(frozen=True)
+class FederationNatsPeer:
+    name: str
+    nats_url: str
+    nats_token: str | None = None
+    subjects: tuple[str, ...] = DEFAULT_SUBJECTS
+
+
+def configured_nats_peers(settings: Settings | None = None) -> list[FederationNatsPeer]:
+    """Return valid NATS federation peers from runtime settings."""
+    settings = settings or get_settings()
+    peers: list[FederationNatsPeer] = []
+    for raw in settings.federation.nats_peers:
+        name = raw.name.strip()
+        url = raw.nats_url.strip()
+        if not name or not url:
+            logger.warning("federation nats peer missing name or nats_url: %r", raw)
+            continue
+        subjects = tuple(_expand_subject(s.strip()) for s in raw.subjects if s and s.strip())
+        expanded = tuple(dict.fromkeys(item for group in subjects for item in group))
+        peers.append(
+            FederationNatsPeer(
+                name=name,
+                nats_url=url,
+                nats_token=raw.nats_token,
+                subjects=expanded or DEFAULT_SUBJECTS,
+            )
+        )
+    return peers
+
+
+async def run_configured_consumers(
+    pool: asyncpg.Pool,
+    *,
+    settings: Settings | None = None,
+    retry_seconds: float = 30.0,
+) -> None:
+    """Run all configured peer consumers until cancelled."""
+    peers = configured_nats_peers(settings)
+    if not peers:
+        logger.info("federation nats consumer disabled (MNEMOS_FEDERATION_NATS_PEERS empty)")
+        return
+
+    tasks = [
+        asyncio.create_task(consumer_loop(pool, peer, retry_seconds=retry_seconds))
+        for peer in peers
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+
+
+async def consumer_loop(
+    pool: asyncpg.Pool,
+    peer: FederationNatsPeer,
+    *,
+    retry_seconds: float = 30.0,
+    connect: Callable[[FederationNatsPeer], Awaitable[Any]] | None = None,
+) -> None:
+    """Connect to one upstream peer and consume memory events forever."""
+    connect = connect or _connect_peer
+
+    while True:
+        try:
+            js = await connect(peer)
+            logger.info(
+                "federation nats consumer connected peer=%s url=%s subjects=%s",
+                peer.name,
+                peer.nats_url,
+                ",".join(peer.subjects),
+            )
+            subscriptions = [await _subscribe(js, peer, subject) for subject in peer.subjects]
+            async with _SubscriptionGroup(pool, peer, subscriptions) as group:
+                async for _ in group:
+                    pass
+        except asyncio.CancelledError:
+            logger.info("federation nats consumer cancelled peer=%s", peer.name)
+            raise
+        except Exception as exc:
+            logger.warning(
+                "federation nats consumer peer=%s unavailable: %s; retrying in %.0fs",
+                peer.name,
+                exc,
+                retry_seconds,
+            )
+            await asyncio.sleep(retry_seconds)
+
+
+async def handle_message(
+    pool: asyncpg.Pool,
+    peer: FederationNatsPeer,
+    msg: Any,
+    *,
+    store: Callable[[Any, str, list[dict[str, Any]]], Awaitable[tuple[int, int]]] = _store_memories,
+    delete: Callable[[asyncpg.Pool, str, str], Awaitable[int]] | None = None,
+) -> None:
+    """Apply a single NATS memory event to local federation storage."""
+    delete = delete or delete_federated_memory
+    subject = getattr(msg, "subject", "")
+    payload = _decode_payload(getattr(msg, "data", b""))
+    memory_id = _memory_id(payload)
+    logger.debug(
+        "federation nats received peer=%s subject=%s memory_id=%s",
+        peer.name,
+        subject,
+        memory_id,
+    )
+
+    if not memory_id:
+        raise ValueError("federation nats event missing memory_id")
+
+    if _is_deleted_subject(subject):
+        await delete(pool, peer.name, memory_id)
+        return
+
+    memory = _memory_from_event(payload, peer.name, memory_id)
+    async with pool.acquire() as conn:
+        await store(conn, peer.name, [memory])
+
+
+async def delete_federated_memory(pool: asyncpg.Pool, peer_name: str, memory_id: str) -> int:
+    """Hard-delete a federated row matching the poll-path local id shape."""
+    local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{memory_id}"
+    async with pool.acquire() as conn:
+        result = await conn.execute(
+            """
+            DELETE FROM memories
+            WHERE id = $1
+              AND federation_source = $2
+            """,
+            local_id,
+            peer_name,
+        )
+    try:
+        return int(str(result).rsplit(" ", 1)[-1])
+    except (IndexError, ValueError):
+        return 0
+
+
+async def _connect_peer(peer: FederationNatsPeer):
+    try:
+        import nats  # type: ignore[import-not-found]
+    except ImportError as exc:
+        raise RuntimeError("nats-py not installed") from exc
+
+    connect_kwargs: dict[str, Any] = {"servers": [peer.nats_url]}
+    if peer.nats_token:
+        connect_kwargs["token"] = peer.nats_token
+    nc = await nats.connect(**connect_kwargs)
+    return nc.jetstream()
+
+
+async def _subscribe(js: Any, peer: FederationNatsPeer, subject: str):
+    durable = _durable_name(peer.name, subject)
+    try:
+        from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
+
+        config = ConsumerConfig(
+            durable_name=durable,
+            deliver_policy=DeliverPolicy.NEW,
+            ack_policy=AckPolicy.EXPLICIT,
+        )
+    except ImportError:
+        config = None
+
+    return await js.subscribe(
+        subject,
+        durable=durable,
+        stream=MEMORY_STREAM,
+        config=config,
+    )
+
+
+class _SubscriptionGroup:
+    def __init__(self, pool: asyncpg.Pool, peer: FederationNatsPeer, subscriptions: Iterable[Any]):
+        self.pool = pool
+        self.peer = peer
+        self.subscriptions = list(subscriptions)
+        self.tasks: list[asyncio.Task] = []
+
+    async def __aenter__(self):
+        self.tasks = [
+            asyncio.create_task(_consume_subscription(self.pool, self.peer, sub))
+            for sub in self.subscriptions
+        ]
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        for task in self.tasks:
+            task.cancel()
+        await asyncio.gather(*self.tasks, return_exceptions=True)
+        return False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if not self.tasks:
+            raise StopAsyncIteration
+        done, _pending = await asyncio.wait(self.tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            exc = task.exception()
+            if exc is not None:
+                raise exc
+            self.tasks.remove(task)
+        raise RuntimeError("federation nats subscription ended unexpectedly")
+
+
+async def _consume_subscription(pool: asyncpg.Pool, peer: FederationNatsPeer, sub: Any) -> None:
+    received = 0
+    while True:
+        msg = None
+        try:
+            msg = await sub.next_msg(timeout=1)
+            await handle_message(pool, peer, msg)
+            received += 1
+            if received % 100 == 0:
+                logger.info(
+                    "federation nats peer=%s subject=%s received=%d events",
+                    peer.name,
+                    getattr(msg, "subject", "?"),
+                    received,
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                continue
+            logger.exception("federation nats peer=%s event error: %s", peer.name, exc)
+        finally:
+            if msg is not None:
+                await _ack(msg)
+
+
+async def _ack(msg: Any) -> None:
+    ack = getattr(msg, "ack", None)
+    if ack is None:
+        return
+    result = ack()
+    if hasattr(result, "__await__"):
+        await result
+
+
+def _decode_payload(data: bytes | bytearray | memoryview | str) -> dict[str, Any]:
+    if isinstance(data, str):
+        raw = data
+    else:
+        raw = bytes(data).decode("utf-8")
+    payload = json.loads(raw)
+    if not isinstance(payload, dict):
+        raise ValueError("federation nats payload must be a JSON object")
+    return payload
+
+
+def _memory_id(payload: Mapping[str, Any]) -> str | None:
+    value = payload.get("memory_id") or payload.get("id")
+    return value if isinstance(value, str) and value else None
+
+
+def _memory_from_event(payload: Mapping[str, Any], peer_name: str, memory_id: str) -> dict[str, Any]:
+    metadata = payload.get("metadata")
+    if not isinstance(metadata, dict):
+        metadata = {}
+    metadata = {**metadata, "fed_origin": peer_name}
+    return {
+        "id": memory_id,
+        "content": payload.get("content") or "",
+        "verbatim_content": payload.get("verbatim_content") or payload.get("content") or "",
+        "category": payload.get("category") or "federation",
+        "subcategory": payload.get("subcategory"),
+        "namespace": payload.get("namespace") or "default",
+        "quality_rating": payload.get("quality_rating") or 75,
+        "metadata": metadata,
+        "source_model": payload.get("source_model"),
+        "source_provider": payload.get("source_provider"),
+        "source_session": payload.get("source_session"),
+        "source_agent": "federation-nats",
+        "created": payload.get("created"),
+        "updated": payload.get("updated") or payload.get("created"),
+    }
+
+
+def _durable_name(peer_name: str, subject: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{peer_name}_{subject}").strip("_")
+    return f"mnemos_federation_{safe}"[:128]
+
+
+def _expand_subject(subject: str) -> tuple[str, ...]:
+    if subject == "mnemos.memory.>":
+        return DEFAULT_SUBJECTS
+    return (subject,)
+
+
+def _is_deleted_subject(subject: str) -> bool:
+    return subject.startswith("mnemos.memory.deleted.") or subject == "mnemos.memory.deleted"
+
+
+def _is_timeout(exc: Exception) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    return exc.__class__.__name__ == "TimeoutError" and exc.__class__.__module__.startswith("nats")

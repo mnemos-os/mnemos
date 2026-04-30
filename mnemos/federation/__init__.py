@@ -1,0 +1,1 @@
+"""Federation transport adapters."""
