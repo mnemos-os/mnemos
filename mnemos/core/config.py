@@ -362,6 +362,13 @@ class _LoggingSettings(BaseSettings):
     backup_count: int = 5
 
 
+class _NatsSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    url: str | None = Field(None, validation_alias="MNEMOS_NATS_URL")
+    token: str | None = Field(None, validation_alias="MNEMOS_NATS_TOKEN")
+
+
 class Settings(BaseSettings):
     model_config = _config_model_config()
 
@@ -384,6 +391,7 @@ class Settings(BaseSettings):
     runtime: _RuntimeSettings
     tools: _ToolSettings
     logging: _LoggingSettings
+    nats: _NatsSettings
 
     @property
     def profile(self) -> str:
@@ -451,6 +459,7 @@ def _build_settings() -> Settings:
         "runtime": _RuntimeSettings(**_toml_section(toml_config, "runtime")),
         "tools": _ToolSettings(**_toml_section(toml_config, "tools")),
         "logging": _LoggingSettings(**_toml_section(toml_config, "logging")),
+        "nats": _NatsSettings(**_toml_section(toml_config, "nats")),
     }
     settings = Settings(
         database=groups["database"],
@@ -470,6 +479,7 @@ def _build_settings() -> Settings:
         runtime=groups["runtime"],
         tools=groups["tools"],
         logging=groups["logging"],
+        nats=groups["nats"],
     )
     settings._explicit_fields = {
         group_name: set(group.model_fields_set)

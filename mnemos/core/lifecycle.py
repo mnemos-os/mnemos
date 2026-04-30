@@ -576,6 +576,15 @@ async def lifespan(app):
                     logger.exception('oauth gc iteration failed')
         _schedule_worker(_oauth_gc_loop())
 
+    # NATS JetStream connection (v4.2 MQ substrate). Optional — if
+    # MNEMOS_NATS_URL is unset, this is a no-op. Failures are logged
+    # and do NOT block startup; publishers fall back to silent skip.
+    try:
+        from mnemos.nats import connect_nats as _connect_nats
+        await _connect_nats(settings.nats.url, settings.nats.token)
+    except Exception:
+        logger.exception("[NATS] startup hook failed; publishing disabled")
+
     yield
 
     await _cancel_tracked_tasks(

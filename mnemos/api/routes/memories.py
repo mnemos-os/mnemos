@@ -199,21 +199,34 @@ async def _insert_memory_with_created_webhook(
             f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
         )
 
+    event_payload = {
+        "memory_id": mem_id,
+        "category": category,
+        "subcategory": subcategory,
+        "content": content,
+        "owner_id": owner_id,
+        "namespace": namespace,
+    }
+
     from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
     await _dispatch_webhook(
         "memory.created",
-        {
-            "memory_id": mem_id,
-            "category": category,
-            "subcategory": subcategory,
-            "content": content,
-            "owner_id": owner_id,
-            "namespace": namespace,
-        },
+        event_payload,
         conn=conn,
         owner_id=owner_id,
         namespace=namespace,
     )
+
+    # v4.2 NATS additive emit. Best-effort — silent skip when broker
+    # unreachable. Webhooks outbox above is the durable path.
+    from mnemos.nats import publish_event as _nats_publish_event
+    safe_ns = (namespace or "default").replace(".", "_")
+    await _nats_publish_event(
+        f"mnemos.memory.created.{safe_ns}",
+        event_payload,
+        msg_id=f"{mem_id}.created",
+    )
+
     return row
 
 

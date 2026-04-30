@@ -2,6 +2,28 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [4.2.0a1] — 2026-04-30
+
+NATS JetStream substrate alpha — first slice of the v4.2 MQ work
+chartered in `project_mnemos_graeae_mq_design.md`. Additive only:
+existing webhook outbox remains the durable delivery path.
+
+### Added
+
+- `mnemos/nats/` package: `connect_nats`, `ensure_streams`,
+  `publish_event`, `get_jetstream`. Fail-open — if NATS is
+  unreachable or `MNEMOS_NATS_URL` is unset, publishing is a silent
+  no-op.
+- `MNEMOS_MEMORY` JetStream stream declared on startup. Subjects
+  `mnemos.memory.created.<namespace>`, `…updated.…`, `…deleted.…`.
+  File-backed, 30-day retention, 10 GB cap, 2-min duplicate window.
+- `MNEMOS_NATS_URL` + `MNEMOS_NATS_TOKEN` settings (typed
+  `_NatsSettings`).
+- `memory.created` events now publish to NATS in addition to the
+  transactional webhook outbox. `Nats-Msg-Id` header set to
+  `<memory_id>.created` for idempotent re-publishes.
+- Hatchet workflow-engine integration deferred to v4.2.0a2.
+
 ## [4.1.3] — 2026-04-29
 
 Corpus-review hardening release.
