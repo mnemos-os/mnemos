@@ -52,11 +52,11 @@ async def test_consult_cancellation_releases_provider_slots(monkeypatch):
 
     started = asyncio.Event()
 
-    async def query_provider(*_args, **_kwargs):
+    async def provider_worker(_request):
         started.set()
         await asyncio.sleep(60)
 
-    monkeypatch.setattr(engine, "_query_provider", query_provider)
+    engine.provider_worker = provider_worker
 
     task = asyncio.create_task(engine.consult("prompt", "reasoning"))
     await started.wait()

@@ -7,6 +7,7 @@ from httpx import AsyncClient
 from pydantic import ValidationError
 
 from mnemos.domain.models import ConsultationRequest, SUPPORTED_CONSULTATION_MODES
+from mnemos.domain.graeae.provider_worker import ProviderQueryResponse
 
 
 class _AllowAll:
@@ -92,11 +93,13 @@ def _build_engine(monkeypatch, responses: dict[str, str] | Callable[[str, str], 
     })
     calls: list[dict] = []
 
-    async def _fake_query(provider_name, prompt, task_type, timeout, model_override=None, **kwargs):
+    async def _fake_provider_worker(request):
+        provider_name = request.provider
+        prompt = request.params["prompt"]
         calls.append({
             "provider": provider_name,
             "prompt": prompt,
-            "model_override": model_override,
+            "model_override": request.model,
         })
         if callable(responses):
             text = responses(provider_name, prompt)
@@ -104,15 +107,23 @@ def _build_engine(monkeypatch, responses: dict[str, str] | Callable[[str, str], 
             text = responses.get(provider_name, f"{provider_name} response")
         else:
             text = f"{provider_name} response to {prompt}"
-        return {
+        payload = {
             "status": "success",
             "response_text": text,
             "latency_ms": 10,
-            "model_id": model_override or engine.providers[provider_name]["model"],
+            "model_id": request.model or engine.providers[provider_name]["model"],
             "final_score": engine.providers[provider_name]["weight"],
         }
+        return ProviderQueryResponse(
+            response_text=payload["response_text"],
+            latency_ms=payload["latency_ms"],
+            status=payload["status"],
+            cost=payload.get("cost"),
+            model_id_used=payload["model_id"],
+            raw_provider_payload=payload,
+        )
 
-    monkeypatch.setattr(engine, "_query_provider", _fake_query)
+    engine.provider_worker = _fake_provider_worker
     return engine, calls
 
 

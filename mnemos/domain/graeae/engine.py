@@ -37,7 +37,6 @@ import math
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Any, Dict, Optional
@@ -63,6 +62,12 @@ def _env_var_hint(key_name: str) -> str:
 from mnemos.domain.graeae._cache import ResponseCache
 from mnemos.domain.graeae._quality import QualityTracker
 from mnemos.domain.graeae.elo_sync import get_elo_weights
+from mnemos.domain.graeae.provider_worker import (
+    LocalProviderWorker,
+    ProviderQueryRequest,
+    ProviderQueryResponse,
+    ProviderWorker,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -463,6 +468,7 @@ class GraeaeEngine:
         self._quality = QualityTracker({p: cfg["weight"] for p, cfg in self.providers.items()})
         self._cache = ResponseCache(ttl_seconds=3600, max_entries=500)
         self._concurrency: Optional[Any] = None
+        self.provider_worker: ProviderWorker = LocalProviderWorker(self)
 
     def _get_concurrency(self) -> Any:
         """Lazy-init concurrency pool (requires running event loop)."""
@@ -686,7 +692,7 @@ class GraeaeEngine:
                 if override and name in self.providers:
                     overrides[name] = override
         tasks = [
-            asyncio.create_task(self._query_provider(
+            asyncio.create_task(self._call_provider_worker(
                 name, prompt, task_type, timeout,
                 model_override=overrides.get(name),
             ))
@@ -1037,7 +1043,7 @@ class GraeaeEngine:
                     query_kwargs["request_params"] = request_params
                 if messages is not None:
                     query_kwargs["messages"] = messages
-                result = await self._query_provider(provider, prompt, task_type, timeout, **query_kwargs)
+                result = await self._call_provider_worker(provider, prompt, task_type, timeout, **query_kwargs)
             except Exception as e:
                 # Record the failure against the breaker so repeated
                 # gateway-path failures actually trip it, and quality
@@ -1123,7 +1129,7 @@ class GraeaeEngine:
                     ):
                         yield chunk
                 else:
-                    result = await self._query_provider(
+                    result = await self._call_provider_worker(
                         provider,
                         prompt,
                         task_type,
@@ -1166,6 +1172,27 @@ class GraeaeEngine:
         finally:
             await call_maybe_async(concurrency.release, provider)
 
+    async def _call_provider_worker(
+        self, provider_name: str, prompt: str, task_type: str, timeout: int,
+        model_override: Optional[str] = None,
+        generation_params: Optional[Dict[str, Any]] = None,
+        request_params: Optional[Dict[str, Any]] = None,
+        messages: Optional[list[dict]] = None,
+    ) -> Dict:
+        response = await self.provider_worker(ProviderQueryRequest(
+            provider=provider_name,
+            model=model_override,
+            messages=messages,
+            params={
+                "prompt": prompt,
+                "task_type": task_type,
+                "timeout": timeout,
+                "generation_params": generation_params,
+                "request_params": request_params,
+            },
+        ))
+        return self._provider_worker_payload(response)
+
     async def _query_provider(
         self, provider_name: str, prompt: str, task_type: str, timeout: int,
         model_override: Optional[str] = None,
@@ -1173,56 +1200,19 @@ class GraeaeEngine:
         request_params: Optional[Dict[str, Any]] = None,
         messages: Optional[list[dict]] = None,
     ) -> Dict:
-        # Snapshot the provider config so a concurrent reload_from_registry
-        # mutation can't tear the dict mid-dispatch. shallow copy is enough
-        # because we only read scalar fields (model, url, weight, api,
-        # key_name) and never mutate them here.
-        provider = dict(self.providers[provider_name])
-        if model_override:
-            provider["model"] = model_override
-            # gemini's URL embeds the model name; rebuild for the override.
-            if provider.get("api") == "gemini":
-                provider["url"] = (
-                    f"https://generativelanguage.googleapis.com/v1beta/"
-                    f"models/{model_override}:generateContent"
-                )
-        start = datetime.now(timezone.utc)
-        api = provider["api"]
+        return await self._call_provider_worker(
+            provider_name,
+            prompt,
+            task_type,
+            timeout,
+            model_override=model_override,
+            generation_params=generation_params,
+            request_params=request_params,
+            messages=messages,
+        )
 
-        if api == "openai":
-            response = await self._query_openai_compatible(
-                provider,
-                prompt,
-                timeout,
-                generation_params=generation_params,
-                request_params=request_params,
-                messages=messages,
-            )
-        elif api == "anthropic":
-            response = await self._query_anthropic(
-                provider,
-                prompt,
-                timeout,
-                generation_params=generation_params,
-                request_params=request_params,
-                messages=messages,
-            )
-        elif api == "gemini":
-            response = await self._query_gemini(
-                provider,
-                prompt,
-                timeout,
-                generation_params=generation_params,
-                request_params=request_params,
-                messages=messages,
-            )
-        else:
-            raise ValueError(f"Unknown api style '{api}' for provider '{provider_name}'")
-
-        latency = int((datetime.now(timezone.utc) - start).total_seconds() * 1000)
-        response["latency_ms"] = latency
-        response["final_score"] = provider["weight"]  # overridden by quality tracker in consult()
-        return response
+    def _provider_worker_payload(self, response: ProviderQueryResponse) -> Dict:
+        return response.raw_provider_payload
 
     def _openai_payload(
         self,

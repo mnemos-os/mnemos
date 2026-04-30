@@ -21,6 +21,7 @@ import asyncio
 from unittest.mock import MagicMock
 
 from mnemos.api.dependencies import UserContext
+from mnemos.domain.graeae.provider_worker import ProviderQueryResponse
 
 
 def _alice() -> UserContext:
@@ -296,7 +297,7 @@ class _FakeQuality:
 def _engine_with_fakes(*, breaker_allow=True, rate_allow=True, conc_allow=True):
     """Build a GraeaeEngine instance with its reliability substructures
     replaced by controllable fakes. We don't need a real key file or
-    HTTP client because the _query_provider call is also stubbed in
+    HTTP client because the provider_worker call is also stubbed in
     the individual tests."""
     from mnemos.domain.graeae.engine import GraeaeEngine
 
@@ -341,10 +342,18 @@ def test_h3_route_refused_when_concurrency_saturated(monkeypatch):
 def test_h3_route_releases_concurrency_on_success(monkeypatch):
     engine = _engine_with_fakes()
 
-    async def _fake_query(self, provider_name, prompt, task_type, timeout, model_override=None):
-        return {"status": "success", "response_text": "ok", "latency_ms": 20, "model_id": "gpt-5", "final_score": 0.9}
+    async def _fake_provider_worker(request):
+        payload = {"status": "success", "response_text": "ok", "latency_ms": 20, "model_id": "gpt-5", "final_score": 0.9}
+        return ProviderQueryResponse(
+            response_text=payload["response_text"],
+            latency_ms=payload["latency_ms"],
+            status=payload["status"],
+            cost=payload.get("cost"),
+            model_id_used=payload["model_id"],
+            raw_provider_payload=payload,
+        )
 
-    monkeypatch.setattr(engine.__class__, "_query_provider", _fake_query)
+    engine.provider_worker = _fake_provider_worker
 
     asyncio.run(engine.route("openai", "gpt-5", "prompt", "reasoning"))
 
@@ -355,15 +364,15 @@ def test_h3_route_releases_concurrency_on_success(monkeypatch):
 
 
 def test_h3_route_releases_concurrency_on_provider_error(monkeypatch):
-    """Even when _query_provider raises, the concurrency slot must be
+    """Even when provider_worker raises, the concurrency slot must be
     released and the breaker/quality tracker must record the failure
     — otherwise the gateway leaks concurrency capacity on errors."""
     engine = _engine_with_fakes()
 
-    async def _fake_query(self, provider_name, prompt, task_type, timeout, model_override=None):
+    async def _fake_provider_worker(request):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(engine.__class__, "_query_provider", _fake_query)
+    engine.provider_worker = _fake_provider_worker
 
     result = asyncio.run(engine.route("openai", "gpt-5", "prompt", "reasoning"))
 
