@@ -713,6 +713,24 @@ async def create_memory(
     # Schedule HTTP delivery for each enqueued outbox row, after the
     # transaction has committed.
     _schedule_outbox_deliveries(delivery_ids)
+
+    # v4.2 NATS additive emit. Best-effort — silent skip when broker
+    # unreachable. Webhooks outbox above is the durable path.
+    from mnemos.nats import publish_event as _nats_publish_event
+    safe_ns = (namespace or "default").replace(".", "_")
+    await _nats_publish_event(
+        f"mnemos.memory.created.{safe_ns}",
+        {
+            "memory_id": mem_id,
+            "category": request.category,
+            "subcategory": request.subcategory,
+            "content": request.content,
+            "owner_id": owner_id,
+            "namespace": namespace,
+        },
+        msg_id=f"{mem_id}.created",
+    )
+
     await _invalidate_caches_after_mutation()
     return _row_to_memory(row)
 

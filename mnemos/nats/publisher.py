@@ -31,6 +31,7 @@ async def publish_event(
     """
     js = get_jetstream()
     if js is None:
+        logger.debug("publish_event: jetstream context is None, skip %s", subject)
         return
 
     try:
@@ -42,6 +43,10 @@ async def publish_event(
     headers = {"Nats-Msg-Id": msg_id} if msg_id else None
 
     try:
-        await js.publish(subject, body, headers=headers)
+        ack = await js.publish(subject, body, headers=headers)
+        logger.info(
+            "publish_event: subject=%s seq=%s stream=%s",
+            subject, getattr(ack, "seq", "?"), getattr(ack, "stream", "?"),
+        )
     except Exception as exc:
         logger.warning("publish_event: %s failed: %s", subject, exc)
