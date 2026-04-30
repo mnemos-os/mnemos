@@ -18,6 +18,7 @@ _ENV_KEYS = (
     "PG_POOL_MIN",
     "PG_POOL_MAX",
     "MNEMOS_CONFIG_PATH",
+    "MNEMOS_GRAEAE_NATS_FANOUT",
 )
 
 
@@ -52,11 +53,26 @@ def test_default_values_when_env_unset(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert settings.database.user == "mnemos_user"
         assert settings.database.password == ""
         assert settings.server.port == 5002
+        assert settings.graeae.nats_fanout is False
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     with _isolated_settings(monkeypatch, str(tmp_path / "missing.toml"), {"PG_HOST": "foo"}):
         assert config.get_settings().database.host == "foo"
+
+
+def test_graeae_nats_fanout_feature_flag_defaults_off_and_can_enable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    with _isolated_settings(
+        monkeypatch,
+        str(tmp_path / "missing.toml"),
+        {"MNEMOS_GRAEAE_NATS_FANOUT": "true"},
+    ):
+        settings = config.get_settings()
+        assert settings.graeae.nats_fanout is True
+        assert config.GRAEAE_CONFIG["nats_fanout"] is True
 
 
 def test_config_toml_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

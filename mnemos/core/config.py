@@ -112,6 +112,7 @@ class _GraeaeSettings(BaseSettings):
 
     providers: dict[str, Any] = Field(default_factory=dict)
     mode_default: str = Field("auto", validation_alias="GRAEAE_MODE_DEFAULT")
+    nats_fanout: bool = Field(False, validation_alias="MNEMOS_GRAEAE_NATS_FANOUT")
     providers_enabled: str = Field("together,groq,openai,anthropic", validation_alias="GRAEAE_PROVIDERS")
     consensus_mode: bool = Field(True, validation_alias="GRAEAE_CONSENSUS_MODE")
     consensus_quorum_size: int = Field(3, validation_alias="GRAEAE_CONSENSUS_QUORUM_SIZE")
