@@ -15,7 +15,6 @@ logger = logging.getLogger("mnemos.webhooks.nats_trigger")
 SUBJECT = "mnemos.webhook.delivery.queued.>"
 STREAM = "MNEMOS_WEBHOOK"
 DURABLE = "mnemos_webhook_delivery_trigger"
-QUEUE = "mnemos_webhook_dispatchers"
 
 
 async def consumer_loop(
@@ -131,10 +130,14 @@ async def _subscribe(js: Any):
     except ImportError:
         config = None
 
+    # Postgres SELECT FOR UPDATE SKIP LOCKED already serializes
+    # delivery claims across workers; a NATS queue group adds no
+    # correctness value and complicates DeliverGroup setup on the
+    # durable consumer. Single subscription per node — every worker
+    # races to claim, only one wins.
     return await js.subscribe(
         SUBJECT,
         durable=DURABLE,
-        queue=QUEUE,
         stream=STREAM,
         config=config,
     )

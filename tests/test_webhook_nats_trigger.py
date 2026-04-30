@@ -148,7 +148,10 @@ async def test_stream_subscription_declared_with_right_subject():
     assert subject == "mnemos.webhook.delivery.queued.>"
     assert kwargs["stream"] == "MNEMOS_WEBHOOK"
     assert kwargs["durable"] == "mnemos_webhook_delivery_trigger"
-    assert kwargs["queue"] == "mnemos_webhook_dispatchers"
+    # No queue param: Postgres SKIP LOCKED handles cross-worker
+    # serialization; queue group on JS would need DeliverGroup on the
+    # consumer config, which 10110-fails with our durable shape.
+    assert "queue" not in kwargs
     config_obj = kwargs["config"]
     if config_obj is not None:
         assert "NEW" in str(getattr(config_obj, "deliver_policy", "NEW"))

@@ -29,10 +29,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import hashlib
+import json
 import logging
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any
 from urllib.parse import parse_qs, quote
 from uuid import UUID
 
@@ -42,6 +44,10 @@ from starlette.applications import Starlette
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse, PlainTextResponse
+try:
+    from starlette.responses import StreamingResponse
+except ImportError:  # pragma: no cover - exercised only by lightweight test stubs.
+    StreamingResponse = None  # type: ignore[assignment]
 from starlette.routing import Mount, Route
 
 from mnemos.core.config import get_settings
@@ -63,6 +69,8 @@ logger = logging.getLogger(__name__)
 
 
 HTTP_TOOL_REGISTRY = TOOL_REGISTRY
+DEFAULT_NATS_SSE_SUBJECT = "mnemos.>"
+NATS_SSE_PATH = "/mcp/events/stream"
 
 
 @dataclass(frozen=True)
@@ -341,6 +349,146 @@ async def handle_sse(request):
         reset_mcp_backend_context(context_tokens)
 
 
+def _parse_nats_sse_subjects(request) -> list[str]:
+    raw = request.query_params.get("subjects") if hasattr(request, "query_params") else None
+    if not raw:
+        return [DEFAULT_NATS_SSE_SUBJECT]
+    subjects = [part.strip() for part in raw.split(",") if part.strip()]
+    if not subjects:
+        return [DEFAULT_NATS_SSE_SUBJECT]
+    invalid = [
+        subject for subject in subjects
+        if not subject.startswith("mnemos.") or any(ch.isspace() for ch in subject)
+    ]
+    if invalid:
+        raise ValueError(f"invalid NATS subject filter: {invalid[0]}")
+    return subjects
+
+
+def _sse_frame(event: str, data: str) -> bytes:
+    lines = [f"event: {event}"]
+    for line in data.splitlines() or [""]:
+        lines.append(f"data: {line}")
+    return ("\n".join(lines) + "\n\n").encode("utf-8")
+
+
+def _nats_msg_data(msg: Any) -> str:
+    data = getattr(msg, "data", b"")
+    if isinstance(data, str):
+        return data
+    return bytes(data).decode("utf-8", errors="replace")
+
+
+async def _subscribe_nats_sse_subject(js: Any, subject: str) -> Any:
+    nc = getattr(js, "_nc", None)
+    subscribe = getattr(nc, "subscribe", None)
+    if subscribe is not None:
+        return await subscribe(subject)
+
+    try:
+        from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
+
+        config = ConsumerConfig(
+            deliver_policy=DeliverPolicy.NEW,
+            ack_policy=AckPolicy.NONE,
+        )
+    except ImportError:
+        config = None
+    return await js.subscribe(subject, config=config)
+
+
+def _is_nats_sse_timeout(exc: BaseException) -> bool:
+    if isinstance(exc, asyncio.TimeoutError):
+        return True
+    return exc.__class__.__name__ == "TimeoutError" and exc.__class__.__module__.startswith("nats")
+
+
+async def _unsubscribe_nats_sse(sub: Any) -> None:
+    unsubscribe = getattr(sub, "unsubscribe", None)
+    if unsubscribe is None:
+        return
+    result = unsubscribe()
+    if hasattr(result, "__await__"):
+        await result
+
+
+async def _nats_sse_event_source(subscriptions: list[Any]):
+    queue: asyncio.Queue[tuple[str, Any]] = asyncio.Queue()
+
+    async def pump(sub: Any) -> None:
+        while True:
+            try:
+                msg = await sub.next_msg(timeout=1)
+                await queue.put(("message", msg))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                if _is_nats_sse_timeout(exc):
+                    continue
+                await queue.put(("error", exc))
+                return
+
+    tasks = [asyncio.create_task(pump(sub)) for sub in subscriptions]
+    try:
+        while True:
+            kind, item = await queue.get()
+            if kind == "error":
+                logger.warning("NATS SSE stream closing after subscription error: %s", item)
+                yield _sse_frame(
+                    "error",
+                    json.dumps({"error": "nats_connection_lost", "detail": str(item)}),
+                )
+                return
+            yield _sse_frame(getattr(item, "subject", "mnemos.event"), _nats_msg_data(item))
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *(_unsubscribe_nats_sse(sub) for sub in subscriptions),
+            return_exceptions=True,
+        )
+
+
+async def handle_nats_event_stream(request):
+    """Expose MNEMOS bus events as a thin NATS-to-SSE bridge.
+
+    This is intentionally separate from `/sse`, which is the MCP SDK's
+    bidirectional protocol transport.
+    """
+    if StreamingResponse is None:
+        return PlainTextResponse("streaming responses unavailable", status_code=503)
+
+    try:
+        subjects = _parse_nats_sse_subjects(request)
+    except ValueError as exc:
+        return PlainTextResponse(str(exc), status_code=400)
+
+    from mnemos.nats.client import get_jetstream
+
+    js = get_jetstream()
+    if js is None:
+        return PlainTextResponse("NATS unavailable", status_code=503)
+
+    subscriptions: list[Any] = []
+    try:
+        for subject in subjects:
+            subscriptions.append(await _subscribe_nats_sse_subject(js, subject))
+    except Exception as exc:
+        await asyncio.gather(
+            *(_unsubscribe_nats_sse(sub) for sub in subscriptions),
+            return_exceptions=True,
+        )
+        logger.warning("NATS SSE subscription failed for subjects=%s: %s", subjects, exc)
+        return PlainTextResponse("NATS unavailable", status_code=503)
+
+    return StreamingResponse(
+        _nats_sse_event_source(subscriptions),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 async def healthz(_request):
     """Readiness probe. Skips bearer auth so deployment infra
     (cloudflared, k8s) can confirm the process is up without
@@ -352,6 +500,7 @@ starlette_app = Starlette(
     routes=[
         Route("/healthz", endpoint=healthz),
         Route("/sse", endpoint=handle_sse),
+        Route(NATS_SSE_PATH, endpoint=handle_nats_event_stream),
         Mount("/messages/", app=handle_post_message),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
