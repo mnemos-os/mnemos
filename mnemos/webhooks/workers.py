@@ -161,7 +161,7 @@ async def _claim_recoverable_deliveries(
                   d.payload_hash, d.attempt_num, d.status,
                   d.lease_expires_at, claim_clock.claim_now AS claim_db_now,
                   $2::uuid AS lease_token,
-                  s.url, s.secret, s.revoked
+                  s.url, s.secret, s.revoked, s.owner_id, s.namespace
         """,
         webhook_types.MAX_ATTEMPTS,
         lease_token,

@@ -843,7 +843,7 @@ class PostgresWebhookRepository(WebhookRepository):
     ) -> list[str]:
         conn = _postgres_tx(tx).conn
         query = """
-            SELECT id
+            SELECT id, url, owner_id, namespace
             FROM webhook_subscriptions
             WHERE NOT revoked AND $1 = ANY(events)
         """
@@ -876,6 +876,16 @@ class PostgresWebhookRepository(WebhookRepository):
                 body,
                 body_hash,
                 webhook_types.NEW_CODE_WRITER_REVISION,
+            )
+            from mnemos.webhooks.nats_events import publish_delivery_queued
+            await publish_delivery_queued(
+                delivery_id=delivery_id,
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
             )
             delivery_ids.append(delivery_id)
         return delivery_ids

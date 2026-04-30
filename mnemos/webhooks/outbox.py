@@ -9,6 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 import asyncpg
 
 from . import types as webhook_types
+from .nats_events import publish_delivery_queued
 
 
 async def _matching_subscriptions(
@@ -68,6 +69,15 @@ async def _dispatch_on_conn(
             RETURNING id
             """,
             sub["id"], event_type, body, body_hash, webhook_types.NEW_CODE_WRITER_REVISION,
+        )
+        await publish_delivery_queued(
+            delivery_id=str(delivery_id),
+            subscription_id=sub["id"],
+            event_type=event_type,
+            url=sub["url"],
+            payload_hash=body_hash,
+            namespace=sub["namespace"],
+            owner_id=sub["owner_id"],
         )
         delivery_ids.append(str(delivery_id))
     return delivery_ids

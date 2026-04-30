@@ -600,6 +600,17 @@ async def lifespan(app):
         except Exception:
             logger.exception("[NATS] federation consumer startup hook failed")
 
+    # Webhook NATS push trigger (v4.2 slice 4). Optional and additive:
+    # the polling recovery worker remains the durable fallback path.
+    if _pool:
+        try:
+            from mnemos.webhooks.nats_trigger import consumer_loop as _webhook_nats_trigger_loop
+
+            logger.info("Launching webhook nats trigger consumer")
+            _schedule_worker(_webhook_nats_trigger_loop(_pool, settings=settings))
+        except Exception:
+            logger.exception("[NATS] webhook trigger startup hook failed")
+
     yield
 
     await _cancel_tracked_tasks(

@@ -8,6 +8,7 @@ from typing import Any, Optional
 import asyncpg
 
 from . import types as webhook_types
+from .nats_events import publish_delivery_queued
 from .types import _DeliveryResult
 
 
@@ -38,7 +39,7 @@ async def _insert_successor_delivery(
     scheduled_at: datetime,
 ) -> Optional[asyncpg.Record]:
     """Insert the next live retry attempt if another writer has not already won."""
-    return await conn.fetchrow(
+    row = await conn.fetchrow(
         """
         INSERT INTO webhook_deliveries
           (subscription_id, event_type, payload, payload_hash,
@@ -57,6 +58,24 @@ async def _insert_successor_delivery(
         scheduled_at,
         webhook_types.NEW_CODE_WRITER_REVISION,
     )
+    if row is not None:
+        await publish_delivery_queued(
+            delivery_id=str(row["id"]),
+            subscription_id=delivery["subscription_id"],
+            event_type=delivery["event_type"],
+            url=_record_value(delivery, "url") or "",
+            payload_hash=delivery["payload_hash"],
+            namespace=_record_value(delivery, "namespace"),
+            owner_id=_record_value(delivery, "owner_id"),
+        )
+    return row
+
+
+def _record_value(record: asyncpg.Record, key: str):
+    try:
+        return record[key]
+    except (KeyError, TypeError):
+        return None
 
 
 def _is_sqlite_connection(conn: Any) -> bool:

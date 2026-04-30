@@ -1640,7 +1640,7 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
             params.append(namespace)
         subscriptions = await _fetch_all(
             conn,
-            f"SELECT id, events FROM webhook_subscriptions WHERE {' AND '.join(conditions)}",
+            f"SELECT id, events, url, owner_id, namespace FROM webhook_subscriptions WHERE {' AND '.join(conditions)}",
             params,
         )
         body = json.dumps(
@@ -1667,6 +1667,16 @@ class SqliteWebhookRepository(_SqliteRepository, WebhookRepository):
                     body_hash,
                     webhook_types.NEW_CODE_WRITER_REVISION,
                 ),
+            )
+            from mnemos.webhooks.nats_events import publish_delivery_queued
+            await publish_delivery_queued(
+                delivery_id=delivery_id,
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
             )
             delivery_ids.append(delivery_id)
         return delivery_ids
