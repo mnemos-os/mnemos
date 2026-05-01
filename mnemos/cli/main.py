@@ -623,6 +623,22 @@ def dump_openapi(
         "--title",
         help="Override the spec title (default: pulled from FastAPI app).",
     ),
+    target: str = typer.Option(
+        "full",
+        "--target",
+        case_sensitive=False,
+        help=(
+            "Spec target. ``full`` (default) emits the raw FastAPI spec "
+            "with no transformations. ``gpt-actions`` truncates endpoint "
+            "summary/description fields to 300 chars and parameter "
+            "description fields to 700 chars per OpenAI's Custom GPT "
+            "Actions limits "
+            "(https://developers.openai.com/api/docs/actions/production); "
+            "use this when the artifact is going into a Custom GPT, "
+            "ChatGPT Pro Developer Mode connector, or OpenAI Actions "
+            "bridge that rejects over-long fields."
+        ),
+    ),
 ) -> None:
     """Dump the FastAPI OpenAPI spec to JSON.
 
@@ -635,14 +651,28 @@ def dump_openapi(
     CLI is the build-time / CI path that produces the static
     artifact.
 
+    For Custom GPT / OpenAI Actions consumers, pass
+    ``--target gpt-actions`` so endpoint descriptions and parameter
+    descriptions are truncated to OpenAI's documented field-length
+    limits. The full target keeps the original prose so other
+    OpenAPI consumers see the complete documentation.
+
     Examples:
 
       mnemos dump-openapi
       mnemos dump-openapi --output mnemos-openapi.json
+      mnemos dump-openapi --target gpt-actions -o gpt-spec.json
       mnemos dump-openapi --indent 0 -o /tmp/spec.min.json
     """
     import json
     import sys
+
+    target_norm = (target or "full").strip().lower()
+    if target_norm not in {"full", "gpt-actions"}:
+        raise typer.BadParameter(
+            f"--target must be 'full' or 'gpt-actions'; got {target!r}",
+            param_hint="--target",
+        )
 
     # Lazy import — building the FastAPI app pulls in lifecycle
     # plumbing we don't want at module-load time.
@@ -651,6 +681,11 @@ def dump_openapi(
     spec = fastapi_app.openapi()
     if title:
         spec.setdefault("info", {})["title"] = title
+
+    if target_norm == "gpt-actions":
+        from mnemos.api.openapi_compat import truncate_for_gpt_actions
+
+        spec = truncate_for_gpt_actions(spec)
 
     rendered = json.dumps(spec, indent=indent if indent > 0 else None, sort_keys=False)
 

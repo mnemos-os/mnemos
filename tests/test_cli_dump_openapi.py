@@ -106,3 +106,207 @@ def test_dump_openapi_indent_clamped_above_max():
     silently accept."""
     result = runner.invoke(app, ["dump-openapi", "--indent", "99"])
     assert result.exit_code != 0
+
+
+# ── --target gpt-actions: OpenAI Custom GPT field-length limits ───────────
+#
+# Codex round-1 of round-36 caught that the raw FastAPI spec emits
+# endpoint descriptions over OpenAI's 300-char limit (one was 884
+# chars), so a Custom GPT importing the artifact would fail or
+# silently truncate. ``--target gpt-actions`` runs the spec through
+# truncate_for_gpt_actions before serialization.
+
+
+def test_full_target_keeps_long_descriptions(tmp_path: Path):
+    """Confirm the regression that motivated --target gpt-actions:
+    at least one endpoint description in the raw FastAPI spec is
+    longer than the GPT-Actions 300-char limit."""
+    out = tmp_path / "spec.json"
+    result = runner.invoke(
+        app, ["dump-openapi", "--target", "full", "-o", str(out)],
+    )
+    assert result.exit_code == 0
+    spec = json.loads(out.read_text())
+
+    long_descriptions = []
+    for path, methods in (spec.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in {
+                "get", "put", "post", "delete", "options",
+                "head", "patch", "trace",
+            }:
+                continue
+            desc = op.get("description") or ""
+            if len(desc) > 300:
+                long_descriptions.append((method, path, len(desc)))
+    assert long_descriptions, (
+        "expected at least one description over 300 chars in --target full; "
+        "if this fails, the full target's descriptions all happen to fit "
+        "and the gpt-actions transform is no longer load-bearing"
+    )
+
+
+def test_gpt_actions_target_truncates_endpoint_descriptions(tmp_path: Path):
+    """Pin the contract: with --target gpt-actions, NO endpoint
+    description exceeds the OpenAI 300-char limit."""
+    from mnemos.api.openapi_compat import GPT_ACTIONS_DESCRIPTION_LIMIT
+
+    out = tmp_path / "gpt-spec.json"
+    result = runner.invoke(
+        app, ["dump-openapi", "--target", "gpt-actions", "-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    spec = json.loads(out.read_text())
+
+    over_limit = []
+    for path, methods in (spec.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in {
+                "get", "put", "post", "delete", "options",
+                "head", "patch", "trace",
+            }:
+                continue
+            for field in ("summary", "description"):
+                value = op.get(field) or ""
+                if len(value) > GPT_ACTIONS_DESCRIPTION_LIMIT:
+                    over_limit.append(
+                        (method, path, field, len(value))
+                    )
+    assert over_limit == [], (
+        f"--target gpt-actions still emits over-limit description "
+        f"fields: {over_limit!r}"
+    )
+
+
+def test_gpt_actions_target_truncates_parameter_descriptions(tmp_path: Path):
+    """Pin parameter description limit (700 chars) for the same
+    reason."""
+    from mnemos.api.openapi_compat import (
+        GPT_ACTIONS_PARAMETER_DESCRIPTION_LIMIT,
+    )
+
+    out = tmp_path / "gpt-spec.json"
+    result = runner.invoke(
+        app, ["dump-openapi", "--target", "gpt-actions", "-o", str(out)],
+    )
+    assert result.exit_code == 0
+    spec = json.loads(out.read_text())
+
+    over_limit = []
+    for path, methods in (spec.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in {
+                "get", "put", "post", "delete", "options",
+                "head", "patch", "trace",
+            }:
+                continue
+            for param in op.get("parameters") or []:
+                if not isinstance(param, dict):
+                    continue
+                desc = param.get("description") or ""
+                if len(desc) > GPT_ACTIONS_PARAMETER_DESCRIPTION_LIMIT:
+                    over_limit.append((method, path, param.get("name"), len(desc)))
+    assert over_limit == [], (
+        f"--target gpt-actions still emits over-limit parameter "
+        f"description fields: {over_limit!r}"
+    )
+
+
+def test_gpt_actions_target_truncates_request_body_descriptions(tmp_path: Path):
+    from mnemos.api.openapi_compat import (
+        GPT_ACTIONS_PARAMETER_DESCRIPTION_LIMIT,
+    )
+
+    out = tmp_path / "gpt-spec.json"
+    result = runner.invoke(
+        app, ["dump-openapi", "--target", "gpt-actions", "-o", str(out)],
+    )
+    assert result.exit_code == 0
+    spec = json.loads(out.read_text())
+
+    over_limit = []
+    for path, methods in (spec.get("paths") or {}).items():
+        if not isinstance(methods, dict):
+            continue
+        for method, op in methods.items():
+            if method.lower() not in {
+                "get", "put", "post", "delete", "options",
+                "head", "patch", "trace",
+            }:
+                continue
+            request_body = op.get("requestBody")
+            if not isinstance(request_body, dict):
+                continue
+            desc = request_body.get("description") or ""
+            if len(desc) > GPT_ACTIONS_PARAMETER_DESCRIPTION_LIMIT:
+                over_limit.append((method, path, len(desc)))
+    assert over_limit == []
+
+
+def test_invalid_target_rejected():
+    result = runner.invoke(
+        app, ["dump-openapi", "--target", "swagger-2.0"],
+    )
+    assert result.exit_code != 0
+    assert "target" in result.output.lower()
+
+
+def test_default_target_is_full(tmp_path: Path):
+    """Without --target, behaviour is unchanged from round-36 v1
+    (full spec). Confirm via long-description presence — same
+    detector as the full-target test, just driven by the default."""
+    result_default = runner.invoke(app, ["dump-openapi"])
+    assert result_default.exit_code == 0
+    spec = json.loads(result_default.output)
+
+    found_long = any(
+        len((op.get("description") or "")) > 300
+        for path_methods in (spec.get("paths") or {}).values()
+        if isinstance(path_methods, dict)
+        for method, op in path_methods.items()
+        if method.lower() in {
+            "get", "put", "post", "delete", "options",
+            "head", "patch", "trace",
+        }
+    )
+    assert found_long, (
+        "default target should be 'full' (raw FastAPI spec, "
+        "long descriptions intact); none found"
+    )
+
+
+# ── Helper-level coverage for the truncate function ──────────────────────
+
+
+def test_truncate_helper_caps_at_limit():
+    from mnemos.api.openapi_compat import _truncate
+
+    out = _truncate("a" * 500, 300)
+    assert len(out) == 300
+    # Final char is the ellipsis to signal truncation.
+    assert out.endswith("…")
+
+
+def test_truncate_helper_short_text_unchanged():
+    from mnemos.api.openapi_compat import _truncate
+
+    assert _truncate("short", 300) == "short"
+
+
+def test_truncate_helper_zero_limit():
+    from mnemos.api.openapi_compat import _truncate
+
+    assert _truncate("anything", 0) == ""
+
+
+def test_truncate_helper_non_string_passthrough():
+    from mnemos.api.openapi_compat import _truncate
+
+    assert _truncate(None, 100) is None
+    assert _truncate(42, 100) == 42
