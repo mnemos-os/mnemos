@@ -25,6 +25,13 @@ def test_top_level_help_lists_all_subcommands() -> None:
         "consult",
         "health",
         "version",
+        # Round-36/37: dump-openapi CLI for Custom GPT / Actions
+        # / OpenAPI-aware connector consumers.
+        "dump-openapi",
+        # Wave-2: hardware accelerator detector (recommends ml/
+        # gpu/phi extra). Help-listing guarantee so a future CLI
+        # restructure can't quietly drop it from the surface.
+        "doctor",
     ):
         assert command in result.output
 
@@ -44,6 +51,8 @@ def test_top_level_help_lists_all_subcommands() -> None:
         ["consult", "--help"],
         ["health", "--help"],
         ["version", "--help"],
+        ["dump-openapi", "--help"],
+        ["doctor", "--help"],
     ],
 )
 def test_subcommand_help_works(args: list[str]) -> None:
