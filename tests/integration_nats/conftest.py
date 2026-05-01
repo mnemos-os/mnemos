@@ -161,6 +161,7 @@ import signal  # noqa: E402
 import socket  # noqa: E402
 import subprocess  # noqa: E402
 import time  # noqa: E402
+import uuid  # noqa: E402
 from contextlib import closing  # noqa: E402
 
 
@@ -223,6 +224,15 @@ class ManagedBroker:
         self.store_dir = store_dir
         self.proc: subprocess.Popen | None = None
         self.url = f"nats://127.0.0.1:{port}"
+        # Per-instance connection-level identity tag. Codex round-4
+        # flagged that subprocess liveness alone is not proof of socket
+        # ownership: an unrelated nats-server can already be bound to
+        # the port we picked, our child can be briefly alive trying to
+        # bind, and the handshake can succeed against the squatter
+        # while ``proc.poll() is None`` is still true. Stamp each
+        # spawned child with a unique --server_name and verify the
+        # CONNECT reply carries the same name before declaring ready.
+        self._server_name = f"mnemos-managed-{uuid.uuid4().hex}"
 
     def _start_proc(self) -> None:
         """Just spawn the nats-server child. Caller is responsible
@@ -236,6 +246,9 @@ class ManagedBroker:
                 "-p", str(self.port),
                 "-js",
                 "--store_dir", store_str,
+                # Identity stamp checked by _probe_once() — see
+                # __init__() comment on _server_name.
+                "--server_name", self._server_name,
                 # Quiet logging so the test output isn't drowned.
                 "-l", "/dev/null",
             ],
@@ -256,10 +269,16 @@ class ManagedBroker:
     async def _probe_once(self) -> None:
         """One handshake + identity check. Raises on failure.
 
-        Shared between sync and async readiness paths so that the
-        port-race identity check (handshake succeeded → confirm OUR
-        child is still alive → otherwise an unrelated nats-server
-        won the port) lives in exactly one place.
+        Shared between sync and async readiness paths.
+
+        Identity model (codex round-4): we cannot rely on subprocess
+        liveness alone — an unrelated nats-server may already own the
+        socket, our child can be briefly alive trying to bind, and the
+        handshake can succeed against the squatter while
+        ``proc.poll() is None`` is still true. Instead, each managed
+        child is launched with a unique ``--server_name`` and we
+        verify that the CONNECT response advertises the same name
+        before declaring readiness.
         """
         import asyncio as _asyncio
         import nats
@@ -268,11 +287,30 @@ class ManagedBroker:
             nats.connect(servers=[self.url]), timeout=0.5
         )
         try:
-            # Identity check: make sure the server we just connected
-            # to is OUR child, not an unrelated nats-server that won
-            # the port race. The simplest test that survives
-            # nats-server version variation is "the child we spawned
-            # is still alive after the handshake."
+            # Connection-level identity assertion. nats.py exposes the
+            # server INFO response on the client; the field name has
+            # been stable across 2.x. Probe the most-likely attributes
+            # in order so the test stays robust if a release shuffles
+            # the surface.
+            info = (
+                getattr(client, "_server_info", None)
+                or getattr(client, "connected_server_info", None)
+                or {}
+            )
+            advertised = None
+            if isinstance(info, dict):
+                advertised = info.get("server_name")
+            else:
+                advertised = getattr(info, "server_name", None)
+            if advertised != self._server_name:
+                raise RuntimeError(
+                    "handshake reached the wrong nats-server: "
+                    f"expected server_name={self._server_name!r}, "
+                    f"got {advertised!r}. Another listener won the port."
+                )
+            # Belt-and-braces: also confirm our child has not exited
+            # since we spawned it. Cheap, catches early-bind failures
+            # that may not have surfaced in INFO yet.
             if self.proc is None or self.proc.poll() is not None:
                 raise RuntimeError(
                     "handshake succeeded but our subprocess is gone — "
