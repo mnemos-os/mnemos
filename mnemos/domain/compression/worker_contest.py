@@ -215,36 +215,71 @@ WHERE id = $1
 """
 
 
-async def _reset_row_for_infra_retry(
-    pool: Any, queue_id: Any, error_marker: str,
+# Batch variant of the reset SQL — used when an infra error fires
+# mid-batch and the un-processed tail rows must also be reset back
+# to 'pending'. Without this, the tail rows sit at 'running' until
+# the stale sweep catches them; under sustained pool pressure their
+# attempts climb on each retake until the sweep terminalizes them
+# (codex round-5 of round-28 caught this remaining surface).
+_INFRA_RESET_BATCH_SQL = """
+UPDATE memory_compression_queue
+SET status      = 'pending',
+    attempts    = GREATEST(attempts - 1, 0),
+    started_at  = NULL,
+    finished_at = NULL,
+    error       = $2
+WHERE id = ANY($1::uuid[])
+  AND status = 'running'
+"""
+
+
+async def _reset_rows_for_infra_retry(
+    pool: Any, queue_ids: Sequence[Any], error_marker: str,
 ) -> None:
-    """Reset a 'running' queue row to 'pending' with attempts
-    decremented, so an infrastructure-class outage does NOT consume
-    the row's content-attempts budget.
+    """Reset multiple 'running' queue rows to 'pending' in one
+    UPDATE so a mid-batch infrastructure error does NOT consume
+    the content-attempts budget for ANY row in the dequeue.
 
     Best-effort: if the reset itself raises an infra error (truly
     wedged pool), swallow + log — the stale-running sweep will
-    still pick the row up eventually. Other reset failures
+    still pick the rows up eventually. Other reset failures
     (content-class) are logged but otherwise ignored; the worker's
     primary infra-error re-raise still surfaces to the reconnect
     path.
+
+    Empty queue_ids is a no-op (nothing to reset).
     """
     from mnemos.core.pool import is_infrastructure_error
 
+    if not queue_ids:
+        return
     try:
         async with pool.acquire() as conn:
-            await conn.execute(_INFRA_RESET_SQL, queue_id, error_marker)
+            await conn.execute(
+                _INFRA_RESET_BATCH_SQL, list(queue_ids), error_marker,
+            )
     except Exception as reset_exc:
         if is_infrastructure_error(reset_exc):
             logger.warning(
-                "contest_queue[%s]: infra-reset acquire timed out (%s); "
-                "row left at 'running' for stale-recovery",
-                queue_id, type(reset_exc).__name__,
+                "contest_queue: infra-reset acquire timed out (%s) for "
+                "%d row(s); rows left at 'running' for stale-recovery",
+                type(reset_exc).__name__, len(queue_ids),
             )
         else:
             logger.exception(
-                "contest_queue[%s]: infra-reset failed unexpectedly", queue_id,
+                "contest_queue: infra-reset failed unexpectedly for %d row(s)",
+                len(queue_ids),
             )
+
+
+async def _reset_row_for_infra_retry(
+    pool: Any, queue_id: Any, error_marker: str,
+) -> None:
+    """Single-row form of ``_reset_rows_for_infra_retry``. Kept for
+    backward compatibility with the round-32 single-site call shape;
+    new sites should prefer the batch helper to amortise the
+    acquire when more than one row needs resetting."""
+    await _reset_rows_for_infra_retry(pool, [queue_id], error_marker)
 
 
 async def _sweep_stale_running(
@@ -369,7 +404,7 @@ async def process_contest_queue(
 
     counts["dequeued"] = len(rows)
 
-    for row in rows:
+    for row_idx, row in enumerate(rows):
         queue_id = row["id"]
         memory_id = row["memory_id"]
         owner_id = row["owner_id"]
@@ -418,19 +453,28 @@ async def process_contest_queue(
             from mnemos.core.pool import is_infrastructure_error
 
             if is_infrastructure_error(exc):
+                # Reset every unprocessed row in the dequeue batch
+                # — current row + any tail. Without resetting the
+                # tail, those rows sit at 'running' (already
+                # attempts-bumped by the dequeue) until the
+                # stale-running sweep catches them; codex round-5
+                # of round-28 caught that under repeated pool
+                # pressure the tail rows' attempts climb on each
+                # retake until the sweep terminalizes them as
+                # 'stranded_running' even though no content
+                # failure occurred. Single batch UPDATE so we
+                # amortise the (potentially-also-failing) acquire.
+                tail_ids = [r["id"] for r in rows[row_idx:]]
                 logger.warning(
-                    "contest_queue[%s]: infrastructure error %s; row left "
-                    "retryable, re-raising to worker loop",
+                    "contest_queue[%s]: infrastructure error %s; resetting "
+                    "%d unprocessed row(s) (current + %d tail) for retry "
+                    "without consuming attempts budget, then re-raising",
                     memory_id, type(exc).__name__,
+                    len(tail_ids), len(tail_ids) - 1,
                 )
-                # Reset the row before re-raising so this infra
-                # outage doesn't consume the content-attempts budget.
-                # Without the reset, repeated pool pressure burns
-                # max_attempts cycles and the sweep terminalizes
-                # the row even though no content failure occurred.
-                await _reset_row_for_infra_retry(
+                await _reset_rows_for_infra_retry(
                     pool,
-                    queue_id,
+                    tail_ids,
                     f"infra_retry: {type(exc).__name__}: {str(exc)[:200]}",
                 )
                 counts["infra_errors"] += 1

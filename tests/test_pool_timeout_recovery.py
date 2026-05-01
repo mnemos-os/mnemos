@@ -331,6 +331,143 @@ async def test_worker_log_stats_reraises_infrastructure_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_infra_error_resets_entire_batch_tail(monkeypatch):
+    """Codex round-5 of round-28: with batch_size > 1, an infra
+    error on the FIRST row left the remaining N-1 dequeued rows at
+    'running' with attempts already bumped. The stale sweep would
+    eventually pick them up but each retake bumped attempts again,
+    so under sustained pool pressure the tail rows could still get
+    terminalized as 'stranded_running'.
+
+    Round-33 fixes by resetting the WHOLE unprocessed tail in a
+    single batch UPDATE before re-raising. Pin: when row 1 raises
+    infra, the reset SQL targets all 3 rows.
+    """
+    from mnemos.domain.compression import worker_contest
+
+    async def _fake_process_one(*args, **kwargs):
+        # Always raise infra so the FIRST row is the failing one.
+        raise asyncio.TimeoutError("simulated acquire timeout")
+
+    monkeypatch.setattr(
+        worker_contest, "_process_one", _fake_process_one,
+    )
+
+    fake_rows = [
+        {
+            "id": f"queue-{i}",
+            "memory_id": f"mem_{i}",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        }
+        for i in range(3)
+    ]
+
+    executes: list[tuple] = []
+
+    async def _record_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    pool = _build_fake_pool_for_contest(
+        dequeue_rows=fake_rows, on_execute=_record_execute,
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest.process_contest_queue(
+            pool,
+            engines=[],
+            batch_size=3,
+            max_attempts=3,
+            stale_threshold_secs=0,
+        )
+
+    # Find the batch-reset SQL execute. It uses ANY($1::uuid[]) and
+    # the args' first element should be a list of all 3 queue IDs.
+    batch_resets = [
+        (sql, args) for sql, args in executes
+        if "ANY(" in sql and "memory_compression_queue" in sql
+        and "pending" in sql.lower()
+    ]
+    assert len(batch_resets) == 1, (
+        f"expected exactly one batch-reset SQL execute; got {batch_resets!r}"
+    )
+    _, args = batch_resets[0]
+    queue_ids_arg = args[0]
+    assert isinstance(queue_ids_arg, list)
+    assert set(queue_ids_arg) == {"queue-0", "queue-1", "queue-2"}, (
+        f"batch-reset must target ALL un-processed rows; got {queue_ids_arg!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_infra_error_resets_only_tail_not_already_processed_rows(
+    monkeypatch,
+):
+    """When row 0 succeeds (no exception) and row 1 raises infra,
+    only rows 1 + 2 should be reset — row 0 has reached a terminal
+    'done' state and must NOT be touched (the WHERE status='running'
+    clause guards against accidental rewrite anyway, but the queue_ids
+    list should still be precise)."""
+    from mnemos.domain.compression import worker_contest
+
+    call_count = {"n": 0}
+
+    async def _fake_process_one(*args, **kwargs):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return  # row 0 succeeds
+        raise asyncio.TimeoutError("simulated acquire timeout on row 1")
+
+    monkeypatch.setattr(
+        worker_contest, "_process_one", _fake_process_one,
+    )
+
+    fake_rows = [
+        {
+            "id": f"queue-{i}",
+            "memory_id": f"mem_{i}",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        }
+        for i in range(3)
+    ]
+
+    executes: list[tuple] = []
+
+    async def _record_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    pool = _build_fake_pool_for_contest(
+        dequeue_rows=fake_rows, on_execute=_record_execute,
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest.process_contest_queue(
+            pool,
+            engines=[],
+            batch_size=3,
+            max_attempts=3,
+            stale_threshold_secs=0,
+        )
+
+    batch_resets = [
+        (sql, args) for sql, args in executes
+        if "ANY(" in sql and "memory_compression_queue" in sql
+        and "pending" in sql.lower()
+    ]
+    assert len(batch_resets) == 1
+    queue_ids_arg = batch_resets[0][1][0]
+    # Tail = rows 1 + 2. Row 0 is NOT in the reset.
+    assert set(queue_ids_arg) == {"queue-1", "queue-2"}, (
+        f"reset must skip row 0 (already terminal); got {queue_ids_arg!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_repeated_infra_errors_do_not_consume_attempts_budget(monkeypatch):
     """Codex round-4 of round-30 caught: even with the round-30
     fix, repeated infra errors would let attempts climb on each
