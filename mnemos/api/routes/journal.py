@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import scope_namespace, scope_owner
 
 logger = logging.getLogger(__name__)
@@ -43,8 +44,7 @@ async def create_journal_entry(
     owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/journal")
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
@@ -88,8 +88,7 @@ async def list_journal_entries(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/journal")
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
@@ -141,8 +140,7 @@ async def delete_journal_entry(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="DELETE /v1/journal/{entry_id}")
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     async with _lc.get_pool_manager().transactional() as conn:
