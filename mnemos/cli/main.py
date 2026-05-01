@@ -639,6 +639,21 @@ def dump_openapi(
             "bridge that rejects over-long fields."
         ),
     ),
+    server_url: Optional[str] = typer.Option(
+        None,
+        "--server-url",
+        help=(
+            "Inject this URL as the spec's ``servers[0].url``. "
+            "FastAPI does NOT auto-populate the servers field, so "
+            "downstream consumers (notably OpenAI Custom GPT "
+            "Actions) get a spec whose default server is ``/`` — "
+            "useless when the artifact is uploaded into a Builder "
+            "running outside your network. Pass the public HTTPS "
+            "URL of your MNEMOS deployment "
+            "(e.g., ``--server-url https://mnemos.example.com``) "
+            "so the consumer's REST calls land at the right host."
+        ),
+    ),
 ) -> None:
     """Dump the FastAPI OpenAPI spec to JSON.
 
@@ -676,11 +691,26 @@ def dump_openapi(
 
     # Lazy import — building the FastAPI app pulls in lifecycle
     # plumbing we don't want at module-load time.
+    import copy as _copy
+
     from mnemos.api.main import app as fastapi_app
 
-    spec = fastapi_app.openapi()
+    # FastAPI caches ``app.openapi()``'s return value and reuses
+    # the same dict reference across calls. Mutating it (e.g.
+    # ``spec["servers"] = [...]``) bleeds state across CLI
+    # invocations — and across tests. Deep-copy first.
+    spec = _copy.deepcopy(fastapi_app.openapi())
     if title:
         spec.setdefault("info", {})["title"] = title
+
+    if server_url:
+        normalized = server_url.strip()
+        if not normalized:
+            raise typer.BadParameter(
+                "--server-url must not be empty",
+                param_hint="--server-url",
+            )
+        spec["servers"] = [{"url": normalized}]
 
     if target_norm == "gpt-actions":
         from mnemos.api.openapi_compat import truncate_for_gpt_actions

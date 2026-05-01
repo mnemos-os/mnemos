@@ -310,3 +310,64 @@ def test_truncate_helper_non_string_passthrough():
 
     assert _truncate(None, 100) is None
     assert _truncate(42, 100) == 42
+
+
+# ── --server-url: inject servers[0].url for downstream consumers ──────────
+#
+# FastAPI doesn't auto-populate the OpenAPI ``servers`` field;
+# ``--server-url`` injects it so OpenAI Custom GPT Actions and
+# similar consumers get a working artifact in one command.
+
+
+def test_server_url_injected_when_flag_set(tmp_path: Path):
+    out = tmp_path / "spec.json"
+    result = runner.invoke(
+        app,
+        [
+            "dump-openapi",
+            "--server-url", "https://mnemos.example.com",
+            "-o", str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    spec = json.loads(out.read_text())
+    assert spec.get("servers") == [{"url": "https://mnemos.example.com"}]
+
+
+def test_no_server_url_means_field_unset(tmp_path: Path):
+    """Default behaviour: no --server-url, no servers field
+    (or whatever FastAPI produced). Pin so the flag stays
+    opt-in."""
+    out = tmp_path / "spec.json"
+    result = runner.invoke(app, ["dump-openapi", "-o", str(out)])
+    assert result.exit_code == 0
+    spec = json.loads(out.read_text())
+    # FastAPI omits servers when none configured. If it ever
+    # changes default behaviour, this test catches the drift.
+    assert "servers" not in spec or spec["servers"] == [{"url": "/"}]
+
+
+def test_server_url_works_with_gpt_actions_target(tmp_path: Path):
+    """Combining --target gpt-actions + --server-url is the
+    primary use case (Custom GPT Action upload)."""
+    out = tmp_path / "spec.json"
+    result = runner.invoke(
+        app,
+        [
+            "dump-openapi",
+            "--target", "gpt-actions",
+            "--server-url", "https://mnemos.prod.example.com",
+            "-o", str(out),
+        ],
+    )
+    assert result.exit_code == 0
+    spec = json.loads(out.read_text())
+    assert spec["servers"] == [{"url": "https://mnemos.prod.example.com"}]
+
+
+def test_empty_server_url_rejected():
+    """Passing --server-url '' fails fast rather than producing
+    a spec with an empty server URL."""
+    result = runner.invoke(app, ["dump-openapi", "--server-url", " "])
+    assert result.exit_code != 0
+    assert "server-url" in result.output.lower()

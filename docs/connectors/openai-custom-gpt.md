@@ -59,35 +59,26 @@ truncate, neither of which is a great experience.
 
 ## Step 2: Set the public base URL
 
-The OpenAPI spec's `servers[0].url` is what ChatGPT calls. By
-default `mnemos dump-openapi` emits whatever the running
-`MNEMOS_BASE` resolves to (typically `http://localhost:5002`),
-which won't work from ChatGPT's network.
-
-Two ways to fix:
-
-**Option A — set `MNEMOS_BASE` before generating the artifact:**
+The OpenAPI spec's `servers[0].url` is what ChatGPT calls. FastAPI
+does NOT auto-populate `servers[]` from any env var, so the
+default-rendered spec has no `servers[0].url` at all (consumers
+fall back to `/` which is useless from ChatGPT's network).
+Inject it explicitly:
 
 ```bash
-MNEMOS_BASE=https://mnemos.example.com mnemos dump-openapi \
-  --target gpt-actions --output mnemos-openapi.json
-```
-
-**Option B — edit the JSON post-export:**
-
-```json
-{
-  "openapi": "3.1.0",
-  "info": { ... },
-  "servers": [
-    { "url": "https://mnemos.example.com" }
-  ],
-  "paths": { ... }
-}
+mnemos dump-openapi --target gpt-actions \
+  --server-url https://mnemos.example.com \
+  --output mnemos-openapi.json
 ```
 
 The Custom GPT Actions importer is strict about `servers[0].url`
-matching the actual host that responds to the requests.
+matching the actual host that responds to the requests, so set
+it to the FQDN your tunnel/proxy/cert resolves at.
+
+If you forget the flag, the artifact will still parse — but
+ChatGPT will reject it at import time with a "missing server URL"
+error or attempt to call against the relative path `/`. Adding
+`--server-url` is mandatory for OpenAI Actions consumption.
 
 ## Step 3: Upload to the GPT Builder
 
