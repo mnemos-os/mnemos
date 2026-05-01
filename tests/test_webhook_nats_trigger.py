@@ -159,22 +159,31 @@ async def test_stream_subscription_declared_with_right_subject():
 
 async def test_subscribe_with_queue_group_uses_shared_durable():
     """v4.2.0a8: Audit Finding 5 — multi-replica webhook trigger via
-    queue-group sharding. The durable must be the SHARED bare name
-    (no per-node suffix) so all replicas bind to the same JetStream
-    consumer, with JetStream load-balancing via the deliver_group."""
+    queue-group sharding.
+
+    Per nats-py 2.14: ``js.subscribe(queue=Q, durable=D)`` requires
+    ``D == Q``. And the consumer ``deliver_group`` must match the
+    subscriber's queue. So all three end up the same string.
+
+    Distinct ``_q_<group>`` namespace from the legacy per-node
+    durable shape so legacy and queue-mode replicas can coexist on
+    the same broker without consumer-config collision."""
     js = _FakeJetStream()
 
     await trigger._subscribe(js, queue_group="webhook_pool")
 
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.webhook.delivery.queued.>"
-    assert kwargs["queue"] == "webhook_pool"
-    # SHARED durable (no per-node suffix) — every replica binds to
-    # the same JetStream consumer.
-    assert kwargs["durable"] == "mnemos_webhook_delivery_trigger"
+    expected_durable = "mnemos_webhook_delivery_trigger_q_webhook_pool"
+    assert kwargs["durable"] == expected_durable
+    assert kwargs["queue"] == expected_durable, (
+        "nats-py requires queue == durable for queue-mode subscribe"
+    )
+    # Distinct namespace from per-node legacy.
+    assert "_q_" in expected_durable
     config_obj = kwargs["config"]
     assert config_obj is not None
-    assert getattr(config_obj, "deliver_group", None) == "webhook_pool"
+    assert getattr(config_obj, "deliver_group", None) == expected_durable
 
 
 async def test_transient_handle_error_is_not_acked(monkeypatch):

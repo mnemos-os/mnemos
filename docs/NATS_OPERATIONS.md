@@ -249,41 +249,71 @@ or delete + recreate the stream (latter loses retained messages).
 `v4.2.0a8` added JetStream queue-group support to both consumer
 loops. By default the substrate is single-replica safe:
 
-| Env var                                  | Effect when empty (default)                                                  | Effect when set                                                                                              |
-|------------------------------------------|------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
-| `MNEMOS_FEDERATION_NATS_QUEUE_GROUP`     | Per-(peer, subject) durable. Single-replica only.                            | Replicas joining this group share one durable per (peer, subject); JetStream load-balances messages.         |
-| `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP`        | Per-node durable (every replica receives every nudge; SKIP LOCKED race).     | Shared durable named `mnemos_webhook_delivery_trigger`; JetStream delivers each nudge to ONE replica.        |
+| Env var                              | Empty (default)                                                          | Non-empty                                                                                                                                                              |
+|--------------------------------------|--------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` | Durable: `mnemos_federation_<peer>_<subject>`. Single subscriber.        | Durable: `mnemos_federation_q_<group>_<peer>_<subject>` (queue == durable per nats-py). JetStream load-balances within the group.                                        |
+| `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP`    | Durable: `mnemos_webhook_delivery_trigger_<node>`. Per-replica fan-out.  | Durable: `mnemos_webhook_delivery_trigger_q_<group>` (queue == durable per nats-py). JetStream delivers each nudge to exactly ONE replica.                               |
 
-To roll out multi-replica:
+### Why durable == queue
 
-1. Pick a stable group name (anything; `fed_pool` or `webhook_pool`
-   are fine — it is just the JetStream `deliver_group` label).
-2. Make sure EVERY replica that will join the group is on a build
-   that understands the env var (v4.2.0a8 or later). A pre-a8
-   replica on the same broker would collide on the durable name
-   without the deliver_group set.
+`nats-py 2.14`'s `js.subscribe(subject, queue=Q, durable=D)` raises
+``cannot create queue subscription 'Q' to consumer 'D'`` whenever
+`D != Q` — internally the queue name *is* the durable name. mnemos
+forces both to the same value (the full namespaced durable above)
+and stamps the consumer's `deliver_group` to match. There is no
+operator-visible knob to pull these apart.
+
+### Rollout: separate-namespace coexistence (NOT a queue subscriber on a legacy durable)
+
+Queue-mode durables intentionally live in a DIFFERENT namespace
+(`_q_<group>_…`) from the legacy single-replica durables. This is
+not cosmetic — it is the only way nats-py allows the two modes to
+coexist on the same broker, because:
+
+* nats-py rejects a queue subscription against a consumer whose
+  `deliver_group` is unset (`cannot create a queue subscription
+  for a consumer without a deliver group`).
+* Switching an existing consumer's `deliver_group` requires
+  delete-and-recreate; mnemos does not do this on your behalf.
+
+So an a8 replica with queue-group set and an a7 replica running
+default behavior land on **two separate JetStream consumers** for
+the same stream. Both consumers receive every event published to
+the stream. Both replica groups process those events. **Expect
+the federation receive path to do duplicate work during a partial
+upgrade window.** The persistence layer's
+`ON CONFLICT (id) DO NOTHING` makes this idempotent at rest, but
+the work itself is not free — get the partial-upgrade window
+short, and prefer flipping the entire fleet at once when feasible.
+
+The webhook side has the same shape, but the outbox `delivery_id`
+UUID + Postgres `SKIP LOCKED` claim already serializes the actual
+delivery work, so duplicate nudges land on the same outbox row and
+only one wins. Less to worry about there.
+
+### Steps
+
+1. Pick a stable group name (e.g. `fed_pool`, `webhook_pool`).
+2. Ensure every replica scheduled to join the group is on
+   `v4.2.0a8` or later.
 3. Set `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` and/or
-   `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP` on every replica and roll the
-   fleet.
-4. Operators MUST also set `MNEMOS_NODE_NAME` to a stable,
-   per-replica unique value so `source_node` filtering still works
-   for federation echo suppression.
+   `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP` on those replicas.
+4. Set `MNEMOS_NODE_NAME` per replica to a stable, unique value so
+   `source_node` filtering still works (federation echo suppression
+   does not depend on the queue group).
+5. Roll the fleet. The queue-mode durable will be auto-created the
+   first time a replica subscribes; subsequent replicas bind to it.
+6. Once the fleet is fully on a8 + queue-group, you can delete the
+   stale legacy durables to stop their event flow (and the
+   duplicate work):
 
-If a partial fleet is on a8 and the rest on a7, run the older
-replicas with the env vars unset; they will keep their
-per-(peer,subject) or per-node durables and behave as before. The
-queue-group durable on a8 replicas is independent.
+   ```
+   nats consumer rm MNEMOS_MEMORY mnemos_federation_<peer>_<subject>
+   nats consumer rm MNEMOS_WEBHOOK mnemos_webhook_delivery_trigger_<old_node_name>
+   ```
 
-When switching from per-node webhook durables to shared, the old
-per-node durables remain on the broker until you delete them. They
-will sit idle (no subscribers) until the 30-day age limit prunes
-their inactive consumer state. To clean up immediately:
-
-```
-nats consumer rm MNEMOS_WEBHOOK mnemos_webhook_delivery_trigger_<old_node_name>
-```
-
-per old replica.
+   per legacy durable. JetStream auto-prunes inactive consumers
+   after the 30-day age limit if you forget.
 
 ## Known limitations
 

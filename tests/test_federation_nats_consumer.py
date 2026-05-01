@@ -259,9 +259,18 @@ async def test_fake_jetstream_subscription_uses_deliver_policy_new_shape():
 
 async def test_subscribe_with_queue_group_sets_queue_and_deliver_group():
     """v4.2.0a8: Audit Finding 5 — multi-replica federation receiver
-    via JetStream queue-group sharding. Subscribe must pass queue=...
-    AND ConsumerConfig.deliver_group=... so JetStream load-balances
-    across replicas instead of one taking the durable exclusively."""
+    via JetStream queue-group sharding.
+
+    Per nats-py 2.14: ``js.subscribe(queue=Q, durable=D)`` requires
+    ``D == Q`` (it treats the queue name as the durable). And the
+    consumer's ``deliver_group`` must match the subscriber's queue.
+    So all three end up the same string.
+
+    Distinct ``_q_<group>_`` namespace from the legacy
+    ``mnemos_federation_<peer>_<subject>`` durable so legacy a7-shape
+    replicas and a8-queue-mode replicas can coexist on the same
+    broker without colliding on the consumer object.
+    """
     js = _FakeJetStream([])
 
     await consumer._subscribe(
@@ -273,12 +282,21 @@ async def test_subscribe_with_queue_group_sets_queue_and_deliver_group():
 
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.memory.created.>"
-    assert kwargs["queue"] == "fed_pool"
-    # Durable is unchanged — queue group is the sharing mechanism.
-    assert kwargs["durable"].startswith("mnemos_federation_pythia_")
+    expected_durable = consumer._queue_durable_name(
+        "fed_pool", "pythia", "mnemos.memory.created.>"
+    )
+    assert kwargs["durable"] == expected_durable
+    assert kwargs["queue"] == expected_durable, (
+        "nats-py requires queue == durable for queue-mode subscribe"
+    )
+    # Distinct namespace from legacy durable.
+    assert expected_durable.startswith("mnemos_federation_q_fed_pool_")
+    legacy_durable = consumer._durable_name("pythia", "mnemos.memory.created.>")
+    assert expected_durable != legacy_durable
+
     config_obj = kwargs["config"]
     assert config_obj is not None
-    assert getattr(config_obj, "deliver_group", None) == "fed_pool"
+    assert getattr(config_obj, "deliver_group", None) == expected_durable
 
 
 async def _async_list(value):

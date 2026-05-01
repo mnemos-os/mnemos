@@ -253,20 +253,37 @@ def _node_durable() -> str:
     return f"{DURABLE}_{safe}"
 
 
+def _queue_durable_name(queue_group: str) -> str:
+    """Durable name for queue-group mode.
+
+    Distinct namespace from :func:`_node_durable` so legacy per-node
+    durables and queue-mode shared durables can coexist on the same
+    broker during a partial-fleet rollout.
+    """
+    import re
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")
+    return f"{DURABLE}_q_{safe}"
+
+
 async def _subscribe(js: Any, *, queue_group: str = ""):
     """Subscribe to webhook nudges.
 
-    When ``queue_group`` is empty (default), each node uses a unique
-    per-node durable — the historical single-replica-safe shape.
+    Single-replica (default, ``queue_group`` empty)
+        Durable: ``mnemos_webhook_delivery_trigger_<node>``. Each node
+        has its own consumer; every replica receives every nudge and
+        races for the Postgres SKIP LOCKED claim.
 
-    When ``queue_group`` is non-empty, all replicas use a SHARED
-    durable named exactly :data:`DURABLE` and join the queue group;
-    JetStream load-balances delivery across them. This avoids the
-    Postgres SKIP LOCKED race in multi-replica deployments.
-    (Audit Finding 5.)
+    Multi-replica (``queue_group`` non-empty)
+        Durable: ``mnemos_webhook_delivery_trigger_q_<group>``.
+        ``durable``/``queue``/``deliver_group`` all the same string,
+        which is what nats-py's ``js.subscribe`` requires. The
+        ``_q_<group>`` namespace separation prevents collision with
+        legacy per-node durables on the same broker.
+
+    See Audit Finding 5.
     """
     if queue_group:
-        durable = DURABLE
+        durable = _queue_durable_name(queue_group)
     else:
         durable = _node_durable()
     try:
@@ -276,7 +293,7 @@ async def _subscribe(js: Any, *, queue_group: str = ""):
             durable_name=durable,
             deliver_policy=DeliverPolicy.NEW,
             ack_policy=AckPolicy.EXPLICIT,
-            deliver_group=queue_group or None,
+            deliver_group=durable if queue_group else None,
         )
     except ImportError:
         config = None
@@ -287,7 +304,10 @@ async def _subscribe(js: Any, *, queue_group: str = ""):
         config=config,
     )
     if queue_group:
-        subscribe_kwargs["queue"] = queue_group
+        # nats-py: queue MUST equal durable. Forcing equality here
+        # also ensures the deliver_group on the consumer matches the
+        # subscriber's queue, so binds across replicas line up.
+        subscribe_kwargs["queue"] = durable
 
     return await js.subscribe(SUBJECT, **subscribe_kwargs)
 

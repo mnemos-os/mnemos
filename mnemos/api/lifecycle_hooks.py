@@ -103,9 +103,17 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
             len(peers),
         )
 
+    queue_group = (settings.federation.nats_queue_group or "").strip()
+    if queue_group:
+        logger.info(
+            "[NATS] federation queue group enabled: queue_group=%s "
+            "(JetStream load-balances messages across replicas in this group)",
+            queue_group,
+        )
+
     for peer in peers:
         logger.info("Launching federation nats consumer for peer %s", peer.name)
-        lifecycle.schedule_worker(consumer_loop(pool, peer))
+        lifecycle.schedule_worker(consumer_loop(pool, peer, queue_group=queue_group))
 
 
 async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:

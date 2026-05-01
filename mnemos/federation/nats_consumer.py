@@ -319,16 +319,28 @@ async def _subscribe(
 ):
     """Subscribe to one (peer, subject) push stream.
 
-    When ``queue_group`` is empty (default), the consumer is a standard
-    single-subscriber durable — the historical single-replica shape.
+    Single-replica (default, ``queue_group`` empty)
+        Durable: ``mnemos_federation_<peer>_<subject>``. One subscriber.
 
-    When ``queue_group`` is non-empty, the durable's ``deliver_group``
-    is set and the subscription joins as a queue worker. JetStream
-    load-balances messages across replicas in the same group, so two
-    mnemos replicas configured against the same peer can run side by
-    side without colliding on the durable. (Audit Finding 5.)
+    Multi-replica (``queue_group`` non-empty)
+        Durable: ``mnemos_federation_q_<group>_<peer>_<subject>``.
+        ``durable``/``queue``/``deliver_group`` all the same string,
+        which is what nats-py's ``js.subscribe`` requires (it treats
+        the queue name AS the durable name and rejects mismatched
+        values). The ``_q_<group>_`` prefix gives a distinct namespace
+        from the legacy durable so legacy a7-shape replicas and
+        a8-queue-mode replicas can coexist on the same broker
+        without colliding on the same consumer object.
+
+    See Audit Finding 5; the rollout caveat (legacy + queue-mode
+    durables receive duplicate copies of every event during the
+    transition window — federation persistence handles this via
+    ON CONFLICT idempotency) is documented in NATS_OPERATIONS.md.
     """
-    durable = _durable_name(peer.name, subject)
+    if queue_group:
+        durable = _queue_durable_name(queue_group, peer.name, subject)
+    else:
+        durable = _durable_name(peer.name, subject)
     try:
         from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
 
@@ -336,7 +348,7 @@ async def _subscribe(
             durable_name=durable,
             deliver_policy=DeliverPolicy.NEW,
             ack_policy=AckPolicy.EXPLICIT,
-            deliver_group=queue_group or None,
+            deliver_group=durable if queue_group else None,
         )
     except ImportError:
         config = None
@@ -347,7 +359,10 @@ async def _subscribe(
         config=config,
     )
     if queue_group:
-        subscribe_kwargs["queue"] = queue_group
+        # nats-py: queue MUST equal durable. Forcing equality here
+        # also ensures the deliver_group on the consumer matches the
+        # subscriber's queue, so binds across replicas line up.
+        subscribe_kwargs["queue"] = durable
 
     return await js.subscribe(subject, **subscribe_kwargs)
 
@@ -540,6 +555,18 @@ def _memory_from_event(payload: Mapping[str, Any], peer_name: str, memory_id: st
 def _durable_name(peer_name: str, subject: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{peer_name}_{subject}").strip("_")
     return f"mnemos_federation_{safe}"[:128]
+
+
+def _queue_durable_name(queue_group: str, peer_name: str, subject: str) -> str:
+    """Durable name for queue-group mode.
+
+    Distinct namespace from :func:`_durable_name` so legacy single-
+    replica durables and queue-mode durables can coexist on the same
+    broker during a partial-fleet rollout.
+    """
+    group_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")
+    rest = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{peer_name}_{subject}").strip("_")
+    return f"mnemos_federation_q_{group_safe}_{rest}"[:128]
 
 
 def _expand_subject(subject: str) -> tuple[str, ...]:
