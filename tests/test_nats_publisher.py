@@ -138,21 +138,22 @@ _CANONICAL_SUBJECTS = {
 
 def test_ensure_streams_returns_true_when_existing_matches(monkeypatch):
     """The classic idempotent case — operator's redeploy ships the
-    SAME config that's already declared. ensure_streams must report
-    success and let publishing proceed."""
+    SAME config that's already declared.
+
+    In real nats-py 2.14, ``js.add_stream`` on an existing stream
+    with MATCHING config returns the existing StreamInfo silently
+    (no raise); only DRIFT raises BadRequestError. So the matching
+    case never even hits the drift-readback branch — add_stream
+    just returns the info. ensure_streams logs INFO and continues.
+    """
 
     class _Js:
         async def add_stream(self, config=None, **_):
-            # Simulate broker rejection because stream exists.
-            raise RuntimeError("nats: API error: code=400 description=stream name already in use with a different configuration")
-
-        async def stream_info(self, name):
-            # Existing config matches what ensure_streams was about
-            # to declare for this specific stream.
+            # Matching redeclare: nats-py just returns existing info.
             return SimpleNamespace(
                 config=_stream_config_obj(
-                    name=name,
-                    subjects=_CANONICAL_SUBJECTS[name],
+                    name=config.name,
+                    subjects=list(config.subjects),
                 )
             )
 
@@ -292,6 +293,88 @@ def test_ensure_streams_storage_or_retention_drift_disables_publishing(monkeypat
     assert result is False, "storage-policy drift must disable publishing"
     assert any("storage" in rec.message for rec in caplog.records), (
         f"drift log must name 'storage'. caplog: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_ensure_streams_fail_closed_on_unexplained_rejection(monkeypatch, caplog):
+    """Codex round-7: if add_stream raises duplicate-config rejection
+    but our drift detector returns {} because the diff is in a field
+    we DON'T compare (e.g. max_msg_size, no_ack, discard, replicas),
+    we must fail closed — not silently green-light publishing.
+
+    The reasoning: the broker has already signalled the configs
+    diverge. An empty partial-comparison result from us is not
+    proof of safety, only proof that we didn't look at the right
+    field.
+    """
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="mnemos.nats.client")
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            raise RuntimeError("nats: stream name already in use")
+
+        async def stream_info(self, name):
+            # Every field we KNOW to compare matches. Diff is in a
+            # field we don't compare — drift detector returns {}.
+            return SimpleNamespace(
+                config=_stream_config_obj(
+                    name=name,
+                    subjects=_CANONICAL_SUBJECTS[name],
+                )
+            )
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is False, (
+        "broker-signalled duplicate + empty partial drift must fail "
+        "closed (not silently enable publishing on stale config)"
+    )
+    assert any(
+        "fail closed" in rec.message.lower() or "does not compare" in rec.message.lower()
+        for rec in caplog.records
+    ), (
+        "fail-closed log should mention 'fail closed' or 'does not "
+        f"compare'. caplog: {[r.message for r in caplog.records]}"
+    )
+
+
+def test_ensure_streams_smaller_non_fallback_max_bytes_disables_publishing(monkeypatch, caplog):
+    """Codex round-7: only the EXACT 1 GiB fallback this code creates
+    is allowed to coexist with a 10 GiB desired stream. An operator
+    who manually shrunk to 5 GiB, or a legacy 256 MiB stream, should
+    look like real drift (publishing disabled) — not be silently
+    green-lit because running < desired.
+    """
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="mnemos.nats.client")
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            raise RuntimeError("nats: stream name already in use")
+
+        async def stream_info(self, name):
+            # Operator manually shrunk to 5 GiB — not the documented
+            # fallback. Real drift.
+            return SimpleNamespace(
+                config=_stream_config_obj(
+                    name=name,
+                    subjects=_CANONICAL_SUBJECTS[name],
+                    max_bytes=5 * 1024**3,
+                )
+            )
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is False, (
+        "smaller-than-desired max_bytes that is NOT the exact 1 GiB "
+        "fallback must trip drift-disables-publishing"
     )
 
 

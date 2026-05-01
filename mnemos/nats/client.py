@@ -164,26 +164,44 @@ async def ensure_streams(js) -> bool:
         if looks_like_existing:
             drift = await _stream_config_drift(js, cfg)
             if not drift:
-                logger.debug("NATS stream %s already exists (config matches)", cfg.name)
-                continue
+                # The broker rejected add_stream as a duplicate but
+                # OUR partial drift comparison sees no mismatch. That
+                # means the rejection is over a field we don't check
+                # (max_msg_size, no_ack, discard, replicas, ...). Fail
+                # closed: the broker has already signalled the configs
+                # diverge, so an empty partial-comparison result is
+                # not proof of safety. Codex round-7 finding.
+                logger.error(
+                    "NATS stream %s rejected as duplicate but no drift "
+                    "detected in compared dimensions (max_age, max_bytes, "
+                    "duplicate_window, subjects, retention, storage). The "
+                    "broker is signalling a config mismatch in a field "
+                    "this code does not compare — fail closed. Operator "
+                    "must inspect via `nats stream info %s` and reconcile "
+                    "(nats stream update or delete+recreate).",
+                    cfg.name,
+                    cfg.name,
+                )
+                return False
             # Special-case: if the ONLY drift is max_bytes AND the
-            # running stream is smaller than what we asked for, the
-            # broker took the documented insufficient-storage
-            # fallback on a previous boot. Don't disable publishing
-            # — operator can grow the stream out-of-band when they
-            # have the space. Log info so it's visible.
+            # running stream is EXACTLY the 1 GiB this code creates
+            # under insufficient-storage, the broker took the documented
+            # fallback on a previous boot. Don't disable publishing —
+            # operator can grow the stream out-of-band when they have
+            # the space. Anything else (operator manually shrunk to 5GB,
+            # legacy 256MB stream, etc.) IS drift.
+            # Codex round-7 finding: pre-fix accepted any smaller value.
+            FALLBACK_MAX_BYTES = 1024**3
             if (
                 set(drift.keys()) == {"max_bytes"}
-                and isinstance(drift["max_bytes"][0], (int, float))
-                and isinstance(drift["max_bytes"][1], (int, float))
-                and drift["max_bytes"][0] < drift["max_bytes"][1]
+                and drift["max_bytes"][0] == FALLBACK_MAX_BYTES
             ):
                 logger.info(
-                    "NATS stream %s running on smaller max_bytes than requested "
-                    "(running=%s, requested=%s) — likely the documented "
-                    "insufficient-storage fallback path. Publishing stays enabled.",
+                    "NATS stream %s running on 1 GiB max_bytes (the documented "
+                    "insufficient-storage fallback path) — requested %s. "
+                    "Publishing stays enabled. Operator can grow the stream "
+                    "out-of-band when storage is available.",
                     cfg.name,
-                    drift["max_bytes"][0],
                     drift["max_bytes"][1],
                 )
                 continue
