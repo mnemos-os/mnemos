@@ -508,3 +508,72 @@ class TestStoreMemoriesConcurrency:
         assert executes[0][0].strip().startswith("INSERT")
         assert executes[1][0].strip().startswith("UPDATE")
         assert len(fetchrows) == 2  # initial check + post-conflict refetch
+
+    @pytest.mark.asyncio
+    async def test_stale_update_loses_race_via_where_clause(self):
+        """v4.2.0a8 round-4: codex Finding 4 — the UPDATE itself must
+        be atomic against concurrent delivery.
+
+        Scenario: two consumers see baseline T0 in their initial
+        SELECT. Consumer A has remote_updated=T2 (newer), Consumer B
+        has remote_updated=T1 (newer than T0 but older than T2).
+        Both pass the Python-side freshness check on the snapshot
+        they read. A commits first (row → T2). B commits second.
+        Without a WHERE-clause guard B's UPDATE rolls the row back
+        to T1.
+
+        Post-fix the UPDATE includes
+        ``AND (federation_remote_updated IS NULL OR
+                federation_remote_updated < $9::timestamptz)``
+        which means B's UPDATE matches 0 rows once A has committed.
+        upd_n is NOT incremented.
+        """
+        from mnemos.domain.federation import _store_memories
+
+        execute_calls: list[tuple] = []
+
+        class _FakeConn:
+            async def fetchrow(self, sql, *args):
+                # Existing row: T0 baseline (older than both A and B).
+                return {
+                    "federation_remote_updated": datetime(
+                        2026, 5, 1, 0, 0, 0, tzinfo=timezone.utc
+                    )
+                }
+
+            async def execute(self, sql, *args):
+                execute_calls.append((sql, args))
+                # Simulate that consumer A committed first: B's UPDATE
+                # WHERE clause matches 0 rows now.
+                return "UPDATE 0"
+
+        # Consumer B with the OLDER remote_updated (T1).
+        feed = [{
+            "id": "mem_race",
+            "content": "stale content",
+            "category": "facts",
+            "verbatim_content": "stale content",
+            "namespace": "default",
+            "metadata": {"source": "B"},
+            "quality_rating": 75,
+            "updated": "2026-05-01T01:00:00Z",  # T1
+            "created": "2026-05-01T01:00:00Z",
+        }]
+
+        new_n, upd_n = await _store_memories(_FakeConn(), "pythia", feed)
+
+        assert new_n == 0
+        assert upd_n == 0, (
+            "stale UPDATE must NOT be counted: WHERE-clause filter "
+            "fired (UPDATE 0) because the concurrent newer event "
+            "already committed; counting upd_n=1 would falsely claim "
+            "we applied a delta we did not"
+        )
+        # Verify the WHERE clause is in the SQL — defense against
+        # someone refactoring the guard out without realizing this
+        # invariant.
+        assert len(execute_calls) == 1
+        update_sql = execute_calls[0][0]
+        assert "federation_remote_updated < $9::timestamptz" in update_sql, (
+            "the UPDATE must carry a freshness WHERE-clause guard"
+        )

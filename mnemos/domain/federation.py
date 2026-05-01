@@ -746,12 +746,20 @@ async def _store_memories(
                 )
 
         if existing is not None:
-            # Only update if the remote is newer.
+            # Update only if the inbound remote_updated beats the
+            # CURRENT row state — not the snapshot we read at the top
+            # of this iteration. Without the WHERE-clause freshness
+            # guard, two concurrent consumers handling events at
+            # different remote_updated timestamps can both pass the
+            # Python-side check on the same baseline and the older
+            # one's UPDATE can commit second, rolling local state
+            # backward to the older remote_updated. Codex round-3
+            # audit (2026-05-01).
             if (
                 existing["federation_remote_updated"] is None
                 or (remote_updated and remote_updated > existing["federation_remote_updated"])
             ):
-                await conn.execute(
+                result = await conn.execute(
                     """
                     UPDATE memories SET
                       content = $2, category = $3, subcategory = $4,
@@ -760,6 +768,10 @@ async def _store_memories(
                       federation_remote_updated = $9::timestamptz,
                       updated = ($9::timestamptz AT TIME ZONE 'UTC')
                     WHERE id = $1
+                      AND (
+                          federation_remote_updated IS NULL
+                          OR federation_remote_updated < $9::timestamptz
+                      )
                     """,
                     local_id,
                     content,
@@ -771,7 +783,14 @@ async def _store_memories(
                     namespace,
                     remote_updated,
                 )
-                upd_n += 1
+                # asyncpg execute returns "UPDATE <n>" — count only
+                # rows actually affected. A concurrent newer event
+                # commits first → our WHERE filter fails → 0 rows
+                # → don't increment upd_n. The state in the row is
+                # already as fresh as we have, and ON CONFLICT
+                # idempotency means this is a successful no-op.
+                if result and result.split()[-1] != "0":
+                    upd_n += 1
 
     return new_n, upd_n
 
