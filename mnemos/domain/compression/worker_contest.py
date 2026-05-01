@@ -404,6 +404,8 @@ async def process_contest_queue(
 
     counts["dequeued"] = len(rows)
 
+    from mnemos.core.pool import is_infrastructure_error
+
     for row_idx, row in enumerate(rows):
         queue_id = row["id"]
         memory_id = row["memory_id"]
@@ -411,99 +413,102 @@ async def process_contest_queue(
         attempts = row["attempts"]
         scoring_profile = row["scoring_profile"]
 
-        if attempts > max_attempts:
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    _MARK_FAILED_SQL,
-                    queue_id,
-                    f"max_attempts exceeded ({attempts} > {max_attempts})",
-                )
-            counts["skipped_max_attempts"] += 1
-            counts["failed"] += 1
-            logger.warning(
-                "contest_queue[%s]: skipped, attempts=%d > max=%d",
-                memory_id, attempts, max_attempts,
-            )
-            continue
-
+        # All post-dequeue per-row work runs inside this single
+        # try/except so EVERY infrastructure error — whether it
+        # fires in the max-attempts fast-fail acquire, in
+        # _process_one's many internal acquires, or in the
+        # content-error fallback MARK_FAILED acquire — converges on
+        # one tail-reset path. Codex round-6 caught that the
+        # round-33 fix only handled the _process_one infra branch;
+        # the other two acquire sites would still leave
+        # rows[row_idx:] at 'running' with attempts already
+        # bumped, exactly the regression class the round-32 reset
+        # exists to prevent.
         try:
-            await _process_one(
-                pool,
-                queue_id=queue_id,
-                memory_id=memory_id,
-                owner_id=owner_id,
-                scoring_profile=scoring_profile,
-                engines=engines,
-                counts=counts,
-                judge_model=judge_model,
-                judge=judge,
-                min_content_length=min_content_length,
-                expected_attempts=attempts,
-            )
-        except Exception as exc:
-            # Distinguish infrastructure errors (pool exhaustion,
-            # asyncpg disconnect, asyncio.TimeoutError from the
-            # round-28 TimeoutPool wrap) from content / contest
-            # failures. Marking a row failed on a transient pool
-            # timeout would convert pool pressure into an
-            # irreversible failed compression row — the worker's
-            # retry/stale-recovery flow exists to handle the
-            # transient case. Re-raise so the worker loop's
-            # reconnect path sees the error.
-            from mnemos.core.pool import is_infrastructure_error
+            if attempts > max_attempts:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        _MARK_FAILED_SQL,
+                        queue_id,
+                        f"max_attempts exceeded ({attempts} > {max_attempts})",
+                    )
+                counts["skipped_max_attempts"] += 1
+                counts["failed"] += 1
+                logger.warning(
+                    "contest_queue[%s]: skipped, attempts=%d > max=%d",
+                    memory_id, attempts, max_attempts,
+                )
+                continue
 
-            if is_infrastructure_error(exc):
-                # Reset every unprocessed row in the dequeue batch
-                # — current row + any tail. Without resetting the
-                # tail, those rows sit at 'running' (already
-                # attempts-bumped by the dequeue) until the
-                # stale-running sweep catches them; codex round-5
-                # of round-28 caught that under repeated pool
-                # pressure the tail rows' attempts climb on each
-                # retake until the sweep terminalizes them as
-                # 'stranded_running' even though no content
-                # failure occurred. Single batch UPDATE so we
-                # amortise the (potentially-also-failing) acquire.
+            try:
+                await _process_one(
+                    pool,
+                    queue_id=queue_id,
+                    memory_id=memory_id,
+                    owner_id=owner_id,
+                    scoring_profile=scoring_profile,
+                    engines=engines,
+                    counts=counts,
+                    judge_model=judge_model,
+                    judge=judge,
+                    min_content_length=min_content_length,
+                    expected_attempts=attempts,
+                )
+            except Exception as inner_exc:
+                if is_infrastructure_error(inner_exc):
+                    # Surface to the outer except so the tail reset
+                    # runs once at a single site rather than at every
+                    # acquire boundary.
+                    raise
+                logger.exception(
+                    "contest_queue[%s]: unhandled exception", memory_id
+                )
+                # Content / contest error: mark this row failed.
+                # If THAT acquire is itself an infra error, raise
+                # to the outer handler (which then resets the tail
+                # before re-raising). If it's some other unexpected
+                # failure, surface it raw — there's no benign
+                # handling left.
+                try:
+                    async with pool.acquire() as conn:
+                        await conn.execute(
+                            _MARK_FAILED_SQL,
+                            queue_id,
+                            f"{type(inner_exc).__name__}: {inner_exc}",
+                        )
+                except Exception as mark_exc:
+                    if is_infrastructure_error(mark_exc):
+                        logger.warning(
+                            "contest_queue[%s]: failed-mark acquire timed out "
+                            "(%s); re-raising for tail reset",
+                            memory_id, type(mark_exc).__name__,
+                        )
+                        raise mark_exc from inner_exc
+                    raise
+                counts["failed"] += 1
+        except Exception as outer_exc:
+            if is_infrastructure_error(outer_exc):
                 tail_ids = [r["id"] for r in rows[row_idx:]]
                 logger.warning(
-                    "contest_queue[%s]: infrastructure error %s; resetting "
-                    "%d unprocessed row(s) (current + %d tail) for retry "
-                    "without consuming attempts budget, then re-raising",
-                    memory_id, type(exc).__name__,
+                    "contest_queue[%s]: post-dequeue infrastructure error "
+                    "%s; resetting %d unprocessed row(s) (current + %d "
+                    "tail) for retry without consuming attempts budget, "
+                    "then re-raising",
+                    memory_id, type(outer_exc).__name__,
                     len(tail_ids), len(tail_ids) - 1,
                 )
                 await _reset_rows_for_infra_retry(
                     pool,
                     tail_ids,
-                    f"infra_retry: {type(exc).__name__}: {str(exc)[:200]}",
+                    f"infra_retry: {type(outer_exc).__name__}: "
+                    f"{str(outer_exc)[:200]}",
                 )
                 counts["infra_errors"] += 1
                 raise
-
-            logger.exception(
-                "contest_queue[%s]: unhandled exception", memory_id
-            )
-            try:
-                async with pool.acquire() as conn:
-                    await conn.execute(
-                        _MARK_FAILED_SQL,
-                        queue_id,
-                        f"{type(exc).__name__}: {exc}",
-                    )
-            except Exception as mark_exc:
-                # If we can't even acquire to mark failed, that's
-                # also infrastructure — bubble up rather than
-                # silently leaving the row in-flight.
-                if is_infrastructure_error(mark_exc):
-                    logger.warning(
-                        "contest_queue[%s]: failed-mark acquire timed out (%s); "
-                        "re-raising original error",
-                        memory_id, type(mark_exc).__name__,
-                    )
-                    counts["infra_errors"] += 1
-                    raise mark_exc from exc
-                raise
-            counts["failed"] += 1
+            # Non-infra escape from this row (e.g., the content-error
+            # fallback hit a non-infra error of its own). Bubble up
+            # cleanly.
+            raise
 
     return dict(counts)
 

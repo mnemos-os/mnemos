@@ -468,6 +468,244 @@ async def test_infra_error_resets_only_tail_not_already_processed_rows(
 
 
 @pytest.mark.asyncio
+async def test_infra_during_max_attempts_fast_fail_resets_tail(monkeypatch):
+    """Codex round-6 of round-33: the max-attempts fast-fail path
+    (when row.attempts > max_attempts at dequeue time) acquires a
+    connection to write MARK_FAILED. If THAT acquire times out,
+    pre-round-34 the function would propagate the exception
+    without resetting the un-processed batch tail. Round-34 wraps
+    the whole per-row block in a single try/except so this exit
+    path also drops through the tail reset.
+    """
+    from mnemos.domain.compression import worker_contest
+
+    fake_rows = [
+        # First row exceeds max-attempts → fast-fail path.
+        {
+            "id": "queue-0",
+            "memory_id": "mem_0",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 99,  # > max_attempts=3
+        },
+        # Tail rows that must NOT be left at 'running' if the
+        # MARK_FAILED acquire times out.
+        {
+            "id": "queue-1",
+            "memory_id": "mem_1",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        },
+        {
+            "id": "queue-2",
+            "memory_id": "mem_2",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        },
+    ]
+
+    executes: list[tuple] = []
+
+    async def _record_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    # Build a pool whose first acquire (the dequeue) succeeds, but
+    # the SECOND acquire (max-attempts MARK_FAILED) raises
+    # TimeoutError. Subsequent acquires (the tail reset) succeed.
+    acquire_count = {"n": 0}
+
+    class _DequeueCtx:
+        async def __aenter__(self_):
+            return _conn_with_dequeue
+
+        async def __aexit__(self_, *args):
+            return None
+
+    class _TimeoutCtx:
+        async def __aenter__(self_):
+            raise asyncio.TimeoutError("max-attempts MARK_FAILED acquire timed out")
+
+        async def __aexit__(self_, *args):
+            return None
+
+    class _ResetCtx:
+        async def __aenter__(self_):
+            return _conn_for_reset
+
+        async def __aexit__(self_, *args):
+            return None
+
+    async def _dequeue_fetch(sql, *args):
+        return fake_rows
+
+    async def _reset_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    class _Tx:
+        async def __aenter__(self_):
+            return None
+
+        async def __aexit__(self_, *args):
+            return None
+
+    _conn_with_dequeue = MagicMock()
+    _conn_with_dequeue.fetch = _dequeue_fetch
+    _conn_with_dequeue.fetchrow = MagicMock()
+    _conn_with_dequeue.execute = _record_execute
+    _conn_with_dequeue.transaction = lambda *a, **kw: _Tx()
+
+    _conn_for_reset = MagicMock()
+    _conn_for_reset.execute = _reset_execute
+    _conn_for_reset.transaction = lambda *a, **kw: _Tx()
+
+    def _acquire():
+        acquire_count["n"] += 1
+        if acquire_count["n"] == 1:
+            return _DequeueCtx()
+        if acquire_count["n"] == 2:
+            return _TimeoutCtx()
+        return _ResetCtx()
+
+    pool = MagicMock()
+    pool.acquire = _acquire
+
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest.process_contest_queue(
+            pool,
+            engines=[],
+            batch_size=3,
+            max_attempts=3,
+            stale_threshold_secs=0,
+        )
+
+    # The reset SQL ran on the third acquire and targeted ALL three
+    # rows — current (queue-0) + the un-processed tail (queue-1, 2).
+    batch_resets = [
+        (sql, args) for sql, args in executes
+        if "ANY(" in sql and "memory_compression_queue" in sql
+        and "pending" in sql.lower()
+    ]
+    assert len(batch_resets) == 1, (
+        f"expected one batch reset; got {batch_resets!r}"
+    )
+    queue_ids = batch_resets[0][1][0]
+    assert set(queue_ids) == {"queue-0", "queue-1", "queue-2"}, (
+        f"max-attempts MARK_FAILED timeout must reset all 3 batch rows; "
+        f"got {queue_ids!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_infra_during_content_error_fallback_resets_tail(monkeypatch):
+    """The other post-dequeue path: row 0 raises a CONTENT error
+    (ValueError), the outer fallback MARK_FAILED tries to acquire,
+    THAT acquire times out. Round-34's outer wrap must convert this
+    into a tail reset for rows[0:] before the exception propagates."""
+    from mnemos.domain.compression import worker_contest
+
+    async def _fake_process_one(*args, **kwargs):
+        raise ValueError("malformed payload")
+
+    monkeypatch.setattr(
+        worker_contest, "_process_one", _fake_process_one,
+    )
+
+    fake_rows = [
+        {
+            "id": "queue-0",
+            "memory_id": "mem_0",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        },
+        {
+            "id": "queue-1",
+            "memory_id": "mem_1",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        },
+    ]
+
+    executes: list[tuple] = []
+    acquire_count = {"n": 0}
+
+    async def _dequeue_fetch(sql, *args):
+        return fake_rows
+
+    async def _reset_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    class _Tx:
+        async def __aenter__(self_):
+            return None
+
+        async def __aexit__(self_, *args):
+            return None
+
+    _conn_with_dequeue = MagicMock()
+    _conn_with_dequeue.fetch = _dequeue_fetch
+    _conn_with_dequeue.execute = _reset_execute
+    _conn_with_dequeue.fetchrow = MagicMock()
+    _conn_with_dequeue.transaction = lambda *a, **kw: _Tx()
+
+    class _DequeueCtx:
+        async def __aenter__(self_):
+            return _conn_with_dequeue
+
+        async def __aexit__(self_, *args):
+            return None
+
+    class _TimeoutCtx:
+        async def __aenter__(self_):
+            raise asyncio.TimeoutError("MARK_FAILED acquire timed out")
+
+        async def __aexit__(self_, *args):
+            return None
+
+    def _acquire():
+        acquire_count["n"] += 1
+        if acquire_count["n"] == 1:
+            return _DequeueCtx()
+        if acquire_count["n"] == 2:
+            # The outer fallback MARK_FAILED acquire timeouts.
+            return _TimeoutCtx()
+        # Third acquire is the tail reset.
+        return _DequeueCtx()
+
+    pool = MagicMock()
+    pool.acquire = _acquire
+
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest.process_contest_queue(
+            pool,
+            engines=[],
+            batch_size=2,
+            max_attempts=3,
+            stale_threshold_secs=0,
+        )
+
+    batch_resets = [
+        (sql, args) for sql, args in executes
+        if "ANY(" in sql and "memory_compression_queue" in sql
+        and "pending" in sql.lower()
+    ]
+    assert len(batch_resets) == 1, (
+        f"expected one batch reset; got {batch_resets!r}"
+    )
+    queue_ids = batch_resets[0][1][0]
+    assert set(queue_ids) == {"queue-0", "queue-1"}, (
+        f"content-error fallback MARK_FAILED timeout must reset both batch "
+        f"rows; got {queue_ids!r}"
+    )
+
+
+@pytest.mark.asyncio
 async def test_repeated_infra_errors_do_not_consume_attempts_budget(monkeypatch):
     """Codex round-4 of round-30 caught: even with the round-30
     fix, repeated infra errors would let attempts climb on each
