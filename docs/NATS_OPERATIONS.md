@@ -50,6 +50,133 @@ offline) should use the HTTP federation pull path — it's the
 canonical backfill route. The NATS consumer is an additive
 fast-path; the HTTP poll is the durable fallback.
 
+## Payload sensitivity
+
+What lands on each subject:
+
+| Subject family               | Payload                                                                                                        | Sensitivity |
+|------------------------------|----------------------------------------------------------------------------------------------------------------|-------------|
+| `mnemos.memory.created.*`    | Full memory body — `id`, `content`, `verbatim_content`, `category`, `metadata`, `owner_id`, `namespace`        | **HIGH**    |
+| `mnemos.memory.updated.*`    | Same shape as `created` (full body of the post-update row)                                                     | **HIGH**    |
+| `mnemos.memory.deleted.*`    | `id` + tombstone metadata only (no content)                                                                    | low         |
+| `mnemos.consultation.*`      | Consultation `id`, `prompt`, `task_type`, model selection, response excerpts                                   | medium-high |
+| `mnemos.webhook.*`           | Delivery `id`, `subscription_id`, `event_type`, target URL, payload hash (NOT the payload body)                | medium      |
+| MCP SSE summaries (`/sse`)   | Filtered subset by default: `subject`, `memory_id`, `namespace`, `category`, `source_node`. Full content only when `MNEMOS_MCP_NATS_RAW=true` | medium      |
+
+**Operator implication:** every NATS broker that receives
+``mnemos.memory.created.*`` or ``mnemos.memory.updated.*`` traffic
+holds a copy of every memory body that flowed through during the
+30-day retention window. Treat the broker's storage as authoritative-
+data-tier, not as a "cache". Encrypt at rest, restrict the
+filesystem, and back up alongside Postgres.
+
+## NATS ACL recommendations
+
+The MNEMOS publish/subscribe topology is asymmetric:
+
+  * MNEMOS server processes PUBLISH on
+    ``mnemos.memory.>``, ``mnemos.consultation.>``, ``mnemos.webhook.>``,
+    ``mnemos.federation.>``.
+  * MNEMOS server processes SUBSCRIBE to the same subjects (federation
+    push receivers, webhook NATS triggers).
+  * MCP HTTP/SSE clients SUBSCRIBE only to the principal-namespaced
+    summary subset (subjects derived server-side from the
+    authenticated principal — a non-operator client cannot pick its
+    own subject filter; see ``mnemos/mcp/http.py::_parse_nats_sse_subjects``).
+
+Recommended ``authorization`` block (NATS server config snippet):
+
+```hocon
+authorization {
+  users = [
+    # MNEMOS server processes — full pub/sub on every shipped subject.
+    {
+      user: "mnemos-server"
+      password: "$MNEMOS_NATS_TOKEN"
+      permissions: {
+        publish:   { allow: ["mnemos.>"] }
+        subscribe: { allow: ["mnemos.>", "_INBOX.>"] }
+      }
+    }
+
+    # Operator / observability clients — subscribe-only.
+    {
+      user: "mnemos-observer"
+      password: "$MNEMOS_OBS_TOKEN"
+      permissions: {
+        publish:   { deny: [">"] }
+        subscribe: { allow: ["mnemos.>", "_INBOX.>"] }
+      }
+    }
+
+    # External federation peers (if you trust a peer to publish into
+    # YOUR memory namespace, which is unusual — most operators
+    # prefer the HTTP federation feed for inbound). Scope tightly:
+    # one user per peer with publish-only on a peer-prefixed
+    # subject the local consumer subscribes to.
+    # {
+    #   user: "peer-alpha"
+    #   permissions: {
+    #     publish:   { allow: ["mnemos.federation.alpha.>"] }
+    #     subscribe: { deny: [">"] }
+    #   }
+    # }
+  ]
+}
+```
+
+The "external federation peers" pattern is intentionally commented
+out — most operators receive federation via the HTTP pull / push
+endpoints, NOT by giving an external peer publish access to their
+broker. Only enable it when the peer is operationally trusted at
+the same level as the local mnemos process.
+
+**Anti-pattern:** a single shared `mnemos` user with no per-role
+split. A compromised MCP HTTP/SSE bridge would then have publish
+authority on every memory subject, which lets an attacker forge
+``mnemos.memory.created.<any-namespace>`` events that the
+federation push receiver would write into the local store as
+incoming federated rows. Always split publish from subscribe.
+
+## Subject isolation per tenant
+
+The MCP HTTP/SSE bridge derives subscriber subjects from the
+authenticated principal:
+
+  * Default subject for a non-operator client:
+    ``mnemos.<event_class>.<event_action>.<safe_namespace>``
+    where ``safe_namespace`` comes from the principal's
+    ``user.namespace`` (sanitised to a NATS-safe token).
+  * Operator-class principals (``role='root'``) MAY pass
+    ``?subjects=mnemos.x.y.*`` to widen, but the substring filter
+    must still start with ``mnemos.`` and contain no whitespace —
+    enforced by ``_parse_nats_sse_subjects`` so a non-operator
+    cannot tunnel arbitrary subject filters.
+
+For multi-tenant deployments, the recommended hardening:
+
+  1. Set ``MNEMOS_MCP_NATS_RAW=false`` (the default) so MCP SSE
+     emits filtered summaries, not full content payloads.
+  2. Scope NATS user permissions to per-namespace publish/subscribe
+     prefixes when running multiple tenants on a shared broker.
+     Example for tenant ``alice``:
+
+     ```hocon
+     {
+       user: "tenant-alice"
+       permissions: {
+         publish:   { allow: ["mnemos.memory.created.alice",
+                              "mnemos.memory.updated.alice",
+                              "mnemos.memory.deleted.alice"] }
+         subscribe: { allow: ["mnemos.>.alice", "_INBOX.>"] }
+       }
+     }
+     ```
+
+  3. Run separate broker accounts (NATS multi-tenancy primitive)
+     for hard isolation between tenants who must NOT see each
+     other's metadata even at the subject level.
+
 ## Federation peer config
 
 Set `MNEMOS_FEDERATION_NATS_PEERS` to a JSON array per peer:
