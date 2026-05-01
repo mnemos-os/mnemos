@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.rate_limit import limiter
 from mnemos.core.security import is_root, scope_namespace
 from mnemos.domain.graeae.engine import _REGISTRY_MAP
@@ -69,8 +70,7 @@ async def _tier_lineup(tier: str) -> dict:
     treats that as a hard error (otherwise we'd silently fall back
     to auto, which violates the caller's intent).
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/consultations")
 
     if tier == "frontier":
         sql = """
@@ -133,8 +133,7 @@ async def _resolve_models(model_ids: List[str]) -> dict:
     unrecognized model_id — fail-loudly beats silently narrowing a
     deliberately-chosen lineup.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/consultations")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             """
@@ -537,8 +536,7 @@ async def list_audit_log(
     Non-root callers only see audit rows for their own consultations. Root
     callers keep the operational global view.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/consultations/audit")
     target_ns = scope_namespace(user, namespace)
     async with _lc.get_pool_manager().acquire() as conn:
         root = is_root(user)
@@ -613,8 +611,7 @@ async def verify_audit_chain(
     the row's tamperable prev_id. Rate-limited because the cost grows linearly
     with audit-log size. Returns details of any broken sequences.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/consultations/audit/verify")
     target_ns = scope_namespace(user, namespace)
     verify_global_chain = is_root(user) and namespace is None
     async with _lc.get_pool_manager().acquire() as conn:
@@ -855,8 +852,7 @@ async def get_consultation(
     consultations. Not-yours and not-exists both return 404 so we don't
     leak which consultation IDs are in use across users.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/consultations/{consultation_id}")
     target_ns = scope_namespace(user, namespace)
 
     async with _lc.get_pool_manager().acquire() as conn:
@@ -906,8 +902,7 @@ async def get_consultation_artifacts(
     user: UserContext = Depends(get_current_user),
 ):
     """Retrieve structured outputs and citations from a consultation."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/consultations/{consultation_id}/artifacts")
     target_ns = scope_namespace(user, namespace)
 
     async with _lc.get_pool_manager().acquire() as conn:

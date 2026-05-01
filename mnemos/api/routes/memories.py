@@ -16,6 +16,7 @@ from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import (
     backend_or_503 as _backend_or_503,
     maybe_set_pg_rls as _maybe_set_pg_rls,
+    require_postgres_pool_or_503,
 )
 from mnemos.core.ids import new_memory_id
 from mnemos.core.lifecycle import (
@@ -412,8 +413,7 @@ async def get_compression_manifests(
     operators can reason about what was tried, what scored how, and why
     each engine was or wasn't picked.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/compression-manifests")
 
     async with _lc.get_pool_manager().acquire() as conn:
         async with _rls_context(conn, user):
@@ -1052,8 +1052,7 @@ async def rehydrate_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Return memories optimized for Claude context injection (Phase 5)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/memories/rehydrate")
     # Same v3.1.2 Tier 3 pinning as /memories/search — rehydrate is a
     # read path for the caller's own corpus.
     rehydrate_owner_id = None if is_root(user) else user.user_id
