@@ -34,9 +34,9 @@ async def test_redeclare_with_matching_config_is_idempotent_noop(js, stream_clea
         subjects=[f"{name.lower()}.>"],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
-        max_age=int(timedelta(minutes=5).total_seconds() * 1_000_000_000),
+        max_age=int(timedelta(minutes=5).total_seconds()),
         max_bytes=1024 * 1024,  # 1 MiB
-        duplicate_window=int(timedelta(seconds=30).total_seconds() * 1_000_000_000),
+        duplicate_window=int(timedelta(seconds=30).total_seconds()),
     )
 
     info_a = await js.add_stream(config=config)
@@ -63,9 +63,9 @@ async def test_redeclare_with_drift_raises_and_keeps_old_config(js, stream_clean
         subjects=[f"{name.lower()}.>"],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
-        max_age=int(timedelta(minutes=5).total_seconds() * 1_000_000_000),
+        max_age=int(timedelta(minutes=5).total_seconds()),
         max_bytes=1024 * 1024,
-        duplicate_window=int(timedelta(seconds=30).total_seconds() * 1_000_000_000),
+        duplicate_window=int(timedelta(seconds=30).total_seconds()),
     )
     await js.add_stream(config=base)
 
@@ -74,9 +74,9 @@ async def test_redeclare_with_drift_raises_and_keeps_old_config(js, stream_clean
         subjects=[f"{name.lower()}.>"],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
-        max_age=int(timedelta(minutes=10).total_seconds() * 1_000_000_000),  # drift
+        max_age=int(timedelta(minutes=10).total_seconds()),  # drift
         max_bytes=2 * 1024 * 1024,  # drift
-        duplicate_window=int(timedelta(seconds=30).total_seconds() * 1_000_000_000),
+        duplicate_window=int(timedelta(seconds=30).total_seconds()),
     )
 
     with pytest.raises((NatsError, Exception)):
@@ -111,9 +111,9 @@ async def test_redeclare_three_times_with_matching_config(js, stream_cleanup):
         subjects=[f"{name.lower()}.>"],
         retention=RetentionPolicy.LIMITS,
         storage=StorageType.FILE,
-        max_age=int(timedelta(minutes=5).total_seconds() * 1_000_000_000),
+        max_age=int(timedelta(minutes=5).total_seconds()),
         max_bytes=4 * 1024 * 1024,
-        duplicate_window=int(timedelta(seconds=30).total_seconds() * 1_000_000_000),
+        duplicate_window=int(timedelta(seconds=30).total_seconds()),
     )
 
     info1 = await js.add_stream(config=config)

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import secrets
+from pathlib import Path
 from typing import AsyncIterator
 
 import pytest
@@ -24,21 +25,34 @@ def _broker_token() -> str | None:
 
 # Collection hook: skip ONLY the live-broker tests in this directory
 # when MNEMOS_NATS_TEST_URL is unset. Critically, this filters by
-# item.fspath because pytest's plugin contract says
+# item path because pytest's plugin contract says
 # pytest_collection_modifyitems in a subdirectory conftest still
 # sees ALL collected items (not just items "below" the conftest).
 # Without the path filter the hook would skip the entire test suite.
+#
+# Path containment uses pathlib's relative_to / commonpath rather
+# than string prefix — `tests/integration_nats_extra/` would match
+# `startswith("tests/integration_nats")` and silently get skipped.
 def pytest_collection_modifyitems(config, items):
     if _broker_url():
         return
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = Path(__file__).resolve().parent
     skip = pytest.mark.skip(
         reason="MNEMOS_NATS_TEST_URL not set — live-broker tests require a real NATS server"
     )
     for item in items:
-        item_path = str(getattr(item, "fspath", "") or "")
-        if item_path.startswith(here):
-            item.add_marker(skip)
+        raw_path = getattr(item, "path", None) or getattr(item, "fspath", None)
+        if raw_path is None:
+            continue
+        try:
+            item_path = Path(str(raw_path)).resolve()
+        except OSError:
+            continue
+        try:
+            item_path.relative_to(here)
+        except ValueError:
+            continue
+        item.add_marker(skip)
 
 
 @pytest.fixture(scope="session")

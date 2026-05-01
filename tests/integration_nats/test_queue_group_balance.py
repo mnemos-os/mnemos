@@ -76,9 +76,9 @@ async def test_queue_group_load_balances_across_subscribers(js, stream_cleanup):
             subjects=[f"{subject_root}.>"],
             retention=RetentionPolicy.LIMITS,
             storage=StorageType.FILE,
-            max_age=int(timedelta(minutes=5).total_seconds() * 1_000_000_000),
+            max_age=int(timedelta(minutes=5).total_seconds()),
             max_bytes=10 * 1024 * 1024,
-            duplicate_window=int(timedelta(seconds=10).total_seconds() * 1_000_000_000),
+            duplicate_window=int(timedelta(seconds=10).total_seconds()),
         )
     )
 
@@ -113,41 +113,62 @@ async def test_queue_group_load_balances_across_subscribers(js, stream_cleanup):
     consumer_a = asyncio.create_task(_consume_into(sub_a, bucket_a, ready_a, stop))
     consumer_b = asyncio.create_task(_consume_into(sub_b, bucket_b, ready_b, stop))
 
+    warmup_payloads: list[str] = []
     try:
-        # Step 1 — publish 2 warmup messages, ONE per subscriber.
-        # Wait until both ready events fire before the real burst.
-        # This rules out the "subscriber B handshake hadn't
-        # completed when the burst started" failure mode that
-        # would otherwise make balance assertions race-prone.
-        for i in range(2):
-            await _publish_one(js, subject_pub, f"warmup-{i}")
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(ready_a.wait(), ready_b.wait()),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            pytest.fail(
-                "queue-group test setup: one or both subscribers never "
-                "received a warmup message within 10s — broker "
-                "delivery path may be wedged"
-            )
+        # Step 1 — bring BOTH subscribers to ready by publishing
+        # warmup messages until each has observed one. JetStream
+        # delivers a warmup to whichever subscriber is currently
+        # free, so two warmups COULD legally land on the same
+        # subscriber (codex round-2 finding 3). Bounded loop with
+        # cap to avoid runaway publishing if delivery is wedged.
+        warmup_deadline = asyncio.get_event_loop().time() + 10.0
+        warmup_seq = 0
+        warmup_cap = 50
+        while not (ready_a.is_set() and ready_b.is_set()):
+            if warmup_seq >= warmup_cap:
+                pytest.fail(
+                    f"queue-group test setup: published {warmup_seq} "
+                    f"warmup messages but ready_a={ready_a.is_set()} "
+                    f"ready_b={ready_b.is_set()} — broker delivery path "
+                    f"may be wedged or queue-group not actually balancing"
+                )
+            if asyncio.get_event_loop().time() > warmup_deadline:
+                pytest.fail(
+                    "queue-group test setup: 10s elapsed and one or "
+                    "both subscribers never reached ready state"
+                )
+            payload = f"warmup-{warmup_seq}"
+            warmup_payloads.append(payload)
+            await _publish_one(js, subject_pub, payload)
+            warmup_seq += 1
+            # Yield long enough for the broker round-trip + the
+            # consumer task to dequeue. 0.2s is conservative.
+            await asyncio.sleep(0.2)
 
         # Step 2 — publish the balance-check burst.
         burst_payloads = [f"burst-{i}" for i in range(20)]
         for p in burst_payloads:
             await _publish_one(js, subject_pub, p)
 
-        # Step 3 — drain. Total expected = 2 warmup + 20 burst = 22.
-        expected_total = 2 + len(burst_payloads)
-        deadline = asyncio.get_event_loop().time() + 15.0
+        # Step 3 — drain. Total expected = warmup_count + 20 burst.
+        expected_total = len(warmup_payloads) + len(burst_payloads)
+        deadline = asyncio.get_event_loop().time() + 20.0
         while len(bucket_a) + len(bucket_b) < expected_total:
             if asyncio.get_event_loop().time() > deadline:
                 break
             await asyncio.sleep(0.1)
     finally:
         stop.set()
-        await asyncio.gather(consumer_a, consumer_b, return_exceptions=True)
+        # Critical: re-raise non-CancelledError consumer exceptions
+        # (codex round-2 finding 2). A swallowed ack failure would
+        # let a redelivered message look like a successful one and
+        # make the multiset assertion below pass on a false count.
+        consumer_results = await asyncio.gather(
+            consumer_a, consumer_b, return_exceptions=True
+        )
+        for r in consumer_results:
+            if isinstance(r, BaseException) and not isinstance(r, asyncio.CancelledError):
+                raise r
         try:
             await sub_a.unsubscribe()
         finally:
@@ -160,7 +181,7 @@ async def test_queue_group_load_balances_across_subscribers(js, stream_cleanup):
     # equals what was published. No drops, no duplicates within or
     # across either bucket.
     delivered = sorted(bucket_a + bucket_b)
-    expected = sorted(["warmup-0", "warmup-1"] + burst_payloads)
+    expected = sorted(warmup_payloads + burst_payloads)
     assert delivered == expected, (
         f"queue-group payload set mismatch:\n"
         f"  delivered count: {len(delivered)} (expected {len(expected)})\n"
