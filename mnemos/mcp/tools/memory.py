@@ -11,18 +11,33 @@ from ._runtime import _rest_delete, _rest_get, _rest_post, _tool
 
 
 def _connector_namespace() -> str | None:
-    """Per-connector default namespace.
+    """Per-connector default-namespace WRITE STAMP.
 
-    The connector-gallery docs (claude-code.md, cursor.md,
-    codex-cli.md, continue-dev.md, cline.md) document
-    ``MNEMOS_DEFAULT_NAMESPACE`` as the per-MCP-server isolation
-    mechanism. Every memory created or searched through this MCP
-    bridge stamps that namespace on the REST request so two MCP
-    server entries with different env vars (but the same backing
-    API key) write/read distinct namespace scopes.
+    Reads ``MNEMOS_DEFAULT_NAMESPACE`` and stamps it on
+    create_memory / search_memories / list_memories /
+    bulk_create_memories REST calls. The connector-gallery docs
+    (claude-code.md, cursor.md, codex-cli.md, continue-dev.md,
+    cline.md) explicitly retract any claim that this is an
+    enforced isolation boundary — it's a default-namespace
+    convenience for ergonomic per-connector write scoping.
 
-    Empty / unset → no namespace override; server falls through to
-    the API key's resolved namespace.
+    NOT scoped by this helper:
+    * get_memory / update_memory / delete_memory — these take
+      a memory_id directly and the REST seam doesn't currently
+      accept a namespace constraint on the ID-based path.
+    * branch_memory / log_memory / diff_memory_commits /
+      checkout_memory — same, ID-based.
+
+    A root API key with this env stamp set will WRITE into the
+    configured namespace by default but can still READ /
+    UPDATE / DELETE any memory by ID across all namespaces.
+    For ENFORCED isolation, the docs point operators at distinct
+    non-root **users** with ``users.namespace`` set; API keys
+    issued for those users inherit the user's namespace via the
+    server-side auth-resolution path.
+
+    Empty / unset → no namespace override; server falls through
+    to the API key's resolved namespace.
     """
     val = os.environ.get("MNEMOS_DEFAULT_NAMESPACE", "").strip()
     return val or None

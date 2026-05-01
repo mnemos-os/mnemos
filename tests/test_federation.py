@@ -620,15 +620,22 @@ class TestFederationFeedPreferCompressed:
         )
 
         # SQL shape verification: handler must have built a
-        # COALESCE-against-LEFT-JOIN query, not the default one.
+        # CASE-WHEN byte-gate query against the LEFT JOIN. Pre-
+        # round-2 the gate was a plain COALESCE; codex round-11
+        # tightened it to a per-row octet_length comparison so
+        # the prefer_compressed path can never produce LARGER
+        # payloads than the legacy raw path.
         seen = pool.conn.queries[-1]
-        assert "COALESCE(v.compressed_content, m.content)" in seen, (
-            f"prefer_compressed branch must use COALESCE; got SQL: {seen[:300]}"
-        )
         assert "LEFT JOIN memory_compressed_variants" in seen
-        assert "WHEN v.compressed_content IS NOT NULL THEN NULL" in seen, (
-            "verbatim_content must be NULLed when a compressed variant exists"
+        assert "octet_length(v.compressed_content) < octet_length(m.content)" in seen, (
+            "prefer_compressed branch must gate variant use on a "
+            f"byte comparison; got SQL: {seen[:300]}"
         )
+        # verbatim_content gets NULLed only inside the "use variant" branch
+        assert (
+            "octet_length(v.compressed_content) < octet_length(m.content) THEN NULL"
+            in seen
+        ), "verbatim_content must be NULLed when (and only when) the variant is selected"
 
         # Wire shape verification: the MemoryItem should carry the
         # compressed payload as its content + compressed_content
@@ -668,6 +675,47 @@ class TestFederationFeedPreferCompressed:
         assert m.content == row["content"]  # raw
         assert m.compressed_content is None
         assert m.verbatim_content == row["verbatim_content"]
+
+    @pytest.mark.asyncio
+    async def test_byte_gate_predicate_in_sql(self, monkeypatch):
+        """Codex round-11 audit: the prefer_compressed branch must
+        guarantee wire bytes never go UP. The SQL CASE predicate
+        only swaps to the variant when octet_length(variant) <
+        octet_length(raw). Pin that the predicate is in the SQL so
+        a future refactor can't drop the gate without tripping this
+        test.
+        """
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+
+        updated = datetime(2026, 5, 1, 0, 0, 0)
+        row = _feed_row("00000000-0000-0000-0000-000000000020", updated)
+        row["compressed_content"] = "<<COMPRESSED>>"
+        pool = _FeedPool([row])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        await handler.federation_feed(
+            None, None,
+            since=None, namespace=None, category=None,
+            limit=10,
+            prefer_compressed=True,
+        )
+
+        seen = pool.conn.queries[-1]
+        assert "octet_length(v.compressed_content) < octet_length(m.content)" in seen, (
+            "prefer_compressed must gate the variant on a byte-comparison "
+            "so it can NEVER make payloads larger; got SQL:\n"
+            f"{seen[:600]}"
+        )
+        # And the predicate must be applied to all three fields
+        # (content / compressed_content / verbatim_content) so a
+        # variant that fails the gate falls through consistently
+        # across the row.
+        assert seen.count("v.compressed_content IS NOT NULL") >= 3, (
+            "byte gate must wrap content + compressed_content + "
+            "verbatim_content so the row stays consistent when the "
+            "variant is rejected"
+        )
 
     @pytest.mark.asyncio
     async def test_default_off_preserves_legacy_shape(self, monkeypatch):

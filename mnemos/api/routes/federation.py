@@ -477,31 +477,43 @@ async def federation_feed(
     where_clause = " AND ".join(query_parts)
 
     # prefer_compressed contract:
-    #   * The SELECT returns COALESCE(v.compressed_content, m.content)
-    #     as the row's ``content`` — the peer SEES the compressed
-    #     payload as content when a variant exists, raw content
-    #     otherwise. Wire bytes go DOWN proportional to the
-    #     compression ratio.
-    #   * ``compressed_content`` field on MemoryItem stays populated
-    #     (only when a variant exists) so the peer can distinguish
-    #     "this content is compressed" from "this content is raw."
-    #     compressed_content == None → got raw; non-None → got
-    #     compressed and the same value also lives in ``content``.
-    #   * ``verbatim_content`` is OMITTED (NULL) on compressed rows
-    #     to avoid double-shipping the original payload, which
-    #     would defeat the bytes-reduction goal.
+    #   * Per-row byte gate: the variant is used only when its
+    #     octet_length is STRICTLY SMALLER than m.content. A
+    #     pathological compression ratio > 1 (rare but possible
+    #     for already-dense or short content) leaves the row on
+    #     the raw payload, so the prefer_compressed path can
+    #     never make a feed payload bigger than the legacy one.
+    #     Codex round-11 audit (2026-05-01) — pre-fix the COALESCE
+    #     used the variant unconditionally on presence, which was
+    #     correct in the common case but broke the "wire bytes go
+    #     down" guarantee on edge cases.
+    #   * When the variant IS used: ``content`` carries the
+    #     compressed payload, ``compressed_content`` field is
+    #     populated to the same string (peer detector), and
+    #     ``verbatim_content`` is NULLed (avoid double-shipping).
+    #   * When the variant is NOT used (no row OR compressed
+    #     bigger): identical to the default branch — raw content,
+    #     compressed_content NULL, raw verbatim_content.
     # Default path (prefer_compressed=False) is unchanged — same
     # SQL shape, same MemoryItem fields, identical behavior peers
     # see today.
     if prefer_compressed:
-        content_select = "COALESCE(v.compressed_content, m.content) AS content,"
-        compressed_select = "v.compressed_content AS compressed_content,"
-        # NULL out verbatim_content when we have a compressed variant
-        # — peer can fetch the original via /v1/federation/memory/{id}
-        # if they need it and the wire-bytes savings only apply when
-        # we don't double-ship.
+        # Byte gate predicate (reused 3x below). Truthy iff we
+        # should swap content to the variant.
+        use_variant = (
+            "v.compressed_content IS NOT NULL "
+            "AND octet_length(v.compressed_content) < octet_length(m.content)"
+        )
+        content_select = (
+            f"CASE WHEN {use_variant} THEN v.compressed_content "
+            "ELSE m.content END AS content,"
+        )
+        compressed_select = (
+            f"CASE WHEN {use_variant} THEN v.compressed_content "
+            "ELSE NULL::text END AS compressed_content,"
+        )
         verbatim_select = (
-            "CASE WHEN v.compressed_content IS NOT NULL THEN NULL "
+            f"CASE WHEN {use_variant} THEN NULL "
             "ELSE m.verbatim_content END AS verbatim_content,"
         )
         join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
