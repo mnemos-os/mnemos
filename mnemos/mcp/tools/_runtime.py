@@ -61,7 +61,16 @@ def _backend_headers() -> dict[str, str]:
     return headers
 
 
-_PATH_SEGMENT_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+# Whitelist tightened around the actual ID grammar mnemos uses:
+#   * canonical memory IDs: ``mem_<digits>_<hex>`` (alphanum + _)
+#   * federated memory IDs: ``fed:<peer_name>:<remote_id>`` — the
+#     ``:`` separator is part of the documented format in
+#     ``mnemos.domain.federation.FEDERATION_ID_PREFIX``
+#   * commit hashes / branch names: alphanum + ``_``, ``-``
+# Dots are deliberately omitted — they're the path-traversal signal
+# (``..``) and no current MNEMOS ID format requires them. If a
+# future format does, add ``.`` and a separate ``..`` reject.
+_PATH_SEGMENT_PATTERN = re.compile(r"\A[A-Za-z0-9_:-]{1,128}\Z")
 
 
 def _safe_path_segment(value: object, *, label: str = "id") -> str:
@@ -74,18 +83,26 @@ def _safe_path_segment(value: object, *, label: str = "id") -> str:
     value like ``../../admin`` lets ``httpx`` normalise dot segments
     out of the path entirely, so the request escapes the
     ``/v1/memories`` prefix and reaches other same-origin endpoints.
-    With the new ``_rest_get_text`` helper returning raw response
-    bodies, that path-traversal is a real exfiltration vector for
-    any text endpoint (e.g. ``/metrics``).
+    With the ``_rest_get_text`` helper (round-24) returning raw
+    response bodies, that path-traversal is a real exfiltration
+    vector for any text endpoint (e.g. ``/metrics``).
 
     Defense in depth:
-      1. Type-check + length-bound + character whitelist
-         ``[A-Za-z0-9_-]`` — rejects ``/``, ``\\``, ``.``, ``?``,
-         ``#`` and every other character that could split or rewrite
-         the URL on the server side.
-      2. Belt-and-braces URL-encode with ``safe=""`` so even if a
+      1. Type-check + length-bound (1–128 chars).
+      2. Character whitelist ``[A-Za-z0-9_:-]`` — admits the
+         documented MNEMOS ID grammars (canonical ``mem_<...>``,
+         federated ``fed:<peer>:<remote>``, branch / commit-hash
+         shapes) and rejects ``/``, ``\\``, ``.``, ``?``, ``#``,
+         ``%`` and every other character that could split or
+         rewrite the URL on the server side.
+      3. Belt-and-braces URL-encode with ``safe=""`` so even if a
          future ID format adds new characters, they're guaranteed
          to land inside the path segment they were spliced into.
+
+    Round-3 of the round-24 thread caught two gaps the v1 helper
+    had: it rejected federated memory IDs (``:`` was missing from
+    the whitelist) and the Knossos MCP server still had unvalidated
+    splices. Both fixed in this commit.
     """
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string, got {type(value).__name__}")
@@ -93,7 +110,7 @@ def _safe_path_segment(value: object, *, label: str = "id") -> str:
         raise ValueError(
             f"{label} must match {_PATH_SEGMENT_PATTERN.pattern} — got {value!r}"
         )
-    return urllib.parse.quote(value, safe="")
+    return urllib.parse.quote(value, safe=":")
 
 
 async def _rest_get(path: str, params: dict[str, Any] | None = None) -> Any:

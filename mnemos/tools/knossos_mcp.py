@@ -44,6 +44,7 @@ sys.stdout = sys.stderr
 import httpx  # noqa: E402
 import mcp.types as types  # noqa: E402
 from mnemos.core.config import get_settings  # noqa: E402
+from mnemos.mcp.tools._runtime import _safe_path_segment  # noqa: E402
 from mcp.server import Server  # noqa: E402
 from mcp.server.stdio import stdio_server  # noqa: E402
 
@@ -268,7 +269,11 @@ async def t_get_drawer(args: Dict[str, Any]) -> Any:
     drawer_id = args.get("drawer_id") or args.get("id")
     if not drawer_id:
         return {"error": "drawer_id is required"}
-    mem = await _get(f"/v1/memories/{drawer_id}")
+    try:
+        safe_id = _safe_path_segment(drawer_id, label="drawer_id")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    mem = await _get(f"/v1/memories/{safe_id}")
     return _mem_to_drawer(mem)
 
 
@@ -295,6 +300,10 @@ async def t_update_drawer(args: Dict[str, Any]) -> Any:
     drawer_id = args.get("drawer_id") or args.get("id")
     if not drawer_id:
         return {"error": "drawer_id is required"}
+    try:
+        safe_id = _safe_path_segment(drawer_id, label="drawer_id")
+    except ValueError as exc:
+        return {"error": str(exc)}
     body: Dict[str, Any] = {}
     if "content" in args:
         body["content"] = args["content"]
@@ -317,7 +326,7 @@ async def t_update_drawer(args: Dict[str, Any]) -> Any:
     caller_tags = args.get("tags")
     if caller_meta is not None or caller_tags is not None:
         try:
-            existing = await _get(f"/v1/memories/{drawer_id}")
+            existing = await _get(f"/v1/memories/{safe_id}")
             merged = dict((existing or {}).get("metadata") or {})
         except Exception:
             # If the read fails, fall back to sending just what the
@@ -330,7 +339,7 @@ async def t_update_drawer(args: Dict[str, Any]) -> Any:
             merged["tags"] = caller_tags
         body["metadata"] = merged
 
-    resp = await _patch(f"/v1/memories/{drawer_id}", body)
+    resp = await _patch(f"/v1/memories/{safe_id}", body)
     return _mem_to_drawer(resp)
 
 
@@ -338,7 +347,11 @@ async def t_delete_drawer(args: Dict[str, Any]) -> Any:
     drawer_id = args.get("drawer_id") or args.get("id")
     if not drawer_id:
         return {"error": "drawer_id is required"}
-    status = await _delete(f"/v1/memories/{drawer_id}")
+    try:
+        safe_id = _safe_path_segment(drawer_id, label="drawer_id")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    status = await _delete(f"/v1/memories/{safe_id}")
     return {"ok": 200 <= status < 300, "status": status}
 
 

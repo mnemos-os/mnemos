@@ -40,6 +40,26 @@ def test_safe_path_segment_admits_branch_and_commit_hashes():
     assert _safe_path_segment("main", label="branch") == "main"
 
 
+def test_safe_path_segment_admits_federated_memory_ids():
+    """Federation stores remote memories with id =
+    ``fed:<peer>:<remote>``. The whitelist must admit colons so
+    these IDs remain MCP-addressable. Codex round-3 caught that
+    the v1 helper rejected them."""
+    fed_id = "fed:alpha-prod:mem_1234567890123_a1b2c3"
+    out = _safe_path_segment(fed_id, label="memory_id")
+    # ``:`` is in safe= so it's not percent-encoded — keeps the
+    # downstream URL parseable as a single path segment.
+    assert out == fed_id
+
+
+def test_safe_path_segment_admits_simple_peer_name():
+    """Single-segment peer name in federated id."""
+    assert (
+        _safe_path_segment("fed:alpha:remote-id-1", label="memory_id")
+        == "fed:alpha:remote-id-1"
+    )
+
+
 @pytest.mark.parametrize(
     "value",
     [
@@ -207,6 +227,84 @@ async def test_tool_checkout_memory_rejects_traversal_in_commit_hash():
         with pytest.raises(ValueError):
             await tool_checkout_memory("mem_1234567890123_a1b2c3", commit_hash="../../metrics")
     mock_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_knossos_t_get_drawer_rejects_traversal():
+    """The Knossos MCP server (mnemos.tools.knossos_mcp) is a
+    SEPARATE stdio MCP surface from mnemos.mcp.tools. Codex round-3
+    caught that the round-25 hardening missed it. Knossos returns
+    a {"error": ...} envelope rather than raising — pin that
+    contract so callers see the rejection without the helper
+    making an HTTP call."""
+    from mnemos.tools.knossos_mcp import t_get_drawer
+
+    with patch(
+        "mnemos.tools.knossos_mcp._get",
+        new=AsyncMock(),
+    ) as mock_get:
+        result = await t_get_drawer({"drawer_id": "../../metrics"})
+    assert isinstance(result, dict)
+    assert "error" in result
+    mock_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_knossos_t_update_drawer_rejects_traversal():
+    from mnemos.tools.knossos_mcp import t_update_drawer
+
+    with patch(
+        "mnemos.tools.knossos_mcp._patch",
+        new=AsyncMock(),
+    ) as mock_patch, patch(
+        "mnemos.tools.knossos_mcp._get",
+        new=AsyncMock(),
+    ) as mock_get:
+        result = await t_update_drawer(
+            {"drawer_id": "../../metrics", "content": "x"},
+        )
+    assert isinstance(result, dict)
+    assert "error" in result
+    mock_patch.assert_not_awaited()
+    mock_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_knossos_t_delete_drawer_rejects_traversal():
+    from mnemos.tools.knossos_mcp import t_delete_drawer
+
+    with patch(
+        "mnemos.tools.knossos_mcp._delete",
+        new=AsyncMock(),
+    ) as mock_delete:
+        result = await t_delete_drawer({"drawer_id": "../../metrics"})
+    assert isinstance(result, dict)
+    assert "error" in result
+    mock_delete.assert_not_awaited()
+
+
+# ── Federated IDs are admitted by every memory-id call site ────────────────
+
+
+@pytest.mark.asyncio
+async def test_tool_get_memory_admits_federated_id():
+    """Federation IDs (fed:peer:remote) must round-trip through the
+    helper — codex round-3 confirmed they're documented MNEMOS IDs
+    and the helper used to reject them outright."""
+    from mnemos.mcp.tools.memory import tool_get_memory
+
+    with patch(
+        "mnemos.mcp.tools.memory._rest_get",
+        new=AsyncMock(return_value={"id": "fed:alpha:mem_1"}),
+    ) as mock_get:
+        result = await tool_get_memory("fed:alpha:mem_1")
+    mock_get.assert_awaited_once()
+    # The path must contain the unencoded colon — colons are valid
+    # in path segments per RFC 3986; encoding them would change
+    # what the server sees.
+    called_path = mock_get.await_args.args[0]
+    assert called_path == "/v1/memories/fed:alpha:mem_1"
+    assert result == {"id": "fed:alpha:mem_1"}
 
 
 @pytest.mark.asyncio
