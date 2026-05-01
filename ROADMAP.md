@@ -99,7 +99,7 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 
 - ✅ Additional schemas already shipped in v3.2 tail (decision, person, event, code, commit) with adversarial regression tests.
 - 🔵 DAG wiring for derivations: still planned. Each compression candidate as a `memory_versions` child row with `parent_version_id → root`, branch='distilled'; narrated as branch='narrated'. Content-addressed, tamper-evident.
-- 🔵 Read-path routing on `Accept` headers: `text/plain` → narrated; `application/x-apollo-dense` → raw dense.
+- ✅ Read-path routing on `Accept` headers: `text/plain` → narrated; `application/x-apollo-dense` → raw dense — landed v4.2.0a14 round-12 on `GET /v1/memories/{id}` (negotiator at `mnemos/api/content_negotiation.py`, 19 unit + 9 handler tests). Default JSON path is unchanged so legacy clients are unaffected; `Vary: Accept` set on negotiated responses.
 - ✅ **MORPHEUS dream-state subsystem (slice 1: foundation).** v3.3.0-alpha.1 ships `morpheus_runs` table + per-row `morpheus_run_id` tagging + admin/observability API + rollback contract. Synthesis logic stubbed; slice 2 fills it in. Architecture per GRAEAE consensus 2026-04-25: append-only synthesis first, mutation paths (CONSOLIDATE / EXTRACT / ARCHIVE) deferred to v3.6+.
 - ✅ **MORPHEUS slice 2** — real cluster + synthesise phases, cron timer at 03:17 UTC, recall-frequency tracking columns (absorbed from OpenClaw dreaming patterns), per-cluster introspection artifact, per-namespace dream scoping. Landed before the v3.3 stable cut.
 

@@ -79,30 +79,27 @@ async def _fetch_winning_variant(conn, memory_id: str) -> Optional[dict]:
 # ── endpoint ──────────────────────────────────────────────────────────────
 
 
-@router.get("/{memory_id}/narrate", response_model=NarrateResponse)
-async def narrate(
+async def compute_narrate(
     memory_id: str,
-    format: str = Query(
-        "prose",
-        pattern="^(prose|dense)$",
-        description=(
-            "prose → expand APOLLO dense forms to human-readable text; "
-            "non-APOLLO variants passed through unchanged. "
-            "dense → return the raw winning-variant content verbatim; "
-            "falls back to raw memory content when no variant exists."
-        ),
-    ),
-    user: UserContext = Depends(get_current_user),
-):
-    """Expand APOLLO dense forms back to prose for human reading.
+    user: UserContext,
+    format: str,
+) -> NarrateResponse:
+    """Build the narrate response for a memory + caller + format.
 
-    Always safe to call — missing variants degrade gracefully to the
-    raw memory content, non-APOLLO variants pass through unchanged,
-    unknown dense shapes fall through verbatim rather than raising.
+    Pulled out of the HTTP handler so other endpoints can reuse the
+    dispatch (notably GET /v1/memories/{id} content negotiation on
+    ``Accept: text/plain`` / ``Accept: application/x-apollo-dense``,
+    where the same prose / dense variants are surfaced via header
+    negotiation rather than a query string).
 
-    Tenancy: non-root callers filtered by ``owner_id + namespace``.
-    404 when the memory does not exist under the caller's tenancy
-    scope — matches the visibility rules of GET /v1/memories/{id}.
+    ``format`` must be ``"prose"`` or ``"dense"``. The caller is
+    responsible for validating that — narrate's own pydantic Query
+    pattern enforces it on the HTTP edge.
+
+    Raises HTTPException(503) if the DB pool is missing and
+    HTTPException(404) when the memory is not visible under the
+    caller's tenancy scope. Otherwise the return value mirrors the
+    NarrateResponse model.
     """
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
@@ -164,3 +161,31 @@ async def narrate(
             engine_id=engine_id,
             engine_version=variant_row["engine_version"],
         )
+
+
+@router.get("/{memory_id}/narrate", response_model=NarrateResponse)
+async def narrate(
+    memory_id: str,
+    format: str = Query(
+        "prose",
+        pattern="^(prose|dense)$",
+        description=(
+            "prose → expand APOLLO dense forms to human-readable text; "
+            "non-APOLLO variants passed through unchanged. "
+            "dense → return the raw winning-variant content verbatim; "
+            "falls back to raw memory content when no variant exists."
+        ),
+    ),
+    user: UserContext = Depends(get_current_user),
+):
+    """Expand APOLLO dense forms back to prose for human reading.
+
+    Always safe to call — missing variants degrade gracefully to the
+    raw memory content, non-APOLLO variants pass through unchanged,
+    unknown dense shapes fall through verbatim rather than raising.
+
+    Tenancy: non-root callers filtered by ``owner_id + namespace``.
+    404 when the memory does not exist under the caller's tenancy
+    scope — matches the visibility rules of GET /v1/memories/{id}.
+    """
+    return await compute_narrate(memory_id, user, format)

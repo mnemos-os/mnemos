@@ -7,9 +7,11 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import PlainTextResponse
 
 import mnemos.core.lifecycle as _lc
+from mnemos.api.content_negotiation import negotiate_narrate_format
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.ids import new_memory_id
 from mnemos.core.lifecycle import (
@@ -307,8 +309,47 @@ async def list_memories(
 @router.get("/memories/{memory_id}", response_model=MemoryItem)
 async def get_memory(
     memory_id: str,
+    request: Request,
     user: UserContext = Depends(get_current_user),
 ):
+    """Fetch a memory by id.
+
+    Content-negotiation surface (Accept header):
+      * default / ``application/json`` / ``*/*`` — returns the JSON
+        ``MemoryItem`` (existing behaviour, unchanged).
+      * ``text/plain`` — returns the prose narration body, identical
+        to ``GET /v1/memories/{id}/narrate?format=prose``.
+      * ``application/x-apollo-dense`` — returns the raw winning-
+        variant content (APOLLO dense form), identical to
+        ``?format=dense`` on the narrate endpoint.
+
+    Non-default Accept values still go through the same tenancy and
+    404 visibility checks as the JSON path; falling back to default
+    JSON when negotiation does not pick a non-default media type
+    keeps legacy clients unaffected.
+    """
+    accept = request.headers.get("accept", "") if request else ""
+    narrate_format = negotiate_narrate_format(accept)
+    if narrate_format is not None:
+        # Lazy import keeps the route module's import surface stable
+        # even when narrate.py grows further deps over the v3.3 S-III
+        # cached-LLM cutover.
+        from mnemos.api.routes.narrate import compute_narrate
+
+        narrate_response = await compute_narrate(memory_id, user, narrate_format)
+        media_type = (
+            "text/plain"
+            if narrate_format == "prose"
+            else "application/x-apollo-dense"
+        )
+        return PlainTextResponse(
+            narrate_response.content,
+            media_type=media_type,
+            # Vary so caches do not serve a JSON body to a text/plain
+            # caller (and vice-versa).
+            headers={"Vary": "Accept"},
+        )
+
     backend = _backend_or_503()
     # Root callers see everything (namespace=None); non-root callers
     # are pinned to their namespace by the visibility factory. 404

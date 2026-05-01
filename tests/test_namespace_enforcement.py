@@ -53,6 +53,16 @@ def _last_call(backend, method: str) -> dict:
     raise AssertionError(f"no {method} call captured: {backend.memories.calls}")
 
 
+def _empty_request():
+    """Mock fastapi.Request with no Accept header — drives the default
+    JSON negotiation path used by these tests."""
+    from unittest.mock import MagicMock
+
+    req = MagicMock()
+    req.headers = {}
+    return req
+
+
 def _memory_row(*, namespace: str = "other-ns", owner_id: str = "other-owner") -> dict:
     return {
         "id": "memory-1",
@@ -171,7 +181,9 @@ def test_get_memory_filters_by_namespace_for_non_root(monkeypatch):
         memories_handler, "_row_to_memory",
         lambda r, **kw: {"id": r["id"]},
     )
-    asyncio.run(memories_handler.get_memory("memory-1", user=_alice("alice-ns")))
+    asyncio.run(memories_handler.get_memory(
+        "memory-1", request=_empty_request(), user=_alice("alice-ns"),
+    ))
 
     call = _last_call(backend, "get_memory")
     assert call["memory_id"] == "memory-1"
@@ -188,7 +200,9 @@ def test_get_memory_no_namespace_filter_for_root(monkeypatch):
         memories_handler, "_row_to_memory",
         lambda r, **kw: {"id": r["id"]},
     )
-    asyncio.run(memories_handler.get_memory("memory-1", user=_root()))
+    asyncio.run(memories_handler.get_memory(
+        "memory-1", request=_empty_request(), user=_root(),
+    ))
 
     call = _last_call(backend, "get_memory")
     vis = call["visibility"]
@@ -203,7 +217,7 @@ def test_get_memory_returns_404_when_namespace_mismatch(monkeypatch):
     backend.memories.configure_return("get_memory", None)  # repo filtered it out
     with pytest.raises(HTTPException) as exc:
         asyncio.run(memories_handler.get_memory(
-            "memory-1", user=_alice("alice-ns"),
+            "memory-1", request=_empty_request(), user=_alice("alice-ns"),
         ))
     assert exc.value.status_code == 404
 
