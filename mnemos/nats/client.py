@@ -119,13 +119,6 @@ async def ensure_streams(js) -> bool:
         _stream_config("MNEMOS_CONSULTATION", ["mnemos.consultation.>"]),
         _stream_config("MNEMOS_WEBHOOK", ["mnemos.webhook.>"]),
     ]
-    # Lazy-import the structured error class so the absence of the
-    # nats-py JetStream API at import-time doesn't crash this module.
-    try:
-        from nats.js.errors import BadRequestError  # type: ignore
-    except ImportError:
-        BadRequestError = type("BadRequestError", (Exception,), {})  # type: ignore[misc, assignment]
-
     for cfg in streams:
         try:
             await js.add_stream(config=cfg)
@@ -153,31 +146,28 @@ async def ensure_streams(js) -> bool:
                 )
                 return False
 
-        # add_stream raised. nats-py 2.14 silently accepts a TRUE
-        # matching-config redeclare (no raise); BadRequestError /
-        # "already in use" only appears when the existing config
-        # diverges. So we know: existing stream is NOT cfg.
-        #
-        # Distinguish the two acceptable diverging cases from real
-        # drift by re-trying the SAME stream with the fallback
-        # config. If that one is also accepted silently, the
-        # existing stream IS the 1 GiB fallback we ourselves
-        # create; publishing is safe. If it ALSO raises, neither
-        # canonical nor fallback matches → real drift, fail closed.
-        #
-        # Crucially, this approach uses the broker's full config
-        # comparator (which knows about every field — max_msg_size,
-        # replicas, discard, no_ack, ...) instead of our partial
-        # field-by-field drift detector. Codex rounds 6/7/8.
-        looks_like_existing = (
-            isinstance(exc, BadRequestError)
-            or "already in use" in msg
-            or "stream name already" in msg.lower()
-        )
-        if not looks_like_existing:
+        # add_stream raised. We need to distinguish:
+        #   (a) duplicate / config-mismatch — existing stream
+        #       differs. NATS err_code 10058 / message contains
+        #       "already in use" / "stream name already". Safe to
+        #       probe with fallback config to learn whether the
+        #       existing stream IS our fallback shape.
+        #   (b) any OTHER 400 (BadRequest) — max-streams quota,
+        #       subject conflict with another stream, policy
+        #       incompat. Probing with a different max_bytes could
+        #       silently SUCCEED for the wrong reason (creating a
+        #       degraded stream where canonical was rejected for an
+        #       unrelated 400 reason). Fail closed on those.
+        # Codex round-9 finding.
+        if not _is_duplicate_stream_rejection(exc):
             logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
             return False
 
+        # Existing stream differs from canonical. Probe with the
+        # fallback config; the broker is the authoritative
+        # comparator. This delegates the comparison across EVERY
+        # field (max_msg_size, replicas, discard, no_ack, ...) to
+        # the broker rather than our partial field check.
         try:
             await js.add_stream(
                 config=_stream_config(cfg.name, list(cfg.subjects), 1024**3)
@@ -195,26 +185,65 @@ async def ensure_streams(js) -> bool:
                 cfg.name,
             )
             continue
-        except Exception:
-            # Neither canonical nor fallback config matches the
-            # running stream → real drift. Run the drift detector
-            # for an operator-facing diagnostic log of the SHAPE of
-            # drift we can see, then fail closed regardless of what
-            # it returns.
-            drift = await _stream_config_drift(js, cfg)
+        except Exception as fallback_exc:
+            if _is_duplicate_stream_rejection(fallback_exc):
+                # Neither canonical nor fallback matches the running
+                # stream → real drift. Diagnostic log via partial
+                # drift detector + fail closed.
+                drift = await _stream_config_drift(js, cfg)
+                logger.error(
+                    "NATS stream %s config drift detected (running stream "
+                    "matches neither the canonical nor the 1 GiB fallback "
+                    "config). Visible drift fields: %s. Operator must "
+                    "`nats stream update %s` or delete+recreate to apply "
+                    "the new config; field list above is partial — broker "
+                    "may also differ on un-compared fields.",
+                    cfg.name,
+                    drift or "(none in compared dimensions; see broker)",
+                    cfg.name,
+                )
+                return False
+            # Transient failure during fallback probe — DON'T
+            # recommend destructive recovery. A flaky broker
+            # connection should not lead operators to wipe state.
+            # Just log the actual failure and fail closed.
             logger.error(
-                "NATS stream %s config drift detected (running stream "
-                "matches neither the canonical nor the 1 GiB fallback "
-                "config). Visible drift fields: %s. Operator must "
-                "`nats stream update %s` or delete+recreate to apply "
-                "the new config; field list above is partial — broker "
-                "may also differ on un-compared fields.",
+                "NATS stream %s fallback probe failed transiently "
+                "(canonical add_stream returned duplicate-config "
+                "rejection; fallback probe raised: %s). Not classifying "
+                "as config drift. Operator should retry once the broker "
+                "is stable.",
                 cfg.name,
-                drift or "(none in compared dimensions; see broker)",
-                cfg.name,
+                fallback_exc,
             )
             return False
     return True
+
+
+def _is_duplicate_stream_rejection(exc: Exception) -> bool:
+    """True iff ``exc`` is the specific JetStream rejection meaning
+    "stream exists with a different configuration than requested".
+
+    NATS error code 10058 carries this semantic. Older nats-py
+    releases don't expose err_code reliably, so message-text
+    matching is also accepted as a fallback. We deliberately do
+    NOT accept "any BadRequestError" — JetStream 400 covers
+    max-streams quota, subject overlaps with another stream,
+    policy-incompat, and other unrelated rejections; treating
+    those as duplicate-config triggers a fallback probe that
+    could silently succeed for the wrong reason.
+
+    Codex round-9 finding.
+    """
+    code = getattr(exc, "err_code", None) or getattr(exc, "code", None)
+    if code in (10058,) or str(code) == "10058":
+        return True
+    msg = str(exc).lower()
+    return (
+        "10058" in msg
+        or "already in use" in msg
+        or "stream name already" in msg
+    )
 
 
 def _normalize_enum_value(v):

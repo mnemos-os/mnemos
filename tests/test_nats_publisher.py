@@ -379,6 +379,88 @@ def test_ensure_streams_smaller_non_fallback_max_bytes_disables_publishing(monke
     )
 
 
+def test_ensure_streams_non_duplicate_badrequest_fails_closed(monkeypatch, caplog):
+    """Codex round-9: BadRequestError can mean LOTS of things in
+    JetStream — max-streams quota, subject conflict with another
+    stream, policy-incompatibility, etc. Treating any 400 as
+    "stream exists with different config" was wrong because the
+    fallback probe might silently succeed for the wrong reason.
+
+    Fix: only err_code 10058 / "already in use" text triggers the
+    fallback comparator. Other 400s fail closed immediately.
+    """
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="mnemos.nats.client")
+
+    fallback_attempted = []
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            # Simulate a non-duplicate BadRequest (e.g.,
+            # max-streams quota exceeded) on the canonical declare.
+            # If the buggy code took the fallback probe and that
+            # somehow succeeded, the test would falsely pass.
+            if config.max_bytes != 10 * 1024**3:
+                fallback_attempted.append(config.max_bytes)
+                # Hypothetical: lowering max_bytes makes the broker
+                # accept (e.g., quota was on aggregate bytes)
+                return SimpleNamespace(config=config)
+            raise RuntimeError("nats: maximum number of streams reached")
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is False, (
+        "non-duplicate BadRequest must fail closed — must NOT take "
+        "the fallback probe path"
+    )
+    assert not fallback_attempted, (
+        "fallback probe must be skipped for non-duplicate rejections; "
+        f"attempted with max_bytes={fallback_attempted}"
+    )
+
+
+def test_ensure_streams_transient_fallback_failure_does_not_say_drift(monkeypatch, caplog):
+    """Codex round-9: when the fallback probe fails for a transient
+    reason (timeout, broker drop), don't mislead operator with
+    'matches neither + delete+recreate' guidance — that would have
+    them destroy a stream because of a flaky network connection.
+
+    Fix: the matches-neither classification only applies when the
+    fallback probe ALSO raises a duplicate-config rejection. Other
+    failures get a "transient" log and fail closed without
+    delete+recreate guidance.
+    """
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="mnemos.nats.client")
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            if config.max_bytes == 10 * 1024**3:
+                # Canonical: duplicate rejection.
+                raise RuntimeError("nats: stream name already in use")
+            # Fallback probe: transient broker failure.
+            raise TimeoutError("broker unreachable")
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is False, "transient fallback failure must fail closed"
+    # Operator must NOT see the destructive-recovery guidance.
+    full_log = " ".join(rec.message.lower() for rec in caplog.records)
+    assert "transient" in full_log, (
+        f"transient fallback failure must log 'transient'. caplog: "
+        f"{[r.message for r in caplog.records]}"
+    )
+    assert "delete+recreate" not in full_log, (
+        "transient failure must NOT recommend destructive recovery"
+    )
+
+
 def test_ensure_streams_drift_detector_returns_empty_on_match():
     """Direct unit test of the drift helper — matching configs
     produce an empty drift dict (= idempotent)."""
