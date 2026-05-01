@@ -11,6 +11,7 @@ import inspect
 import json
 import logging
 import math
+import os
 import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
@@ -286,7 +287,47 @@ def _parse_embedding(raw: Any) -> list[float]:
     return []
 
 
+# Optional Rust hot-path accelerator. Loaded lazily so the absence of
+# the wheel on a given build host does NOT break the import — the
+# Python implementation below stays the source of truth.
+# Opt-in via env var MNEMOS_HOT_RS_ENABLED=1; default off until soak.
+_HOT_RS = None
+_HOT_RS_ENABLED = os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+if _HOT_RS_ENABLED:
+    try:
+        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+        logger.info(
+            "mnemos_hot Rust accelerator enabled (cosine UDF will use mnemos_hot %s)",
+            getattr(_HOT_RS, "__version__", "?"),
+        )
+    except ImportError as _exc:
+        # Wheel not built for this platform / venv — fall back to the
+        # Python implementation. Operator can install via
+        # `maturin develop` from /private/tmp/mnemos-hot-rs.
+        logger.warning(
+            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
+            "Falling back to pure-Python cosine UDF.",
+            _exc,
+        )
+        _HOT_RS = None
+
+
 def _cosine_similarity(left: Any, right: Any) -> float:
+    if _HOT_RS is not None:
+        # Rust path: ~12× faster on 384-dim batches per
+        # /private/tmp/mnemos-hot-rs/bench_vs_python.py. The Rust
+        # parse_embedding mirrors the Python semantics 1:1 (None →
+        # [], list → float-extract, str → JSON-array hand-parse,
+        # length mismatch → 0.0, zero norm → 0.0).
+        try:
+            a = _HOT_RS.parse_embedding(left)
+            b = _HOT_RS.parse_embedding(right)
+        except Exception:
+            # Defensive: an unexpected input shape (e.g., bytes) would
+            # raise ValueError out of pyo3. Fall back to Python.
+            a = _parse_embedding(left)
+            b = _parse_embedding(right)
+        return _HOT_RS.cosine(a, b)
     a = _parse_embedding(left)
     b = _parse_embedding(right)
     if not a or not b or len(a) != len(b):
