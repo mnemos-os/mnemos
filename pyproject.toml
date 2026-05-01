@@ -221,11 +221,16 @@ forbidden_modules = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-# tests/integration_nats/ requires a live NATS broker
-# (MNEMOS_NATS_TEST_URL); the conftest skips them when the env var
-# is absent. The --ignore here is belt-and-suspenders for default
-# `pytest` invocations on dev boxes without the env var set.
-addopts = "--ignore=tests/test_live_e2e.py --ignore=tests/integration_nats"
+# Note on tests/integration_nats/: those tests require a live NATS
+# broker (MNEMOS_NATS_TEST_URL). They are NOT in addopts ignore
+# here on purpose — pytest's --ignore short-circuits collection
+# BEFORE conftest hooks run, so an explicit `pytest tests/
+# integration_nats/` would silently collect zero tests if we
+# kept the ignore. Instead, the conftest in that directory uses
+# pytest_collection_modifyitems to mark every collected test as
+# skipped when MNEMOS_NATS_TEST_URL is unset — default `pytest`
+# stays green without skipping a directory by name.
+addopts = "--ignore=tests/test_live_e2e.py"
 markers = [
   "integration: integration tests requiring MNEMOS_TEST_DB (postgres://...)",
 ]
