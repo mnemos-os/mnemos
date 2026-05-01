@@ -291,22 +291,97 @@ class PrometheusMiddleware(BaseHTTPMiddleware):
 
 # The /metrics router is defined here so operators importing this
 # module get one place to hook everything. api_server.py includes
-# this router alongside the others; no auth on /metrics, per the
-# Prometheus scrape convention — operators network-scope the
-# endpoint via their ingress/firewall, not per-request auth.
+# this router alongside the others. Auth is opt-in via the
+# ``MNEMOS_METRICS_REQUIRE_AUTH`` setting (default False, matching
+# the Prometheus convention of network-scoping the scrape endpoint).
+# When flipped on, /metrics requires the same Bearer token as the
+# rest of the API.
 metrics_router = APIRouter(tags=["observability"])
 
 
+def _metrics_auth_required() -> bool:
+    """Read the runtime metrics-auth setting through ``get_settings``
+    so operators can flip it via env var without restarting. Imports
+    are kept lazy to avoid a circular at module-load time."""
+    try:
+        return bool(get_settings().observability.metrics_require_auth)
+    except Exception:
+        # Settings not yet built (test bootstrap, importlib reloads,
+        # etc.). Fail open — same default as the env-unset case.
+        return False
+
+
+async def _verify_metrics_token(request: Request) -> None:
+    """Reject /metrics scrapes that don't carry a valid Bearer token.
+
+    Only runs when ``MNEMOS_METRICS_REQUIRE_AUTH`` is True. Uses the
+    same ``api_keys`` table check the other read endpoints use; bound
+    to a single SHA-256 lookup so the scrape latency cost is one
+    indexed query.
+
+    Returning ``None`` means the request is authorized (or auth is
+    disabled at the metrics layer). Anything else raises
+    ``HTTPException`` with the appropriate status code.
+    """
+    if not _metrics_auth_required():
+        return None
+
+    auth_header = request.headers.get("authorization", "")
+    parts = auth_header.split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=401,
+            detail="Bearer token required for /metrics",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+    raw_token = parts[1].strip()
+    pool = getattr(request.app.state, "pool", None)
+    if pool is None:
+        # Auth is required but no DB pool — fail closed rather than
+        # silently letting the scrape through.
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=503, detail="Database pool not available for auth check",
+        )
+
+    import hashlib
+
+    key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT revoked FROM api_keys WHERE key_hash = $1", key_hash,
+        )
+    if row is None or row["revoked"]:
+        from fastapi import HTTPException
+
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid or revoked API key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return None
+
+
 @metrics_router.get("/metrics", include_in_schema=False)
-async def prometheus_metrics() -> Response:
+async def prometheus_metrics(request: Request) -> Response:
     """Prometheus text-exposition endpoint. Returns the default-registry
     payload — every metric defined against the default registry shows
     up here.
+
+    When ``MNEMOS_METRICS_REQUIRE_AUTH`` is ``true``, the request must
+    carry a valid Bearer token (same ``api_keys`` table as the rest
+    of the API). Default behaviour (env unset / false) is unchanged:
+    no per-request auth, scope-by-ingress.
 
     Returns a stub when prometheus_client isn't installed, so scrapers
     pointed at this endpoint see a clear empty-but-valid response
     instead of a 500.
     """
+    await _verify_metrics_token(request)
     if not _PROMETHEUS_AVAILABLE:
         return Response(
             content="# prometheus_client not installed\n",

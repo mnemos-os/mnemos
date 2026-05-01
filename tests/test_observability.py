@@ -274,6 +274,185 @@ def test_metrics_unknown_route_bucketed_as_no_route():
     assert 'route="/does-not-exist"' not in body
 
 
+# ---- Metrics auth gate (MNEMOS_METRICS_REQUIRE_AUTH) -----------------------
+#
+# Default is OFF — operators network-scope the scrape endpoint via
+# their ingress / firewall. When flipped on, /metrics requires a
+# valid Bearer token from the same ``api_keys`` table the rest of
+# the API uses. These tests pin both shapes so a refactor of the
+# gate cannot silently regress to either always-open or always-closed.
+
+
+import hashlib
+from contextlib import contextmanager
+from unittest.mock import AsyncMock, MagicMock
+
+
+def _auth_app(*, require_auth: bool):
+    """Same /metrics app but with metrics_require_auth toggled via
+    monkeypatching the live setting through a contextmanager
+    pattern. Returns the FastAPI app + a callable to install/remove
+    the toggle."""
+    from mnemos.core.observability import PrometheusMiddleware, metrics_router
+
+    app = FastAPI()
+    app.add_middleware(PrometheusMiddleware)
+    app.include_router(metrics_router)
+
+    # Mount a fake pool on app.state so the auth path's pool lookup
+    # finds something. The pool itself is replaced per-test depending
+    # on what api_keys row should be returned.
+    app.state.pool = None
+    return app
+
+
+@contextmanager
+def _override_metrics_auth(value: bool):
+    """Toggle MNEMOS_METRICS_REQUIRE_AUTH at runtime by patching the
+    settings instance get_settings() returns. Cleanup restores the
+    original value."""
+    from mnemos.core import config as config_mod
+
+    settings = config_mod.get_settings()
+    obs = settings.observability
+    original = obs.metrics_require_auth
+    object.__setattr__(obs, "metrics_require_auth", value)
+    try:
+        yield
+    finally:
+        object.__setattr__(obs, "metrics_require_auth", original)
+
+
+def _install_auth_pool(app, *, key_hash_to_row: dict):
+    """Wire a fake asyncpg pool onto app.state.pool that returns the
+    given row mapping for SELECT queries against api_keys."""
+
+    class _AsyncCtx:
+        def __init__(self, conn):
+            self._c = conn
+
+        async def __aenter__(self):
+            return self._c
+
+        async def __aexit__(self, *args):
+            return None
+
+    conn = MagicMock()
+
+    async def _fetchrow(sql, value):
+        return key_hash_to_row.get(value)
+
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AsyncCtx(conn))
+    app.state.pool = pool
+
+
+def test_metrics_open_by_default(monkeypatch):
+    """Default behaviour: no Authorization header required, no
+    Bearer token required, /metrics returns 200."""
+    app = _auth_app(require_auth=False)
+    client = TestClient(app)
+    with _override_metrics_auth(False):
+        resp = client.get("/metrics")
+    assert resp.status_code == 200
+
+
+def test_metrics_open_default_ignores_invalid_bearer(monkeypatch):
+    """Even with a malformed Authorization header, default-mode
+    /metrics still returns 200 — the gate is off."""
+    app = _auth_app(require_auth=False)
+    client = TestClient(app)
+    with _override_metrics_auth(False):
+        resp = client.get("/metrics", headers={"Authorization": "Bearer bogus"})
+    assert resp.status_code == 200
+
+
+def test_metrics_auth_required_rejects_missing_token(monkeypatch):
+    """When the gate is on and no Authorization header is sent,
+    /metrics returns 401 with WWW-Authenticate: Bearer."""
+    app = _auth_app(require_auth=True)
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get("/metrics")
+    assert resp.status_code == 401
+    assert "Bearer" in resp.headers.get("www-authenticate", "")
+
+
+def test_metrics_auth_required_rejects_non_bearer_scheme(monkeypatch):
+    """A Basic or other-scheme header doesn't satisfy the Bearer
+    requirement."""
+    app = _auth_app(require_auth=True)
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": "Basic dXNlcjpwYXNz"},
+        )
+    assert resp.status_code == 401
+
+
+def test_metrics_auth_required_rejects_empty_token(monkeypatch):
+    app = _auth_app(require_auth=True)
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get("/metrics", headers={"Authorization": "Bearer "})
+    assert resp.status_code == 401
+
+
+def test_metrics_auth_required_503_when_no_pool(monkeypatch):
+    """The auth path needs the DB pool to look up the token's hash.
+    With auth required AND no pool, fail closed (503), do NOT silently
+    serve the metrics body."""
+    app = _auth_app(require_auth=True)
+    app.state.pool = None
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": "Bearer sometoken"},
+        )
+    assert resp.status_code == 503
+
+
+def test_metrics_auth_required_rejects_unknown_token(monkeypatch):
+    app = _auth_app(require_auth=True)
+    _install_auth_pool(app, key_hash_to_row={})
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": "Bearer wrong-token"},
+        )
+    assert resp.status_code == 401
+
+
+def test_metrics_auth_required_rejects_revoked_token(monkeypatch):
+    raw_token = "revoked-token-xyz"
+    key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    app = _auth_app(require_auth=True)
+    _install_auth_pool(app, key_hash_to_row={key_hash: {"revoked": True}})
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": f"Bearer {raw_token}"},
+        )
+    assert resp.status_code == 401
+
+
+def test_metrics_auth_required_admits_valid_token(monkeypatch):
+    """Happy path: gate on, valid Bearer token, /metrics returns 200."""
+    raw_token = "good-token-abc"
+    key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    app = _auth_app(require_auth=True)
+    _install_auth_pool(app, key_hash_to_row={key_hash: {"revoked": False}})
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": f"Bearer {raw_token}"},
+        )
+    assert resp.status_code == 200
+    # Body shape is the standard prometheus exposition.
+    assert "text/plain" in resp.headers["content-type"]
+
+
 # ---- OpenTelemetry tracing (v3.2 observability slice 3) --------------------
 
 

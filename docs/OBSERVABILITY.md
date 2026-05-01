@@ -33,11 +33,9 @@ scrape_configs:
   - job_name: mnemos
     scrape_interval: 30s
     metrics_path: /metrics
-    # /metrics is intentionally unauthenticated — it carries no
-    # secrets, only counters and histograms. Network-level controls
-    # (private VPC, firewall rules, mesh ACLs) are the right gate.
-    # If you DO need bearer auth on the metrics endpoint, terminate
-    # at a reverse proxy (Caddy / nginx with auth_basic + Bearer).
+    # By default /metrics is unauthenticated and carries no secrets,
+    # only counters and histograms. Operators network-scope the
+    # endpoint (private VPC, firewall rules, mesh ACLs).
     static_configs:
       - targets:
           - mnemos-prod-1:5002
@@ -51,6 +49,32 @@ scrape_configs:
           env: production
           tier: edge
 ```
+
+### 2.1 Optional: bearer auth on `/metrics`
+
+If you can't network-scope (shared cloud Prometheus, public-internet-
+routed clusters), set `MNEMOS_METRICS_REQUIRE_AUTH=true` on the
+mnemos process. The endpoint then requires the same Bearer token
+the rest of the API uses (looked up against the `api_keys` table —
+revoked keys are rejected). Add the credential to Prometheus's
+scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: mnemos
+    scrape_interval: 30s
+    metrics_path: /metrics
+    authorization:
+      type: Bearer
+      credentials: <api-key-token>
+    static_configs:
+      - targets: [mnemos-prod-1:5002]
+```
+
+Default is `false` — flipping the env var does not change behaviour
+for operators who already network-scope, and has zero startup cost
+(the per-request check is one indexed `api_keys` lookup keyed on
+the SHA-256 of the token).
 
 If you run multiple replicas behind a load balancer, scrape each
 backend directly (not the LB) so per-replica metrics distinguish

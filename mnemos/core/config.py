@@ -274,6 +274,15 @@ class _ObservabilitySettings(BaseSettings):
     structured_logs: bool = Field(False, validation_alias="MNEMOS_STRUCTURED_LOGS")
     tracing_enabled: bool = Field(True, validation_alias="MNEMOS_TRACING_ENABLED")
     metrics_enabled: bool = Field(True, validation_alias="MNEMOS_METRICS_ENABLED")
+    # When True, /metrics requires the same Bearer token as the rest of
+    # the API. Default False matches the Prometheus convention of
+    # network-scoping the scrape endpoint via ingress / firewall rather
+    # than per-request auth. Operators in environments where the
+    # /metrics endpoint is reachable from less-trusted networks (shared
+    # cloud Prometheus, public-internet-routed clusters) flip this on.
+    metrics_require_auth: bool = Field(
+        False, validation_alias="MNEMOS_METRICS_REQUIRE_AUTH",
+    )
     otel_service_name: str = Field("mnemos", validation_alias="OTEL_SERVICE_NAME")
     otel_exporter_otlp_endpoint: str = Field("", validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
 
