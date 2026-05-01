@@ -38,8 +38,16 @@ async def consumer_loop(
     backoff = ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)
 
     while True:
+        nc = None
+        sub = None
         try:
-            js = await connect(settings)
+            connect_result = await connect(settings)
+            # Backwards compat: legacy connect callables returned the
+            # JetStream context directly; new path returns (nc, js).
+            if isinstance(connect_result, tuple) and len(connect_result) == 2:
+                nc, js = connect_result
+            else:
+                nc, js = None, connect_result
             if js is None:
                 raise RuntimeError("NATS JetStream unavailable")
             logger.info("webhook nats trigger connected subject=%s", SUBJECT)
@@ -49,11 +57,24 @@ async def consumer_loop(
             # consumer-group recovery) would otherwise reset every
             # iteration and burn through a tight loop.
             backoff.reset()
-            await _consume_subscription(pool, sub)
+            # Subscription is now driven by _consume_subscription;
+            # ownership transfers there. Don't double-clean below.
+            sub_owned = sub
+            sub = None
+            try:
+                await _consume_subscription(pool, sub_owned)
+            finally:
+                # Always drain after consume returns or raises;
+                # otherwise the connection stays open across loop
+                # iterations.
+                await _drain_partial(nc, [sub_owned])
+                nc = None
         except asyncio.CancelledError:
             logger.info("webhook nats trigger cancelled")
+            await _drain_partial(nc, [s for s in [sub] if s is not None])
             raise
         except Exception as exc:
+            await _drain_partial(nc, [s for s in [sub] if s is not None])
             delay = backoff.next_delay()
             logger.warning(
                 "webhook nats trigger unavailable: %s; retrying in %.1fs",
@@ -61,6 +82,30 @@ async def consumer_loop(
                 delay,
             )
             await asyncio.sleep(delay)
+
+
+async def _drain_partial(nc: Any, subscriptions: list[Any]) -> None:
+    """Best-effort cleanup for partial connect/subscribe state.
+
+    On a failed subscribe (broker accepted connection, stream/
+    consumer rejected the subscribe), unsubscribe what landed and
+    drain the underlying NATS connection so we do not leak one
+    socket per retry. Errors during cleanup are swallowed — we are
+    already in a failure path.
+    """
+    for s in subscriptions:
+        try:
+            await s.unsubscribe()
+        except Exception:
+            pass
+    if nc is not None:
+        try:
+            await nc.drain()
+        except Exception:
+            try:
+                await nc.close()
+            except Exception:
+                pass
 
 
 async def handle_message(
@@ -119,6 +164,12 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
 
 
 async def _connect(settings: Settings):
+    """Open a NATS connection + JetStream context.
+
+    Returns ``(nc, js)`` so the caller can drain ``nc`` if subscribe
+    fails before the consume loop starts. Without surfacing ``nc``,
+    every subscribe failure leaked one TCP connection per retry.
+    """
     try:
         import nats  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -128,7 +179,7 @@ async def _connect(settings: Settings):
     if settings.nats.token:
         connect_kwargs["token"] = settings.nats.token
     nc = await nats.connect(**connect_kwargs)
-    return nc.jetstream()
+    return nc, nc.jetstream()
 
 
 def _node_durable() -> str:

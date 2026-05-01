@@ -945,7 +945,7 @@ async def test_compression_candidate_variant_and_export(backend_case: BackendCas
                     "INSERT INTO memory_compression_candidates "
                     "(id, memory_id, owner_id, contest_id, engine_id, "
                     "is_winner, reject_reason) "
-                    "VALUES (?, ?, ?, ?, ?, 0, 'parity_seed_loser')"
+                    "VALUES (?, ?, ?, ?, ?, 0, 'inferior')"
                 ),
             )
         else:
@@ -960,7 +960,7 @@ async def test_compression_candidate_variant_and_export(backend_case: BackendCas
                 "INSERT INTO memory_compression_candidates "
                 "(id, memory_id, owner_id, contest_id, engine_id, "
                 "is_winner, reject_reason) "
-                "VALUES ($1::uuid, $2, $3, $4::uuid, $5, false, 'parity_seed_loser')",
+                "VALUES ($1::uuid, $2, $3, $4::uuid, $5, false, 'inferior')",
                 candidate_id,
                 memory_id,
                 owner,

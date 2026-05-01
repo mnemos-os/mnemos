@@ -380,7 +380,7 @@ async def fetch_memory_branch_heads(
         return await conn.fetch(
             """
             SELECT DISTINCT ON (memory_id, branch)
-                memory_id, branch, id AS head_version_id
+                memory_id, branch, id::text AS head_version_id
             FROM memory_versions
             WHERE memory_id = ANY($1::text[])
               AND id = ANY($2::uuid[])
@@ -392,7 +392,7 @@ async def fetch_memory_branch_heads(
     return await conn.fetch(
         """
         SELECT DISTINCT ON (memory_id, branch)
-            memory_id, branch, id AS head_version_id
+            memory_id, branch, id::text AS head_version_id
         FROM memory_versions
         WHERE memory_id = ANY($1::text[])
         ORDER BY memory_id, branch, version_num DESC

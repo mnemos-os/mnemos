@@ -113,8 +113,16 @@ async def consumer_loop(
     backoff = ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)
 
     while True:
+        nc = None
+        subscriptions: list[Any] = []
         try:
-            js = await connect(peer)
+            connect_result = await connect(peer)
+            # Backwards compat: legacy connect callables returned the
+            # JetStream context directly; new path returns (nc, js).
+            if isinstance(connect_result, tuple) and len(connect_result) == 2:
+                nc, js = connect_result
+            else:
+                nc, js = None, connect_result
             logger.info(
                 "federation nats consumer connected peer=%s url=%s subjects=%s",
                 peer.name,
@@ -129,12 +137,17 @@ async def consumer_loop(
             # tight reconnect loop instead of backing off.
             backoff.reset()
             async with _SubscriptionGroup(pool, peer, subscriptions) as group:
+                # Subscriptions are now owned by the group; the
+                # finally-block below should NOT double-drain them.
+                subscriptions = []
                 async for _ in group:
                     pass
         except asyncio.CancelledError:
             logger.info("federation nats consumer cancelled peer=%s", peer.name)
+            await _drain_partial(nc, subscriptions)
             raise
         except Exception as exc:
+            await _drain_partial(nc, subscriptions)
             delay = backoff.next_delay()
             logger.warning(
                 "federation nats consumer peer=%s unavailable: %s; retrying in %.1fs",
@@ -143,6 +156,30 @@ async def consumer_loop(
                 delay,
             )
             await asyncio.sleep(delay)
+
+
+async def _drain_partial(nc: Any, subscriptions: list[Any]) -> None:
+    """Best-effort cleanup for partial connect/subscribe state.
+
+    On a failed subscribe (e.g. second subject's subscribe errors
+    after the first succeeded), unsubscribe what landed and drain
+    the underlying NATS connection so we don't accumulate
+    abandoned TCP sockets per retry. Errors during cleanup are
+    swallowed — we are already in a failure path.
+    """
+    for sub in subscriptions:
+        try:
+            await sub.unsubscribe()
+        except Exception:
+            pass
+    if nc is not None:
+        try:
+            await nc.drain()
+        except Exception:
+            try:
+                await nc.close()
+            except Exception:
+                pass
 
 
 async def handle_message(
@@ -234,6 +271,13 @@ async def delete_federated_memory(pool: asyncpg.Pool, peer_name: str, memory_id:
 
 
 async def _connect_peer(peer: FederationNatsPeer):
+    """Open a NATS connection + JetStream context for one peer.
+
+    Returns ``(nc, js)`` so the caller can drain ``nc`` if subscribe
+    fails before the consume group is active. Without surfacing
+    ``nc``, every failed subscribe leaked one TCP connection per
+    retry — Audit Finding from v4.2.0a6 round-2 codex.
+    """
     try:
         import nats  # type: ignore[import-not-found]
     except ImportError as exc:
@@ -243,7 +287,7 @@ async def _connect_peer(peer: FederationNatsPeer):
     if peer.nats_token:
         connect_kwargs["token"] = peer.nats_token
     nc = await nats.connect(**connect_kwargs)
-    return nc.jetstream()
+    return nc, nc.jetstream()
 
 
 async def _subscribe(js: Any, peer: FederationNatsPeer, subject: str):

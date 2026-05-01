@@ -4,6 +4,14 @@ Slice 6 preparation only. The engine remains on the existing in-process
 provider calls until `MNEMOS_GRAEAE_NATS_FANOUT=true` is implemented by a
 future slice.
 
+> **Looking for the operational reference?** This doc covers the
+> not-yet-flagged GRAEAE consultation fan-out design. For the live
+> NATS substrate (federation push consumers + webhook delivery
+> nudges, the three production streams MNEMOS_MEMORY /
+> MNEMOS_CONSULTATION / MNEMOS_WEBHOOK, federation peer config,
+> reconnect/backoff/cleanup behavior, and operator runbook) see
+> [`docs/NATS_OPERATIONS.md`](../../../docs/NATS_OPERATIONS.md).
+
 ## Goal
 
 Move GRAEAE consultation fan-out from ad-hoc in-process slot tracking to a
