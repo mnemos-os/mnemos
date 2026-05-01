@@ -480,6 +480,37 @@ def _nats_sse_data(msg: Any) -> str:
 
 
 async def _subscribe_nats_sse_subject(js: Any, subject: str) -> Any:
+    """Subscribe an MCP SSE bridge to a NATS subject.
+
+    LIVE-ONLY telemetry contract. Both branches deliberately give
+    up JetStream durability/replay semantics:
+
+      * Core-NATS path (``js._nc.subscribe``) — used when the
+        underlying connection exposes the core NATS handle. Pure
+        live pub/sub: messages published while no SSE client is
+        connected are dropped by the broker, no replay window, no
+        delivery acks.
+      * JetStream path — uses ``DeliverPolicy.NEW`` +
+        ``AckPolicy.NONE``: each subscriber starts at the live
+        edge, does NOT replay the 30-day stream backlog, and
+        does NOT ack messages back to the broker. So even though
+        this branch goes through JetStream API, the SSE bridge
+        is configured to behave like a live-only feed.
+
+    Operator expectations: ``GET /sse?subjects=...`` is a
+    real-time telemetry stream for SSE clients that are
+    connected RIGHT NOW. It is NOT a replay-able audit log; for
+    historical reads use the HTTP REST surface (``GET /v1/
+    memories/...``, ``GET /v1/federation/feed``, etc.) which
+    runs through the visibility-gated repository path.
+
+    Codex round-10 of the v4.2-NATS corpus review surfaced the
+    expectation gap: a docs-aware operator might assume a
+    NATS-backed SSE over MNEMOS events implied JetStream
+    semantics. This docstring + ``docs/NATS_OPERATIONS.md``
+    "MCP event bridge" section make the live-only contract
+    explicit.
+    """
     nc = getattr(js, "_nc", None)
     subscribe = getattr(nc, "subscribe", None)
     if subscribe is not None:

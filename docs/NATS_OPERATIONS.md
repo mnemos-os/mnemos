@@ -177,6 +177,48 @@ For multi-tenant deployments, the recommended hardening:
      for hard isolation between tenants who must NOT see each
      other's metadata even at the subject level.
 
+## MCP event bridge — live-only contract
+
+``GET /sse`` (the MCP HTTP/SSE event bridge in
+``mnemos/mcp/http.py``) is a **live-only telemetry stream**, NOT
+a replay-able audit log.
+
+What that means in practice:
+
+  * A SSE client connected at time T sees events published
+    AFTER T. Events from before T are not surfaced; this
+    bridge does not consume the JetStream stream's 30-day
+    backlog.
+  * The subscription uses ``DeliverPolicy.NEW`` +
+    ``AckPolicy.NONE`` even when it goes through JetStream's
+    consumer API, so messages are not acked back to the broker
+    and the broker keeps no per-subscriber lag state.
+  * If the underlying connection exposes the core-NATS handle
+    (``js._nc``), the bridge uses core-NATS ``subscribe`` —
+    even more clearly live-only with no JetStream involvement
+    at all.
+
+Why: SSE is a long-poll affordance for agent surfaces (Claude
+Code, Cursor, ChatGPT Pro Developer Mode) that want to react
+to NEW events as they fire. A replay-on-reconnect contract
+would force operators to think about per-client cursors and
+durable state, which is the opposite of what an interactive
+agent loop wants — they generally just resubscribe and pick
+up from "now."
+
+Operators who need historical / audit-style reads:
+
+  * Use the HTTP REST surface (``GET /v1/memories/...``,
+    ``GET /v1/federation/feed``, ``GET /v1/memories/{id}/log``
+    etc.) which goes through the visibility-gated repository
+    path with the proper ``VisibilityFilter.for_read`` checks
+    + RLS context.
+  * The NATS streams (``MNEMOS_MEMORY``, ``MNEMOS_CONSULTATION``,
+    ``MNEMOS_WEBHOOK``) DO retain 30 days of events for
+    backend consumers — federation push receivers and webhook
+    NATS triggers ARE durable. The MCP SSE bridge is the
+    OUTLIER that gives up durability deliberately.
+
 ## Federation peer config
 
 Set `MNEMOS_FEDERATION_NATS_PEERS` to a JSON array per peer:
