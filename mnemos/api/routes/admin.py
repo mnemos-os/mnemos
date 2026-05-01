@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.domain.models import (
     ApiKeyCreateRequest,
     ApiKeyResponse,
@@ -34,8 +35,7 @@ async def create_user(
     _: UserContext = Depends(require_root),
 ):
     """Create a new user. id must be unique."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /admin/users")
     if request.role not in ("user", "root", "federation"):
         raise HTTPException(
             status_code=422,
@@ -65,8 +65,7 @@ async def create_user(
 @router.get("/users", response_model=List[UserResponse])
 async def list_users(_: UserContext = Depends(require_root)):
     """List all users."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /admin/users")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             "SELECT id, display_name, email, role, namespace, created_at "
@@ -94,8 +93,7 @@ async def create_api_key(
     _: UserContext = Depends(require_root),
 ):
     """Generate a new API key for user_id. Raw key is returned once and never stored."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /admin/users/{user_id}/apikeys")
 
     async with _lc.get_pool_manager().acquire() as conn:
         user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
@@ -141,8 +139,7 @@ async def list_api_keys(
     _: UserContext = Depends(require_root),
 ):
     """List API keys for user_id (no raw key in response)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /admin/users/{user_id}/apikeys")
     async with _lc.get_pool_manager().acquire() as conn:
         user = await conn.fetchrow("SELECT id FROM users WHERE id=$1", user_id)
         if not user:
@@ -172,8 +169,7 @@ async def revoke_api_key(
     _: UserContext = Depends(require_root),
 ):
     """Revoke an API key by ID (soft-delete: sets revoked=true)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="DELETE /admin/apikeys/{key_id}")
     async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
             "UPDATE api_keys SET revoked=true WHERE id=$1::uuid AND NOT revoked",
@@ -211,8 +207,7 @@ async def create_oauth_provider(
     _: UserContext = Depends(require_root),
 ):
     """Register a new OAuth provider (root only)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /admin/oauth/providers")
     if request.kind not in ("oidc", "oauth2"):
         raise HTTPException(status_code=422, detail="kind must be 'oidc' or 'oauth2'")
     if request.kind == "oidc" and not request.issuer_url:
@@ -241,8 +236,7 @@ async def create_oauth_provider(
 
 @router.get("/oauth/providers", response_model=OAuthProviderAdminListResponse)
 async def list_oauth_providers(_: UserContext = Depends(require_root)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /admin/oauth/providers")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch("SELECT * FROM oauth_providers ORDER BY name")
     items = [_to_provider_admin(r) for r in rows]
@@ -255,8 +249,7 @@ async def update_oauth_provider(
     request: OAuthProviderUpdateRequest,
     _: UserContext = Depends(require_root),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="PATCH /admin/oauth/providers/{name}")
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=422, detail="No fields to update")
@@ -278,8 +271,7 @@ async def delete_oauth_provider(
     name: str,
     _: UserContext = Depends(require_root),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="DELETE /admin/oauth/providers/{name}")
     async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
             "DELETE FROM oauth_providers WHERE name=$1", name,
@@ -294,8 +286,7 @@ async def list_oauth_identities(
     user_id: str = None,
 ):
     """List OAuth identities. Filter by user_id optional."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /admin/oauth/identities")
     async with _lc.get_pool_manager().acquire() as conn:
         if user_id:
             rows = await conn.fetch(
@@ -381,8 +372,7 @@ async def compression_enqueue(
     supersedes on the variant. Operators who want dedupe should check
     for existing pending rows first.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /admin/compression/enqueue")
     if request.reason not in _VALID_REASONS:
         raise HTTPException(
             status_code=422,
@@ -473,8 +463,7 @@ async def compression_enqueue_all(
     raise limit — but run the endpoint repeatedly rather than trying to
     enqueue the full corpus in one call.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /admin/compression/enqueue-all")
     if request.reason not in _VALID_REASONS:
         raise HTTPException(
             status_code=422,
@@ -539,8 +528,7 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
     Lets the daily provider /v1/models cron rotate model_ids in-process
     without restarting the container. Returns a dict of changes.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /admin/graeae/reload-providers")
     from mnemos.domain.graeae.engine import get_graeae_engine
     changes = await get_graeae_engine().reload_from_registry(_lc._pool)
     return {"changes": changes, "providers": {
