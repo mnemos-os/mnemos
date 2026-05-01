@@ -98,7 +98,8 @@ EXACT registry names — strip the prefix when configuring.
 | Continue.dev | stdio MCP or HTTP/SSE | 🧪 experimental | Continue v0.9+ has MCP support |
 | Cline (formerly Claude Dev) | stdio MCP or HTTP/SSE | 🧪 experimental | VS Code extension, autonomous-edit loop. Cline v3.x |
 | ChatGPT Pro Developer Mode (web) | HTTP/SSE | 🧪 experimental | Requires the Pro / Team / Enterprise / Edu tier with Developer Mode enabled, plus a public HTTPS URL pointing at your MNEMOS |
-| ChatGPT consumer (free / Plus) | none | ❌ not supported | OpenAI hasn't broadened MCP to those tiers; no plan to ship a non-MCP shim for them |
+| ChatGPT Custom GPT (Actions) | HTTPS REST | 🧪 experimental | Plus and above. OpenAPI spec via `mnemos dump-openapi --target gpt-actions`; Bearer auth; sync request/response (no streaming). [Connector guide](./openai-custom-gpt.md). |
+| ChatGPT consumer (free) | none | ❌ not supported | Free tier doesn't allow Custom GPTs with Actions or MCP; no plan to ship a non-MCP / non-Actions shim |
 
 ## Quick start
 
@@ -115,15 +116,28 @@ server as a child process. See the per-surface guides:
 - [Continue.dev](./continue-dev.md)
 - [Cline (VS Code)](./cline.md)
 
-### If you want ChatGPT Pro / Team to talk to your MNEMOS
+### If you want ChatGPT to talk to your MNEMOS
 
-ChatGPT's web app needs a public HTTPS URL — it can't spawn local
-processes. You expose MNEMOS's MCP HTTP/SSE endpoint via a tunnel,
-register it as a Custom Connector, paste the bearer token. See:
+Two distinct paths depending on the user's tier and what they need:
 
-- [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md) — full
-  walkthrough including ngrok setup and the experimental
-  `mnemos-tunnel-setup` helper script.
+- **MCP / SSE — ChatGPT Pro Developer Mode (Pro / Team / Enterprise / Edu).**
+  Streaming MCP transport, full tool registry, Bearer auth on the
+  SSE handshake. ChatGPT's web app needs a public HTTPS URL — it
+  can't spawn local processes. You expose MNEMOS's MCP HTTP/SSE
+  endpoint via a tunnel, register it as a Custom Connector,
+  paste the bearer token. See:
+  - [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md) —
+    full walkthrough including ngrok setup and the experimental
+    `mnemos-tunnel-setup` helper script.
+
+- **Custom GPT (Actions) — Plus and above.** Sync REST-over-HTTPS
+  consuming an OpenAPI 3.x spec. Use this when the user is on a
+  tier that doesn't have Developer Mode but wants to expose MNEMOS
+  as a Custom GPT tool. The new `mnemos dump-openapi --target
+  gpt-actions` CLI emits an OpenAI-Actions-compatible artifact
+  with descriptions truncated to OpenAI's documented limits. See:
+  - [OpenAI Custom GPT (Actions)](./openai-custom-gpt.md) — full
+    walkthrough from spec generation through GPT Builder upload.
 
 ### Mobile / laptop tether to a home or SOHO MNEMOS
 
