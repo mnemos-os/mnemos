@@ -155,7 +155,7 @@ Remaining after v3.5.0:
 - 🔵 **Dedicated deletion-log / GDPR wipe workflow.** v3.5 keeps DELETE tombstone snapshots live in the version DAG, but no separate deletion-log table ships.
 - 🔵 **PANTHEON + IRIS.** Unified LLM facade and MCP model discovery layer, deferred from the historical v3.5 charter.
 - 🔵 **RFC-002 / MemPalace re-engagement.** Re-open with v3.4 CHARON evidence and KNOSSOS interop framing.
-- 🔵 **Compression hot-path expansion.** More read paths can consume `memory_compressed_variants`; `/v1/memories/search` documents `compression_applied` / `compression_metadata` as reserved false fields in v3.5.x.
+- ✅ **Compression hot-path expansion.** All three v3.6 §2.5 surfaces shipped: federation feed `prefer_compressed=true` (v4.2.0a14 round-1, byte-gated to `to_json(text)::text` exact measurement), HTTP `GET /v1/memories/{id}` Accept-header negotiation (round-12, ``text/plain`` → prose, ``application/x-apollo-dense`` → raw dense), and MCP `get_memory` `format=prose|dense` parameter (round-24, surfaces the same prose/dense variants to stdio + HTTP-SSE MCP clients). `compression_applied` / `compression_metadata` on search remain reserved-but-always-false; real compressed reads use the routes above.
 - 🔵 **Design paper draft.** Git-like DAG + LLM-synthesized distillation/narration + judge-verified fidelity, carried from the v3.4 charter.
 
 ### v3.6 — PERSEPHONE + MORPHEUS mutation paths

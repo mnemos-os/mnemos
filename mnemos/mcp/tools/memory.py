@@ -7,7 +7,7 @@ from typing import Any
 
 from mnemos.core.auth_context import UserContext
 
-from ._runtime import _rest_delete, _rest_get, _rest_post, _tool
+from ._runtime import _rest_delete, _rest_get, _rest_get_text, _rest_post, _tool
 
 
 def _connector_namespace() -> str | None:
@@ -88,9 +88,45 @@ async def tool_update_memory(
 
 async def tool_get_memory(
     memory_id: str,
+    format: str | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
-    return await _rest_get(f"/v1/memories/{memory_id}")
+    """Fetch a memory by id, optionally in compressed form.
+
+    ``format`` is the v3.6 §2.5-item-3 hook for letting MCP clients
+    consume the same prose / dense compressed-variant representations
+    that ``GET /v1/memories/{id}`` exposes via Accept-header
+    content negotiation:
+
+      * ``"prose"``  → prose narration body (Accept: text/plain)
+      * ``"dense"``  → raw winning-variant content (Accept:
+                       application/x-apollo-dense)
+      * ``None``     → existing JSON ``MemoryItem`` (default,
+                       backwards-compatible)
+
+    Returns either the JSON-parsed dict (default path) or a
+    ``{"format": <fmt>, "content": <body>, "memory_id": <id>}``
+    envelope when ``format`` is set, so MCP clients always receive
+    a structured response regardless of the body type underneath.
+    """
+    if format is None:
+        return await _rest_get(f"/v1/memories/{memory_id}")
+    accept_map = {
+        "prose": "text/plain",
+        "dense": "application/x-apollo-dense",
+    }
+    if format not in accept_map:
+        raise ValueError(
+            f"format must be 'prose' or 'dense', got {format!r}"
+        )
+    body = await _rest_get_text(
+        f"/v1/memories/{memory_id}", accept=accept_map[format],
+    )
+    return {
+        "memory_id": memory_id,
+        "format": format,
+        "content": body,
+    }
 
 
 async def tool_create_memory(
@@ -197,8 +233,27 @@ TOOLS: dict[str, dict[str, Any]] = {
         tool_update_memory,
     ),
     "get_memory": _tool(
-        "Retrieve a single memory by its ID (mem_xxxxxxxxxxxx).",
-        {"memory_id": {"type": "string"}},
+        (
+            "Retrieve a single memory by its ID (mem_xxxxxxxxxxxx). "
+            "Default response is the JSON memory object. Optional "
+            "``format='prose'`` returns the prose-narrated body "
+            "(human-readable), ``format='dense'`` returns the raw "
+            "APOLLO compressed variant — both intended for clients "
+            "that want to feed the compressed form straight to a "
+            "downstream LLM without round-tripping through JSON."
+        ),
+        {
+            "memory_id": {"type": "string"},
+            "format": {
+                "type": "string",
+                "enum": ["prose", "dense"],
+                "description": (
+                    "Optional. ``prose`` → text/plain narration. "
+                    "``dense`` → application/x-apollo-dense raw "
+                    "variant. Omit for default JSON."
+                ),
+            },
+        },
         ["memory_id"],
         tool_get_memory,
     ),

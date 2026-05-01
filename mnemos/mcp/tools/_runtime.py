@@ -70,6 +70,28 @@ async def _rest_get(path: str, params: dict[str, Any] | None = None) -> Any:
         return response.json() if response.content else {}
 
 
+async def _rest_get_text(
+    path: str, *, accept: str, params: dict[str, Any] | None = None,
+) -> str:
+    """GET that requests an alternate ``Accept`` representation
+    and returns the raw body text.
+
+    Used by MCP tools that proxy the HTTP API's content-negotiation
+    paths — notably ``get_memory`` with ``format=prose|dense`` which
+    surfaces the same prose/dense narrate output as the HTTP
+    ``Accept: text/plain`` / ``Accept: application/x-apollo-dense``
+    branches without parsing through JSON.
+    """
+    headers = _backend_headers()
+    headers["Accept"] = accept
+    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+        response = await client.get(
+            f"{_mnemos_base()}{path}", params=params, headers=headers,
+        )
+        response.raise_for_status()
+        return response.text
+
+
 async def _rest_post(path: str, body: dict[str, Any], method: str = "POST") -> Any:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         if method == "PATCH":
