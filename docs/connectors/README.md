@@ -40,6 +40,8 @@ deliberately scaled differently. The two compose via the
 | Claude Desktop | stdio MCP or HTTP/SSE | ✅ stable (stdio) / 🧪 experimental (HTTP) | Stdio for local; HTTP/SSE if you want the same MNEMOS to back multiple machines |
 | Cursor | stdio MCP or HTTP/SSE | ✅ stable | Cursor's MCP support is mature |
 | Codex CLI (OpenAI) | stdio MCP or HTTP/SSE | 🧪 experimental | Codex 0.125.0+ has MCP; we test against 0.126.0-alpha.1 |
+| Continue.dev | stdio MCP or HTTP/SSE | 🧪 experimental | Continue v0.9+ has MCP support |
+| Cline (formerly Claude Dev) | stdio MCP or HTTP/SSE | 🧪 experimental | VS Code extension, autonomous-edit loop. Cline v3.x |
 | ChatGPT Pro Developer Mode (web) | HTTP/SSE | 🧪 experimental | Requires the Pro / Team / Enterprise / Edu tier with Developer Mode enabled, plus a public HTTPS URL pointing at your MNEMOS |
 | ChatGPT consumer (free / Plus) | none | ❌ not supported | OpenAI hasn't broadened MCP to those tiers; no plan to ship a non-MCP shim for them |
 
@@ -55,6 +57,8 @@ server as a child process. See the per-surface guides:
 - [Claude Desktop](./claude-desktop.md)
 - [Cursor](./cursor.md)
 - [Codex CLI](./codex-cli.md)
+- [Continue.dev](./continue-dev.md)
+- [Cline (VS Code)](./cline.md)
 
 ### If you want ChatGPT Pro / Team to talk to your MNEMOS
 

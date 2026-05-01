@@ -587,6 +587,20 @@ def version() -> None:
     typer.echo(__version__)
 
 
+@app.command()
+def doctor() -> None:
+    """Probe host accelerators and print the recommended pip extra.
+
+    Pure-stdlib detection of NVIDIA CUDA / Tegra, Intel iGPU, and
+    Apple Silicon. Output names the right ``mnemos-os[ml|gpu|phi]``
+    extra for the host. Use this BEFORE pip install to pick the
+    correct ML extra — see docs/SPECIFICATION.md §8.3.
+    """
+    from mnemos.runtime.hardware import cli_doctor
+
+    raise typer.Exit(code=cli_doctor())
+
+
 app.add_typer(serve_app, name="serve")
 app.add_typer(worker_app, name="worker")
 
