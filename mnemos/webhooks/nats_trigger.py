@@ -51,7 +51,7 @@ async def consumer_loop(
             if js is None:
                 raise RuntimeError("NATS JetStream unavailable")
             logger.info("webhook nats trigger connected subject=%s", SUBJECT)
-            sub = await _subscribe(js)
+            sub = await _subscribe(js, queue_group=settings.nats.webhook_queue_group)
             # Reset AFTER subscribe succeeds. A broker that accepts
             # the connection but fails subscribe (stream drift,
             # consumer-group recovery) would otherwise reset every
@@ -239,24 +239,36 @@ async def _connect(settings: Settings):
 
 
 def _node_durable() -> str:
-    """Per-node durable name. The audit-fix queue-group attempt
-    (`js.subscribe(durable=..., queue=..., config=DeliverGroup)`)
-    is rejected by JetStream/nats-py 2.6 even when the consumer
-    config declares a matching deliver_group. The proper path
-    likely needs `js.add_consumer + js.pull_subscribe` (or
-    bind_subscribe) instead of subscribe(); deferred.
+    """Per-node durable name (single-replica default).
 
-    Per-node durables mean each node receives every nudge and
-    races for the Postgres SKIP LOCKED claim — wasteful but
-    correct. Audit Finding 5 stays open with this caveat.
+    Per-node durables mean each node receives every nudge and races
+    for the Postgres SKIP LOCKED claim — wasteful but correct in
+    multi-replica deployments. Set ``MNEMOS_WEBHOOK_NATS_QUEUE_GROUP``
+    to a non-empty value to switch to a SHARED durable + queue-group
+    path so JetStream itself load-balances and only one replica
+    receives each nudge. (Audit Finding 5, resolved in v4.2.0a8.)
     """
     from mnemos.nats.client import get_node_name
     safe = get_node_name().replace(".", "_").replace("-", "_") or "node"
     return f"{DURABLE}_{safe}"
 
 
-async def _subscribe(js: Any):
-    durable = _node_durable()
+async def _subscribe(js: Any, *, queue_group: str = ""):
+    """Subscribe to webhook nudges.
+
+    When ``queue_group`` is empty (default), each node uses a unique
+    per-node durable — the historical single-replica-safe shape.
+
+    When ``queue_group`` is non-empty, all replicas use a SHARED
+    durable named exactly :data:`DURABLE` and join the queue group;
+    JetStream load-balances delivery across them. This avoids the
+    Postgres SKIP LOCKED race in multi-replica deployments.
+    (Audit Finding 5.)
+    """
+    if queue_group:
+        durable = DURABLE
+    else:
+        durable = _node_durable()
     try:
         from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
 
@@ -264,16 +276,20 @@ async def _subscribe(js: Any):
             durable_name=durable,
             deliver_policy=DeliverPolicy.NEW,
             ack_policy=AckPolicy.EXPLICIT,
+            deliver_group=queue_group or None,
         )
     except ImportError:
         config = None
 
-    return await js.subscribe(
-        SUBJECT,
+    subscribe_kwargs: dict[str, Any] = dict(
         durable=durable,
         stream=STREAM,
         config=config,
     )
+    if queue_group:
+        subscribe_kwargs["queue"] = queue_group
+
+    return await js.subscribe(SUBJECT, **subscribe_kwargs)
 
 
 class PoisonMessageError(ValueError):

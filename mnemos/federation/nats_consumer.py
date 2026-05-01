@@ -78,13 +78,22 @@ async def run_configured_consumers(
     retry_seconds: float = 30.0,
 ) -> None:
     """Run all configured peer consumers until cancelled."""
+    settings = settings or get_settings()
     peers = configured_nats_peers(settings)
     if not peers:
         logger.info("federation nats consumer disabled (MNEMOS_FEDERATION_NATS_PEERS empty)")
         return
 
+    queue_group = (settings.federation.nats_queue_group or "").strip()
     tasks = [
-        asyncio.create_task(consumer_loop(pool, peer, retry_seconds=retry_seconds))
+        asyncio.create_task(
+            consumer_loop(
+                pool,
+                peer,
+                retry_seconds=retry_seconds,
+                queue_group=queue_group,
+            )
+        )
         for peer in peers
     ]
     try:
@@ -102,12 +111,19 @@ async def consumer_loop(
     *,
     retry_seconds: float = 30.0,
     connect: Callable[[FederationNatsPeer], Awaitable[Any]] | None = None,
+    queue_group: str = "",
 ) -> None:
     """Connect to one upstream peer and consume memory events forever.
 
     Reconnect backoff is exponential with full jitter (cap at the
     legacy ``retry_seconds`` ceiling so existing tuning is honoured).
     See ``mnemos.nats.backoff.ReconnectBackoff`` — Audit Finding 8.
+
+    ``queue_group`` (Audit Finding 5): when non-empty, all mnemos
+    replicas subscribing with the same queue-group name share a single
+    durable JetStream consumer per (peer, subject) and JetStream
+    load-balances messages across them. Empty string preserves the
+    historical single-replica shape.
     """
     connect = connect or _connect_peer
     backoff = ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)
@@ -124,12 +140,16 @@ async def consumer_loop(
             else:
                 nc, js = None, connect_result
             logger.info(
-                "federation nats consumer connected peer=%s url=%s subjects=%s",
+                "federation nats consumer connected peer=%s url=%s subjects=%s queue_group=%s",
                 peer.name,
                 peer.nats_url,
                 ",".join(peer.subjects),
+                queue_group or "(single-replica)",
             )
-            subscriptions = [await _subscribe(js, peer, subject) for subject in peer.subjects]
+            subscriptions = [
+                await _subscribe(js, peer, subject, queue_group=queue_group)
+                for subject in peer.subjects
+            ]
             # Reset AFTER all subscriptions succeed. A broker that
             # accepts the connection but fails JetStream subscribe
             # (stream drift, consumer-group recovery) would otherwise
@@ -290,7 +310,24 @@ async def _connect_peer(peer: FederationNatsPeer):
     return nc, nc.jetstream()
 
 
-async def _subscribe(js: Any, peer: FederationNatsPeer, subject: str):
+async def _subscribe(
+    js: Any,
+    peer: FederationNatsPeer,
+    subject: str,
+    *,
+    queue_group: str = "",
+):
+    """Subscribe to one (peer, subject) push stream.
+
+    When ``queue_group`` is empty (default), the consumer is a standard
+    single-subscriber durable — the historical single-replica shape.
+
+    When ``queue_group`` is non-empty, the durable's ``deliver_group``
+    is set and the subscription joins as a queue worker. JetStream
+    load-balances messages across replicas in the same group, so two
+    mnemos replicas configured against the same peer can run side by
+    side without colliding on the durable. (Audit Finding 5.)
+    """
     durable = _durable_name(peer.name, subject)
     try:
         from nats.js.api import AckPolicy, ConsumerConfig, DeliverPolicy  # type: ignore
@@ -299,16 +336,20 @@ async def _subscribe(js: Any, peer: FederationNatsPeer, subject: str):
             durable_name=durable,
             deliver_policy=DeliverPolicy.NEW,
             ack_policy=AckPolicy.EXPLICIT,
+            deliver_group=queue_group or None,
         )
     except ImportError:
         config = None
 
-    return await js.subscribe(
-        subject,
+    subscribe_kwargs: dict[str, Any] = dict(
         durable=durable,
         stream=MEMORY_STREAM,
         config=config,
     )
+    if queue_group:
+        subscribe_kwargs["queue"] = queue_group
+
+    return await js.subscribe(subject, **subscribe_kwargs)
 
 
 class _SubscriptionGroup:

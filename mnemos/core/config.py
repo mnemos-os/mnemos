@@ -334,6 +334,15 @@ class _FederationSettings(BaseSettings):
     )
     allow_insecure: bool = Field(False, validation_alias="FEDERATION_ALLOW_INSECURE")
     allow_private: bool = Field(False, validation_alias="FEDERATION_ALLOW_PRIVATE")
+    # When set, federation NATS receivers join a JetStream queue group
+    # under a SHARED durable consumer per (peer, subject) instead of
+    # their default single-replica per-(peer, subject) durable. JetStream
+    # load-balances messages across replicas in the same group; this is
+    # the supported multi-replica deployment shape (Audit Finding 5).
+    # Empty (default) preserves single-replica behavior with no
+    # cross-replica coordination — flip to a non-empty group name only
+    # after every replica is known to be on a build that understands it.
+    nats_queue_group: str = Field("", validation_alias="MNEMOS_FEDERATION_NATS_QUEUE_GROUP")
 
 
 class _OAuthSettings(BaseSettings):
@@ -384,6 +393,17 @@ class _NatsSettings(BaseSettings):
     url: str | None = Field(None, validation_alias="MNEMOS_NATS_URL")
     token: str | None = Field(None, validation_alias="MNEMOS_NATS_TOKEN")
     node_name: str = Field("", validation_alias="MNEMOS_NODE_NAME")
+    # When set, the webhook NATS trigger uses a SHARED durable consumer
+    # joined via this queue group instead of per-node durables. JetStream
+    # load-balances delivery so only one replica receives each nudge
+    # (rather than every replica racing for the Postgres SKIP LOCKED
+    # claim). Empty (default) preserves the per-node behavior — safe for
+    # both single- and multi-replica deployments, just wasteful in the
+    # multi-replica case. Flip to a non-empty group name only after all
+    # replicas understand it. (Audit Finding 5.)
+    webhook_queue_group: str = Field(
+        "", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP"
+    )
 
 
 class Settings(BaseSettings):

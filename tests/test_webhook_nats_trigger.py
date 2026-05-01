@@ -147,12 +147,34 @@ async def test_stream_subscription_declared_with_right_subject():
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.webhook.delivery.queued.>"
     assert kwargs["stream"] == "MNEMOS_WEBHOOK"
-    # Per-node durable, no queue group — see _node_durable docstring.
+    # Default shape: per-node durable, no queue group.
     assert kwargs["durable"].startswith("mnemos_webhook_delivery_trigger_")
+    assert kwargs["durable"] != "mnemos_webhook_delivery_trigger"  # not bare
     assert "queue" not in kwargs
     config_obj = kwargs["config"]
     if config_obj is not None:
         assert "NEW" in str(getattr(config_obj, "deliver_policy", "NEW"))
+        assert getattr(config_obj, "deliver_group", None) is None
+
+
+async def test_subscribe_with_queue_group_uses_shared_durable():
+    """v4.2.0a8: Audit Finding 5 — multi-replica webhook trigger via
+    queue-group sharding. The durable must be the SHARED bare name
+    (no per-node suffix) so all replicas bind to the same JetStream
+    consumer, with JetStream load-balancing via the deliver_group."""
+    js = _FakeJetStream()
+
+    await trigger._subscribe(js, queue_group="webhook_pool")
+
+    subject, kwargs = js.subscribe_calls[0]
+    assert subject == "mnemos.webhook.delivery.queued.>"
+    assert kwargs["queue"] == "webhook_pool"
+    # SHARED durable (no per-node suffix) — every replica binds to
+    # the same JetStream consumer.
+    assert kwargs["durable"] == "mnemos_webhook_delivery_trigger"
+    config_obj = kwargs["config"]
+    assert config_obj is not None
+    assert getattr(config_obj, "deliver_group", None) == "webhook_pool"
 
 
 async def test_transient_handle_error_is_not_acked(monkeypatch):

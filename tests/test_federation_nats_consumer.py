@@ -248,9 +248,37 @@ async def test_fake_jetstream_subscription_uses_deliver_policy_new_shape():
     assert subject == "mnemos.memory.created.>"
     assert kwargs["durable"].startswith("mnemos_federation_pythia_")
     assert kwargs["stream"] == "MNEMOS_MEMORY"
+    # Default (single-replica) shape: NO queue arg.
+    assert "queue" not in kwargs
     config_obj = kwargs["config"]
     if config_obj is not None:
         assert "NEW" in str(getattr(config_obj, "deliver_policy", "NEW"))
+        # No deliver_group when queue_group is empty.
+        assert getattr(config_obj, "deliver_group", None) is None
+
+
+async def test_subscribe_with_queue_group_sets_queue_and_deliver_group():
+    """v4.2.0a8: Audit Finding 5 — multi-replica federation receiver
+    via JetStream queue-group sharding. Subscribe must pass queue=...
+    AND ConsumerConfig.deliver_group=... so JetStream load-balances
+    across replicas instead of one taking the durable exclusively."""
+    js = _FakeJetStream([])
+
+    await consumer._subscribe(
+        js,
+        _peer(),
+        "mnemos.memory.created.>",
+        queue_group="fed_pool",
+    )
+
+    subject, kwargs = js.subscribe_calls[0]
+    assert subject == "mnemos.memory.created.>"
+    assert kwargs["queue"] == "fed_pool"
+    # Durable is unchanged — queue group is the sharing mechanism.
+    assert kwargs["durable"].startswith("mnemos_federation_pythia_")
+    config_obj = kwargs["config"]
+    assert config_obj is not None
+    assert getattr(config_obj, "deliver_group", None) == "fed_pool"
 
 
 async def _async_list(value):

@@ -244,35 +244,53 @@ running broker, the new declaration will fail with
 apply the new config, operator must `nats stream update` manually
 or delete + recreate the stream (latter loses retained messages).
 
+## Multi-replica deployment (queue groups)
+
+`v4.2.0a8` added JetStream queue-group support to both consumer
+loops. By default the substrate is single-replica safe:
+
+| Env var                                  | Effect when empty (default)                                                  | Effect when set                                                                                              |
+|------------------------------------------|------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------------------|
+| `MNEMOS_FEDERATION_NATS_QUEUE_GROUP`     | Per-(peer, subject) durable. Single-replica only.                            | Replicas joining this group share one durable per (peer, subject); JetStream load-balances messages.         |
+| `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP`        | Per-node durable (every replica receives every nudge; SKIP LOCKED race).     | Shared durable named `mnemos_webhook_delivery_trigger`; JetStream delivers each nudge to ONE replica.        |
+
+To roll out multi-replica:
+
+1. Pick a stable group name (anything; `fed_pool` or `webhook_pool`
+   are fine — it is just the JetStream `deliver_group` label).
+2. Make sure EVERY replica that will join the group is on a build
+   that understands the env var (v4.2.0a8 or later). A pre-a8
+   replica on the same broker would collide on the durable name
+   without the deliver_group set.
+3. Set `MNEMOS_FEDERATION_NATS_QUEUE_GROUP` and/or
+   `MNEMOS_WEBHOOK_NATS_QUEUE_GROUP` on every replica and roll the
+   fleet.
+4. Operators MUST also set `MNEMOS_NODE_NAME` to a stable,
+   per-replica unique value so `source_node` filtering still works
+   for federation echo suppression.
+
+If a partial fleet is on a8 and the rest on a7, run the older
+replicas with the env vars unset; they will keep their
+per-(peer,subject) or per-node durables and behave as before. The
+queue-group durable on a8 replicas is independent.
+
+When switching from per-node webhook durables to shared, the old
+per-node durables remain on the broker until you delete them. They
+will sit idle (no subscribers) until the 30-day age limit prunes
+their inactive consumer state. To clean up immediately:
+
+```
+nats consumer rm MNEMOS_WEBHOOK mnemos_webhook_delivery_trigger_<old_node_name>
+```
+
+per old replica.
+
 ## Known limitations
 
-* **Federation durable name is per-(peer, subject), NOT per-node.**
-  `_durable_name(peer.name, subject)` in
-  `mnemos/federation/nats_consumer.py` builds the consumer name
-  from peer and subject only — the local node identity is NOT in
-  the durable name. Operational implications:
-  - **Single-replica federation receiver** — the canonical and
-    intended deployment. The durable consumer tracks
-    delivered/acked messages on the broker and survives restarts.
-  - **Multi-replica federation receiver** — NOT correctly
-    supported by this naming scheme. Two replicas configured
-    against the same peer collide on the same durable consumer;
-    only one is the active subscriber at a time, and re-election
-    flaps can cause apparent delivery gaps. Operators running
-    multiple mnemos replicas behind a load balancer should run
-    federation consumers from EXACTLY ONE replica until the
-    cross-node queue-group fix lands.
-  - The webhook NATS trigger side has the same shape — see the
-    `_node_durable` docstring in `mnemos/webhooks/nats_trigger.py`
-    which calls the queue-group attempt out as deferred for the
-    same reason.
-  - Principled fix: `add_consumer` + `bind_subscribe` pattern
-    with a JetStream queue-group, allowing N replicas to share
-    one durable consumer with workload sharding. Original
-    handoff's "deferred-with-caveat" Audit Finding 5 — flagged
-    for v4.2.0a7+.
 * Broker-failure test depth — current tests cover happy-path
-  publish/subscribe and the reconnect backoff scheduler, but do
-  NOT exercise stream-drift scenarios (config mismatch on
-  redeploy) or partial-broker-outage paths against a live
-  broker. Audit Finding 11 — v4.2.0a7+ candidate.
+  publish/subscribe, the reconnect backoff scheduler, the three-
+  scope `_consume_subscription` policy, and the queue-group
+  subscribe shape, but do NOT exercise stream-drift scenarios
+  (config mismatch on redeploy) or partial-broker-outage paths
+  against a LIVE broker. Audit Finding 11 — open candidate for
+  a future slice once a real-broker test harness is in place.
