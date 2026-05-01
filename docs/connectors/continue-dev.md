@@ -27,9 +27,12 @@ Continue's MCP config lives in `~/.continue/config.json` (the
 same file that holds model + completion settings). Add a
 ``mcpServers`` block:
 
+Merge the ``mcpServers`` block into your existing
+``~/.continue/config.json`` alongside your ``models`` array; the
+snippet below shows the MCP-server entries only:
+
 ```json
 {
-  "models": [...existing...],
   "mcpServers": {
     "mnemos": {
       "command": "mnemos",

@@ -71,7 +71,10 @@ If `mnemos` isn't on the desktop-launched PATH:
     "mnemos": {
       "command": "/Users/<you>/.local/bin/mnemos",
       "args": ["serve", "mcp-stdio"],
-      "env": { ... }
+      "env": {
+        "MNEMOS_BASE": "http://localhost:5002",
+        "MNEMOS_API_KEY": "<your bearer token>"
+      }
     }
   }
 }
