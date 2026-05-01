@@ -121,3 +121,96 @@ async def test_helper_orders_user_id_before_role(monkeypatch):
     sql1, _ = conn.execute.await_args_list[1].args
     assert "mnemos.current_user_id" in sql0
     assert "mnemos.current_role" in sql1
+
+
+# ── _rls_context (raw asyncpg path) — same SQL shape ──────────────────────
+#
+# Codex round-5 (review-moms3d5t-0b5c5t) caught that the helper-fix
+# in round-16 missed the parallel _rls_context() in
+# memories.py used by raw asyncpg endpoints (compression manifests,
+# rehydrate, ingest, session). The two paths must use the same
+# parameterizable SQL or RLS-enabled deployments will still 500
+# whenever they hit one of those routes.
+
+
+@pytest.mark.asyncio
+async def test_rls_context_uses_set_config_not_set_local(monkeypatch):
+    """The raw-asyncpg RLS context must use the same set_config
+    form as maybe_set_pg_rls. Pinning so a divergence is caught
+    by tests, not by an unhappy production deployment."""
+    from mnemos.api.routes.memories import _rls_context
+
+    monkeypatch.setattr(_lc, "_rls_enabled", True)
+
+    @AsyncMock
+    async def _exec(sql, *args):
+        return None
+
+    conn = SimpleNamespace()
+    conn.execute = AsyncMock()
+
+    class _Tx:
+        async def __aenter__(self_inner):
+            return None
+
+        async def __aexit__(self_inner, *exc):
+            return None
+
+    conn.transaction = lambda: _Tx()
+
+    user = _user(user_id="alice", role="user")
+    async with _rls_context(conn, user):
+        pass
+
+    assert conn.execute.await_count == 2
+    sqls = [call.args[0] for call in conn.execute.await_args_list]
+    for sql in sqls:
+        assert "set_config" in sql, (
+            f"_rls_context must use set_config(), got: {sql!r}"
+        )
+        assert "SET LOCAL" not in sql, (
+            f"_rls_context must NOT use SET LOCAL ... = $1 form (broken on PG): {sql!r}"
+        )
+        assert "$1" in sql and "true" in sql
+
+    vals = [call.args[1] for call in conn.execute.await_args_list]
+    assert "alice" in vals
+    assert "user" in vals
+
+
+@pytest.mark.asyncio
+async def test_rls_context_no_op_when_rls_disabled(monkeypatch):
+    from mnemos.api.routes.memories import _rls_context
+
+    monkeypatch.setattr(_lc, "_rls_enabled", False)
+    conn = SimpleNamespace()
+    conn.execute = AsyncMock()
+    conn.transaction = AsyncMock()
+
+    async with _rls_context(conn, _user()):
+        pass
+
+    assert conn.execute.await_count == 0
+    assert conn.transaction.await_count == 0
+
+
+@pytest.mark.asyncio
+async def test_no_remaining_set_local_with_bind_in_codebase():
+    """Belt-and-braces: scan the live codebase for the broken
+    ``SET LOCAL <name> = $`` shape so a future addition can't
+    silently re-introduce the bug. Comments and docstrings about
+    the pattern are allowed; only executable string literals
+    matching the SQL prefix count.
+    """
+    import pathlib
+    import re
+
+    bad_pattern = re.compile(r'"\s*SET\s+LOCAL\s+\S+\s*=\s*\$\d')
+    repo_root = pathlib.Path(__file__).resolve().parent.parent
+    for path in (repo_root / "mnemos").rglob("*.py"):
+        text = path.read_text(encoding="utf-8")
+        match = bad_pattern.search(text)
+        assert match is None, (
+            f"Found broken SET LOCAL ... = $1 form at {path}: "
+            f"matched {match.group(0)!r}. Use SELECT set_config(...) instead."
+        )

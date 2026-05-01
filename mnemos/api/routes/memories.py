@@ -46,14 +46,26 @@ NatsPublishIntent = tuple[str, dict, str]
 
 @asynccontextmanager
 async def _rls_context(conn, user: UserContext):
-    """Set PostgreSQL session variables for RLS when auth is active."""
+    """Set PostgreSQL session variables for RLS when auth is active.
+
+    Uses ``SELECT set_config(name, $1, true)`` rather than
+    ``SET LOCAL <name> = $1`` because Postgres SET syntax does not
+    accept bind parameters (the value position must be a literal —
+    https://www.postgresql.org/docs/current/sql-set.html). The third
+    argument ``true`` makes the binding transaction-local, equivalent
+    to SET LOCAL. Same shape as ``maybe_set_pg_rls`` in
+    ``mnemos.api.persistence_helpers`` so the two RLS context paths
+    cannot drift.
+    """
     if _lc._rls_enabled and user.authenticated:
         async with conn.transaction():
             await conn.execute(
-                "SET LOCAL mnemos.current_user_id = $1", user.user_id
+                "SELECT set_config('mnemos.current_user_id', $1, true)",
+                user.user_id,
             )
             await conn.execute(
-                "SET LOCAL mnemos.current_role = $1", user.role
+                "SELECT set_config('mnemos.current_role', $1, true)",
+                user.role,
             )
             yield conn
     else:
