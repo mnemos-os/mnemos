@@ -231,22 +231,32 @@ def _scan_for_broken_set_local(text: str, path: object) -> list[tuple[int, str]]
     def _flatten_joined_str(node: ast.JoinedStr) -> str:
         """Reconstruct a conservative template for an f-string.
 
-        Each ``FormattedValue`` becomes the placeholder ``\\S+`` so
-        the regex still matches when the SQL is split by an
-        interpolation: ``f"SET LOCAL {setting} = $1"`` flattens to
-        ``"SET LOCAL \\S+ = $1"`` which trips the same broken-shape
-        detector that catches the literal form. Codex round-7
-        (review-momsb4fe-2simsa) flagged that without this, the
-        scanner missed the f-string-interpolated bypass.
+        Each ``FormattedValue`` is replaced with a single ASCII
+        digit placeholder so the regex matches the broken shape
+        regardless of whether the interpolation falls inside the
+        identifier (\\S+ position) OR after the bind-marker ``$``
+        (\\d position). Examples:
+
+          f"SET LOCAL {setting} = $1"
+              → "SET LOCAL 0 = $1"           (\\S+ matches "0", \\d matches "1")
+          f"SET LOCAL mnemos.x = ${slot}"
+              → "SET LOCAL mnemos.x = $0"    (\\d matches "0")
+
+        Codex round-7 caught the literal-name interpolation case;
+        round-8 caught the split-bind-marker case where the digit
+        itself is interpolated. Using a digit placeholder closes
+        both with a single template.
         """
         parts: list[str] = []
         for sub in node.values:
             if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
                 parts.append(sub.value)
             else:
-                # FormattedValue (or anything else) — stand-in
-                # token that the regex's \S+ will match.
-                parts.append(r"<INTERPOLATED>")
+                # Single-digit ASCII token: matches \S+ when in
+                # identifier position AND \d when in bind-marker
+                # position. Using a real digit (not a Unicode
+                # punctuation token) is critical for the latter.
+                parts.append("0")
         return "".join(parts)
 
     # Track JoinedStr ids we've already flattened so the inner
@@ -335,6 +345,10 @@ async def test_no_remaining_set_local_with_bind_in_codebase():
         'SQL = f"SET LOCAL mnemos.{setting} = $1"',
         # Two interpolated parts in the name; literal bind.
         'SQL = f"SET LOCAL {ns}.{name} = $1"',
+        # Split bind: the digit itself is interpolated.
+        'SQL = f"SET LOCAL mnemos.current_user_id = ${slot}"',
+        # Split bind AND split name.
+        'SQL = f"SET LOCAL {name} = ${slot}"',
     ],
 )
 def test_scanner_catches_broken_shape(snippet):
