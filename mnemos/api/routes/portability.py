@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Annotated, Optional
 
-from fastapi import APIRouter, Body, Depends, HTTPException, Query
+from fastapi import APIRouter, Body, Depends, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.domain.portability.export import (
     _EXPORT_HARD_LIMIT,
     _EXPORT_SIDECAR_HARD_LIMIT,
@@ -47,8 +48,7 @@ async def export_memories(
     include_unattached_kg: Annotated[bool, Query()] = False,
     user: UserContext = Depends(get_current_user),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/export")
 
     async with _lc.get_pool_manager().acquire() as conn:
         return await _export_memories(
@@ -70,8 +70,7 @@ async def import_memories(
     preserve_owner: Annotated[bool, Query()] = False,
     user: UserContext = Depends(get_current_user),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/import")
 
     async with _lc.get_pool_manager().acquire() as conn:
         return await _import_memories(

@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes.memories import (
     _insert_memory_with_created_webhook,
     _rls_context,
@@ -43,8 +44,7 @@ def _extract_readable(items: list, max_items: int = 20) -> str:
 @router.post("/ingest/session", response_model=SessionIngestResponse)
 async def ingest_session(request: SessionIngestRequest, user: UserContext = Depends(get_current_user)):
     """Ingest Claude Code session data into MNEMOS."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/ingest/session")
     permission_mode = _validate_permission_mode(request.permission_mode, default=600)
     stored_ids = []
     try:

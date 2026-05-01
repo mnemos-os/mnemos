@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes._postgres_only import _require_postgres_backend
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import scope_namespace
 from mnemos.domain.openai_compat.router import search_memory_context as _search_mnemos_context
 from mnemos.domain.openai_compat.providers import _route_to_provider
@@ -31,13 +31,14 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/sessions", tags=["sessions"])
 
 
-def _require_pool():
-    _require_postgres_backend()
-    if not _lc._pool:
-        raise HTTPException(
-            status_code=503,
-            detail="this endpoint requires a Postgres backend (server profile)",
-        )
+def _require_pool(*, route_label: str = "/v1/sessions"):
+    """Return the asyncpg pool or emit a profile-aware 503.
+
+    Wraps ``require_postgres_pool_or_503`` so each session endpoint
+    can keep a one-line guard while sharing the canonical detail
+    message with the rest of the Postgres-only routes.
+    """
+    require_postgres_pool_or_503(route_label=route_label)
     return _lc._pool
 
 @router.post("", response_model=SessionResponse)
@@ -46,7 +47,7 @@ async def create_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Create a new session for multi-turn conversation."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="POST /v1/sessions")
 
     session_id = None
     try:
@@ -101,7 +102,7 @@ async def get_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Get session context and metadata."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="GET /v1/sessions/{session_id}")
     target_ns = scope_namespace(user, namespace)
 
     async with pool.acquire() as conn:
@@ -157,7 +158,7 @@ async def add_session_message(
     5. Stores assistant response in history
     6. Updates session metrics
     """
-    pool = _require_pool()
+    pool = _require_pool(route_label="POST /v1/sessions/{session_id}/messages")
     target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
@@ -385,7 +386,7 @@ async def get_session_history(
     user: UserContext = Depends(get_current_user),
 ):
     """Get conversation history for session."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="GET /v1/sessions/{session_id}/history")
     target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
@@ -443,7 +444,7 @@ async def delete_session(
     user: UserContext = Depends(get_current_user),
 ):
     """Close and delete session."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="DELETE /v1/sessions/{session_id}")
     target_ns = scope_namespace(user, namespace)
 
     # Verify session ownership
