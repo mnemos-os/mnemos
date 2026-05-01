@@ -27,6 +27,50 @@ def backend_or_503():
     return backend
 
 
+def require_postgres_pool_or_503(*, route_label: str = "this endpoint"):
+    """Return the asyncpg pool or raise a 503 with profile-aware
+    detail.
+
+    Many legacy routes use raw asyncpg SQL and hard-require
+    ``_lc._pool``. On SQLite/edge profiles the lifecycle sets
+    ``_pool = None`` deliberately — those routes are
+    Postgres-only-by-design, not transiently down. Distinguishing
+    the two failure modes in the 503 detail saves operators on
+    edge profiles from chasing a phantom outage.
+
+    Returns the pool for caller use. Raises HTTPException(503) with:
+      * "endpoint requires Postgres backend ..." when the active
+        persistence backend is SQLite (the route is fundamentally
+        unsupported on this profile).
+      * "Database pool not available" when the backend is Postgres
+        but the pool isn't (transient — startup race or pool
+        terminated mid-request).
+    """
+    pool = _lc._pool
+    if pool is not None:
+        return pool
+
+    # Pool is None. Decide whether that's a profile artefact or a
+    # transient outage.
+    backend = _lc._persistence_backend
+    backend_kind = type(backend).__name__ if backend is not None else None
+    if backend_kind and "Sqlite" in backend_kind:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"{route_label} requires the Postgres backend; "
+                f"this deployment is configured with SQLite. "
+                f"Set MNEMOS_PROFILE=server (or MNEMOS_PERSISTENCE_BACKEND="
+                f"postgres + a working PG_* / MNEMOS_DATABASE_URL) to "
+                f"enable Postgres-only routes."
+            ),
+        )
+    raise HTTPException(
+        status_code=503,
+        detail="Database pool not available",
+    )
+
+
 async def maybe_set_pg_rls(tx, user: UserContext) -> None:
     """Apply Postgres RLS GUCs inside a backend-neutral transaction.
 
@@ -67,4 +111,4 @@ async def maybe_set_pg_rls(tx, user: UserContext) -> None:
     )
 
 
-__all__ = ["backend_or_503", "maybe_set_pg_rls"]
+__all__ = ["backend_or_503", "maybe_set_pg_rls", "require_postgres_pool_or_503"]

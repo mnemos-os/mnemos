@@ -300,6 +300,57 @@ def _scan_for_broken_set_local(text: str, path: object) -> list[tuple[int, str]]
     return findings
 
 
+def test_require_pg_pool_returns_pool_when_present(monkeypatch):
+    """Happy path: pool is set, helper returns it."""
+    from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+
+    sentinel = object()
+    monkeypatch.setattr(_lc, "_pool", sentinel)
+    out = require_postgres_pool_or_503()
+    assert out is sentinel
+
+
+def test_require_pg_pool_503_with_postgres_message_when_no_backend(monkeypatch):
+    """No backend installed yet AND no pool — generic transient
+    503. Operators should retry."""
+    from fastapi import HTTPException
+
+    from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+
+    monkeypatch.setattr(_lc, "_pool", None)
+    monkeypatch.setattr(_lc, "_persistence_backend", None)
+
+    with pytest.raises(HTTPException) as exc:
+        require_postgres_pool_or_503()
+    assert exc.value.status_code == 503
+    assert "Database pool not available" in exc.value.detail
+
+
+def test_require_pg_pool_503_explains_sqlite_profile(monkeypatch):
+    """On a SQLite profile, the 503 detail must explain that the
+    route requires Postgres. Operators on edge/SQLite see this
+    immediately rather than chasing a phantom outage."""
+    from fastapi import HTTPException
+
+    from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+
+    class _FakeSqliteBackend:
+        pass
+
+    monkeypatch.setattr(_lc, "_pool", None)
+    monkeypatch.setattr(_lc, "_persistence_backend", _FakeSqliteBackend())
+
+    with pytest.raises(HTTPException) as exc:
+        require_postgres_pool_or_503(route_label="GET /v1/journal")
+    assert exc.value.status_code == 503
+    detail = exc.value.detail
+    assert "Postgres backend" in detail
+    assert "SQLite" in detail
+    assert "MNEMOS_PROFILE=server" in detail
+    # Custom route_label flows through.
+    assert "GET /v1/journal" in detail
+
+
 @pytest.mark.asyncio
 async def test_no_remaining_set_local_with_bind_in_codebase():
     """Belt-and-braces: AST-walk every string literal under
