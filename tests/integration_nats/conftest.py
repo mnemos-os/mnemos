@@ -253,6 +253,34 @@ class ManagedBroker:
             pass
         self.proc = None
 
+    async def _probe_once(self) -> None:
+        """One handshake + identity check. Raises on failure.
+
+        Shared between sync and async readiness paths so that the
+        port-race identity check (handshake succeeded → confirm OUR
+        child is still alive → otherwise an unrelated nats-server
+        won the port) lives in exactly one place.
+        """
+        import asyncio as _asyncio
+        import nats
+
+        client = await _asyncio.wait_for(
+            nats.connect(servers=[self.url]), timeout=0.5
+        )
+        try:
+            # Identity check: make sure the server we just connected
+            # to is OUR child, not an unrelated nats-server that won
+            # the port race. The simplest test that survives
+            # nats-server version variation is "the child we spawned
+            # is still alive after the handshake."
+            if self.proc is None or self.proc.poll() is not None:
+                raise RuntimeError(
+                    "handshake succeeded but our subprocess is gone — "
+                    "another nats-server won the port"
+                )
+        finally:
+            await client.drain()
+
     def _spawn(self) -> None:
         """Spawn + sync-probe readiness. Used at fixture setup
         when there is no running event loop yet.
@@ -274,6 +302,11 @@ class ManagedBroker:
             running loop).
           * async_spawn() — async path, used from inside async
             tests so we can ``await`` instead of ``asyncio.run``.
+
+        Codex round-3 flagged that the post-handshake child-
+        liveness check was only on the async path; sync _spawn()
+        could still accept a wrong nats-server that won the port
+        race. Both paths now go through ``_probe_once()``.
         """
         import asyncio as _asyncio
 
@@ -287,15 +320,7 @@ class ManagedBroker:
                         f"nats-server exited early (code={self.proc.returncode})"
                     )
                 try:
-                    import nats
-
-                    async def _probe():
-                        client = await _asyncio.wait_for(
-                            nats.connect(servers=[self.url]), timeout=0.5
-                        )
-                        await client.drain()
-
-                    _asyncio.run(_probe())
+                    _asyncio.run(self._probe_once())
                     return
                 except Exception as exc:
                     last_exc = exc
@@ -326,24 +351,7 @@ class ManagedBroker:
                         f"nats-server exited early (code={self.proc.returncode})"
                     )
                 try:
-                    import nats
-
-                    client = await _asyncio.wait_for(
-                        nats.connect(servers=[self.url]), timeout=0.5
-                    )
-                    # Identity check (codex round-2 finding 3): make
-                    # sure the server we just connected to is OUR
-                    # child, not an unrelated nats-server that won the
-                    # port race. The simplest test that survives
-                    # nats-server version variation is "the child we
-                    # spawned is still alive after the handshake."
-                    if self.proc is None or self.proc.poll() is not None:
-                        await client.drain()
-                        raise RuntimeError(
-                            "handshake succeeded but our subprocess is gone — "
-                            "another nats-server won the port"
-                        )
-                    await client.drain()
+                    await self._probe_once()
                     return
                 except Exception as exc:
                     last_exc = exc

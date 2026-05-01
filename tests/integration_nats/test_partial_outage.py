@@ -369,7 +369,10 @@ async def test_ensure_streams_safe_across_managed_broker_restart(managed_broker)
         await nc.drain()
 
     # Restart the broker (preserving store_dir → streams persist).
-    managed_broker.restart()
+    # Must use async_restart() inside an async test — sync restart()
+    # calls asyncio.run() under the hood and will deadlock when a
+    # pytest-asyncio event loop is already running.
+    await managed_broker.async_restart()
 
     # Second ensure_streams call against the restarted broker.
     nc2 = await nats.connect(servers=[managed_broker.url])
