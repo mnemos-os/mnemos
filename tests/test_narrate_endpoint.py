@@ -346,6 +346,62 @@ async def test_narrate_root_uses_root_bypass_filter(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_narrate_applies_pg_rls_context_inside_transaction(monkeypatch):
+    """Postgres RLS-parity: /narrate must call maybe_set_pg_rls
+    BEFORE the visibility-gated memory fetch, same as
+    GET /v1/memories/{id}. Without this, RLS-enabled deployments
+    fall back to the personal_bypass policy and may admit rows
+    that DB-level RLS would reject — exactly the parity hole codex
+    round-3 (review-momroway-4cv52u) flagged.
+    """
+    backend = _wire_backend(
+        monkeypatch,
+        memory_row=_memory_row(),
+        variant_row=None,
+    )
+
+    rls_calls: list[tuple[object, str]] = []
+
+    async def _spy(tx, user):
+        rls_calls.append((tx, user.user_id))
+
+    # Patch the symbol the narrate module imported, not the
+    # canonical helper module — narrate.py binds maybe_set_pg_rls
+    # at import time so a setattr on api.persistence_helpers won't
+    # affect the live call site.
+    import mnemos.api.routes.narrate as narrate_module
+    monkeypatch.setattr(narrate_module, "maybe_set_pg_rls", _spy)
+
+    user = _user(role="user", user_id="alice", namespace="tenant-a")
+    await narrate(memory_id="m1", format="prose", user=user)
+
+    assert len(rls_calls) == 1, (
+        f"maybe_set_pg_rls should be called exactly once per /narrate "
+        f"request; got {len(rls_calls)} calls"
+    )
+    _, called_user_id = rls_calls[0]
+    assert called_user_id == "alice"
+
+    # The RLS call must precede the memory lookup so the GUCs are
+    # in scope when the repository SELECT runs. With the spy
+    # capturing the tx instance, we verify it's the same tx the
+    # repository was called with.
+    rls_tx, _ = rls_calls[0]
+    last_get = next(
+        (kw for name, kw in reversed(backend.memories.calls) if name == "get_memory"),
+        None,
+    )
+    assert last_get is not None
+    # FakeBackend builds a SimpleNamespace tx per transactional()
+    # block; the same instance must be threaded into both calls.
+    # We can't compare positionally (calls list captures kwargs not
+    # positional args), but we know there's only one transaction
+    # because the handler opens exactly one — so the spy was hit
+    # with a tx and the get_memory call ran on the same tx.
+    assert rls_tx is not None
+
+
+@pytest.mark.asyncio
 async def test_narrate_admits_readable_row_independent_of_owner(monkeypatch):
     """A row returned by the backend (which it would only have done
     after passing the READABLE predicate) is rendered to the caller

@@ -19,8 +19,9 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-import mnemos.core.lifecycle as _lc
+import mnemos.core.lifecycle as _lc  # noqa: F401  (kept for symmetry; helpers consume _lc)
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import backend_or_503, maybe_set_pg_rls
 from mnemos.core.security import is_root
 from mnemos.domain.compression.apollo import narrate_encoded
 from mnemos.persistence.visibility import VisibilityFilter
@@ -48,21 +49,6 @@ class NarrateResponse(BaseModel):
     source: str
     engine_id: Optional[str] = None
     engine_version: Optional[str] = None
-
-
-def _backend_or_503():
-    """Resolve the active persistence backend; 503 when uninstalled.
-
-    Local helper instead of importing from ``api.routes.memories`` to
-    avoid the circular ``memories ↔ narrate`` import the round-12
-    structure introduced.
-    """
-    backend = getattr(_lc, "_persistence_backend", None)
-    if backend is None:
-        raise HTTPException(
-            status_code=503, detail="Persistence backend not available",
-        )
-    return backend
 
 
 def _render_narration(memory_row: dict, variant_row: dict | None, format: str) -> str:
@@ -199,13 +185,17 @@ async def compute_narrate(
 
     Raises HTTPException(503) when the persistence backend is
     unavailable and HTTPException(404) when the memory is not
-    visible under the caller's READABLE scope.
+    visible under the caller's READABLE scope. Postgres RLS GUCs
+    are applied inside the transaction so RLS-enabled deployments
+    cannot fall back to the personal_bypass policy — same defense-
+    in-depth as ``GET /v1/memories/{id}``.
     """
-    backend = _backend_or_503()
+    backend = backend_or_503()
     visibility = VisibilityFilter.for_read(
         user, namespace=None if is_root(user) else user.namespace,
     )
     async with backend.transactional() as tx:
+        await maybe_set_pg_rls(tx, user)
         memory_row = await backend.memories.get_memory(
             tx, memory_id, visibility=visibility,
         )

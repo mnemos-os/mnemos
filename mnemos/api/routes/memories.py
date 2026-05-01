@@ -13,6 +13,10 @@ from fastapi.responses import PlainTextResponse
 import mnemos.core.lifecycle as _lc
 from mnemos.api.content_negotiation import negotiate_narrate_format
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import (
+    backend_or_503 as _backend_or_503,
+    maybe_set_pg_rls as _maybe_set_pg_rls,
+)
 from mnemos.core.ids import new_memory_id
 from mnemos.core.lifecycle import (
     _get_cache_key,
@@ -54,39 +58,6 @@ async def _rls_context(conn, user: UserContext):
             yield conn
     else:
         yield conn
-
-
-async def _maybe_set_pg_rls(tx, user: UserContext) -> None:
-    """Apply Postgres RLS GUCs inside a backend-neutral transaction.
-
-    No-op on SQLite (no RLS). Postgres ``transactional()`` already
-    opened a transaction before yielding, so ``SET LOCAL`` applies
-    only within that scope.
-
-    Repository SQL also bakes the visibility predicate inline as
-    primary enforcement; this helper is defense-in-depth for the
-    Postgres path.
-    """
-    if not _lc._rls_enabled or not user.authenticated:
-        return
-    # Lazy import keeps this module from owning a Postgres-only
-    # dependency at module load time on edge profiles.
-    from mnemos.persistence.postgres import PostgresTransaction
-    if not isinstance(tx, PostgresTransaction):
-        return
-    await tx.conn.execute("SET LOCAL mnemos.current_user_id = $1", user.user_id)
-    await tx.conn.execute("SET LOCAL mnemos.current_role = $1", user.role)
-
-
-def _backend_or_503():
-    """Return the active persistence backend or raise 503."""
-    backend = _lc._persistence_backend
-    if backend is None:
-        raise HTTPException(
-            status_code=503,
-            detail="Persistence backend not available",
-        )
-    return backend
 
 
 def _validate_permission_mode(value: int | None, *, default: int | None = None) -> int | None:
