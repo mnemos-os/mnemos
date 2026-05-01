@@ -78,7 +78,21 @@ def _to_peer(row) -> FederationPeer:
     )
 
 
-def _memory_item_from_row(row) -> MemoryItem:
+def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
+    """Build a MemoryItem from a feed row.
+
+    ``include_compressed`` populates ``compressed_content`` from the
+    LEFT JOIN against memory_compressed_variants when the row has one
+    (and the caller of the row-fetch actually selected the column).
+    Receivers that don't recognize compressed_content fall through
+    to the raw ``content`` with no behavior change.
+    """
+    compressed = None
+    if include_compressed:
+        try:
+            compressed = row["compressed_content"]
+        except (KeyError, IndexError):
+            compressed = None
     return MemoryItem(
         id=row["id"],
         content=row["content"],
@@ -92,6 +106,7 @@ def _memory_item_from_row(row) -> MemoryItem:
             else (dict(row["metadata"]) if row["metadata"] else None)
         ),
         quality_rating=row["quality_rating"],
+        compressed_content=compressed,
         verbatim_content=row["verbatim_content"],
         owner_id=row["owner_id"],
         namespace=row["namespace"],
@@ -398,6 +413,19 @@ async def federation_feed(
     namespace: Optional[str] = Query(None, description="Comma-separated namespace filter"),
     category: Optional[str] = Query(None, description="Comma-separated category filter"),
     limit: int = Query(100, ge=1, le=500),
+    prefer_compressed: bool = Query(
+        False,
+        description=(
+            "When true, prefer the engine-compressed variant from "
+            "memory_compressed_variants over the raw memory.content "
+            "for memories that have a compressed variant. Reduces "
+            "wire bytes on cross-cluster federation pulls. The peer "
+            "knows compression was applied because compressed_content "
+            "is populated on the MemoryItem; raw content stays "
+            "fetchable via /v1/federation/memory/{id} without the "
+            "flag."
+        ),
+    ),
 ):
     """Serve memories for a remote peer to pull. Requires role='federation' or 'root'."""
     if not _lc._pool:
@@ -448,14 +476,34 @@ async def federation_feed(
     args.append(limit + 1)   # request one extra to detect has_more
     where_clause = " AND ".join(query_parts)
 
+    # When prefer_compressed=True we LEFT JOIN memory_compressed_variants
+    # so the receiver can pick up the compressed payload in the same
+    # request — saves a follow-up round trip per memory and reduces
+    # wire bytes on the cross-cluster federation hot path. The raw
+    # content + verbatim_content are still in the row so receivers
+    # that ignore compressed_content fall through to the original
+    # shape with no behavior change.
+    select_compressed_col = (
+        "v.compressed_content AS compressed_content,"
+        if prefer_compressed
+        else "NULL::text AS compressed_content,"
+    )
+    join_compressed = (
+        "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
+        if prefer_compressed
+        else ""
+    )
+
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT id, content, category, subcategory, metadata, quality_rating,
-                   verbatim_content, owner_id, namespace, permission_mode,
-                   source_model, source_provider, source_session, source_agent,
-                   created, updated
+            SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
+                   m.quality_rating, m.verbatim_content, m.owner_id, m.namespace,
+                   m.permission_mode, m.source_model, m.source_provider,
+                   m.source_session, m.source_agent, m.created, m.updated,
+                   {select_compressed_col.rstrip(',')}
             FROM memories m
+            {join_compressed}
             WHERE {where_clause}
             ORDER BY m.updated ASC, m.id ASC
             LIMIT ${len(args)}
@@ -466,7 +514,7 @@ async def federation_feed(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    memories = [_memory_item_from_row(r) for r in rows]
+    memories = [_memory_item_from_row(r, include_compressed=prefer_compressed) for r in rows]
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(rows[-1]["updated"], rows[-1]["id"])
     else:

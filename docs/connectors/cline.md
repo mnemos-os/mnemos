@@ -182,6 +182,8 @@ permission boundary is enforced server-side. Setup:
          "autoApprove": [
            "search_memories", "list_memories", "get_memory", "get_stats",
            "kg_search", "kg_timeline",
+           "log_memory", "diff_memory_commits", "checkout_memory",
+           "recommend_model",
            "create_memory", "bulk_create_memories"
          ]
        }
