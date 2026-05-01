@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from mnemos.mcp.tools._runtime import _safe_path_segment
+from mnemos.mcp.tools._runtime import _safe_path_segment, _safe_path_value
 
 
 # ── Helper validation contract ─────────────────────────────────────────────
@@ -58,6 +58,64 @@ def test_safe_path_segment_admits_simple_peer_name():
         _safe_path_segment("fed:alpha:remote-id-1", label="memory_id")
         == "fed:alpha:remote-id-1"
     )
+
+
+# ── _safe_path_value (looser helper for free-form fields) ─────────────────
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        # Plain entity name — encoded by quote(safe="").
+        ("alice", "alice"),
+        # Email-shaped entity.
+        ("alice@acme.com", "alice%40acme.com"),
+        # URL-shaped entity (https://example.com/page).
+        # Slash inside is rejected; here we test a colon + dot
+        # combination without slash.
+        ("isbn:9780123456789", "isbn%3A9780123456789"),
+        # Spaces preserved (encoded as %20).
+        ("project alpha", "project%20alpha"),
+        # Unicode — quote handles via UTF-8 encoding.
+        ("café", "caf%C3%A9"),
+    ],
+)
+def test_safe_path_value_admits_free_form_entities(value, expected):
+    out = _safe_path_value(value, label="subject")
+    assert out == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../../export",
+        "..",
+        "alice/../export",
+        "alice\\..\\export",
+        "subject?evil=1",
+        "subject#frag",
+        "alice\nlog-injection",
+        "alice\x00null",
+        "",
+    ],
+)
+def test_safe_path_value_rejects_traversal_and_url_rewrite(value):
+    with pytest.raises(ValueError):
+        _safe_path_value(value, label="subject")
+
+
+def test_safe_path_value_rejects_overlong():
+    with pytest.raises(ValueError):
+        _safe_path_value("a" * 1024, label="subject")
+
+
+def test_safe_path_value_admits_single_dot():
+    """A single ``.`` is harmless (URL paths can have it). Only the
+    ``..`` traversal sequence is the threat."""
+    assert _safe_path_value("v1.0", label="subject") == "v1.0"
+    # quote() leaves single dots unencoded by default — that's fine.
+    out = _safe_path_value("alice.bob", label="subject")
+    assert out == "alice.bob"
 
 
 @pytest.mark.parametrize(
@@ -305,6 +363,83 @@ async def test_tool_get_memory_admits_federated_id():
     called_path = mock_get.await_args.args[0]
     assert called_path == "/v1/memories/fed:alpha:mem_1"
     assert result == {"id": "fed:alpha:mem_1"}
+
+
+@pytest.mark.asyncio
+async def test_tool_kg_timeline_rejects_traversal_in_subject():
+    """Codex round-4 (review-momtgp9j-e9u9zf) caught that
+    ``/v1/kg/timeline/{subject}`` was unvalidated. ``../../export``
+    would let httpx normalise the path back to ``/v1/export``,
+    reaching the bulk export endpoint under the MCP server's
+    bearer token."""
+    from mnemos.mcp.tools.kg import tool_kg_timeline
+
+    with patch(
+        "mnemos.mcp.tools.kg._rest_get",
+        new=AsyncMock(),
+    ) as mock_get:
+        with pytest.raises(ValueError):
+            await tool_kg_timeline("../../export")
+    mock_get.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_kg_timeline_admits_free_form_subject():
+    """Email / URL / unicode entity names must round-trip safely."""
+    from mnemos.mcp.tools.kg import tool_kg_timeline
+
+    with patch(
+        "mnemos.mcp.tools.kg._rest_get",
+        new=AsyncMock(return_value={"events": []}),
+    ) as mock_get:
+        await tool_kg_timeline("alice@acme.com")
+    mock_get.assert_awaited_once()
+    called_path = mock_get.await_args.args[0]
+    # `@` encoded so the URL parser doesn't treat alice as userinfo.
+    assert called_path == "/v1/kg/timeline/alice%40acme.com"
+
+
+@pytest.mark.asyncio
+async def test_tool_update_triple_rejects_traversal():
+    from mnemos.mcp.tools.kg import tool_update_triple
+
+    with patch(
+        "mnemos.mcp.tools.kg._rest_post",
+        new=AsyncMock(),
+    ) as mock_post:
+        with pytest.raises(ValueError):
+            await tool_update_triple("../../admin", subject="x")
+    mock_post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_tool_delete_triple_rejects_traversal():
+    from mnemos.mcp.tools.kg import tool_delete_triple
+
+    with patch(
+        "mnemos.mcp.tools.kg._rest_delete",
+        new=AsyncMock(),
+    ) as mock_delete:
+        with pytest.raises(ValueError):
+            await tool_delete_triple("../../admin")
+    mock_delete.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_knossos_t_kg_timeline_rejects_traversal():
+    """Knossos has its OWN KG timeline tool (`t_kg_timeline`)
+    that splices subject into the same /v1/kg/timeline path. Same
+    fix shape as the canonical surface — return error envelope."""
+    from mnemos.tools.knossos_mcp import t_kg_timeline
+
+    with patch(
+        "mnemos.tools.knossos_mcp._get",
+        new=AsyncMock(),
+    ) as mock_get:
+        result = await t_kg_timeline({"subject": "../../export"})
+    assert isinstance(result, dict)
+    assert "error" in result
+    mock_get.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -44,7 +44,7 @@ sys.stdout = sys.stderr
 import httpx  # noqa: E402
 import mcp.types as types  # noqa: E402
 from mnemos.core.config import get_settings  # noqa: E402
-from mnemos.mcp.tools._runtime import _safe_path_segment  # noqa: E402
+from mnemos.mcp.tools._runtime import _safe_path_segment, _safe_path_value  # noqa: E402
 from mcp.server import Server  # noqa: E402
 from mcp.server.stdio import stdio_server  # noqa: E402
 
@@ -394,7 +394,11 @@ async def t_kg_timeline(args: Dict[str, Any]) -> Any:
     subject = args.get("subject")
     if not subject:
         return {"error": "subject is required"}
-    return await _get(f"/v1/kg/timeline/{subject}")
+    try:
+        safe_subject = _safe_path_value(subject, label="subject")
+    except ValueError as exc:
+        return {"error": str(exc)}
+    return await _get(f"/v1/kg/timeline/{safe_subject}")
 
 
 async def t_kg_stats(_args: Dict[str, Any]) -> Any:

@@ -73,6 +73,50 @@ def _backend_headers() -> dict[str, str]:
 _PATH_SEGMENT_PATTERN = re.compile(r"\A[A-Za-z0-9_:-]{1,128}\Z")
 
 
+_LOOSE_PATH_REJECT_PATTERN = re.compile(
+    r"(?:\.\.)|[\/\\\x00-\x1f\x7f?#]"
+)
+
+
+def _safe_path_value(value: object, *, label: str = "value", max_length: int = 512) -> str:
+    """Looser variant of ``_safe_path_segment`` for free-form fields
+    (e.g. KG subject identifiers / entity names, which can contain
+    arbitrary characters like URLs, email addresses, natural-language
+    phrases).
+
+    Strict character whitelisting would over-reject these legitimate
+    inputs. Instead this helper:
+
+      1. Type-checks + length-bounds.
+      2. Rejects the actual path-traversal signal ``..`` (consecutive
+         dots) AND the URL-rewrite/control characters ``/`` ``\\``
+         ``?`` ``#`` and any byte in the ASCII control range.
+      3. ``urllib.parse.quote`` with ``safe=""`` so every remaining
+         special character is percent-encoded into a single path
+         segment — including the otherwise-default-safe ``.`` (URL
+         encoding of single dots is harmless; it's only the literal
+         ``..`` that triggers httpx's dot-segment normalization).
+
+    The KG subject splice site is the original motivating case
+    (codex round-4 of the round-24 thread caught
+    ``/v1/kg/timeline/../../export`` reaching ``/v1/export``).
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string, got {type(value).__name__}")
+    if not value:
+        raise ValueError(f"{label} must be non-empty")
+    if len(value) > max_length:
+        raise ValueError(
+            f"{label} must be at most {max_length} characters; got {len(value)}"
+        )
+    if _LOOSE_PATH_REJECT_PATTERN.search(value):
+        raise ValueError(
+            f"{label} contains a path-rewrite character or "
+            f".. traversal sequence; got {value!r}"
+        )
+    return urllib.parse.quote(value, safe="")
+
+
 def _safe_path_segment(value: object, *, label: str = "id") -> str:
     """Validate + URL-encode an identifier before splicing it into a
     REST path.

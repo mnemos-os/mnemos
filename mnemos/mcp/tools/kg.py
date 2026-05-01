@@ -6,7 +6,14 @@ from typing import Any
 
 from mnemos.core.auth_context import UserContext
 
-from ._runtime import _rest_delete, _rest_get, _rest_post, _tool
+from ._runtime import (
+    _rest_delete,
+    _rest_get,
+    _rest_post,
+    _safe_path_segment,
+    _safe_path_value,
+    _tool,
+)
 
 
 async def tool_kg_create_triple(
@@ -60,7 +67,10 @@ async def tool_kg_timeline(
     limit: int = 100,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
-    return await _rest_get(f"/v1/kg/timeline/{subject}", params={"limit": limit})
+    safe_subject = _safe_path_value(subject, label="subject")
+    return await _rest_get(
+        f"/v1/kg/timeline/{safe_subject}", params={"limit": limit},
+    )
 
 
 async def tool_update_triple(
@@ -83,8 +93,9 @@ async def tool_update_triple(
         "valid_until": valid_until,
         "confidence": confidence,
     }
+    safe_triple_id = _safe_path_segment(triple_id, label="triple_id")
     return await _rest_post(
-        f"/v1/kg/triples/{triple_id}",
+        f"/v1/kg/triples/{safe_triple_id}",
         {k: v for k, v in body.items() if v is not None},
         method="PATCH",
     )
@@ -94,7 +105,8 @@ async def tool_delete_triple(
     triple_id: str,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
-    status = await _rest_delete(f"/v1/kg/triples/{triple_id}")
+    safe_triple_id = _safe_path_segment(triple_id, label="triple_id")
+    status = await _rest_delete(f"/v1/kg/triples/{safe_triple_id}")
     return {"deleted": True, "status": status}
 
 
