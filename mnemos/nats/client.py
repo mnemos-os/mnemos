@@ -134,11 +134,74 @@ async def ensure_streams(js) -> bool:
                 except Exception as fallback_exc:
                     exc = fallback_exc
                     msg = str(fallback_exc)
-            # add_stream is idempotent for matching configs; mismatched
-            # configs raise. Log and continue — operator must intervene.
+            # add_stream is idempotent for matching configs and raises
+            # BadRequestError for mismatched configs. Both paths surface
+            # text like "already in use" / "stream name already" — so
+            # we MUST disambiguate by reading back the existing config
+            # and comparing. Otherwise a redeploy with a drifted
+            # max_bytes / max_age / duplicate_window silently leaves the
+            # broker on the old retention/dedup settings while
+            # ensure_streams reports success.
+            # Audit Finding 11 / codex round-5 (2026-05-01).
             if "already in use" in msg or "stream name already" in msg.lower():
-                logger.debug("NATS stream %s already exists", cfg.name)
+                drift = await _stream_config_drift(js, cfg)
+                if not drift:
+                    logger.debug("NATS stream %s already exists (config matches)", cfg.name)
+                    continue
+                logger.error(
+                    "NATS stream %s config drift detected; broker keeps OLD "
+                    "config. Drift: %s. Operator must `nats stream update %s` "
+                    "or delete+recreate to apply the new config.",
+                    cfg.name,
+                    drift,
+                    cfg.name,
+                )
+                return False
             else:
                 logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
                 return False
     return True
+
+
+async def _stream_config_drift(js, desired) -> dict[str, tuple]:
+    """Compare desired StreamConfig vs the running stream's actual config.
+
+    Returns a dict of ``{field: (running_value, desired_value)}`` for
+    every retention dimension that has drifted. Empty dict means
+    configs match — safe to treat the redeclare as idempotent.
+
+    Only the operator-facing retention dimensions are checked
+    (max_age, max_bytes, duplicate_window, retention, storage,
+    subjects). Internal nats-py defaults that vary across versions
+    are not part of the drift surface.
+    """
+    try:
+        info = await js.stream_info(desired.name)
+    except Exception as exc:
+        # stream_info itself failed — we can't tell drift from
+        # "broker is unavailable now"; surface as drift so the caller
+        # logs and bails rather than silently continuing.
+        return {"_stream_info_error": (str(exc), None)}
+
+    current = info.config
+    fields = ("max_age", "max_bytes", "duplicate_window")
+    drift: dict[str, tuple] = {}
+    for f in fields:
+        cur = getattr(current, f, None)
+        des = getattr(desired, f, None)
+        if cur is None or des is None:
+            continue
+        # max_age/duplicate_window: stream_info reads back as float
+        # seconds (nats-py 2.14 converts from ns); desired is int
+        # seconds. Compare with a tiny tolerance.
+        if isinstance(cur, float) or isinstance(des, float):
+            if abs(float(cur) - float(des)) > 1e-3:
+                drift[f] = (cur, des)
+        else:
+            if cur != des:
+                drift[f] = (cur, des)
+
+    if list(getattr(current, "subjects", []) or []) != list(getattr(desired, "subjects", []) or []):
+        drift["subjects"] = (current.subjects, desired.subjects)
+
+    return drift

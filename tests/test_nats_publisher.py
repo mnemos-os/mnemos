@@ -99,3 +99,146 @@ def test_connect_nats_enables_publishing_only_after_streams_verified(monkeypatch
     assert result is js
     assert nats_client.get_jetstream() is js
     assert nats_client.publishing_enabled() is True
+
+
+# v4.2.0a9 round-6: codex Audit Finding 11 / round-5 follow-up.
+#
+# ensure_streams used to lump "stream exists with MATCHING config"
+# (idempotent no-op) and "stream exists with DIFFERENT config"
+# (drift, broker keeps OLD config) into the same "already in use"
+# substring branch and silently returned True for both. A redeploy
+# with a drifted max_bytes would silently get publishing enabled
+# while the broker kept the old config — operator never sees the
+# drift unless they look at the stream directly.
+#
+# These tests verify the new disambiguation: matching → True
+# (publishing safe), drifted → False (operator must intervene).
+
+
+def _stream_config_obj(**overrides):
+    """Build a minimal StreamConfig-like object covering the fields
+    ensure_streams' drift detector reads."""
+    base = dict(
+        name=overrides.get("name", "MNEMOS_MEMORY"),
+        subjects=overrides.get("subjects", ["mnemos.memory.>"]),
+        max_age=overrides.get("max_age", 30 * 24 * 60 * 60),
+        max_bytes=overrides.get("max_bytes", 10 * 1024**3),
+        duplicate_window=overrides.get("duplicate_window", 2 * 60),
+    )
+    return SimpleNamespace(**base)
+
+
+# Per-stream subject map mirrors ensure_streams' canonical declarations.
+_CANONICAL_SUBJECTS = {
+    "MNEMOS_MEMORY": ["mnemos.memory.>"],
+    "MNEMOS_CONSULTATION": ["mnemos.consultation.>"],
+    "MNEMOS_WEBHOOK": ["mnemos.webhook.>"],
+}
+
+
+def test_ensure_streams_returns_true_when_existing_matches(monkeypatch):
+    """The classic idempotent case — operator's redeploy ships the
+    SAME config that's already declared. ensure_streams must report
+    success and let publishing proceed."""
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            # Simulate broker rejection because stream exists.
+            raise RuntimeError("nats: API error: code=400 description=stream name already in use with a different configuration")
+
+        async def stream_info(self, name):
+            # Existing config matches what ensure_streams was about
+            # to declare for this specific stream.
+            return SimpleNamespace(
+                config=_stream_config_obj(
+                    name=name,
+                    subjects=_CANONICAL_SUBJECTS[name],
+                )
+            )
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is True, (
+        "matching-config redeclare must be idempotent and return True"
+    )
+
+
+def test_ensure_streams_returns_false_when_existing_drifts(monkeypatch, caplog):
+    """A redeploy with drifted max_bytes (or any retention dim) must
+    return False so connect_nats disables publishing — operator sees
+    the broker keeping the OLD config and can intervene with
+    nats stream update / delete+recreate before traffic resumes
+    against stale retention.
+    """
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="mnemos.nats.client")
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            raise RuntimeError("nats: stream name already in use")
+
+        async def stream_info(self, name):
+            # The running stream has the OLD config; we tried to
+            # ship max_bytes=10GB but broker has 1GB.
+            return SimpleNamespace(
+                config=_stream_config_obj(
+                    name=name,
+                    subjects=_CANONICAL_SUBJECTS[name],
+                    max_bytes=1024**3,
+                )
+            )
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is False, (
+        "drifted redeclare must return False so publishing stays "
+        "disabled until the operator intervenes"
+    )
+    # Operator-facing log must name the field that drifted so they
+    # know what to fix. Don't be picky about exact wording — just
+    # the field name.
+    assert any("max_bytes" in rec.message for rec in caplog.records), (
+        f"drift log must name the drifted field. caplog: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+
+def test_ensure_streams_drift_detector_returns_empty_on_match():
+    """Direct unit test of the drift helper — matching configs
+    produce an empty drift dict (= idempotent)."""
+    from mnemos.nats.client import _stream_config_drift
+
+    class _Js:
+        async def stream_info(self, name):
+            return SimpleNamespace(config=_stream_config_obj(name=name))
+
+    desired = _stream_config_obj()
+    drift = asyncio.run(_stream_config_drift(_Js(), desired))
+    assert drift == {}
+
+
+def test_ensure_streams_drift_detector_reports_field_drift():
+    """Direct unit test — every drifted field shows up in the dict
+    with its (running, desired) tuple."""
+    from mnemos.nats.client import _stream_config_drift
+
+    class _Js:
+        async def stream_info(self, name):
+            return SimpleNamespace(
+                config=_stream_config_obj(
+                    name=name,
+                    max_bytes=1024**3,            # drift
+                    max_age=15 * 24 * 60 * 60,    # drift
+                )
+            )
+
+    desired = _stream_config_obj()  # ensure_streams' canonical config
+    drift = asyncio.run(_stream_config_drift(_Js(), desired))
+    assert "max_bytes" in drift
+    assert "max_age" in drift
+    assert "duplicate_window" not in drift  # this field matched
