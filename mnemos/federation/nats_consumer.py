@@ -347,21 +347,47 @@ class _SubscriptionGroup:
 
 
 async def _consume_subscription(pool: asyncpg.Pool, peer: FederationNatsPeer, sub: Any) -> None:
+    """Drive a single subscription's receive/handle/ack lifecycle.
+
+    Three failure scopes, deliberately separated:
+
+    1. **Receive** (``sub.next_msg``) — a non-timeout failure here is a
+       NATS-connection issue (broker shutdown, durable deletion, etc.).
+       Escapes for ``consumer_loop`` to drain + reconnect with backoff.
+    2. **Handle** (``handle_message``) — ANY failure is local. Could be
+       an HTTP backfill 401, a peer RuntimeError, an asyncpg.PostgresError
+       from the local pool, an asyncpg.InterfaceError from a closed
+       connection — none of these mean the NATS subscription is broken,
+       so a per-peer reconnect would just pause unrelated subjects behind
+       backoff. Don't ack; JetStream redelivers after ack-wait.
+    3. **Ack** (``_ack``) — a failure here is also a NATS-connection
+       issue (the broker is what we're acking to). Escape for reconnect.
+
+    See v4.2.0a7 round-3 audit (codex finding 2026-05-01).
+    """
     received = 0
     while True:
         msg = None
+
+        # Scope 1: receive
         try:
             msg = await sub.next_msg(timeout=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                continue
+            logger.exception(
+                "federation nats peer=%s receive error (escaping for reconnect): %s",
+                peer.name,
+                exc,
+            )
+            raise
+
+        # Scope 2: handle (all failures stay local — don't ack,
+        # JetStream redelivers after ack-wait).
+        try:
             await handle_message(pool, peer, msg)
-            await _ack(msg)
-            received += 1
-            if received % 100 == 0:
-                logger.info(
-                    "federation nats peer=%s subject=%s received=%d events",
-                    peer.name,
-                    getattr(msg, "subject", "?"),
-                    received,
-                )
         except asyncio.CancelledError:
             raise
         except PoisonMessageError as exc:
@@ -371,33 +397,48 @@ async def _consume_subscription(pool: asyncpg.Pool, peer: FederationNatsPeer, su
                 getattr(msg, "subject", "?"),
                 exc,
             )
-            if msg is not None:
-                await _ack(msg)
-        except asyncpg.PostgresError as exc:
-            # Handler-level DB error: log and DON'T ack (so JetStream
-            # redelivers after the ack-wait window). Stay in the
-            # consume loop — a transient DB hiccup should not force
-            # a NATS reconnect.
-            logger.exception(
-                "federation nats peer=%s db error: %s", peer.name, exc
-            )
+            await _ack_safely(msg, peer_label=peer.name)
             continue
         except Exception as exc:
-            if _is_timeout(exc):
-                continue
-            # Connection-level / unknown failure: escape so
-            # consumer_loop can drain the NATS connection and
-            # reconnect with backoff. Without this, errors like
-            # broker shutdown mid-consume or durable consumer
-            # deletion leave the consume loop spinning on the same
-            # dead subscription forever. (Audit Finding from
-            # v4.2.0a7 round 2.)
             logger.exception(
-                "federation nats peer=%s subscription error (escaping for reconnect): %s",
+                "federation nats peer=%s handler error (subscription stays alive, no ack): %s",
+                peer.name,
+                exc,
+            )
+            continue
+
+        # Scope 3: ack (failure here is a NATS issue → reconnect).
+        try:
+            await _ack(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "federation nats peer=%s ack error (escaping for reconnect): %s",
                 peer.name,
                 exc,
             )
             raise
+
+        received += 1
+        if received % 100 == 0:
+            logger.info(
+                "federation nats peer=%s subject=%s received=%d events",
+                peer.name,
+                getattr(msg, "subject", "?"),
+                received,
+            )
+
+
+async def _ack_safely(msg: Any, *, peer_label: str) -> None:
+    try:
+        await _ack(msg)
+    except Exception as exc:  # noqa: BLE001 — best-effort poison ack
+        logger.warning(
+            "federation nats peer=%s poison-ack failed (will be redelivered): %s",
+            peer_label,
+            exc,
+        )
 
 
 async def _ack(msg: Any) -> None:

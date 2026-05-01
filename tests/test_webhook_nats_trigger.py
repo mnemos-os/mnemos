@@ -169,3 +169,96 @@ async def test_transient_handle_error_is_not_acked(monkeypatch):
     await asyncio.gather(task, return_exceptions=True)
 
     assert msg.acked is False
+
+
+# --- v4.2.0a7 round-3: receive/handle/ack scope-split coverage ---
+
+
+async def test_handler_runtime_error_does_not_kill_loop(monkeypatch):
+    """Generic RuntimeError from handle_message must stay local — outbox
+    polling fallback re-drives missed deliveries; tearing down the NATS
+    subscription would just delay unrelated webhooks behind backoff."""
+    first = _FakeMsg("mnemos.webhook.delivery.queued.default", _payload("first"))
+    second = _FakeMsg("mnemos.webhook.delivery.queued.default", _payload("second"))
+    sub = _FakeSubscription([first, second])
+    seen: list[str] = []
+
+    async def handle_message(pool, msg_arg):
+        payload = json.loads(msg_arg.data.decode())
+        seen.append(payload["delivery_id"])
+        if payload["delivery_id"] == "first":
+            raise RuntimeError("transient downstream error")
+
+    monkeypatch.setattr(trigger, "handle_message", handle_message)
+    task = asyncio.create_task(trigger._consume_subscription(object(), sub))
+    for _ in range(50):
+        if "second" in seen:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert seen == ["first", "second"]
+    assert first.acked is False
+    assert second.acked is True
+
+
+async def test_handler_interface_error_does_not_kill_loop(monkeypatch):
+    """asyncpg.InterfaceError from handler must stay local."""
+    import asyncpg
+
+    first = _FakeMsg("mnemos.webhook.delivery.queued.default", _payload("first"))
+    second = _FakeMsg("mnemos.webhook.delivery.queued.default", _payload("second"))
+    sub = _FakeSubscription([first, second])
+    seen: list[str] = []
+
+    async def handle_message(pool, msg_arg):
+        payload = json.loads(msg_arg.data.decode())
+        seen.append(payload["delivery_id"])
+        if payload["delivery_id"] == "first":
+            raise asyncpg.InterfaceError("connection is closed")
+
+    monkeypatch.setattr(trigger, "handle_message", handle_message)
+    task = asyncio.create_task(trigger._consume_subscription(object(), sub))
+    for _ in range(50):
+        if "second" in seen:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert seen == ["first", "second"]
+    assert first.acked is False
+    assert second.acked is True
+
+
+async def test_receive_error_escapes_for_reconnect(monkeypatch):
+    """Non-timeout next_msg failure must escape so the consumer_loop
+    can drain + reconnect with backoff."""
+    sub = _FakeSubscription([ConnectionResetError("broker gone")])
+
+    async def handle_message(pool, msg_arg):  # noqa: ARG001
+        pytest.fail("handler must not be called when next_msg fails")
+
+    monkeypatch.setattr(trigger, "handle_message", handle_message)
+
+    with pytest.raises(ConnectionResetError):
+        await trigger._consume_subscription(object(), sub)
+
+
+async def test_ack_error_escapes_for_reconnect(monkeypatch):
+    """Ack failure is a NATS issue → must escape for reconnect."""
+    msg = _FakeMsg("mnemos.webhook.delivery.queued.default", _payload("ok"))
+    sub = _FakeSubscription([msg])
+
+    async def handle_message(pool, msg_arg):
+        return None
+
+    async def broken_ack(msg_arg):
+        raise ConnectionResetError("ack send failed")
+
+    monkeypatch.setattr(trigger, "handle_message", handle_message)
+    monkeypatch.setattr(trigger, "_ack", broken_ack)
+
+    with pytest.raises(ConnectionResetError):
+        await trigger._consume_subscription(object(), sub)

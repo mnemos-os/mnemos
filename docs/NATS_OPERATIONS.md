@@ -132,9 +132,13 @@ exponential window so collisions are rare.
 2. Connect-level exceptions before `_consume_subscription` starts
 3. Subscribe-level exceptions (durable name collision, stream
    drift, consumer-group recovery)
-4. Connection-level exceptions DURING consume (`next_msg` raising
-   non-timeout NATS errors). These are re-raised out of
-   `_consume_subscription` so they reach the outer drain handler.
+4. Receive-scope exceptions DURING consume (`next_msg` raising
+   non-timeout NATS errors).
+5. Ack-scope exceptions DURING consume (`_ack` failing — the broker
+   is what we're acking to, so this is a NATS-connection issue).
+
+Both (4) and (5) are re-raised out of `_consume_subscription` so they
+reach the outer drain handler.
 
 `_drain_partial` itself does:
 
@@ -142,18 +146,44 @@ exponential window so collisions are rare.
    subscription.
 2. Best-effort `await nc.drain()` (falls back to `nc.close()`).
 
-Handler-level errors during message processing (e.g.
-`asyncpg.PostgresError` from a DB hiccup in `handle_message`) are
-caught locally INSIDE `_consume_subscription`: log + don't ack
-(JetStream redelivers after the ack-wait window) + continue. A
-transient DB error does not force a NATS reconnect.
+### Three-scope split inside `_consume_subscription`
 
-Pre-fix, a subscribe failure leaked one TCP connection per retry,
-and a connection-level error mid-consume left the loop spinning
-on a dead subscription forever. With backoff bounding the rate,
-drain bounding the total, and consume-time errors escaping for
-reconnect, a sustained NATS failure now stays in a bounded steady
-state instead of accumulating sockets or wedging.
+`_consume_subscription` separates the per-message lifecycle into three
+distinct try/except scopes — each with its own classification of
+"escape for reconnect" vs "stay local":
+
+| Scope        | Method            | Failure disposition                                                                |
+|--------------|-------------------|------------------------------------------------------------------------------------|
+| Receive      | `sub.next_msg`    | Timeout → continue. Anything else → re-raise (NATS issue, reconnect)                |
+| Handle       | `handle_message`  | **Any** exception → log + don't ack + continue (subscription stays alive)           |
+| Ack          | `_ack`            | Any exception → re-raise (broker-side issue, reconnect)                             |
+
+The handle-scope is the load-bearing one for stability:
+
+* `asyncpg.PostgresError` (transient DB hiccup)
+* `asyncpg.InterfaceError` (closed/bad pool connection)
+* `RuntimeError` from a custom store/fetch path
+* HTTP errors from federation by-id backfill (401, timeout, etc.)
+
+…all stay local. The NATS subscription itself is healthy in those
+cases, and tearing it down would just delay unrelated traffic on the
+same peer behind reconnect backoff. JetStream redelivers unacked
+messages after the ack-wait window, so transient handler failures get
+retried without code-side intervention.
+
+Pre-round-2 (v4.2.0a6), a subscribe failure leaked one TCP connection
+per retry. v4.2.0a7 round-2 added the receive/ack escape path for
+genuine NATS issues. v4.2.0a7 round-3 (codex audit 2026-05-01) split
+the handle scope from the receive/ack scopes so handler errors stay
+local regardless of exception type — earlier code only kept
+`asyncpg.PostgresError` local, which would have torn down NATS on a
+plain `RuntimeError` or `asyncpg.InterfaceError`.
+
+With backoff bounding the rate, drain bounding the total, the
+receive/ack escape paths handling NATS issues, and the handle scope
+keeping handler errors local, a sustained failure now stays in a
+bounded steady state instead of accumulating sockets, wedging, or
+amplifying handler hiccups into peer-wide reconnect storms.
 
 ## Operator runbook
 

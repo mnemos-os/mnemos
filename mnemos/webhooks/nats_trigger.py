@@ -141,12 +141,44 @@ async def _attempt_once(
 
 
 async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
+    """Drive the webhook trigger subscription's receive/handle/ack lifecycle.
+
+    Three failure scopes, deliberately separated:
+
+    1. **Receive** (``sub.next_msg``) — non-timeout failure is a
+       NATS-connection issue. Escapes for ``consumer_loop`` to drain
+       and reconnect with backoff.
+    2. **Handle** (``handle_message``) — ANY failure is local. The
+       webhook outbox in Postgres is authoritative; the
+       ``repair_worker_loop`` polling fallback re-drives missed
+       deliveries. A handler error (DB hiccup, downstream HTTP, etc.)
+       should NOT tear down the NATS subscription. JetStream redelivers
+       after ack-wait.
+    3. **Ack** (``_ack``) — failure here is a NATS-connection issue
+       (the broker is what we're acking to). Escape for reconnect.
+
+    See v4.2.0a7 round-3 audit (codex finding 2026-05-01).
+    """
     while True:
         msg = None
+
+        # Scope 1: receive
         try:
             msg = await sub.next_msg(timeout=1)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if _is_timeout(exc):
+                continue
+            logger.exception(
+                "webhook nats trigger receive error (escaping for reconnect): %s",
+                exc,
+            )
+            raise
+
+        # Scope 2: handle (all failures stay local).
+        try:
             await handle_message(pool, msg)
-            await _ack(msg)
         except asyncio.CancelledError:
             raise
         except PoisonMessageError as exc:
@@ -155,27 +187,36 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
                 getattr(msg, "subject", "?"),
                 exc,
             )
-            if msg is not None:
-                await _ack(msg)
-        except asyncpg.PostgresError as exc:
-            # Handler-level DB error: log and don't ack (JetStream
-            # redelivers after the ack-wait window). Transient DB
-            # hiccups should not force a NATS reconnect.
-            logger.exception("webhook nats trigger db error: %s", exc)
+            await _ack_safely(msg)
             continue
         except Exception as exc:
-            if _is_timeout(exc):
-                continue
-            # Connection-level / unknown failure: escape so
-            # consumer_loop can drain the NATS connection and
-            # reconnect with backoff. Without this, broker shutdown
-            # mid-consume or durable consumer deletion would leave
-            # the consume loop spinning on the dead subscription.
             logger.exception(
-                "webhook nats trigger subscription error (escaping for reconnect): %s",
+                "webhook nats trigger handler error (subscription stays alive, no ack): %s",
+                exc,
+            )
+            continue
+
+        # Scope 3: ack
+        try:
+            await _ack(msg)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception(
+                "webhook nats trigger ack error (escaping for reconnect): %s",
                 exc,
             )
             raise
+
+
+async def _ack_safely(msg: Any) -> None:
+    try:
+        await _ack(msg)
+    except Exception as exc:  # noqa: BLE001 — best-effort poison ack
+        logger.warning(
+            "webhook nats trigger poison-ack failed (will be redelivered): %s",
+            exc,
+        )
 
 
 async def _connect(settings: Settings):

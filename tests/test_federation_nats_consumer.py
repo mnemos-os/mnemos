@@ -348,3 +348,101 @@ async def test_pull_memory_by_id_uses_explicit_endpoint(monkeypatch):
             {"timeout": federation_domain.FEDERATION_HTTP_TIMEOUT},
         )
     ]
+
+
+# --- v4.2.0a7 round-3: receive/handle/ack scope-split coverage ---
+
+
+async def test_handler_runtime_error_does_not_kill_loop(monkeypatch):
+    """Non-DB handler exception (e.g. RuntimeError from store path) must
+    stay local — the NATS subscription is healthy, JetStream redelivers."""
+    pool = _FakePool()
+    first = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_a"})
+    second = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_b"})
+    sub = _FakeSubscription([first, second])
+    seen: list[str] = []
+
+    async def handle_message(pool_arg, peer_arg, msg_arg):
+        payload = json.loads(msg_arg.data.decode())
+        seen.append(payload["memory_id"])
+        if payload["memory_id"] == "mem_a":
+            raise RuntimeError("transient downstream error")
+
+    monkeypatch.setattr(consumer, "handle_message", handle_message)
+    task = asyncio.create_task(consumer._consume_subscription(pool, _peer(), sub))
+    for _ in range(50):
+        if "mem_b" in seen:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert seen == ["mem_a", "mem_b"], "loop must survive handler error and process mem_b"
+    assert first.acked is False, "errored handler must not ack — JetStream redelivers"
+    assert second.acked is True
+
+
+async def test_handler_interface_error_does_not_kill_loop(monkeypatch):
+    """asyncpg.InterfaceError from a closed-connection handler path must
+    stay local. Pre-fix this would have escaped to reconnect NATS."""
+    import asyncpg
+
+    pool = _FakePool()
+    first = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_x"})
+    second = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_y"})
+    sub = _FakeSubscription([first, second])
+    seen: list[str] = []
+
+    async def handle_message(pool_arg, peer_arg, msg_arg):
+        payload = json.loads(msg_arg.data.decode())
+        seen.append(payload["memory_id"])
+        if payload["memory_id"] == "mem_x":
+            raise asyncpg.InterfaceError("connection is closed")
+
+    monkeypatch.setattr(consumer, "handle_message", handle_message)
+    task = asyncio.create_task(consumer._consume_subscription(pool, _peer(), sub))
+    for _ in range(50):
+        if "mem_y" in seen:
+            break
+        await asyncio.sleep(0.01)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert seen == ["mem_x", "mem_y"]
+    assert first.acked is False
+    assert second.acked is True
+
+
+async def test_receive_error_escapes_for_reconnect(monkeypatch):
+    """Non-timeout next_msg failure (e.g. broker shutdown) must escape
+    out of _consume_subscription so the outer drain+reconnect path runs."""
+    pool = _FakePool()
+    sub = _FakeSubscription([ConnectionResetError("broker gone")])
+
+    async def handle_message(pool_arg, peer_arg, msg_arg):  # noqa: ARG001
+        pytest.fail("handler must not be called when next_msg fails")
+
+    monkeypatch.setattr(consumer, "handle_message", handle_message)
+
+    with pytest.raises(ConnectionResetError):
+        await consumer._consume_subscription(pool, _peer(), sub)
+
+
+async def test_ack_error_escapes_for_reconnect(monkeypatch):
+    """A failure inside _ack is a NATS issue (the broker is what we're
+    acking to). Must escape so the reconnect path runs."""
+    pool = _FakePool()
+    msg = _FakeMsg("mnemos.memory.created.default", {"memory_id": "mem_ok"})
+    sub = _FakeSubscription([msg])
+
+    async def handle_message(pool_arg, peer_arg, msg_arg):
+        return None
+
+    async def broken_ack(msg_arg):
+        raise ConnectionResetError("ack send failed")
+
+    monkeypatch.setattr(consumer, "handle_message", handle_message)
+    monkeypatch.setattr(consumer, "_ack", broken_ack)
+
+    with pytest.raises(ConnectionResetError):
+        await consumer._consume_subscription(pool, _peer(), sub)
