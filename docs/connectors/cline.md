@@ -120,43 +120,64 @@ approval, re-search to confirm.
 Even when you trust Cline to autonomously edit code,
 auto-approving `delete_memory` or `kg_delete_triple` is a
 footgun — a single hallucinated tool call can wipe useful
-context. The recommendation in the example config keeps
-write/delete tools manually-approved. For full auto-approve
-in a controlled per-project sandbox, set
-``MNEMOS_DEFAULT_NAMESPACE`` to a session-scoped namespace so
-any damage is bounded:
+context. The recommendation in the example config near the top
+of this page keeps write/delete tools manually-approved.
 
-```json
-{
-  "mcpServers": {
-    "mnemos-cline-sandbox": {
-      "command": "mnemos",
-      "args": ["serve", "mcp-stdio"],
-      "env": {
-        "MNEMOS_BASE": "...",
-        "MNEMOS_API_KEY": "...",
-        "MNEMOS_DEFAULT_NAMESPACE": "cline-sandbox-$(date +%Y%m%d)"
-      },
-      "autoApprove": ["search_memories", "create_memory", "update_memory", "list_memories", "get_memory"]
-    }
-  }
-}
-```
+### Auto-approving write tools? Provision a non-root user first
 
-(Note: bash `$(...)` interpolation does NOT happen inside the
-JSON config; you'd need to set the namespace once per session
-or have a wrapper script generate the config.)
+If you want to expand auto-approve to include write tools
+(``create_memory`` / ``update_memory``), the prerequisite is a
+**non-root user with its own ``users.namespace``** so the
+permission boundary is enforced server-side. Setup:
 
-The env var is a **write stamp** for default-namespace ergonomics,
-not an enforced scope (see [claude-code.md](./claude-code.md) for
-the security caveat). A root API key with the env stamp will
-write into ``cline-sandbox-…`` by default but can still
-read/update/delete any memory by ID across namespaces. For real
-sandbox isolation, provision a non-root **user** with
-``users.namespace=cline-sandbox`` set on the row, issue an API
-key for that user, and bind the key to the connector. Isolation
-is per-user; distinct keys under the same user share the
-user's namespace.
+1. **Server side (one-time)**, create the user + key:
+   ```sql
+   INSERT INTO users (id, role, namespace, display_name)
+   VALUES ('cline-sandbox-user', 'user', 'cline-sandbox', 'Cline Sandbox');
+   -- then issue an API key for that user via the admin path or
+   -- direct INSERT into api_keys with user_id='cline-sandbox-user'
+   ```
+2. **Client side**, bind the new key + namespace stamp to the
+   MCP server:
+   ```json
+   {
+     "mcpServers": {
+       "mnemos-cline-sandbox": {
+         "command": "mnemos",
+         "args": ["serve", "mcp-stdio"],
+         "env": {
+           "MNEMOS_BASE": "...",
+           "MNEMOS_API_KEY": "<the new non-root key>",
+           "MNEMOS_DEFAULT_NAMESPACE": "cline-sandbox"
+         },
+         "autoApprove": [
+           "search_memories", "create_memory", "update_memory",
+           "list_memories", "get_memory"
+         ]
+       }
+     }
+   }
+   ```
+
+With the non-root key + ``users.namespace``, the server enforces
+the scope: even a hallucinated `update_memory` call against a
+stale memory ID outside the namespace is rejected at the auth
+seam, not just stamped at write time.
+
+### What about just setting ``MNEMOS_DEFAULT_NAMESPACE`` with a root key?
+
+Don't. The env var is a **WRITE STAMP** only — see the security
+caveat in [claude-code.md](./claude-code.md). A root API key
+with the env stamp will write new memories into the configured
+namespace by default, but can still ``update_memory`` /
+``delete_memory`` against ANY memory ID across all namespaces.
+Auto-approving `update_memory` on a root key with only the env
+stamp is the dangerous shape this section exists to prevent.
+
+If you must run a root key (one-tenant install, no per-user
+auth), do NOT extend ``autoApprove`` to ``update_memory`` or
+the kg-write tools. The minimal example at the top of this page
+covers the supported auto-approve set for the root-key shape.
 
 ## Cross-references
 
