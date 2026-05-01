@@ -32,7 +32,7 @@ for the local-first single-user Claude-Desktop experience; MNEMOS is
 deliberately scaled differently. The two compose via the
 [KNOSSOS bridge](../KNOSSOS.md) when you want both.
 
-## Canonical MCP tool surface (v4.2.0a13)
+## Canonical MCP tool surface
 
 Every connector below talks to the same MCP tool registry. Use
 these EXACT names when building per-tool allow/deny lists in the

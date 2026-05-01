@@ -9,7 +9,7 @@
 
 Continue.dev's autocomplete + chat surface gains the MNEMOS MCP
 tools — see the canonical exact-name table in
-[README.md](./README.md#canonical-mcp-tool-surface-v420a13).
+[README.md](./README.md#canonical-mcp-tool-surface).
 Useful for capturing decisions during inline-edit sessions
 ("Save this rationale as MNEMOS category=architecture") and
 querying prior context across the same memory pool every other

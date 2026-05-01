@@ -82,7 +82,7 @@ under names like ``mnemos_search_memories``,
 The actual MCP registry names (used in config / autoApprove
 arrays / per-tool permissions) are bare:
 ``search_memories``, ``create_memory``, etc. — see the
-[canonical tool surface table](./README.md#canonical-mcp-tool-surface-v420a13).
+[canonical tool surface table](./README.md#canonical-mcp-tool-surface).
 Strip the ``mnemos_`` prefix when configuring per-tool
 controls.
 

@@ -9,7 +9,7 @@
 ## What this gets you
 
 Claude Code's tool surface gains the MNEMOS MCP tools — see the
-canonical exact-name table in [README.md](./README.md#canonical-mcp-tool-surface-v420a13).
+canonical exact-name table in [README.md](./README.md#canonical-mcp-tool-surface).
 The same memory is shared with every other MCP-aware client you
 have configured against the same MNEMOS instance.
 

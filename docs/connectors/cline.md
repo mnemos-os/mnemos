@@ -10,7 +10,7 @@
 
 Cline's autonomous-edit loop gains the MNEMOS MCP tools — see
 the canonical exact-name table in
-[README.md](./README.md#canonical-mcp-tool-surface-v420a13).
+[README.md](./README.md#canonical-mcp-tool-surface).
 Practically: Cline can search MNEMOS for prior architecture
 decisions before suggesting an approach, save its own decisions
 as memories during the session, and pull KG triples for
@@ -136,7 +136,7 @@ config near the top of this page keeps **all** write tools
 manually-approved.
 
 See the canonical exact-name MCP tool surface in
-[README.md](./README.md#canonical-mcp-tool-surface-v420a13)
+[README.md](./README.md#canonical-mcp-tool-surface)
 for the full set of read + write tools and the ``kg_``-prefix
 asymmetry on ``update_triple`` / ``delete_triple``.
 

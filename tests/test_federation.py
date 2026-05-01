@@ -631,7 +631,7 @@ class TestFederationFeedPreferCompressed:
         # less than content + verbatim. The double accounts for
         # the variant being emitted twice (content + compressed_
         # content); the COALESCE handles NULL/empty verbatim rows.
-        assert "2 * octet_length(v.compressed_content)" in seen, (
+        assert "4 * octet_length(v.compressed_content)" in seen, (
             "prefer_compressed gate must double the variant byte "
             "count to reflect dual emission; got SQL: "
             f"{seen[:400]}"
@@ -717,7 +717,7 @@ class TestFederationFeedPreferCompressed:
         # Doubling + COALESCE-with-0 are the round-12 hardening:
         # account for the variant emitted twice + handle NULL or
         # empty verbatim_content rows.
-        assert "2 * octet_length(v.compressed_content)" in seen, (
+        assert "4 * octet_length(v.compressed_content)" in seen, (
             "prefer_compressed gate must DOUBLE the variant's byte "
             "count to reflect that it is emitted twice (content + "
             f"compressed_content). Got SQL:\n{seen[:600]}"

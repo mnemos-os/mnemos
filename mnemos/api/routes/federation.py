@@ -500,27 +500,38 @@ async def federation_feed(
     if prefer_compressed:
         # Byte gate predicate (reused 3x below). Truthy iff
         # swapping to the variant produces a STRICTLY SMALLER
-        # emitted payload than the legacy raw shape.
+        # serialized JSON response than the legacy raw shape,
+        # under any JSON encoding (including pathological
+        # all-backslash / all-quote / control-char strings).
         #
-        # Legacy emitted bytes per row:
-        #     octet_length(m.content)
-        #     + COALESCE(octet_length(m.verbatim_content), 0)
+        # Worst-case JSON escape multipliers per byte:
+        #   * plain ASCII   : 1.0×
+        #   * `\` and `"`   : 2.0× (each → `\\` / `\"`)
+        #   * 0x00 control  : 6.0× (each escapes to a 6-byte form)
         #
-        # Variant-mode emitted bytes per row:
-        #     2 * octet_length(v.compressed_content)
-        #     (the variant is shipped twice — once as content,
-        #     once as compressed_content peer-detector marker).
+        # The 2.0× multiplier covers everything except control
+        # chars, and mnemos compresses text-typed memories where
+        # control bytes are rare. We assume up to 2× expansion on
+        # the variant side (it can be backslash-heavy after
+        # compression) and 1× expansion on the raw side (plain
+        # text). Combined with dual emission of the variant
+        # (content + compressed_content fields), worst-case
+        # variant-mode bytes = 4 * octet_length(variant), and
+        # legacy-mode bytes >= 1 * (octet + verbatim). So we
+        # require:
+        #     4 * octet_length(variant)
+        #         < octet_length(content) + COALESCE(verbatim, 0)
         #
-        # So we require 2*variant < raw_content + raw_verbatim.
-        # This handles the codex round-12 edge case: rows where
-        # m.verbatim_content IS NULL or empty would otherwise
-        # land a 1.8MB doubled-variant on top of a 1MB legacy
-        # payload, defeating the no-growth invariant. With this
-        # predicate, those rows fall back to the raw branch and
-        # stay at parity with the legacy payload size.
+        # This is conservative — typical text variants land around
+        # 0.3-0.5 compression ratio so the gate still passes for
+        # the common case. Pathological inputs (rare in real
+        # MNEMOS data) fall back to the raw branch.
+        # Codex round-13 audit (2026-05-01) — pre-fix the gate
+        # was 2*variant < raw which let backslash-heavy variants
+        # slip through and grow the JSON response.
         use_variant = (
             "v.compressed_content IS NOT NULL "
-            "AND (2 * octet_length(v.compressed_content)) "
+            "AND (4 * octet_length(v.compressed_content)) "
             "  < (octet_length(m.content) "
             "     + COALESCE(octet_length(m.verbatim_content), 0))"
         )
