@@ -48,8 +48,23 @@ async def maybe_set_pg_rls(tx, user: UserContext) -> None:
 
     if not isinstance(tx, PostgresTransaction):
         return
-    await tx.conn.execute("SET LOCAL mnemos.current_user_id = $1", user.user_id)
-    await tx.conn.execute("SET LOCAL mnemos.current_role = $1", user.role)
+    # Postgres ``SET LOCAL`` syntax does NOT accept bind parameters
+    # (https://www.postgresql.org/docs/current/sql-set.html — value
+    # must be a literal). Use ``set_config(name, value, is_local)``
+    # instead, which IS a function and therefore parameterizable;
+    # third argument ``true`` makes it transaction-local, equivalent
+    # to SET LOCAL. The earlier ``SET LOCAL ... = $1`` form would
+    # raise a syntax error on RLS-enabled Postgres deployments,
+    # converting every authenticated read into a 500 before the
+    # protected query ran.
+    await tx.conn.execute(
+        "SELECT set_config('mnemos.current_user_id', $1, true)",
+        user.user_id,
+    )
+    await tx.conn.execute(
+        "SELECT set_config('mnemos.current_role', $1, true)",
+        user.role,
+    )
 
 
 __all__ = ["backend_or_503", "maybe_set_pg_rls"]
