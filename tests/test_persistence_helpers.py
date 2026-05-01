@@ -214,8 +214,17 @@ def _scan_for_broken_set_local(text: str, path: object) -> list[tuple[int, str]]
     # of "SET LOCAL ... = $1" inside docstrings/comments don't match,
     # but actual SQL statements that START with SET LOCAL (possibly
     # after a semicolon-newline in multi-statement strings) do.
+    #
+    # Postgres SET syntax accepts both ``=`` and the ``TO`` keyword
+    # between the configuration parameter and the value
+    # (https://www.postgresql.org/docs/current/sql-set.html). Both
+    # forms reject bind parameters identically, so the scanner has
+    # to flag both. ``\s*=\s*`` keeps the no-whitespace ``x=$1``
+    # case; ``\s+to\s+`` requires whitespace around the keyword so
+    # accidental matches inside identifiers (``settoken``) don't
+    # false-positive.
     pattern = re.compile(
-        r"(?:^|;\s*)\s*set\s+local\s+\S+\s*=\s*\$\d",
+        r"(?:^|;\s*)\s*set\s+local\s+\S+(?:\s*=\s*|\s+to\s+)\$\d",
         re.IGNORECASE | re.MULTILINE,
     )
     findings: list[tuple[int, str]] = []
@@ -349,6 +358,11 @@ async def test_no_remaining_set_local_with_bind_in_codebase():
         'SQL = f"SET LOCAL mnemos.current_user_id = ${slot}"',
         # Split bind AND split name.
         'SQL = f"SET LOCAL {name} = ${slot}"',
+        # ``TO`` keyword form — also rejects bind parameters on PG.
+        'SQL = "SET LOCAL mnemos.current_user_id TO $1"',
+        'SQL = "SET LOCAL mnemos.current_user_id to $1"',
+        'SQL = f"SET LOCAL mnemos.current_user_id TO ${slot}"',
+        'SQL = f"SET LOCAL {name} TO $1"',
     ],
 )
 def test_scanner_catches_broken_shape(snippet):
@@ -366,6 +380,8 @@ def test_scanner_catches_broken_shape(snippet):
         "SQL = \"SELECT set_config('mnemos.current_user_id', $1, true)\"",
         # SET LOCAL with literal value (no $-binds; valid SQL).
         'SQL = "SET LOCAL mnemos.suppress_version_snapshot = \'1\'"',
+        # SET LOCAL ... TO <literal> — keyword form, no binds.
+        'SQL = "SET LOCAL statement_timeout TO \'30s\'"',
         # SET (session-level) with no binds.
         'SQL = "SET application_name = \'mnemos\'"',
         # Documentation comment about the broken form should NOT
