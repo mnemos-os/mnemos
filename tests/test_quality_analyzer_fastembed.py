@@ -138,6 +138,43 @@ def test_compute_semantic_similarity_signals_unavailable_on_failure():
     )
 
 
+def test_analyze_caps_rating_when_no_signal_at_all():
+    """Codex round-2 audit (2026-05-01) finding: lowercase unrelated
+    single-sentence inputs have NO entities (zero capitalized words >
+    3 chars) AND near-identical structure-similarity. Pre-fix the
+    weighted average without semantic could land at quality_rating=100
+    with content_preserved=None — operators reading "100" might
+    approve a compression that lost everything important.
+
+    Post-fix: when semantic is unavailable AND entities are also
+    no-signal, the heuristic-only path caps at 70 ("unsure,
+    neutral") so it can't auto-approve high-trust task types like
+    security_review (95) or architecture_design (90).
+    """
+    analyzer = QualityAnalyzer(enable_semantic_analysis=False)
+    assert analyzer.semantic_available is False
+
+    # Lowercase, no capitalized "entities", short identical-shape
+    # prose. Pre-fix this would have hit quality_rating=100.
+    original = "the quick brown fox jumps over the lazy dog"
+    compressed = "i prefer pasta with a side of green olives"
+
+    manifest = asyncio.run(
+        analyzer.analyze(
+            original=original,
+            compressed=compressed,
+            task_type="security_review",  # requires 95
+            method="apollo",
+        )
+    )
+
+    assert manifest.quality_rating <= 70, (
+        "no-signal heuristic-only path must cap at 70 to prevent "
+        f"auto-approval of high-trust tasks. got {manifest.quality_rating}"
+    )
+    assert manifest.quality_summary["content_preserved"] is None
+
+
 def test_analyze_drops_semantic_weight_when_embeddings_missing():
     """The codex round-1 finding: when no embeddings are available,
     the analyzer pre-fix used semantic=100.0 and contributed 0.4

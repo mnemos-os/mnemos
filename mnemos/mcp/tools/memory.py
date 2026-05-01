@@ -2,11 +2,30 @@
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 from mnemos.core.auth_context import UserContext
 
 from ._runtime import _rest_delete, _rest_get, _rest_post, _tool
+
+
+def _connector_namespace() -> str | None:
+    """Per-connector default namespace.
+
+    The connector-gallery docs (claude-code.md, cursor.md,
+    codex-cli.md, continue-dev.md, cline.md) document
+    ``MNEMOS_DEFAULT_NAMESPACE`` as the per-MCP-server isolation
+    mechanism. Every memory created or searched through this MCP
+    bridge stamps that namespace on the REST request so two MCP
+    server entries with different env vars (but the same backing
+    API key) write/read distinct namespace scopes.
+
+    Empty / unset → no namespace override; server falls through to
+    the API key's resolved namespace.
+    """
+    val = os.environ.get("MNEMOS_DEFAULT_NAMESPACE", "").strip()
+    return val or None
 
 
 async def tool_search_memories(
@@ -24,6 +43,9 @@ async def tool_search_memories(
         body["subcategory"] = subcategory
     if semantic:
         body["semantic"] = True
+    ns = _connector_namespace()
+    if ns:
+        body["namespace"] = ns
     return await _rest_post("/v1/memories/search", body)
 
 
@@ -71,6 +93,9 @@ async def tool_create_memory(
         body["metadata"] = metadata
     if permission_mode is not None:
         body["permission_mode"] = permission_mode
+    ns = _connector_namespace()
+    if ns:
+        body["namespace"] = ns
     return await _rest_post("/v1/memories", body)
 
 
@@ -98,6 +123,9 @@ async def tool_list_memories(
     }.items():
         if value is not None:
             params[key] = value
+    ns = _connector_namespace()
+    if ns:
+        params["namespace"] = ns
     return await _rest_get("/v1/memories", params=params)
 
 
@@ -109,6 +137,16 @@ async def tool_bulk_create_memories(
     memories: list[dict[str, Any]],
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    ns = _connector_namespace()
+    if ns:
+        # Stamp the namespace on each row that didn't carry one
+        # explicitly. Caller-supplied namespace per-row wins so an
+        # operator can still override on a per-memory basis if they
+        # genuinely need to.
+        memories = [
+            {**m, "namespace": m.get("namespace", ns)}
+            for m in memories
+        ]
     return await _rest_post("/v1/memories/bulk", {"memories": memories})
 
 

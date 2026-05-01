@@ -331,16 +331,73 @@ def run_migrations(config: Config) -> bool:
 
 
 def create_api_key(config: Config) -> str | None:
-    """Create an initial API key. Returns the raw key string, or None on failure."""
+    """Create an initial API key. Returns the raw key string, or None on failure.
+
+    Connection-driver preference order (codex round-2 finding,
+    2026-05-01):
+
+      1. asyncpg (Apache-2.0; default mnemos dep). Honors
+         host/port/user/password from the operator's Config —
+         works against remote Postgres + auth-enabled installs.
+      2. psycopg / psycopg2 (LGPL-3.0; OPTIONAL — operators install
+         separately if they want this path). Same connection shape
+         as asyncpg but sync API.
+      3. psql CLI (operator's external binary; not bundled with
+         mnemos). Assumes local sudo passwordless access — last
+         resort, often fails on remote / managed Postgres.
+
+    Pre-2026-05-01 the chain was psycopg → psycopg2 → psql, and the
+    psycopg drop in v4.2.0a12 left auth-enabled remote installs with
+    no working path. asyncpg ships in default mnemos and works for
+    every install shape.
+    """
     raw_key = "mnemos_" + secrets.token_hex(32)
+    import hashlib
 
-    # Try via psycopg first
+    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
+
+    # 1. asyncpg path (default; works against any Postgres + auth)
     try:
-        import hashlib
+        import asyncio
 
+        import asyncpg as _asyncpg
+
+        async def _create() -> None:
+            conn = await _asyncpg.connect(
+                host=config.db_host,
+                port=int(config.db_port) if config.db_port else None,
+                database=config.db_name,
+                user=config.db_user,
+                password=config.db_password,
+            )
+            try:
+                # Schema per db/migrations_v1_multiuser.sql:
+                # api_keys(id, user_id, key_hash, key_prefix, label,
+                #          created_at, last_used, revoked)
+                await conn.execute(
+                    """
+                    INSERT INTO api_keys (user_id, key_hash, key_prefix, label)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (key_hash) DO NOTHING
+                    """,
+                    "default",
+                    key_hash,
+                    raw_key[:8],
+                    "installer-generated",
+                )
+            finally:
+                await conn.close()
+
+        asyncio.run(_create())
+        print("[db] API key created via asyncpg.")
+        return raw_key
+    except Exception as _exc:
+        print(f"[db] asyncpg create_api_key failed: {_exc}", file=sys.stderr)
+
+    # 2. psycopg path (LGPL — only fires when operator has it
+    # installed separately; not pulled by default mnemos).
+    try:
         import psycopg
-
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
 
         conn_str = (
             f"host={config.db_host} port={config.db_port} "
@@ -367,13 +424,10 @@ def create_api_key(config: Config) -> str | None:
     except Exception as _exc:
         print(f"[db] psycopg create_api_key failed: {_exc}", file=sys.stderr)
 
-    # Fallback: try psycopg2
+    # 3. psycopg2 path (LGPL — same posture as psycopg above).
     try:
-        import hashlib
-
         import psycopg2
 
-        key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
         conn = psycopg2.connect(
             host=config.db_host,
             port=config.db_port,
@@ -398,11 +452,12 @@ def create_api_key(config: Config) -> str | None:
     except Exception as _exc:
         print(f"[db] psycopg2 create_api_key failed: {_exc}", file=sys.stderr)
 
-    # Fallback: psql CLI — key_hash is a hex digest (safe for interpolation)
-    import hashlib
+    # 4. psql CLI fallback — operator's external binary, assumes
+    # local sudo passwordless access to a postgres role. Last
+    # resort; remote / managed Postgres deployments fall through
+    # to None at the bottom of the function.
     import re as _re
 
-    key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
     if not _re.fullmatch(r'[0-9a-f]{64}', key_hash):
         print("[db] ERROR: unexpected key_hash format", file=sys.stderr)
         return None

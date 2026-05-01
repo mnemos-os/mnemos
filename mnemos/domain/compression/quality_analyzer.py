@@ -188,10 +188,33 @@ class QualityAnalyzer:
         # structure rather than treating "missing" as "perfect."
         # Default weights: 0.4 / 0.3 / 0.3. With semantic missing the
         # remaining components carry the full rating at 0.5 / 0.5.
+        #
+        # Codex round-2 audit (2026-05-01): heuristic-only path can
+        # over-approve when entities + structure are themselves
+        # near-100. Lowercase unrelated single-sentence inputs have
+        # zero entities (which the entity branch counts as 100,
+        # "we didn't lose any entities — there were none") and
+        # near-identical structure-similarity (both inputs are short
+        # plain prose), so the "no signal anywhere" case lands at
+        # quality_rating=100 with content_preserved=None. Operators
+        # downstream may read 100 and approve. Two safety guards
+        # below: (a) when entity_preservation is the empty-sets case
+        # AND semantic is missing, treat entities as no-signal too;
+        # (b) cap heuristic-only ratings at 70 ("unsure, neutral")
+        # so heuristics-only never flags a compression as safe for
+        # high-trust task types like security_review (95) or
+        # architecture_design (90).
+        HEURISTIC_ONLY_CAP = 70  # max rating when no embeddings ran
         if semantic_similarity < 0:
-            quality_rating = int(
-                entity_preservation * 0.5 + structure_similarity * 0.5
-            )
+            entities_signal_present = bool(original_entities)
+            if not entities_signal_present:
+                # No semantic AND no entities → only structure signal
+                # remains. Cap at HEURISTIC_ONLY_CAP regardless of
+                # how identical the structure happens to be.
+                quality_rating = int(min(structure_similarity, HEURISTIC_ONLY_CAP))
+            else:
+                raw = entity_preservation * 0.5 + structure_similarity * 0.5
+                quality_rating = int(min(raw, HEURISTIC_ONLY_CAP))
             # Surface to quality_summary that semantic was unavailable
             # so consumers don't read "100% content preserved" off a
             # stale default.

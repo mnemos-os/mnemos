@@ -80,8 +80,9 @@ SSH-spawn the MCP server on the remote host:
       "command": "ssh",
       "args": [
         "user@mnemos-host",
-        "/opt/mnemos/venv/bin/python",
-        "/opt/mnemos/mcp_server.py"
+        "/opt/mnemos/venv/bin/mnemos",
+        "serve",
+        "mcp-stdio"
       ],
       "env": {
         "MNEMOS_BASE": "http://localhost:5002",
@@ -96,6 +97,8 @@ The MNEMOS_BASE here is `localhost` because the MCP server runs
 ON the remote host; the env vars travel through SSH's environment.
 You'll need pubkey auth set up so SSH doesn't prompt for a
 password each Claude session start (it would block forever).
+If the remote host has a system-wide ``mnemos`` on PATH you can
+omit the ``/opt/mnemos/venv/bin/`` prefix.
 
 ## Setup — remote MNEMOS via HTTP/SSE (multi-machine, no SSH)
 
