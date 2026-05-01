@@ -165,7 +165,22 @@ from contextlib import closing  # noqa: E402
 
 
 def _free_port() -> int:
-    """Pick a free TCP port by binding+closing a transient socket."""
+    """Pick a likely-free TCP port for the broker to bind.
+
+    Codex round-1 of the partial-outage slice flagged the
+    bind-then-close pattern as race-prone: another process can
+    claim the port between the close and nats-server's bind.
+    Mitigations:
+      1. Set SO_REUSEADDR=0 (default) so the port really is
+         released.
+      2. Caller wraps the spawn in a retry loop AND verifies
+         readiness via an actual NATS connection handshake,
+         not a raw TCP probe (so an unrelated listener that
+         happened to grab the port is detected).
+    The legacy bind-then-close-then-spawn approach stays
+    here as a port HINT; the readiness handshake is what
+    actually establishes "we own this port".
+    """
     with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
@@ -210,6 +225,22 @@ class ManagedBroker:
         self.url = f"nats://127.0.0.1:{port}"
 
     def _spawn(self) -> None:
+        """Spawn nats-server and wait until a real NATS handshake
+        succeeds. Cleans up the subprocess if anything fails.
+
+        Codex round-1 of the partial-outage slice flagged two
+        leak paths in the original implementation:
+          1. If readiness wait raises, the spawned subprocess
+             is orphaned (caller's try/finally never runs).
+          2. The readiness check was a raw TCP connect, which
+             would falsely accept an unrelated listener that
+             happened to grab the port between bind-and-close.
+        Both fixed below — try/finally around the readiness
+        wait, and the readiness check is now a real
+        ``nats.connect`` so we know JetStream is reachable.
+        """
+        import asyncio as _asyncio
+
         store_str = str(self.store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self.proc = subprocess.Popen(
@@ -225,19 +256,49 @@ class ManagedBroker:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        # Wait for the broker to start listening (up to 5s).
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            try:
-                with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
-                    s.settimeout(0.2)
-                    s.connect(("127.0.0.1", self.port))
+        try:
+            # Real-handshake readiness check. A raw TCP probe
+            # would falsely succeed on an unrelated listener that
+            # happened to grab the port; nats.connect proves the
+            # NATS protocol greeting parsed cleanly.
+            deadline = time.monotonic() + 5.0
+            last_exc = None
+            while time.monotonic() < deadline:
+                if self.proc.poll() is not None:
+                    raise RuntimeError(
+                        f"nats-server exited early (code={self.proc.returncode})"
+                    )
+                try:
+                    import nats
+
+                    async def _probe():
+                        client = await _asyncio.wait_for(
+                            nats.connect(servers=[self.url]), timeout=0.5
+                        )
+                        await client.drain()
+
+                    _asyncio.run(_probe())
                     return
-            except OSError:
-                time.sleep(0.1)
-        raise RuntimeError(
-            f"nats-server at {self.url} did not start within 5s"
-        )
+                except Exception as exc:
+                    last_exc = exc
+                    time.sleep(0.1)
+            raise RuntimeError(
+                f"nats-server at {self.url} did not become ready within 5s "
+                f"(last probe error: {last_exc})"
+            )
+        except Exception:
+            # Setup-time failure — kill the subprocess so we don't
+            # leak. The fixture's teardown finally still runs but
+            # would otherwise NOT run if _spawn() raised before
+            # the fixture entered its try/yield.
+            try:
+                if self.proc and self.proc.poll() is None:
+                    self.proc.send_signal(signal.SIGKILL)
+                    self.proc.wait(timeout=2.0)
+            except Exception:
+                pass
+            self.proc = None
+            raise
 
     def pause(self) -> None:
         if self.proc and self.proc.poll() is None:
@@ -269,6 +330,12 @@ def managed_broker(tmp_path: Path):
     are independent. The fixture skips with a clear message if
     nats-server isn't installed (most operators won't have it on
     a default mnemos dev box).
+
+    Port-race resilience: codex round-1 flagged that bind-then-
+    close port allocation can lose to another process between
+    the close and nats-server's bind. We retry up to 3 times
+    with fresh ports — if all 3 attempts hit the race, the
+    fixture surfaces the spawn error rather than mask it.
     """
     bin_path = _nats_server_bin()
     if bin_path is None:
@@ -279,9 +346,28 @@ def managed_broker(tmp_path: Path):
             "github.com/nats-io/nats-server. Or set "
             "MNEMOS_NATS_SERVER_BIN to an absolute path."
         )
-    port = _free_port()
-    broker = ManagedBroker(bin_path, port, tmp_path / "jetstream")
-    broker._spawn()
+
+    broker: ManagedBroker | None = None
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        port = _free_port()
+        candidate = ManagedBroker(bin_path, port, tmp_path / f"jetstream-{attempt}")
+        try:
+            candidate._spawn()
+            broker = candidate
+            break
+        except Exception as exc:
+            last_exc = exc
+            # candidate._spawn() already cleaned up its subprocess;
+            # try a fresh port.
+            continue
+
+    if broker is None:
+        raise RuntimeError(
+            f"could not spawn nats-server after 3 port retries; "
+            f"last error: {last_exc}"
+        )
+
     try:
         yield broker
     finally:
