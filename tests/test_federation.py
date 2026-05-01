@@ -627,15 +627,19 @@ class TestFederationFeedPreferCompressed:
         # payloads than the legacy raw path.
         seen = pool.conn.queries[-1]
         assert "LEFT JOIN memory_compressed_variants" in seen
-        assert "octet_length(v.compressed_content) < octet_length(m.content)" in seen, (
-            "prefer_compressed branch must gate variant use on a "
-            f"byte comparison; got SQL: {seen[:300]}"
+        # Round-12 byte gate: 2× variant length must be strictly
+        # less than content + verbatim. The double accounts for
+        # the variant being emitted twice (content + compressed_
+        # content); the COALESCE handles NULL/empty verbatim rows.
+        assert "2 * octet_length(v.compressed_content)" in seen, (
+            "prefer_compressed gate must double the variant byte "
+            "count to reflect dual emission; got SQL: "
+            f"{seen[:400]}"
         )
-        # verbatim_content gets NULLed only inside the "use variant" branch
-        assert (
-            "octet_length(v.compressed_content) < octet_length(m.content) THEN NULL"
-            in seen
-        ), "verbatim_content must be NULLed when (and only when) the variant is selected"
+        assert "COALESCE(octet_length(m.verbatim_content), 0)" in seen, (
+            "gate must COALESCE-with-0 verbatim length so NULL/empty "
+            f"rows don't slip through; got SQL: {seen[:400]}"
+        )
 
         # Wire shape verification: the MemoryItem should carry the
         # compressed payload as its content + compressed_content
@@ -678,12 +682,20 @@ class TestFederationFeedPreferCompressed:
 
     @pytest.mark.asyncio
     async def test_byte_gate_predicate_in_sql(self, monkeypatch):
-        """Codex round-11 audit: the prefer_compressed branch must
-        guarantee wire bytes never go UP. The SQL CASE predicate
-        only swaps to the variant when octet_length(variant) <
-        octet_length(raw). Pin that the predicate is in the SQL so
-        a future refactor can't drop the gate without tripping this
-        test.
+        """Codex round-11/12 audit: the prefer_compressed branch
+        must guarantee wire bytes never go UP. Pin the SQL CASE
+        predicate so a future refactor can't drop the gate.
+
+        Round-12 strengthening: the gate accounts for the variant
+        being EMITTED TWICE (once as content, once as
+        compressed_content). The legacy emitted bytes are
+        ``content + COALESCE(verbatim_content, 0)``, so the
+        predicate is
+        ``2*octet_length(variant) < octet_length(content)
+          + COALESCE(octet_length(verbatim_content), 0)``.
+        Without the doubling + COALESCE, rows with NULL/empty
+        verbatim_content + a 0.5+ compression ratio would have
+        slipped through and grown the payload.
         """
         import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
@@ -702,10 +714,18 @@ class TestFederationFeedPreferCompressed:
         )
 
         seen = pool.conn.queries[-1]
-        assert "octet_length(v.compressed_content) < octet_length(m.content)" in seen, (
-            "prefer_compressed must gate the variant on a byte-comparison "
-            "so it can NEVER make payloads larger; got SQL:\n"
-            f"{seen[:600]}"
+        # Doubling + COALESCE-with-0 are the round-12 hardening:
+        # account for the variant emitted twice + handle NULL or
+        # empty verbatim_content rows.
+        assert "2 * octet_length(v.compressed_content)" in seen, (
+            "prefer_compressed gate must DOUBLE the variant's byte "
+            "count to reflect that it is emitted twice (content + "
+            f"compressed_content). Got SQL:\n{seen[:600]}"
+        )
+        assert "COALESCE(octet_length(m.verbatim_content), 0)" in seen, (
+            "gate must COALESCE-with-0 the verbatim_content length "
+            "so NULL/empty-verbatim rows don't slip through with a "
+            f"medium-ratio variant. Got SQL:\n{seen[:600]}"
         )
         # And the predicate must be applied to all three fields
         # (content / compressed_content / verbatim_content) so a

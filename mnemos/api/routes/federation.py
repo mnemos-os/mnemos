@@ -498,11 +498,31 @@ async def federation_feed(
     # SQL shape, same MemoryItem fields, identical behavior peers
     # see today.
     if prefer_compressed:
-        # Byte gate predicate (reused 3x below). Truthy iff we
-        # should swap content to the variant.
+        # Byte gate predicate (reused 3x below). Truthy iff
+        # swapping to the variant produces a STRICTLY SMALLER
+        # emitted payload than the legacy raw shape.
+        #
+        # Legacy emitted bytes per row:
+        #     octet_length(m.content)
+        #     + COALESCE(octet_length(m.verbatim_content), 0)
+        #
+        # Variant-mode emitted bytes per row:
+        #     2 * octet_length(v.compressed_content)
+        #     (the variant is shipped twice — once as content,
+        #     once as compressed_content peer-detector marker).
+        #
+        # So we require 2*variant < raw_content + raw_verbatim.
+        # This handles the codex round-12 edge case: rows where
+        # m.verbatim_content IS NULL or empty would otherwise
+        # land a 1.8MB doubled-variant on top of a 1MB legacy
+        # payload, defeating the no-growth invariant. With this
+        # predicate, those rows fall back to the raw branch and
+        # stay at parity with the legacy payload size.
         use_variant = (
             "v.compressed_content IS NOT NULL "
-            "AND octet_length(v.compressed_content) < octet_length(m.content)"
+            "AND (2 * octet_length(v.compressed_content)) "
+            "  < (octet_length(m.content) "
+            "     + COALESCE(octet_length(m.verbatim_content), 0))"
         )
         content_select = (
             f"CASE WHEN {use_variant} THEN v.compressed_content "
