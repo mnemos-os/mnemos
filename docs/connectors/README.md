@@ -32,6 +32,48 @@ for the local-first single-user Claude-Desktop experience; MNEMOS is
 deliberately scaled differently. The two compose via the
 [KNOSSOS bridge](../KNOSSOS.md) when you want both.
 
+## Canonical MCP tool surface (v4.2.0a13)
+
+Every connector below talks to the same MCP tool registry. Use
+these EXACT names when building per-tool allow/deny lists in the
+host agent's config (Cline ``autoApprove``, ChatGPT custom
+connector permissions, etc.) — partial matches don't fire.
+
+Source of truth: ``mnemos/mcp/tools/__init__.py`` +
+``mnemos/mcp/tools/kg.py``.
+
+**Read tools (safe to auto-approve on any key):**
+
+| Tool                | Purpose                                        |
+|---------------------|------------------------------------------------|
+| ``search_memories`` | Full-text + vector search                      |
+| ``list_memories``   | Paginated list, optionally scoped              |
+| ``get_memory``      | Fetch by id                                    |
+| ``get_stats``       | Operator stats (counts, namespaces)            |
+| ``kg_search``       | Subject/predicate/object KG search             |
+| ``kg_timeline``     | Temporal KG query                              |
+
+**Write tools (require approval; see per-connector guidance):**
+
+| Tool                    | Mutation shape                              |
+|-------------------------|---------------------------------------------|
+| ``create_memory``       | INSERT new row                              |
+| ``update_memory``       | UPDATE existing row by id                   |
+| ``delete_memory``       | DELETE existing row by id (DAG tombstone)   |
+| ``bulk_create_memories``| INSERT N new rows                           |
+| ``kg_create_triple``    | INSERT new KG triple                        |
+| ``update_triple``       | UPDATE existing KG triple. **No ``kg_`` prefix in MCP registry.** |
+| ``delete_triple``       | DELETE existing KG triple. **No ``kg_`` prefix in MCP registry.** |
+
+The ``kg_``-prefix asymmetry on update/delete vs the rest of the
+KG tools is a registry quirk — autoApprove / deny-list configs
+match exact names, so listing ``kg_delete_triple`` does NOTHING
+while leaving ``delete_triple`` available.
+
+The MCP server may add tools across releases; check
+``/v1/mcp/discovery`` on a running instance OR
+``mnemos serve mcp-stdio --print-schema`` for the live count.
+
 ## Surfaces supported
 
 | Agent surface | Transport | Status | Notes |

@@ -8,11 +8,13 @@
 
 ## What this gets you
 
-Cline's autonomous-edit loop gains the 13 MNEMOS MCP tools.
+Cline's autonomous-edit loop gains the MNEMOS MCP tools — see
+the canonical exact-name table in
+[README.md](./README.md#canonical-mcp-tool-surface-v420a13).
 Practically: Cline can search MNEMOS for prior architecture
-decisions before suggesting an approach, save its own
-decisions as memories during the session, and pull KG triples
-for entity-aware reasoning.
+decisions before suggesting an approach, save its own decisions
+as memories during the session, and pull KG triples for
+entity-aware reasoning.
 
 ## Prerequisites
 
@@ -133,23 +135,10 @@ corrupt useful context. The recommendation in the example
 config near the top of this page keeps **all** write tools
 manually-approved.
 
-The MNEMOS MCP write surface, listed under their actual tool
-names (matches ``mnemos/mcp/tools/__init__.py``):
-
-* ``create_memory`` — insert a new memory.
-* ``update_memory`` — modify an existing memory by id.
-* ``delete_memory`` — soft-delete a memory by id (DAG tombstone).
-* ``bulk_create_memories`` — batch insert.
-* ``kg_create_triple`` — insert a KG triple.
-* ``update_triple`` — modify a KG triple. *Note: no ``kg_``
-  prefix on this one — the MCP tool registry uses the bare
-  name.*
-* ``delete_triple`` — delete a KG triple. *Same — no ``kg_``
-  prefix.*
-
-Read-only tools (safe to auto-approve on any key):
-``search_memories``, ``list_memories``, ``get_memory``,
-``get_stats``, ``kg_search``, ``kg_timeline``.
+See the canonical exact-name MCP tool surface in
+[README.md](./README.md#canonical-mcp-tool-surface-v420a13)
+for the full set of read + write tools and the ``kg_``-prefix
+asymmetry on ``update_triple`` / ``delete_triple``.
 
 ### Auto-approving write tools? Provision a non-root user first
 
@@ -166,12 +155,18 @@ permission boundary is enforced server-side. Setup:
    -- direct INSERT into api_keys with user_id='cline-sandbox-user'
    ```
 2. **Client side**, bind the new key + namespace stamp to the
-   MCP server. The autoApprove list below covers every read +
-   write tool the non-root user can reach in its namespace; KG
-   write tools (``kg_create_triple`` / ``update_triple`` /
-   ``delete_triple``) and ``delete_memory`` are NOT in this list
-   — those are explicit-approval-only even with the per-user
-   sandbox, because a bad call wastes the rollback budget.
+   MCP server. The autoApprove list below auto-approves ALL
+   READ tools plus only the **inserts** of NEW rows
+   (``create_memory``, ``bulk_create_memories``). Every
+   tool that mutates EXISTING rows (``update_memory``,
+   ``delete_memory``, ``update_triple``, ``delete_triple``)
+   stays manually-approved even in this sandbox, because a
+   hallucinated call against a stale id has cross-session
+   blast radius (DAG tombstones / edits on prior memories
+   survive sandbox teardown). KG inserts (``kg_create_triple``)
+   are also kept manual-approve here because hallucinated KG
+   triples are easy to inject and hard to clean up — flip it
+   on if your sandbox is genuinely throwaway.
 
    ```json
    {
@@ -187,18 +182,12 @@ permission boundary is enforced server-side. Setup:
          "autoApprove": [
            "search_memories", "list_memories", "get_memory", "get_stats",
            "kg_search", "kg_timeline",
-           "create_memory", "update_memory", "bulk_create_memories",
-           "kg_create_triple"
+           "create_memory", "bulk_create_memories"
          ]
        }
      }
    }
    ```
-
-   The DELETE / UPDATE-on-existing-rows tools are missing from
-   the array on purpose — they survive across sandbox sessions
-   (tombstones in the DAG, edits on prior memories) so a hallucinated
-   call has out-of-sandbox blast-radius even on a non-root key.
 
 With the non-root key + ``users.namespace``, the server enforces
 the scope: even a hallucinated `update_memory` call against a

@@ -7,12 +7,13 @@
 
 ## What this gets you
 
-Continue.dev's autocomplete + chat surface gains the 13 MNEMOS
-MCP tools — search, create, update, delete, list, get_stats,
-KG triples, bulk_create. Useful for capturing decisions during
-inline-edit sessions ("Save this rationale as MNEMOS category=
-architecture") and querying prior context across the same
-memory pool every other agent uses.
+Continue.dev's autocomplete + chat surface gains the MNEMOS MCP
+tools — see the canonical exact-name table in
+[README.md](./README.md#canonical-mcp-tool-surface-v420a13).
+Useful for capturing decisions during inline-edit sessions
+("Save this rationale as MNEMOS category=architecture") and
+querying prior context across the same memory pool every other
+agent uses.
 
 ## Prerequisites
 

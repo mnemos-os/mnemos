@@ -8,9 +8,8 @@
 
 ## What this gets you
 
-Claude Code's tool surface gains 13 MNEMOS tools (search, create,
-update, delete, list, get_stats, KG triple CRUD + search +
-timeline, bulk_create_memories) usable directly from any prompt.
+Claude Code's tool surface gains the MNEMOS MCP tools — see the
+canonical exact-name table in [README.md](./README.md#canonical-mcp-tool-surface-v420a13).
 The same memory is shared with every other MCP-aware client you
 have configured against the same MNEMOS instance.
 
