@@ -15,6 +15,7 @@ except ImportError:
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes.memories import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
 
@@ -214,8 +215,7 @@ async def import_memories_from_document(
             detail="Docling not installed. Install with: pip install mnemos-os[docling]"
         )
 
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database not available")
+    require_postgres_pool_or_503(route_label="POST /v1/import/document")
 
     # Read file
     content = await file.read()

@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.api.routes._postgres_only import _require_postgres_backend
 from mnemos.api.routes.memories import _schedule_outbox_deliveries
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
@@ -136,9 +137,14 @@ class MergeResult(BaseModel):
     message: str
 
 
-def _require_pool():
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+def _require_pool(*, route_label: str = "/v1/dag"):
+    """Return the asyncpg pool or emit a profile-aware 503.
+
+    Wraps ``require_postgres_pool_or_503`` so DAG endpoints share
+    the canonical SQLite/edge-profile detail with the rest of the
+    Postgres-only routes.
+    """
+    require_postgres_pool_or_503(route_label=route_label)
     return _lc._pool
 
 
@@ -158,7 +164,7 @@ async def get_memory_log(
     Returns commit history (commits reachable from HEAD via parent pointers).
     Equivalent to `git log`.
     """
-    pool = _require_pool()
+    pool = _require_pool(route_label="GET /v1/memories/{memory_id}/log")
 
     try:
         async with pool.acquire() as conn:
@@ -289,7 +295,7 @@ async def get_memory_branches(
     user: UserContext = Depends(get_current_user),
 ):
     """List all branches for a memory."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="GET /v1/memories/{memory_id}/branches")
 
     try:
         async with pool.acquire() as conn:
@@ -377,7 +383,7 @@ async def create_branch(
     user: UserContext = Depends(get_current_user),
 ):
     """Create new branch from HEAD or specific commit hash."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="POST /v1/memories/{memory_id}/branch")
 
     try:
         async with pool.acquire() as conn:
@@ -504,7 +510,7 @@ async def get_commit(
     user: UserContext = Depends(get_current_user),
 ):
     """Fetch commit content by hash."""
-    pool = _require_pool()
+    pool = _require_pool(route_label="GET /v1/memories/{memory_id}/commits/{commit_hash}")
 
     try:
         async with pool.acquire() as conn:
@@ -599,7 +605,7 @@ async def merge_branch(
     user: UserContext = Depends(get_current_user),
 ):
     """Merge source_branch into target_branch."""
-    _require_pool()
+    _require_pool(route_label="POST /v1/memories/{memory_id}/merge")
     backend = _require_postgres_backend()
     if request.strategy not in ("latest-wins", "manual"):
         raise HTTPException(status_code=400, detail="Invalid merge strategy")

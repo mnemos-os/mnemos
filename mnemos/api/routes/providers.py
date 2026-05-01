@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["providers"])
@@ -19,8 +20,7 @@ async def list_providers(
     user: UserContext = Depends(get_current_user),
 ):
     """List available LLM providers with model counts."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/providers")
 
     try:
         from mnemos.domain.graeae.engine import get_graeae_engine
@@ -68,8 +68,7 @@ async def recommend_model(
 
     If no model meets criteria, returns cheapest available.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/providers/recommend")
 
     try:
         # Query model registry for candidates

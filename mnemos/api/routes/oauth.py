@@ -13,6 +13,7 @@ from starlette.responses import JSONResponse, RedirectResponse
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core import oauth as _oauth
 from mnemos.domain.models import (
     OAuthIdentity,
@@ -32,8 +33,7 @@ router = APIRouter(prefix="/auth/oauth", tags=["oauth"])
 @router.get("/providers", response_model=OAuthProviderListResponse)
 async def list_providers_public():
     """List enabled providers for a login UI. No secrets returned."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /auth/oauth/providers")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             "SELECT name, display_name, kind, enabled "
@@ -55,8 +55,7 @@ async def list_providers_public():
 
 async def _load_provider(name: str):
     """Fetch an enabled provider row, else 404."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /auth/oauth/{provider}/login")
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT name, kind, issuer_url, client_id, client_secret, scope, "
@@ -86,8 +85,7 @@ async def oauth_callback(provider: str, request: Request):
     """Provider redirect target. Exchanges code, provisions user, sets cookie."""
     provider_row = await _load_provider(provider)
 
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /auth/oauth/{provider}/callback")
 
     async with _lc.get_pool_manager().acquire() as conn:
         try:
@@ -153,8 +151,7 @@ async def oauth_logout(
     user: UserContext = Depends(get_current_user),
 ):
     """Invalidate the current session cookie (or all sessions for the user)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /auth/oauth/logout")
 
     sessions_revoked = 0
     async with _lc.get_pool_manager().acquire() as conn:
