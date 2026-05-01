@@ -102,10 +102,30 @@ SSH doesn't prompt for a password each Claude session start (it
 would block forever).
 
 If the remote host has a system-wide ``mnemos`` on PATH you can
-omit the ``/opt/mnemos/venv/bin/`` prefix. If the remote host has
-the env vars baked into a shell profile / systemd unit / pam
-session, you can drop the ``env`` prefix — but the inline form
-above always works.
+omit the ``/opt/mnemos/venv/bin/`` prefix.
+
+**Inline-env caveat.** OpenSSH does NOT preserve a remote argv
+boundary across the ssh-client → ssh-server hop; the joined
+command string is parsed by the remote login shell. If your
+``MNEMOS_API_KEY`` or ``MNEMOS_BASE`` value contains whitespace
+or shell metacharacters (``$`` ``"`` ``'`` ``\`` ``;``
+``|`` ``&``), the inline form above can break startup or
+execute unintended shell syntax. Two safer paths:
+
+1. **Bake the env on the remote.** Write a shell wrapper at
+   ``/opt/mnemos/bin/mcp-stdio-wrapper`` that exports the vars
+   from a chmod 0600 file and execs ``mnemos serve mcp-stdio``;
+   point the SSH command at the wrapper. The secret never
+   crosses the wire as part of the argv.
+2. **Configure SendEnv/AcceptEnv on both sides.** ``ssh_config``
+   ``SendEnv MNEMOS_*`` on the client + ``sshd_config``
+   ``AcceptEnv MNEMOS_*`` on the server, then the local ``env``
+   from your Claude Code config block reaches the remote process
+   without going through argv parsing.
+
+The inline form is safe for MNEMOS-generated tokens (``mnemos_``
+prefix + 64 hex chars — no shell metacharacters), but custom
+operator-set tokens should go through path 1 or 2.
 
 ## Setup — remote MNEMOS via HTTP/SSE (multi-machine, no SSH)
 
@@ -201,15 +221,23 @@ created through that stdio bridge:
 enforced scope. The MCP bridge stamps it on every
 create/search/list/bulk request so memories created via the
 ``mnemos-work`` connector default to ``namespace=work``. By-id
-operations (get/update/delete) and bulk per-row override are
-NOT scoped by the env var.
+operations (get/update/delete) are NOT scoped by the env var.
+Bulk per-row ``namespace`` is OVERWRITTEN by the env stamp when
+set (env wins) — cross-namespace bulk requires unsetting
+``MNEMOS_DEFAULT_NAMESPACE`` or hitting the REST API directly.
 
 For ENFORCED per-connector isolation:
-* Provision two distinct non-root API keys on MNEMOS, each with
-  its own ``default_namespace`` set server-side (auth.users +
-  api_keys table). Each key only sees memories in its bound
-  namespace; cross-namespace access requires root.
+* Provision two distinct non-root **users** on MNEMOS, each with
+  its own ``namespace`` value on the ``users`` row (the
+  ``users.namespace`` column added in v3.2). Issue an API key
+  for each user. The MNEMOS auth path resolves a request's
+  effective namespace from the API key's user, so distinct users
+  produce distinct effective scopes.
 * Pair each MCP connector entry with the matching key.
+
+Note: distinct API keys under the SAME user share that user's
+namespace — the ``api_keys`` table itself has no per-key
+namespace column. Isolation is per-user, not per-key.
 
 A root API key with the env stamp will write into the configured
 namespace by default but can still read/update/delete any memory

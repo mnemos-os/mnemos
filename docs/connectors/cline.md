@@ -152,9 +152,11 @@ not an enforced scope (see [claude-code.md](./claude-code.md) for
 the security caveat). A root API key with the env stamp will
 write into ``cline-sandbox-…`` by default but can still
 read/update/delete any memory by ID across namespaces. For real
-sandbox isolation, provision a non-root API key with
-server-side ``default_namespace=cline-sandbox`` and bind that
-key to the connector.
+sandbox isolation, provision a non-root **user** with
+``users.namespace=cline-sandbox`` set on the row, issue an API
+key for that user, and bind the key to the connector. Isolation
+is per-user; distinct keys under the same user share the
+user's namespace.
 
 ## Cross-references
 

@@ -120,8 +120,10 @@ the project root to override the global config per-workspace.
 
 The env var is a **write stamp**, not an enforced scope (see
 [claude-code.md](./claude-code.md) for details). For enforced
-project isolation, provision per-project non-root API keys with
-server-side ``default_namespace`` instead of relying on the env.
+project isolation, provision per-project non-root **users**
+(each with its own ``users.namespace``) and issue API keys for
+those users — distinct keys under the same user share that
+user's namespace.
 
 ## Cross-references
 

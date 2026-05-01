@@ -134,8 +134,10 @@ config; Cursor merges it with the global one.
 
 Same caveat as in [claude-code.md](./claude-code.md): the env var
 is a **write stamp**, not an enforced scope. For real isolation
-between Cursor projects, provision per-project non-root API keys
-with server-side ``default_namespace`` set on the user/key.
+between Cursor projects, provision per-project non-root **users**
+(each with its own ``users.namespace`` value) and issue API keys
+for those users. Distinct keys under the same user share a
+namespace — isolation is per-user, not per-key.
 
 ## Cross-references
 

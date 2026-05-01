@@ -149,10 +149,11 @@ MNEMOS_DEFAULT_NAMESPACE=task-bar codex exec 'do other work'
 Note: this stamps the namespace on writes but does NOT enforce
 isolation against a root-scope API key — a root key can still
 read/update/delete by-id across namespaces. For ENFORCED
-isolation, provision distinct non-root API keys with per-key
-``default_namespace`` set on the server side; the env var is
-the convenience for stamping connector-scoped writes onto an
-already-scoped key.
+isolation, provision distinct non-root **users** with
+``users.namespace`` set on each user row, then issue an API key
+per user and pair it with the right MCP entry. Distinct keys
+under the same user share that user's namespace — isolation is
+per-user, not per-key.
 
 ## Cross-references
 
