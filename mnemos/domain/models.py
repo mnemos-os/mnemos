@@ -275,6 +275,7 @@ class SessionIngestRequest(BaseModel):
     machine_id: Optional[str] = None
     agent_id: Optional[str] = None
     git_commit: Optional[str] = None
+    permission_mode: Optional[StrictInt] = None
 
 
 class SessionIngestResponse(BaseModel):

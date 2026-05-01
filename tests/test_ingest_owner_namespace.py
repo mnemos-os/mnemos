@@ -130,6 +130,51 @@ async def test_ingest_session_stamps_owner_namespace_and_emits_webhooks(pg_app: 
         await _cleanup(pg_app)
 
 
+async def test_ingest_session_honors_explicit_permission_mode(pg_app: NamespaceHarness, monkeypatch):
+    import mnemos.core.lifecycle as lc
+
+    monkeypatch.setattr(lc, "_schedule_delivery_attempt", lambda coro: coro.close())
+
+    try:
+        resp = await pg_app.client.post(
+            "/ingest/session",
+            headers=pg_app.alice.headers,
+            json={
+                "session_id": f"{pg_app.prefix}-alice-perm-644",
+                "source": "claude-code",
+                "agent_id": "agent-perm",
+                "permission_mode": 644,
+                "raw_data": {"messages": [{"role": "user", "content": "federation-visible session"}]},
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        memory_id = resp.json()["memory_ids"][0]
+
+        async with pg_app.pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT permission_mode FROM memories WHERE id = $1",
+                memory_id,
+            )
+        assert row["permission_mode"] == 644
+    finally:
+        await _cleanup(pg_app)
+
+
+async def test_ingest_session_rejects_invalid_permission_mode(pg_app: NamespaceHarness):
+    resp = await pg_app.client.post(
+        "/ingest/session",
+        headers=pg_app.alice.headers,
+        json={
+            "session_id": f"{pg_app.prefix}-alice-perm-bad",
+            "source": "claude-code",
+            "permission_mode": 999,
+            "raw_data": {"messages": [{"role": "user", "content": "out of range"}]},
+        },
+    )
+    assert resp.status_code == 422
+    assert "permission_mode" in resp.text
+
+
 async def test_ingest_session_rolls_back_webhook_when_memory_insert_fails(pg_app: NamespaceHarness, monkeypatch):
     import mnemos.core.lifecycle as lc
     from mnemos.api.routes import ingest

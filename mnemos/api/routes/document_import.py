@@ -14,6 +14,7 @@ except ImportError:
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.routes.memories import _validate_permission_mode
 from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
@@ -182,6 +183,7 @@ async def import_memories_from_document(
     file: UploadFile,
     category: str = Form("documents"),
     subcategory: Optional[str] = Form(None),
+    permission_mode: Optional[int] = Form(None),
     user: UserContext = Depends(get_current_user),
 ) -> Dict[str, Any]:
     """Import document into MNEMOS as memory records.
@@ -189,6 +191,8 @@ async def import_memories_from_document(
     Creates one memory per document chunk with automatic metadata extraction.
     Requires docling extra: pip install mnemos-os[docling]
     """
+    perm_mode = _validate_permission_mode(permission_mode, default=600)
+
     if not DOCLING_AVAILABLE:
         raise HTTPException(
             status_code=501,
@@ -232,7 +236,7 @@ async def import_memories_from_document(
                     "INSERT INTO memories "
                     "(id, content, category, subcategory, metadata, quality_rating, "
                     " verbatim_content, owner_id, namespace, permission_mode) "
-                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, 600)",
+                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9)",
                     memory_id,
                     chunk["content"],
                     category,
@@ -241,6 +245,7 @@ async def import_memories_from_document(
                     chunk["content"],            # verbatim_content == content for chunks
                     user.user_id,
                     user.namespace,
+                    perm_mode,
                 )
                 memory_ids.append(memory_id)
                 logger.debug(f"[DOCLING] Created memory {memory_id} from chunk {chunk['chunk_num']}")
@@ -305,6 +310,7 @@ async def import_document(
     file: UploadFile = File(...),
     category: str = Form("documents"),
     subcategory: Optional[str] = Form(None),
+    permission_mode: Optional[int] = Form(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Import document file into MNEMOS as memory records.
@@ -321,7 +327,9 @@ async def import_document(
         total_text_length: total character count
     }
     """
-    return await import_memories_from_document(file, category, subcategory, user)
+    return await import_memories_from_document(
+        file, category, subcategory, permission_mode, user
+    )
 
 
 # Route: POST /v1/documents/batch-import
@@ -329,17 +337,26 @@ async def import_document(
 async def batch_import_documents(
     files: List[UploadFile] = File(...),
     category: str = Form("documents"),
+    permission_mode: Optional[int] = Form(None),
     user: UserContext = Depends(get_current_user),
 ):
     """Batch import multiple documents into MNEMOS.
 
     Returns list of import results (one per document).
     """
+    # Validate permission_mode at the batch boundary so an invalid value
+    # fails the whole request fast — otherwise the per-file try/except
+    # below would swallow the 422 into a per-file error result.
+    _validate_permission_mode(permission_mode, default=600)
     results = []
     for file in files:
         try:
             result = await import_memories_from_document(
-                file, category=category, subcategory=None, user=user
+                file,
+                category=category,
+                subcategory=None,
+                permission_mode=permission_mode,
+                user=user,
             )
             results.append(result)
         except HTTPException as e:

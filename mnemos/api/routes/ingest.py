@@ -6,7 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes.memories import _insert_memory_with_created_webhook, _rls_context
+from mnemos.api.routes.memories import (
+    _insert_memory_with_created_webhook,
+    _rls_context,
+    _validate_permission_mode,
+)
 from mnemos.core.ids import new_memory_id
 from mnemos.domain.models import SessionIngestRequest, SessionIngestResponse
 
@@ -41,6 +45,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
     """Ingest Claude Code session data into MNEMOS."""
     if not _lc._pool:
         raise HTTPException(status_code=503, detail="Database pool not available")
+    permission_mode = _validate_permission_mode(request.permission_mode, default=600)
     stored_ids = []
     try:
         data = request.raw_data
@@ -82,7 +87,7 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
                             metadata=metadata,
                             owner_id=user.user_id,
                             namespace=user.namespace,
-                            permission_mode=600,
+                            permission_mode=permission_mode,
                             verbatim_content=content,
                             source_model=None,
                             source_provider=request.source,
