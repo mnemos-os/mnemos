@@ -144,20 +144,55 @@ async def test_consumer_loop_recovers_after_broker_restart(monkeypatch, managed_
 
     Pre-outage: consumer_loop receives 3 messages.
     Outage: broker is hard-killed and restarted on the same store_dir.
-    Post-outage: consumer_loop reconnects via backoff, sees 3 new
+    Post-outage: consumer_loop reconnects via OUR backoff path
+    (auto-reconnect at the nats-py layer is disabled), sees 3 new
     messages.
 
-    A regression in ``_consume_subscription`` / ``_drain_partial`` /
-    ``ReconnectBackoff`` would manifest as the loop either dying
-    (task done with exception) or never seeing the post-restart
-    messages. This test asserts both.
+    Codex round-2: naive version could pass via nats-py's
+    internal allow_reconnect=True. We override the consumer's
+    connect callable to disable auto-reconnect AND count spawn
+    attempts, so a regression in our drain+ReconnectBackoff path
+    is forced to fail rather than be masked.
     """
+    import nats
+
     # Set up the federation stream the consumer_loop expects.
     async with _connection_to(managed_broker) as nc:
         js = nc.jetstream()
         await _ensure_test_stream(js, "MNEMOS_MEMORY", ["mnemos.memory.>"])
 
-    task, received, peer = await _spin_consumer(monkeypatch, managed_broker)
+    received: list[dict] = []
+    spawn_count = 0
+
+    async def _fake_handle_message(pool, peer, msg, store=None, fetch=None, delete=None):
+        import json as _json
+        try:
+            payload = _json.loads(msg.data.decode())
+        except Exception:
+            payload = {"_raw": msg.data.decode("utf-8", errors="replace")}
+        received.append({"subject": msg.subject, "data": payload})
+
+    monkeypatch.setattr(consumer, "handle_message", _fake_handle_message)
+
+    async def _no_autorecon_connect(peer):
+        nonlocal spawn_count
+        spawn_count += 1
+        client = await nats.connect(
+            servers=[peer.nats_url],
+            allow_reconnect=False,
+        )
+        return client, client.jetstream()
+
+    peer = FederationNatsPeer(
+        name="outage_restart_test",
+        nats_url=managed_broker.url,
+    )
+    task = asyncio.create_task(
+        consumer.consumer_loop(
+            _FakePool(), peer, retry_seconds=2.0, connect=_no_autorecon_connect
+        )
+    )
+    await asyncio.sleep(0.5)
 
     try:
         # Pre-outage: publish + observe.
@@ -169,27 +204,21 @@ async def test_consumer_loop_recovers_after_broker_restart(monkeypatch, managed_
                     f'{{"memory_id":"pre-{i}"}}'.encode(),
                 )
         await _wait_for_received_count(received, 3, timeout=5.0)
-        assert len(received) == 3, (
-            f"pre-outage message count: expected 3, got {len(received)}; "
-            f"received: {received}"
-        )
-        ids = [r["data"]["memory_id"] for r in received]
-        assert sorted(ids) == ["pre-0", "pre-1", "pre-2"]
+        assert len(received) == 3
+        assert sorted(r["data"]["memory_id"] for r in received) == ["pre-0", "pre-1", "pre-2"]
+        baseline_spawn_count = spawn_count
 
-        # Outage: hard-kill and restart on the same store_dir
-        # (durables persist).
-        managed_broker.restart()
+        # Outage: async-restart (we're in a running event loop;
+        # sync restart() would call asyncio.run() and deadlock).
+        await managed_broker.async_restart()
 
-        # Re-declare stream after restart (store_dir DOES persist
-        # data + consumers, but our fast restart can race the
-        # consumer's reconnect logic; explicit re-declare on the
-        # publisher side is harmless either way).
         async with _connection_to(managed_broker) as nc2:
             js2 = nc2.jetstream()
 
-            # Consumer_loop should be in reconnect-backoff. Give
-            # it up to 5s to come back up and re-subscribe.
-            await asyncio.sleep(2.5)
+            # Consumer_loop should be in reconnect-backoff. With
+            # retry_seconds=2.0 + jitter the next spawn attempt is
+            # within ~0-2s; the second attempt within ~0-4s.
+            await asyncio.sleep(3.0)
 
             for i in range(3):
                 await js2.publish(
@@ -197,7 +226,21 @@ async def test_consumer_loop_recovers_after_broker_restart(monkeypatch, managed_
                     f'{{"memory_id":"post-{i}"}}'.encode(),
                 )
 
-        await _wait_for_received_count(received, 6, timeout=10.0)
+        await _wait_for_received_count(received, 6, timeout=15.0)
+
+        # PROOF that consumer_loop ran the OUTER reconnect: spawn
+        # count must have increased post-restart. With auto-reconnect
+        # disabled the only way to re-establish the connection is
+        # consumer_loop's drain+backoff+spawn cycle.
+        assert spawn_count > baseline_spawn_count, (
+            "consumer_loop did NOT spawn a fresh connection after "
+            "broker restart. baseline_spawn_count="
+            f"{baseline_spawn_count}, final={spawn_count}. "
+            "This indicates the drain+backoff path is broken — "
+            "auto-reconnect at the nats-py layer was disabled, so "
+            "only OUR loop could have re-established the connection."
+        )
+
         assert len(received) == 6, (
             "consumer_loop did NOT recover from broker restart — "
             f"expected 6 received messages, got {len(received)}; "
@@ -211,8 +254,6 @@ async def test_consumer_loop_recovers_after_broker_restart(monkeypatch, managed_
         )
         assert post_ids == ["post-0", "post-1", "post-2"]
 
-        # The task must STILL be alive — production loop doesn't
-        # exit on broker outage, it backs off and retries forever.
         assert not task.done() or task.cancelled(), (
             "consumer_loop should be running OR cancelled, never "
             f"errored. task.done={task.done()}; "
@@ -275,8 +316,10 @@ async def test_consumer_loop_survives_handler_pause(monkeypatch, managed_broker)
                     f'{{"memory_id":"flap-{i}"}}'.encode(),
                 )
 
-        # Allow generous time for ack-wait redeliveries.
-        await _wait_for_received_count(received, 10, timeout=30.0)
+        # Allow generous time for ack-wait redeliveries. The
+        # JetStream default ack_wait is 30s, so 60s is enough for
+        # 1-2 redelivery cycles on the first 5 messages.
+        await _wait_for_received_count(received, 10, timeout=60.0)
 
         # The consumer_loop MUST still be alive — handler errors
         # are scope-2 (local), not scope-1/3 (NATS-issue, escapes).
@@ -285,10 +328,22 @@ async def test_consumer_loop_survives_handler_pause(monkeypatch, managed_broker)
             f"loop; got task.done={task.done()}, "
             f"exception={task.exception() if task.done() else None}"
         )
-        assert len(received) >= 5, (
-            f"after handler stopped failing, the consumer should have "
-            f"processed at least the 5 trailing messages; got "
-            f"{len(received)} successes"
+
+        # HARD assertion (codex round-2 finding 4): must see ALL 10
+        # unique memory_ids exactly. Loose `>= 5` would mask data
+        # loss — if the first 5 handler-failures had been
+        # incorrectly acked, those messages would be lost forever
+        # and the trailing 5 alone would still satisfy `>= 5`. The
+        # exact-set assertion catches that regression.
+        seen_ids = {r["data"]["memory_id"] for r in received}
+        expected_ids = {f"flap-{i}" for i in range(10)}
+        assert seen_ids == expected_ids, (
+            f"handler-pause test must observe ALL 10 messages "
+            f"after redelivery — JetStream's at-least-once contract "
+            f"requires that unacked messages are redelivered, NOT "
+            f"silently dropped. missing: {expected_ids - seen_ids}; "
+            f"unexpected: {seen_ids - expected_ids}; "
+            f"total received entries: {len(received)}"
         )
     finally:
         task.cancel()

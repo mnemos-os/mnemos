@@ -224,23 +224,9 @@ class ManagedBroker:
         self.proc: subprocess.Popen | None = None
         self.url = f"nats://127.0.0.1:{port}"
 
-    def _spawn(self) -> None:
-        """Spawn nats-server and wait until a real NATS handshake
-        succeeds. Cleans up the subprocess if anything fails.
-
-        Codex round-1 of the partial-outage slice flagged two
-        leak paths in the original implementation:
-          1. If readiness wait raises, the spawned subprocess
-             is orphaned (caller's try/finally never runs).
-          2. The readiness check was a raw TCP connect, which
-             would falsely accept an unrelated listener that
-             happened to grab the port between bind-and-close.
-        Both fixed below — try/finally around the readiness
-        wait, and the readiness check is now a real
-        ``nats.connect`` so we know JetStream is reachable.
-        """
-        import asyncio as _asyncio
-
+    def _start_proc(self) -> None:
+        """Just spawn the nats-server child. Caller is responsible
+        for the readiness check (sync or async)."""
         store_str = str(self.store_dir)
         self.store_dir.mkdir(parents=True, exist_ok=True)
         self.proc = subprocess.Popen(
@@ -256,15 +242,47 @@ class ManagedBroker:
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
+
+    def _kill_after_failure(self) -> None:
+        """Defensive subprocess teardown for a failed spawn."""
         try:
-            # Real-handshake readiness check. A raw TCP probe
-            # would falsely succeed on an unrelated listener that
-            # happened to grab the port; nats.connect proves the
-            # NATS protocol greeting parsed cleanly.
+            if self.proc and self.proc.poll() is None:
+                self.proc.send_signal(signal.SIGKILL)
+                self.proc.wait(timeout=2.0)
+        except Exception:
+            pass
+        self.proc = None
+
+    def _spawn(self) -> None:
+        """Spawn + sync-probe readiness. Used at fixture setup
+        when there is no running event loop yet.
+
+        Codex round-1 flagged two leak paths in the original:
+          1. Spawn-then-readiness-fail orphaned the subprocess
+             (caller's try/finally never ran). Fixed by the
+             try/except around the readiness wait that
+             explicitly kills the child on any failure.
+          2. Raw TCP probe could pass against an unrelated
+             listener that grabbed the port. Fixed by using a
+             real nats.connect handshake.
+
+        Codex round-2 flagged that the original also called
+        ``asyncio.run()`` from inside what could be a coroutine
+        (when restart() is invoked from a pytest-asyncio test).
+        Fixed by splitting:
+          * _spawn() — sync path, used from fixture setup (no
+            running loop).
+          * async_spawn() — async path, used from inside async
+            tests so we can ``await`` instead of ``asyncio.run``.
+        """
+        import asyncio as _asyncio
+
+        self._start_proc()
+        try:
             deadline = time.monotonic() + 5.0
-            last_exc = None
+            last_exc: Exception | None = None
             while time.monotonic() < deadline:
-                if self.proc.poll() is not None:
+                if self.proc and self.proc.poll() is not None:
                     raise RuntimeError(
                         f"nats-server exited early (code={self.proc.returncode})"
                     )
@@ -287,17 +305,55 @@ class ManagedBroker:
                 f"(last probe error: {last_exc})"
             )
         except Exception:
-            # Setup-time failure — kill the subprocess so we don't
-            # leak. The fixture's teardown finally still runs but
-            # would otherwise NOT run if _spawn() raised before
-            # the fixture entered its try/yield.
-            try:
-                if self.proc and self.proc.poll() is None:
-                    self.proc.send_signal(signal.SIGKILL)
-                    self.proc.wait(timeout=2.0)
-            except Exception:
-                pass
-            self.proc = None
+            self._kill_after_failure()
+            raise
+
+    async def async_spawn(self) -> None:
+        """Async-native variant of _spawn() — safe to call from
+        inside a running asyncio loop (e.g., a pytest-asyncio
+        test). Same readiness-handshake contract; no
+        ``asyncio.run`` to clash with the running loop.
+        """
+        import asyncio as _asyncio
+
+        self._start_proc()
+        try:
+            deadline = _asyncio.get_event_loop().time() + 5.0
+            last_exc: Exception | None = None
+            while _asyncio.get_event_loop().time() < deadline:
+                if self.proc and self.proc.poll() is not None:
+                    raise RuntimeError(
+                        f"nats-server exited early (code={self.proc.returncode})"
+                    )
+                try:
+                    import nats
+
+                    client = await _asyncio.wait_for(
+                        nats.connect(servers=[self.url]), timeout=0.5
+                    )
+                    # Identity check (codex round-2 finding 3): make
+                    # sure the server we just connected to is OUR
+                    # child, not an unrelated nats-server that won the
+                    # port race. The simplest test that survives
+                    # nats-server version variation is "the child we
+                    # spawned is still alive after the handshake."
+                    if self.proc is None or self.proc.poll() is not None:
+                        await client.drain()
+                        raise RuntimeError(
+                            "handshake succeeded but our subprocess is gone — "
+                            "another nats-server won the port"
+                        )
+                    await client.drain()
+                    return
+                except Exception as exc:
+                    last_exc = exc
+                    await _asyncio.sleep(0.1)
+            raise RuntimeError(
+                f"nats-server at {self.url} did not become ready within 5s "
+                f"(last probe error: {last_exc})"
+            )
+        except Exception:
+            self._kill_after_failure()
             raise
 
     def pause(self) -> None:
@@ -314,12 +370,21 @@ class ManagedBroker:
             self.proc.wait(timeout=2.0)
 
     def restart(self) -> None:
-        """Hard-kill the broker and spawn a fresh one on the same
-        port + store_dir. JetStream durable consumers + streams
-        persist via the store_dir, so an active consumer can
-        reconnect after the cycle and pick up where it left off."""
+        """Sync hard-restart. Use from non-async contexts only —
+        will raise if called from inside a running event loop
+        because ``_spawn`` calls ``asyncio.run()`` for its
+        readiness probe. From async tests, use ``async_restart``
+        instead.
+        """
         self.kill()
         self._spawn()
+
+    async def async_restart(self) -> None:
+        """Async-native hard-restart. Safe from inside
+        pytest-asyncio coroutines.
+        """
+        self.kill()
+        await self.async_spawn()
 
 
 @pytest.fixture
