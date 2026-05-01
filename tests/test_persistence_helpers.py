@@ -194,23 +194,134 @@ async def test_rls_context_no_op_when_rls_disabled(monkeypatch):
     assert conn.transaction.await_count == 0
 
 
-@pytest.mark.asyncio
-async def test_no_remaining_set_local_with_bind_in_codebase():
-    """Belt-and-braces: scan the live codebase for the broken
-    ``SET LOCAL <name> = $`` shape so a future addition can't
-    silently re-introduce the bug. Comments and docstrings about
-    the pattern are allowed; only executable string literals
-    matching the SQL prefix count.
+def _scan_for_broken_set_local(text: str, path: object) -> list[tuple[int, str]]:
+    """AST-walk a Python source file and return every string literal
+    (regardless of quoting style — single/double/triple/raw, f-string
+    literal segment) that matches the broken ``SET LOCAL <name> = $N``
+    SQL shape, case-insensitively.
+
+    Codex round-6 (review-moms6o3v-1jr3xv) flagged that a
+    raw-source regex over the whole file body was too porous: it
+    only catches double-quoted strings starting with uppercase
+    SET LOCAL. An AST walk over ``ast.Constant(value=str)`` and
+    f-string ``ast.JoinedStr`` literal parts catches the shape
+    regardless of how the source quotes it.
     """
-    import pathlib
+    import ast
     import re
 
-    bad_pattern = re.compile(r'"\s*SET\s+LOCAL\s+\S+\s*=\s*\$\d')
+    # Anchor at start-of-line (with re.MULTILINE) so prose mentions
+    # of "SET LOCAL ... = $1" inside docstrings/comments don't match,
+    # but actual SQL statements that START with SET LOCAL (possibly
+    # after a semicolon-newline in multi-statement strings) do.
+    pattern = re.compile(
+        r"(?:^|;\s*)\s*set\s+local\s+\S+\s*=\s*\$\d",
+        re.IGNORECASE | re.MULTILINE,
+    )
+    findings: list[tuple[int, str]] = []
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        return findings
+
+    def _check(value: str, lineno: int) -> None:
+        if pattern.search(value):
+            findings.append((lineno, value))
+
+    for node in ast.walk(tree):
+        # Plain string literals: ast.Constant(value=str). Covers
+        # 'single', "double", '''triple''', """triple""", and
+        # raw-prefix variants since the parsed value is a str
+        # regardless of quoting.
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            _check(node.value, getattr(node, "lineno", 0))
+            continue
+        # f-strings (PEP 498): JoinedStr.values is a list of
+        # FormattedValue + Constant(str) parts. Static literal
+        # segments are Constant nodes with str values; we only
+        # care about those, since interpolated expressions can't
+        # be statically known anyway.
+        if isinstance(node, ast.JoinedStr):
+            for part in node.values:
+                if isinstance(part, ast.Constant) and isinstance(part.value, str):
+                    _check(part.value, getattr(node, "lineno", 0))
+    return findings
+
+
+@pytest.mark.asyncio
+async def test_no_remaining_set_local_with_bind_in_codebase():
+    """Belt-and-braces: AST-walk every string literal under
+    ``mnemos/`` and confirm nothing matches the broken
+    ``SET LOCAL <name> = $N`` shape.
+
+    AST-based so single, double, triple-quoted, raw, and f-string
+    literal segments are ALL covered — codex round-6 caught that
+    the previous source-text regex only handled double-quoted
+    uppercase SQL.
+    """
+    import pathlib
+
     repo_root = pathlib.Path(__file__).resolve().parent.parent
+    failures: list[tuple[pathlib.Path, int, str]] = []
     for path in (repo_root / "mnemos").rglob("*.py"):
         text = path.read_text(encoding="utf-8")
-        match = bad_pattern.search(text)
-        assert match is None, (
-            f"Found broken SET LOCAL ... = $1 form at {path}: "
-            f"matched {match.group(0)!r}. Use SELECT set_config(...) instead."
+        for lineno, value in _scan_for_broken_set_local(text, path):
+            failures.append((path, lineno, value))
+    assert not failures, (
+        "Found broken SET LOCAL ... = $1 SQL string literal(s):\n"
+        + "\n".join(
+            f"  {p}:{ln} -> {repr(v)[:120]}"
+            for (p, ln, v) in failures
         )
+    )
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        # double-quoted, uppercase
+        'SQL = "SET LOCAL mnemos.current_user_id = $1"',
+        # single-quoted
+        "SQL = 'SET LOCAL mnemos.current_user_id = $1'",
+        # triple double-quoted
+        'SQL = """SET LOCAL mnemos.current_user_id = $1"""',
+        # triple single-quoted
+        "SQL = '''SET LOCAL mnemos.current_user_id = $1'''",
+        # lowercase (case-insensitive)
+        'SQL = "set local mnemos.current_user_id = $1"',
+        # mixed case
+        'SQL = "Set Local mnemos.current_role = $2"',
+        # leading whitespace
+        'SQL = "  SET LOCAL mnemos.current_user_id  = $1"',
+        # f-string with literal SQL prefix
+        'SQL = f"SET LOCAL mnemos.current_user_id = $1 -- {note}"',
+    ],
+)
+def test_scanner_catches_broken_shape(snippet):
+    """Negative fixtures proving the AST scanner catches every
+    quoting / casing variant of the broken pattern. Pinning so the
+    scanner can't quietly degrade in future."""
+    findings = _scan_for_broken_set_local(snippet, "<test>")
+    assert findings, f"scanner missed broken shape in: {snippet!r}"
+
+
+@pytest.mark.parametrize(
+    "snippet",
+    [
+        # The fix shape — no $-binds.
+        "SQL = \"SELECT set_config('mnemos.current_user_id', $1, true)\"",
+        # SET LOCAL with literal value (no $-binds; valid SQL).
+        'SQL = "SET LOCAL mnemos.suppress_version_snapshot = \'1\'"',
+        # SET (session-level) with no binds.
+        'SQL = "SET application_name = \'mnemos\'"',
+        # Documentation comment about the broken form should NOT
+        # match — the AST scan only looks at string-literal values,
+        # not comment text.
+        '# Earlier shape SET LOCAL x = $1 was broken.',
+    ],
+)
+def test_scanner_allows_fix_and_unrelated_sql(snippet):
+    findings = _scan_for_broken_set_local(snippet, "<test>")
+    assert not findings, (
+        f"scanner false-positive on safe input {snippet!r}: {findings!r}"
+    )
