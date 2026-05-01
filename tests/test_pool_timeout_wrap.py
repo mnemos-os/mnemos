@@ -141,3 +141,32 @@ def test_proxy_attribute_access_for_internals():
     proxy = TimeoutPool(inner)
     assert proxy.get_size() == 10
     inner.get_size.assert_called_once()
+
+
+# ── Distillation worker also routes through the wrap ───────────────────────
+
+
+def test_distillation_worker_creates_wrapped_pool(monkeypatch):
+    """Codex round-1 of the round-28 thread caught that the
+    distillation worker bypassed the lifecycle wrap by calling
+    ``asyncpg.create_pool`` directly. ``_create_pool`` now wraps
+    the raw pool through ``wrap_pool_with_timeout`` so worker
+    ``self.db_pool.acquire()`` sites also inherit the default
+    timeout. Pin the contract directly."""
+    import asyncio
+
+    from mnemos.workers import distillation
+
+    raw_sentinel = MagicMock(name="raw-asyncpg-pool")
+
+    async def _fake_create_pool(**kwargs):
+        return raw_sentinel
+
+    monkeypatch.setattr(
+        distillation.asyncpg, "create_pool", _fake_create_pool,
+    )
+
+    pool = asyncio.run(distillation.MemoryDistillationWorker._create_pool())
+    assert isinstance(pool, TimeoutPool)
+    # The wrapped instance is the raw pool we created.
+    assert pool._pool is raw_sentinel

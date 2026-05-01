@@ -120,12 +120,32 @@ class MemoryDistillationWorker:
         # v3.3 S-II judge — populated alongside engines in start()
         self._judge = None
 
+    @staticmethod
+    async def _create_pool():
+        """Create the worker-local asyncpg pool wrapped with the
+        ``TimeoutPool`` proxy so direct ``self.db_pool.acquire()``
+        call sites inherit the configured acquire timeout.
+
+        Without the wrap, the worker pool's acquires default to
+        asyncpg's "wait forever" behaviour. Under a wedged or
+        exhausted worker pool the contest-queue loop's bare
+        ``acquire()`` calls would hang indefinitely and strand
+        compression work — corpus-review #6 explicitly listed this
+        worker as a remaining gap when the lifecycle wrap shipped.
+        """
+        # Lazy import keeps the worker module free of a hard
+        # dependency on the lifecycle wrap during test bootstrap.
+        from mnemos.core.pool import wrap_pool_with_timeout
+
+        raw_pool = await asyncpg.create_pool(
+            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS,
+        )
+        return wrap_pool_with_timeout(raw_pool)
+
     async def start(self):
         """Start background worker"""
         logger.info(f"Connecting to DB: {_PG_CONFIG['host']}:{_PG_CONFIG['port']}/{_PG_CONFIG['database']}")
-        self.db_pool = await asyncpg.create_pool(
-            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
-        )
+        self.db_pool = await self._create_pool()
 
         # Construct contest engines if available. Each engine is
         # lazy about creating HTTP clients — construction itself is
@@ -234,9 +254,7 @@ class MemoryDistillationWorker:
                 logger.error(f"Worker error: {e}", exc_info=True)
                 try:
                     await self.db_pool.close()
-                    self.db_pool = await asyncpg.create_pool(
-            min_size=1, max_size=3, command_timeout=60, **_DB_CONNECT_ARGS
-        )
+                    self.db_pool = await self._create_pool()
                 except Exception as re:
                     logger.error(f"DB reconnect failed: {re}")
 
