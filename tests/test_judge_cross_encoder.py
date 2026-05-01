@@ -88,8 +88,15 @@ def test_cross_encoder_judge_import_error_when_missing(monkeypatch):
         CrossEncoderJudge()
     msg = str(exc.value)
     assert "sentence-transformers" in msg.lower() or "sentence_transformers" in msg
-    assert "[full]" in msg, (
-        "error message should point operators at the optional extra"
+    # v4.2.0a11: sentence-transformers was removed from the [full]
+    # extra (it transitively pulls torch + nvidia binary weight that
+    # 95%+ of fleet hosts can't use). The CrossEncoderJudge import
+    # error now tells operators to `pip install sentence-transformers`
+    # directly OR use LLMJudge/heuristic scoring instead — there is
+    # no longer an extra that bundles it.
+    assert "pip install sentence-transformers" in msg or "LLMJudge" in msg, (
+        "error message should point operators at an explicit install "
+        f"or alternative judge. got: {msg}"
     )
 
 

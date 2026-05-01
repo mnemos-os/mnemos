@@ -158,7 +158,11 @@ class MemoryDistillationWorker:
                 except ImportError as exc:
                     logger.warning(
                         "CrossEncoderJudge unavailable (%s); falling back "
-                        "to LLMJudge. Install mnemos-os[full] to enable.",
+                        "to LLMJudge. CrossEncoderJudge requires "
+                        "sentence-transformers which is no longer a default "
+                        "mnemos extra (it pulls torch). Install it "
+                        "explicitly if you need this judge: "
+                        "pip install sentence-transformers",
                         exc,
                     )
                     self._judge = LLMJudge(model_id=_JUDGE_MODEL)
@@ -173,7 +177,9 @@ class MemoryDistillationWorker:
                     logger.warning(
                         "Ensemble mode requested but CrossEncoderJudge "
                         "unavailable (%s); falling back to LLMJudge-only. "
-                        "Install mnemos-os[full] to enable ensemble.",
+                        "Install sentence-transformers explicitly to "
+                        "enable ensemble (no longer pulled by any default "
+                        "mnemos extra).",
                         exc,
                     )
                     self._judge = primary

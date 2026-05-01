@@ -63,23 +63,52 @@ class QualityAnalyzer:
         Args:
             enable_semantic_analysis: If True, use embeddings for semantic comparison
                                      If False, use heuristics only (faster)
+
+        Embedding backend: ``fastembed`` (ONNX runtime). ~10-20 MB
+        package, no torch dependency. We pick the MiniLM ONNX shape
+        which matches the prod mnemos blueprint (PYTHIA :5002 /
+        phi_server.py uses fastembed + openvino_genai across the
+        embedding hot path with zero torch in the venv).
+
+        If fastembed is not installed, the analyzer falls back to
+        pure-heuristic semantic scoring. We deliberately do NOT
+        carry a torch / sentence-transformers fallback — that path
+        exists in `[full]` extra historically but is being phased
+        out. Installing torch as an embedding fallback drags in
+        ~700 MB-1 GB of binary weight that 95%+ of MNEMOS hosts
+        never benefit from (most have Intel iGPU, Apple Silicon,
+        Tegra, or no GPU — none target the torch+CUDA wheel).
         """
         self.enable_semantic_analysis = enable_semantic_analysis
+        self.semantic_available = False
+        self.embedding_backend = None  # "fastembed" | None
 
-        # Try to load semantic analysis tools
-        if enable_semantic_analysis:
-            try:
-                from sentence_transformers import SentenceTransformer
-                self.embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-                self.semantic_available = True
-            except ImportError:
-                logger.warning(
-                    "sentence-transformers not available, "
-                    "using heuristic quality analysis"
-                )
-                self.semantic_available = False
-        else:
-            self.semantic_available = False
+        if not enable_semantic_analysis:
+            return
+
+        try:
+            from fastembed import TextEmbedding
+            # Lazy-loaded; the first encode() call materializes the
+            # ONNX session. No torch required.
+            self.embedding_model = TextEmbedding("sentence-transformers/all-MiniLM-L6-v2")
+            self.embedding_backend = "fastembed"
+            self.semantic_available = True
+            logger.info(
+                "QualityAnalyzer using fastembed (ONNX) for semantic similarity"
+            )
+            return
+        except ImportError:
+            logger.warning(
+                "fastembed not available; QualityAnalyzer falling back to "
+                "pure-heuristic semantic scoring. "
+                "Install with: pip install 'mnemos-os[ml]'"
+            )
+        except Exception as exc:
+            logger.warning(
+                "fastembed initialization failed (%s); QualityAnalyzer "
+                "falling back to pure-heuristic semantic scoring",
+                exc,
+            )
 
     async def analyze(
         self,

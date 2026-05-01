@@ -563,17 +563,37 @@ itsdangerous>=2.2.0        # Starlette session signing
 prometheus_client>=0.20.0  # /metrics exposition
 ```
 
-### 8.3 Python dependencies (optional extras, 5 groups)
+### 8.3 Python dependencies (optional extras)
 
 ```
 [project.optional-dependencies]
 tracing   = [opentelemetry-api, opentelemetry-sdk, opentelemetry-exporter-otlp-proto-http >=1.27.0]
 structlog = [structlog >=25.0.0]
 docling   = [docling >=2.5.0, docling-core >=2.0.0, pillow >=10.0.0]
-full      = [sentence-transformers >=2.7.0, spacy >=3.7.0, networkx >=3.3]
-phi       = [openvino-genai >=2024.4.0, fastembed >=0.3.0]
+ml        = [fastembed >=0.3.0]                                    # CPU embeddings, ONNX, no torch
+gpu       = [fastembed-gpu >=0.3.0]                                # NVIDIA CUDA EP via fastembed-gpu
+phi       = [openvino-genai >=2024.4.0, fastembed >=0.3.0]         # Intel iGPU via OpenVINO
+full      = [spacy >=3.7.0, networkx >=3.3]                        # NLP/graph extras (no embeddings)
+sqlite    = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
 dev       = [pytest >=8.0.0, pytest-asyncio >=0.23.0, pytest-cov >=5.0.0, ruff >=0.5.0]
 ```
+
+The ML extras are deliberately **torch-free**. ``fastembed`` uses
+ONNX runtime for the same MiniLM/Nomic embedding model family that
+``sentence-transformers`` exposes via torch, but ships ~10–20 MB
+instead of ~700 MB–1 GB of torch + nvidia binary weight. This
+matches the production blueprint at PYTHIA :5002 (``phi_server.py``
+uses ``fastembed`` + ``openvino_genai`` with no ``import torch``).
+
+GPU acceleration is gated behind the ``[gpu]`` extra (NVIDIA CUDA EP)
+or ``[phi]`` extra (Intel iGPU OpenVINO). Apple Silicon hosts use
+``[ml]`` (CPU fastembed); MLX / CoreML EP integration is a v4.3+
+candidate. Tegra hosts use ``[ml]`` as well; TensorRT / TRT-LLM
+integration is out of scope.
+
+Use ``python -m mnemos.runtime.hardware`` (or ``mnemos doctor``)
+on the target host to print the suggested extra before running
+the pip install.
 
 ### 8.4 External service dependencies
 

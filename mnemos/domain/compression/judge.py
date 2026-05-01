@@ -339,9 +339,22 @@ class CrossEncoderJudge(Judge):
         try:
             from sentence_transformers import CrossEncoder  # noqa: F401
         except ImportError as exc:
+            # sentence-transformers was removed from default mnemos
+            # extras in v4.2.0a11 (it transitively pulls torch and
+            # ~700 MB of nvidia binary weight that 95%+ of fleet
+            # hosts can't use). CrossEncoderJudge stays available
+            # for operators who explicitly opt in by installing
+            # sentence-transformers themselves; the default judge
+            # path is the LLMJudge (no embeddings) or the cheaper
+            # heuristic scorer in QualityAnalyzer (uses fastembed
+            # via mnemos-os[ml] when present, pure heuristics
+            # otherwise).
             raise ImportError(
-                "CrossEncoderJudge requires sentence-transformers. "
-                "Install with: pip install 'mnemos-os[full]'"
+                "CrossEncoderJudge requires sentence-transformers, which "
+                "is no longer a default mnemos dependency (it pulls torch). "
+                "Install it explicitly: pip install sentence-transformers. "
+                "Or use the LLMJudge / heuristic-only scoring instead — "
+                "see docs/COMPRESSION.md for the judge selection rubric."
             ) from exc
         self.model_name = model_name
         self.model_id = model_name

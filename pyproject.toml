@@ -74,9 +74,30 @@ sqlite = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",
 ]
-full = ["sentence-transformers>=2.7.0", "spacy>=3.7.0", "networkx>=3.3"]
-# Note: the `phi` extras are optional GPU-dependent OpenVINO/FastEmbed support. Most installs don't need it.
+# [ml] — recommended ML stack for default installs that want
+# semantic-similarity quality scoring. fastembed uses ONNX runtime
+# (~10-20 MB), supports the same MiniLM/Nomic embedding model
+# family as sentence-transformers, and pulls NO torch / nvidia /
+# transformers / safetensors weight. This is the prod mnemos
+# blueprint at PYTHIA :5002.
+ml = ["fastembed>=0.3.0"]
+# [gpu] — GPU acceleration for the ML embedding path. Default
+# is fastembed-gpu (ONNX CUDA execution provider) which works
+# with a system CUDA install but does NOT require the torch
+# CUDA wheel chain. Operators on systems WITHOUT NVIDIA CUDA
+# (Apple Silicon, Intel iGPU, Tegra, ARM) should NOT install
+# this extra — install [ml] (CPU) or [phi] (Intel iGPU) instead.
+gpu = ["fastembed-gpu>=0.3.0"]
+# [phi] — Intel-iGPU-accelerated path: OpenVINO + FastEmbed, used
+# in production at PYTHIA. Apache-2.0 across the board, no torch.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
+# [full] — legacy alias for the spacy + networkx text-processing
+# extras. sentence-transformers (and its torch transitive) was
+# removed in v4.2.0a11 — that path is now [ml] (fastembed).
+# Operators on a [full] install who wanted semantic-similarity
+# scoring should switch to [ml] OR install both: pip install
+# 'mnemos-os[full,ml]'.
+full = ["spacy>=3.7.0", "networkx>=3.3"]
 dev = [
   "import-linter>=2.0.0",
   "pytest>=8.0.0",
