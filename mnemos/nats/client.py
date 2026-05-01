@@ -37,13 +37,43 @@ def publishing_enabled() -> bool:
     return _jetstream is not None and _publishing_enabled
 
 
+_NODE_NAME_FALLBACK_LOGGED = False
+
+
 def get_node_name() -> str:
-    """Return the resolved local NATS node name."""
+    """Return the resolved local NATS node name.
+
+    When ``MNEMOS_NODE_NAME`` is unset, falls back to
+    ``socket.gethostname()`` and logs a one-shot warning so
+    operators see the fallback in their startup logs. Container
+    hostnames can collide, change on restart, or differ across
+    blue/green deploys, which affects
+    ``federation.source_node`` self-loop checks and webhook
+    durable consumer names — those need stable, unique
+    identifiers. Operators running NATS-enabled deployments should
+    set ``MNEMOS_NODE_NAME`` explicitly.
+
+    The warning is throttled to once per process (the global
+    flag below) so a hot path that calls ``get_node_name``
+    repeatedly doesn't drown the logs.
+    """
+    global _NODE_NAME_FALLBACK_LOGGED
+
     settings = get_settings()
     node_name = settings.nats.node_name.strip()
     if not node_name:
         node_name = socket.gethostname()
         settings.nats.node_name = node_name
+        if not _NODE_NAME_FALLBACK_LOGGED:
+            logger.warning(
+                "MNEMOS_NODE_NAME unset; falling back to hostname=%r. "
+                "Container hostnames can collide or change on restart, "
+                "which can break federation self-loop checks and "
+                "webhook durable consumer names. Set MNEMOS_NODE_NAME "
+                "explicitly when running NATS-enabled deployments.",
+                node_name,
+            )
+            _NODE_NAME_FALLBACK_LOGGED = True
     return node_name
 
 
