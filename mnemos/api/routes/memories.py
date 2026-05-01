@@ -13,7 +13,6 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.ids import new_memory_id
 from mnemos.core.lifecycle import (
-    _MEMORY_COLS,
     _get_cache_key,
     _get_embedding,
 )
@@ -192,7 +191,6 @@ async def _insert_memory_with_created_webhook(
     source_provider: Optional[str] = None,
     source_session: Optional[str] = None,
     source_agent: Optional[str] = None,
-    fetch_row: bool = False,
 ):
     """Insert a canonical memory row and enqueue memory.created in the same txn."""
     verbatim = verbatim_content if verbatim_content is not None else content
@@ -206,11 +204,6 @@ async def _insert_memory_with_created_webhook(
         owner_id, namespace, permission_mode,
         source_model, source_provider, source_session, source_agent,
     )
-    row = None
-    if fetch_row:
-        row = await conn.fetchrow(
-            f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", mem_id,
-        )
 
     event_payload = {
         "memory_id": mem_id,
