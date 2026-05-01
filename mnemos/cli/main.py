@@ -601,6 +601,72 @@ def doctor() -> None:
     raise typer.Exit(code=cli_doctor())
 
 
+@app.command("dump-openapi")
+def dump_openapi(
+    output: Optional[str] = typer.Option(
+        None,
+        "--output", "-o",
+        help=(
+            "Write the OpenAPI spec to this path instead of stdout. "
+            "Use ``-`` or omit to print to stdout."
+        ),
+    ),
+    indent: int = typer.Option(
+        2,
+        "--indent",
+        min=0,
+        max=8,
+        help="JSON indentation (0 = single-line). Default 2.",
+    ),
+    title: Optional[str] = typer.Option(
+        None,
+        "--title",
+        help="Override the spec title (default: pulled from FastAPI app).",
+    ),
+) -> None:
+    """Dump the FastAPI OpenAPI spec to JSON.
+
+    Produces the ``mnemos-openapi.json`` artifact described in
+    ROADMAP.md (v4.1 connector deliverable). Useful for OpenAPI-
+    aware clients (Custom GPTs, OpenAI Actions bridges, Cursor's
+    HTTP MCP, ChatGPT Pro Developer Mode connectors) that need the
+    spec without booting the server. Operators with a running
+    server can also ``curl http://<host>:5002/openapi.json``; this
+    CLI is the build-time / CI path that produces the static
+    artifact.
+
+    Examples:
+
+      mnemos dump-openapi
+      mnemos dump-openapi --output mnemos-openapi.json
+      mnemos dump-openapi --indent 0 -o /tmp/spec.min.json
+    """
+    import json
+    import sys
+
+    # Lazy import — building the FastAPI app pulls in lifecycle
+    # plumbing we don't want at module-load time.
+    from mnemos.api.main import app as fastapi_app
+
+    spec = fastapi_app.openapi()
+    if title:
+        spec.setdefault("info", {})["title"] = title
+
+    rendered = json.dumps(spec, indent=indent if indent > 0 else None, sort_keys=False)
+
+    if output is None or output == "-":
+        sys.stdout.write(rendered)
+        if not rendered.endswith("\n"):
+            sys.stdout.write("\n")
+        return
+
+    with open(output, "w", encoding="utf-8") as handle:
+        handle.write(rendered)
+        if not rendered.endswith("\n"):
+            handle.write("\n")
+    typer.echo(f"OpenAPI spec written to {output}")
+
+
 app.add_typer(serve_app, name="serve")
 app.add_typer(worker_app, name="worker")
 

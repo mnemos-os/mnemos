@@ -226,7 +226,7 @@ v4.1 work.
 Deliverables:
 - ✅ Initial `docs/connectors/` directory exists with ChatGPT Pro Developer Mode guidance.
 - 🔵 v4.1: one Markdown per surface with exact config snippets.
-- 🔵 v4.1: `mnemos-openapi.json` artifact for Custom GPTs and OpenAPI-aware clients.
+- ✅ v4.1: `mnemos-openapi.json` artifact for Custom GPTs and OpenAPI-aware clients — landed v4.2.0a14 round-36 as the new ``mnemos dump-openapi [-o PATH] [--indent N] [--title TITLE]`` CLI command. Builds the FastAPI OpenAPI spec without booting the server; suitable for CI / static-distribution workflows. Operators with a running server can also continue to ``curl /openapi.json``.
 - 🔵 v4.1: Gemini and OpenAI Actions bridge packages if demand holds.
 - 🔵 v4.1: smoke tests per surface where automatable.
 
