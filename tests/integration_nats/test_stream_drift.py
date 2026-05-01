@@ -103,20 +103,24 @@ async def test_redeclare_with_drift_raises_and_keeps_old_config(
     # ALL THREE retention dimensions must be unchanged after the
     # rejected redeclare. A drift in one field that was silently
     # accepted would otherwise pass a one-field check.
+    #
+    # Units: nats-py 2.14's StreamConfig.from_response converts
+    # JetStream's nanosecond wire values back to SECONDS (as float)
+    # for max_age and duplicate_window. So stream_info reads back
+    # in the same units add_stream accepted. Use pytest.approx to
+    # tolerate float-rep round-trip.
     info = await js.stream_info(name)
     assert info.config.max_bytes == base_max_bytes, (
         f"drift in {drift_field}: max_bytes mutated from "
         f"{base_max_bytes} to {info.config.max_bytes}"
     )
-    assert info.config.max_age == base_max_age * 1_000_000_000, (
-        f"drift in {drift_field}: max_age mutated"
+    assert info.config.max_age == pytest.approx(base_max_age), (
+        f"drift in {drift_field}: max_age mutated from "
+        f"{base_max_age} to {info.config.max_age}"
     )
-    # Note: nats-py serializes max_age/duplicate_window in
-    # nanoseconds on the wire; the stream_info comes back in
-    # nanoseconds as well, hence the *1e9 here. add_stream
-    # accepts seconds.
-    assert info.config.duplicate_window == base_duplicate_window * 1_000_000_000, (
-        f"drift in {drift_field}: duplicate_window mutated"
+    assert info.config.duplicate_window == pytest.approx(base_duplicate_window), (
+        f"drift in {drift_field}: duplicate_window mutated from "
+        f"{base_duplicate_window} to {info.config.duplicate_window}"
     )
 
 
