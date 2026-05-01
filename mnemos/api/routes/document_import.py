@@ -186,11 +186,25 @@ async def import_memories_from_document(
     subcategory: Optional[str] = Form(None),
     permission_mode: Optional[int] = Form(None),
     user: UserContext = Depends(get_current_user),
-) -> Dict[str, Any]:
+) -> Tuple[Dict[str, Any], int]:
     """Import document into MNEMOS as memory records.
 
     Creates one memory per document chunk with automatic metadata extraction.
     Requires docling extra: pip install mnemos-os[docling]
+
+    Returns ``(payload, status_code)`` where ``status_code`` is:
+      * 200 — every chunk committed.
+      * 207 — partial: some committed, some rolled back. ``errors``
+        list itemises the failed chunks.
+      * 502 — total: zero chunks committed.
+
+    Returning a tuple instead of a Response keeps the helper
+    sharable between the single-file ``/import`` route (which
+    wraps in JSONResponse) and the multi-file ``/batch-import``
+    route (which appends ``{**payload, "status_code": ...}`` per
+    file). Codex round-2 of round-47 caught that the previous
+    JSONResponse return leaked Response internals into the batch
+    response shape.
     """
     perm_mode = _validate_permission_mode(permission_mode, default=600)
 
@@ -330,24 +344,19 @@ async def import_memories_from_document(
         "metadata": doc_metadata,
         "total_text_length": len(full_text),
     }
-    # Status-code contract (round-48 / codex round-1 follow-up):
+    # Status-code contract:
     #   * All chunks committed → 200 OK.
     #   * Some chunks committed, some rolled back → 207 Multi-Status.
-    #     Round-47 made the per-chunk INSERT atomic with the
-    #     webhook outbox row, so a webhook-table failure rolls the
-    #     memory back too. Returning 200 hid that from clients
-    #     that only check HTTP status; 207 surfaces the
-    #     partial-success state and the ``errors`` list still
-    #     itemises which chunks failed. Codex round-1 of round-47
-    #     caught this hide.
-    #   * Zero chunks committed (all rolled back) → 502 Bad
-    #     Gateway. The whole document import effectively failed;
-    #     the ``errors`` field carries the per-chunk reasons.
+    #   * Zero chunks committed → 502 Bad Gateway.
+    # Helper returns ``(payload, status_code)``. Caller routes
+    # decide how to surface — single-file /import wraps in
+    # JSONResponse, multi-file /batch-import folds status_code
+    # into each per-file dict.
     if errors and not memory_ids:
-        return JSONResponse(status_code=502, content=payload)
+        return payload, 502
     if errors:
-        return JSONResponse(status_code=207, content=payload)
-    return payload
+        return payload, 207
+    return payload, 200
 
 
 # Route: POST /v1/documents/import
@@ -373,9 +382,12 @@ async def import_document(
         total_text_length: total character count
     }
     """
-    return await import_memories_from_document(
+    payload, status_code = await import_memories_from_document(
         file, category, subcategory, permission_mode, user
     )
+    if status_code == 200:
+        return payload
+    return JSONResponse(status_code=status_code, content=payload)
 
 
 # Route: POST /v1/documents/batch-import
@@ -395,20 +407,41 @@ async def batch_import_documents(
     # below would swallow the 422 into a per-file error result.
     _validate_permission_mode(permission_mode, default=600)
     results = []
+    has_partial_or_full_failure = False
     for file in files:
         try:
-            result = await import_memories_from_document(
+            payload, status_code = await import_memories_from_document(
                 file,
                 category=category,
                 subcategory=None,
                 permission_mode=permission_mode,
                 user=user,
             )
-            results.append(result)
+            # Fold the per-file status_code into the result dict
+            # so batch clients can distinguish per-file 200 / 207
+            # / 502 without inspecting Response internals.
+            entry = {**payload, "status_code": status_code}
+            results.append(entry)
+            if status_code != 200:
+                has_partial_or_full_failure = True
         except HTTPException as e:
             results.append({
                 "source_file": file.filename,
                 "error": e.detail,
                 "memories_created": 0,
+                "status_code": e.status_code,
             })
+            has_partial_or_full_failure = True
+    # Top-level batch HTTP status mirrors the single-file rules:
+    # 200 if every file fully imported, 207 if any file had any
+    # failure (partial or full). 502 reserved for the unusual
+    # "every file totally failed" case.
+    if has_partial_or_full_failure:
+        all_zero = all(
+            r.get("memories_created", 0) == 0 for r in results
+        )
+        return JSONResponse(
+            status_code=502 if all_zero else 207,
+            content=results,
+        )
     return results
