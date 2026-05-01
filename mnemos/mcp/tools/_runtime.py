@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import contextvars
+import re
+import urllib.parse
 from typing import Any
 
 import httpx
@@ -57,6 +59,41 @@ def _backend_headers() -> dict[str, str]:
     if user_id:
         headers["X-MNEMOS-User-Id"] = user_id
     return headers
+
+
+_PATH_SEGMENT_PATTERN = re.compile(r"\A[A-Za-z0-9_-]{1,128}\Z")
+
+
+def _safe_path_segment(value: object, *, label: str = "id") -> str:
+    """Validate + URL-encode an identifier before splicing it into a
+    REST path.
+
+    MCP tools interpolate caller-controlled values such as
+    ``memory_id`` and ``commit_hash`` into ``/v1/memories/{id}`` /
+    ``/v1/memories/{id}/commits/{hash}`` URLs. Without validation, a
+    value like ``../../admin`` lets ``httpx`` normalise dot segments
+    out of the path entirely, so the request escapes the
+    ``/v1/memories`` prefix and reaches other same-origin endpoints.
+    With the new ``_rest_get_text`` helper returning raw response
+    bodies, that path-traversal is a real exfiltration vector for
+    any text endpoint (e.g. ``/metrics``).
+
+    Defense in depth:
+      1. Type-check + length-bound + character whitelist
+         ``[A-Za-z0-9_-]`` — rejects ``/``, ``\\``, ``.``, ``?``,
+         ``#`` and every other character that could split or rewrite
+         the URL on the server side.
+      2. Belt-and-braces URL-encode with ``safe=""`` so even if a
+         future ID format adds new characters, they're guaranteed
+         to land inside the path segment they were spliced into.
+    """
+    if not isinstance(value, str):
+        raise ValueError(f"{label} must be a string, got {type(value).__name__}")
+    if not _PATH_SEGMENT_PATTERN.match(value):
+        raise ValueError(
+            f"{label} must match {_PATH_SEGMENT_PATTERN.pattern} — got {value!r}"
+        )
+    return urllib.parse.quote(value, safe="")
 
 
 async def _rest_get(path: str, params: dict[str, Any] | None = None) -> Any:

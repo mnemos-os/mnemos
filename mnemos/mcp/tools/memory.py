@@ -7,7 +7,14 @@ from typing import Any
 
 from mnemos.core.auth_context import UserContext
 
-from ._runtime import _rest_delete, _rest_get, _rest_get_text, _rest_post, _tool
+from ._runtime import (
+    _rest_delete,
+    _rest_get,
+    _rest_get_text,
+    _rest_post,
+    _safe_path_segment,
+    _tool,
+)
 
 
 def _connector_namespace() -> str | None:
@@ -83,7 +90,8 @@ async def tool_update_memory(
     }.items():
         if value is not None:
             body[key] = value
-    return await _rest_post(f"/v1/memories/{memory_id}", body, method="PATCH")
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    return await _rest_post(f"/v1/memories/{safe_id}", body, method="PATCH")
 
 
 async def tool_get_memory(
@@ -109,8 +117,9 @@ async def tool_get_memory(
     envelope when ``format`` is set, so MCP clients always receive
     a structured response regardless of the body type underneath.
     """
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
     if format is None:
-        return await _rest_get(f"/v1/memories/{memory_id}")
+        return await _rest_get(f"/v1/memories/{safe_id}")
     accept_map = {
         "prose": "text/plain",
         "dense": "application/x-apollo-dense",
@@ -120,7 +129,7 @@ async def tool_get_memory(
             f"format must be 'prose' or 'dense', got {format!r}"
         )
     body = await _rest_get_text(
-        f"/v1/memories/{memory_id}", accept=accept_map[format],
+        f"/v1/memories/{safe_id}", accept=accept_map[format],
     )
     return {
         "memory_id": memory_id,
@@ -154,7 +163,8 @@ async def tool_delete_memory(
     memory_id: str,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
-    status = await _rest_delete(f"/v1/memories/{memory_id}")
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    status = await _rest_delete(f"/v1/memories/{safe_id}")
     return {"deleted": True, "status": status}
 
 

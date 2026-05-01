@@ -10,7 +10,14 @@ import mnemos.core.lifecycle as _lc
 from mnemos.core.auth_context import UserContext
 from mnemos.db import mcp_repo
 
-from ._runtime import _mcp_assert_memory_readable, _mcp_user_required, _rest_get, _rest_post, _tool
+from ._runtime import (
+    _mcp_assert_memory_readable,
+    _mcp_user_required,
+    _rest_get,
+    _rest_post,
+    _safe_path_segment,
+    _tool,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -23,8 +30,9 @@ async def tool_log_memory(
 ) -> dict[str, Any]:
     """Walk commit DAG from branch HEAD to root."""
     if user is None:
+        safe_id = _safe_path_segment(memory_id, label="memory_id")
         commits = await _rest_get(
-            f"/v1/memories/{memory_id}/log",
+            f"/v1/memories/{safe_id}/log",
             params={"branch": branch, "limit": limit},
         )
         return {
@@ -96,7 +104,8 @@ async def tool_branch_memory(
         body: dict[str, Any] = {"name": name}
         if from_commit:
             body["from_commit"] = from_commit
-        branch_info = await _rest_post(f"/v1/memories/{memory_id}/branch", body)
+        safe_id = _safe_path_segment(memory_id, label="memory_id")
+        branch_info = await _rest_post(f"/v1/memories/{safe_id}/branch", body)
         return {
             "success": True,
             "memory_id": memory_id,
@@ -131,8 +140,11 @@ async def tool_diff_memory_commits(
 ) -> dict[str, Any]:
     """Generate unified diff between two commits."""
     if user is None:
-        commit_a_row = await _rest_get(f"/v1/memories/{memory_id}/commits/{commit_a}")
-        commit_b_row = await _rest_get(f"/v1/memories/{memory_id}/commits/{commit_b}")
+        safe_id = _safe_path_segment(memory_id, label="memory_id")
+        safe_a = _safe_path_segment(commit_a, label="commit_a")
+        safe_b = _safe_path_segment(commit_b, label="commit_b")
+        commit_a_row = await _rest_get(f"/v1/memories/{safe_id}/commits/{safe_a}")
+        commit_b_row = await _rest_get(f"/v1/memories/{safe_id}/commits/{safe_b}")
         diff = difflib.unified_diff(
             commit_a_row["content"].splitlines(keepends=True),
             commit_b_row["content"].splitlines(keepends=True),
@@ -202,7 +214,9 @@ async def tool_checkout_memory(
 ) -> dict[str, Any]:
     """Fetch commit content and metadata by hash."""
     if user is None:
-        row = await _rest_get(f"/v1/memories/{memory_id}/commits/{commit_hash}")
+        safe_id = _safe_path_segment(memory_id, label="memory_id")
+        safe_hash = _safe_path_segment(commit_hash, label="commit_hash")
+        row = await _rest_get(f"/v1/memories/{safe_id}/commits/{safe_hash}")
         return {
             "success": True,
             "memory_id": memory_id,
