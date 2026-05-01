@@ -228,23 +228,56 @@ def _scan_for_broken_set_local(text: str, path: object) -> list[tuple[int, str]]
         if pattern.search(value):
             findings.append((lineno, value))
 
+    def _flatten_joined_str(node: ast.JoinedStr) -> str:
+        """Reconstruct a conservative template for an f-string.
+
+        Each ``FormattedValue`` becomes the placeholder ``\\S+`` so
+        the regex still matches when the SQL is split by an
+        interpolation: ``f"SET LOCAL {setting} = $1"`` flattens to
+        ``"SET LOCAL \\S+ = $1"`` which trips the same broken-shape
+        detector that catches the literal form. Codex round-7
+        (review-momsb4fe-2simsa) flagged that without this, the
+        scanner missed the f-string-interpolated bypass.
+        """
+        parts: list[str] = []
+        for sub in node.values:
+            if isinstance(sub, ast.Constant) and isinstance(sub.value, str):
+                parts.append(sub.value)
+            else:
+                # FormattedValue (or anything else) — stand-in
+                # token that the regex's \S+ will match.
+                parts.append(r"<INTERPOLATED>")
+        return "".join(parts)
+
+    # Track JoinedStr ids we've already flattened so the inner
+    # ast.walk traversal doesn't ALSO re-check the inner Constant
+    # parts of the same f-string against the literal pattern (those
+    # parts can't carry the full SQL on their own; the flatten
+    # already covered them).
+    flattened_joined_str_ids: set[int] = set()
     for node in ast.walk(tree):
-        # Plain string literals: ast.Constant(value=str). Covers
-        # 'single', "double", '''triple''', """triple""", and
-        # raw-prefix variants since the parsed value is a str
-        # regardless of quoting.
-        if isinstance(node, ast.Constant) and isinstance(node.value, str):
-            _check(node.value, getattr(node, "lineno", 0))
-            continue
-        # f-strings (PEP 498): JoinedStr.values is a list of
-        # FormattedValue + Constant(str) parts. Static literal
-        # segments are Constant nodes with str values; we only
-        # care about those, since interpolated expressions can't
-        # be statically known anyway.
         if isinstance(node, ast.JoinedStr):
-            for part in node.values:
-                if isinstance(part, ast.Constant) and isinstance(part.value, str):
-                    _check(part.value, getattr(node, "lineno", 0))
+            flattened_joined_str_ids.add(id(node))
+            _check(
+                _flatten_joined_str(node),
+                getattr(node, "lineno", 0),
+            )
+
+    # Now walk Constant nodes — but skip those that are the inner
+    # parts of an already-flattened f-string. ast doesn't give us a
+    # direct parent pointer, so we re-walk and use the parent map
+    # built lazily.
+    parent_map: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parent_map[id(child)] = parent
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            parent = parent_map.get(id(node))
+            if parent is not None and id(parent) in flattened_joined_str_ids:
+                continue
+            _check(node.value, getattr(node, "lineno", 0))
     return findings
 
 
@@ -295,6 +328,13 @@ async def test_no_remaining_set_local_with_bind_in_codebase():
         'SQL = "  SET LOCAL mnemos.current_user_id  = $1"',
         # f-string with literal SQL prefix
         'SQL = f"SET LOCAL mnemos.current_user_id = $1 -- {note}"',
+        # f-string with INTERPOLATED setting name in the middle
+        # (the bypass codex round-7 caught — flatten covers it).
+        'SQL = f"SET LOCAL {setting_name} = $1"',
+        # f-string with interpolated namespace fragment.
+        'SQL = f"SET LOCAL mnemos.{setting} = $1"',
+        # Two interpolated parts in the name; literal bind.
+        'SQL = f"SET LOCAL {ns}.{name} = $1"',
     ],
 )
 def test_scanner_catches_broken_shape(snippet):
