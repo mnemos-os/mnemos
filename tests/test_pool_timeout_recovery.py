@@ -706,6 +706,123 @@ async def test_infra_during_content_error_fallback_resets_tail(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_tail_reset_acquire_failure_still_propagates(monkeypatch):
+    """Codex round-7 of round-34: when the tail-reset acquire ITSELF
+    times out (truly-wedged-pool case), _reset_rows_for_infra_retry
+    swallows the error and logs. The original infra exception still
+    propagates so the worker loop's reconnect path fires. The
+    rows are left at 'running' with attempts bumped — this case is
+    backstopped by the round-35 stale-sweep heuristic (rows with
+    no content-error breadcrumb and attempts >= max_attempts get
+    decremented + reset to pending instead of terminalized)."""
+    from mnemos.domain.compression import worker_contest
+
+    async def _fake_process_one(*args, **kwargs):
+        raise asyncio.TimeoutError("simulated post-dequeue timeout")
+
+    monkeypatch.setattr(
+        worker_contest, "_process_one", _fake_process_one,
+    )
+
+    fake_rows = [
+        {
+            "id": "queue-0",
+            "memory_id": "mem_0",
+            "owner_id": "alice",
+            "scoring_profile": "default",
+            "attempts": 1,
+        },
+    ]
+
+    acquire_count = {"n": 0}
+    executes: list[tuple] = []
+
+    class _Tx:
+        async def __aenter__(self_):
+            return None
+
+        async def __aexit__(self_, *args):
+            return None
+
+    async def _dequeue_fetch(sql, *args):
+        return fake_rows
+
+    async def _record_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    _conn_dequeue = MagicMock()
+    _conn_dequeue.fetch = _dequeue_fetch
+    _conn_dequeue.execute = _record_execute
+    _conn_dequeue.fetchrow = MagicMock()
+    _conn_dequeue.transaction = lambda *a, **kw: _Tx()
+
+    class _DequeueCtx:
+        async def __aenter__(self_):
+            return _conn_dequeue
+
+        async def __aexit__(self_, *args):
+            return None
+
+    class _TimeoutCtx:
+        async def __aenter__(self_):
+            raise asyncio.TimeoutError("tail-reset acquire timed out")
+
+        async def __aexit__(self_, *args):
+            return None
+
+    def _acquire():
+        acquire_count["n"] += 1
+        if acquire_count["n"] == 1:
+            return _DequeueCtx()
+        # Every subsequent acquire (including the tail reset) times out.
+        return _TimeoutCtx()
+
+    pool = MagicMock()
+    pool.acquire = _acquire
+
+    # The original infra error from _process_one still propagates,
+    # even though the reset acquire ALSO failed.
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest.process_contest_queue(
+            pool,
+            engines=[],
+            batch_size=1,
+            max_attempts=3,
+            stale_threshold_secs=0,
+        )
+
+    # No reset SQL was actually written (the acquire failed before
+    # any execute). The row is in the inferable state: 'running',
+    # attempts bumped, no error breadcrumb. Round-35's stale-sweep
+    # heuristic backstops this — see test_sweep_does_not_terminalize_*.
+    reset_executes = [
+        (sql, _) for sql, _ in executes
+        if "ANY(" in sql and "memory_compression_queue" in sql
+    ]
+    assert reset_executes == []
+
+
+def test_sweep_sql_protects_infra_stranded_rows():
+    """Static check that the stale-sweep SQL has the round-35
+    classification: only rows with a recorded content-error
+    breadcrumb (error IS NOT NULL AND error NOT LIKE
+    'infra_retry:%') terminalize on attempts >= max_attempts.
+    Codex round-7 asked for stale-recovery to decrement / ignore
+    attempts for rows known to be stranded by infra (no breadcrumb)."""
+    from mnemos.domain.compression.worker_contest import _SWEEP_STALE_SQL
+
+    # The classification CTE distinguishes terminalize vs not
+    assert "terminalize" in _SWEEP_STALE_SQL.lower()
+    assert "infra_retry:" in _SWEEP_STALE_SQL
+    # Decrement clause for the non-terminal stranded case
+    assert "GREATEST" in _SWEEP_STALE_SQL
+    # Guard: rows without a recorded error column DON'T terminalize
+    assert "error IS NOT NULL" in _SWEEP_STALE_SQL
+    assert "error NOT LIKE 'infra_retry:%'" in _SWEEP_STALE_SQL
+
+
+@pytest.mark.asyncio
 async def test_repeated_infra_errors_do_not_consume_attempts_budget(monkeypatch):
     """Codex round-4 of round-30 caught: even with the round-30
     fix, repeated infra errors would let attempts climb on each

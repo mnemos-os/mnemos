@@ -134,35 +134,72 @@ WHERE id = $1
 """
 
 # $1 = stale_threshold_secs, $2 = max_attempts.
-# Reclaims rows stuck in 'running' past the threshold. Attempts-below-max
-# go back to 'pending' (dequeue will pick them up next); attempts-at-or-
-# above-max get terminal 'failed'. SKIP LOCKED avoids touching a row
-# that a worker currently holds a row lock on (i.e. inside its persist
-# transaction — see `_PRECONDITION_SQL` in _process_one).
+# Reclaims rows stuck in 'running' past the threshold.
 #
-# `started_at IS NULL` rows with status='running' aren't produced by the
-# current happy path (dequeue sets both atomically) but treat them as
-# stale by default so corrupt/manual rows don't become permanent debt.
+# Terminalization rules:
+#   * attempts < max_attempts → reset to 'pending' (next dequeue picks
+#     it up) regardless of error column.
+#   * attempts >= max_attempts AND error column shows a recorded
+#     content / contest failure (NOT NULL and not the
+#     ``infra_retry:`` breadcrumb pattern) → mark 'failed'.
+#   * attempts >= max_attempts but error is NULL or starts with
+#     ``infra_retry:`` → reset to 'pending' AND decrement attempts.
+#     This is the truly-wedged-pool path codex round-7 of round-28
+#     caught: when an infra-error tail-reset acquire ALSO times out,
+#     the row stays at 'running' with attempts bumped and no
+#     breadcrumb. Without this clause the stale sweep eventually
+#     terminalizes a content-OK row purely from infrastructure
+#     pressure. With it, only rows that ACTUALLY had a content
+#     failure recorded reach 'failed'.
+#
+# SKIP LOCKED avoids touching a row that a worker currently holds a
+# row lock on (i.e. inside its persist transaction — see
+# `_PRECONDITION_SQL` in _process_one). `started_at IS NULL` rows
+# with status='running' aren't produced by the current happy path
+# (dequeue sets both atomically) but treat them as stale by default
+# so corrupt/manual rows don't become permanent debt.
 _SWEEP_STALE_SQL = """
 WITH stale AS (
-    SELECT id, attempts
+    SELECT id, attempts, error
     FROM memory_compression_queue
     WHERE status = 'running'
       AND (started_at IS NULL
            OR started_at < NOW() - ($1::int * INTERVAL '1 second'))
     FOR UPDATE SKIP LOCKED
+), classified AS (
+    SELECT id,
+           attempts,
+           error,
+           (attempts >= $2
+            AND error IS NOT NULL
+            AND error NOT LIKE 'infra_retry:%'
+           ) AS terminalize
+    FROM stale
 )
 UPDATE memory_compression_queue q
-SET status      = CASE WHEN stale.attempts >= $2 THEN 'failed' ELSE 'pending' END,
-    started_at  = CASE WHEN stale.attempts >= $2 THEN q.started_at ELSE NULL END,
-    finished_at = CASE WHEN stale.attempts >= $2 THEN NOW()     ELSE NULL END,
-    error       = CASE WHEN stale.attempts >= $2
-                       THEN 'stranded_running: exceeded stale threshold after '
-                            || stale.attempts || ' attempts'
-                       ELSE NULL END
-FROM stale
-WHERE q.id = stale.id
-RETURNING q.id, q.status, stale.attempts
+SET status      = CASE WHEN c.terminalize THEN 'failed' ELSE 'pending' END,
+    started_at  = CASE WHEN c.terminalize THEN q.started_at ELSE NULL END,
+    finished_at = CASE WHEN c.terminalize THEN NOW()        ELSE NULL END,
+    -- Only decrement attempts for the non-terminal infra-stranded
+    -- case (attempts >= max_attempts without a content-error
+    -- breadcrumb). Below-max stranded rows keep their attempts
+    -- count so genuine retries still observe the budget.
+    attempts    = CASE
+                    WHEN c.terminalize THEN q.attempts
+                    WHEN c.attempts >= $2 THEN GREATEST(c.attempts - 1, 0)
+                    ELSE q.attempts
+                  END,
+    error       = CASE
+                    WHEN c.terminalize
+                      THEN 'stranded_running: exceeded stale threshold after '
+                           || c.attempts || ' attempts'
+                    WHEN c.attempts >= $2
+                      THEN 'infra_retry: stale-recovered without content-failure breadcrumb'
+                    ELSE NULL
+                  END
+FROM classified c
+WHERE q.id = c.id
+RETURNING q.id, q.status, c.attempts
 """
 
 # Precondition check run at the start of _process_one's persist
