@@ -703,34 +703,49 @@ async def _store_memories(
                                     "_metadata_truncated": True})
 
         if existing is None:
-            await conn.execute(
-                """
-                INSERT INTO memories
-                  (id, content, category, subcategory, metadata, verbatim_content,
-                   quality_rating, owner_id, namespace, permission_mode,
-                   source_model, source_provider, source_session, source_agent,
-                   federation_source, federation_remote_updated, created, updated)
-                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'federation', $8, 644,
-                        $9, $10, $11, $12, $13, $14::timestamptz, NOW(),
-                        ($14::timestamptz AT TIME ZONE 'UTC'))
-                """,
-                local_id,
-                content,
-                category,
-                subcategory,
-                meta_json,
-                verbatim,
-                mem.get("quality_rating") or 75,
-                namespace,
-                mem.get("source_model"),
-                mem.get("source_provider"),
-                mem.get("source_session"),
-                mem.get("source_agent"),
-                peer_name,
-                remote_updated,
-            )
-            new_n += 1
-        else:
+            try:
+                await conn.execute(
+                    """
+                    INSERT INTO memories
+                      (id, content, category, subcategory, metadata, verbatim_content,
+                       quality_rating, owner_id, namespace, permission_mode,
+                       source_model, source_provider, source_session, source_agent,
+                       federation_source, federation_remote_updated, created, updated)
+                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'federation', $8, 644,
+                            $9, $10, $11, $12, $13, $14::timestamptz, NOW(),
+                            ($14::timestamptz AT TIME ZONE 'UTC'))
+                    """,
+                    local_id,
+                    content,
+                    category,
+                    subcategory,
+                    meta_json,
+                    verbatim,
+                    mem.get("quality_rating") or 75,
+                    namespace,
+                    mem.get("source_model"),
+                    mem.get("source_provider"),
+                    mem.get("source_session"),
+                    mem.get("source_agent"),
+                    peer_name,
+                    remote_updated,
+                )
+                new_n += 1
+            except asyncpg.UniqueViolationError:
+                # Concurrent INSERT from another federation consumer
+                # (the partial-fleet rollout window with queue-mode +
+                # legacy durables is the canonical trigger; both
+                # consumers see the same event, both pass the SELECT,
+                # both attempt INSERT, only one wins). Re-fetch and
+                # fall through to the update-when-newer branch so the
+                # losing path still applies a delta if its remote_updated
+                # is the freshest.
+                existing = await conn.fetchrow(
+                    "SELECT federation_remote_updated FROM memories WHERE id = $1",
+                    local_id,
+                )
+
+        if existing is not None:
             # Only update if the remote is newer.
             if (
                 existing["federation_remote_updated"] is None

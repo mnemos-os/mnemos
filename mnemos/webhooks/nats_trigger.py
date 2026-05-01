@@ -259,10 +259,20 @@ def _queue_durable_name(queue_group: str) -> str:
     Distinct namespace from :func:`_node_durable` so legacy per-node
     durables and queue-mode shared durables can coexist on the same
     broker during a partial-fleet rollout.
+
+    Includes a 12-char SHA-256 hash of the queue_group so two distinct
+    groups can never collide even if their readable prefixes overlap
+    after truncation. JetStream's 128-char durable cap is plenty here
+    (the bare DURABLE prefix is 31 chars + ``_q_`` + group up to 32 +
+    hash) but the same defensive shape matches the federation side
+    and protects against future prefix expansion.
     """
+    import hashlib
     import re
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")
-    return f"{DURABLE}_q_{safe}"
+
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")[:32]
+    digest = hashlib.sha256(queue_group.encode("utf-8")).hexdigest()[:12]
+    return f"{DURABLE}_q_{safe}_{digest}"
 
 
 async def _subscribe(js: Any, *, queue_group: str = ""):

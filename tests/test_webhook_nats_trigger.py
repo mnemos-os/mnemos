@@ -165,25 +165,39 @@ async def test_subscribe_with_queue_group_uses_shared_durable():
     ``D == Q``. And the consumer ``deliver_group`` must match the
     subscriber's queue. So all three end up the same string.
 
-    Distinct ``_q_<group>`` namespace from the legacy per-node
-    durable shape so legacy and queue-mode replicas can coexist on
-    the same broker without consumer-config collision."""
+    Round-3: durable carries a 12-char SHA-256 hash suffix for
+    collision-resistance with long group names. Distinct ``_q_``
+    namespace prefix isolates from legacy per-node durables."""
     js = _FakeJetStream()
 
     await trigger._subscribe(js, queue_group="webhook_pool")
 
     subject, kwargs = js.subscribe_calls[0]
     assert subject == "mnemos.webhook.delivery.queued.>"
-    expected_durable = "mnemos_webhook_delivery_trigger_q_webhook_pool"
+    expected_durable = trigger._queue_durable_name("webhook_pool")
     assert kwargs["durable"] == expected_durable
     assert kwargs["queue"] == expected_durable, (
         "nats-py requires queue == durable for queue-mode subscribe"
     )
-    # Distinct namespace from per-node legacy.
-    assert "_q_" in expected_durable
+    # Distinct namespace from per-node legacy + hash suffix.
+    assert expected_durable.startswith("mnemos_webhook_delivery_trigger_q_webhook_pool_")
+    assert len(expected_durable.rsplit("_", 1)[-1]) == 12  # 12-char hash
     config_obj = kwargs["config"]
     assert config_obj is not None
     assert getattr(config_obj, "deliver_group", None) == expected_durable
+
+
+async def test_webhook_queue_durable_name_collision_resistant():
+    """v4.2.0a8 round-3: distinct queue groups must never produce
+    the same durable name, even after readable-prefix truncation."""
+    a = trigger._queue_durable_name("group_a")
+    b = trigger._queue_durable_name("group_b")
+    assert a != b
+    # Both bounded under 128 chars (NATS durable cap).
+    assert len(a) <= 128
+    assert len(b) <= 128
+    # Not collide with legacy per-node durable namespace.
+    assert "_q_" in a
 
 
 async def test_transient_handle_error_is_not_acked(monkeypatch):

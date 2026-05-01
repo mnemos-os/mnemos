@@ -563,10 +563,33 @@ def _queue_durable_name(queue_group: str, peer_name: str, subject: str) -> str:
     Distinct namespace from :func:`_durable_name` so legacy single-
     replica durables and queue-mode durables can coexist on the same
     broker during a partial-fleet rollout.
+
+    JetStream durable names are bounded at 128 chars; long
+    ``queue_group`` + ``peer_name`` + ``subject`` combinations could
+    push past that in a naive concat. The readable parts get capped,
+    and a 12-char SHA-256 hash of the FULL untruncated triple is
+    appended — two distinct triples can never share a durable, even
+    if their readable prefixes are identical.
     """
-    group_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")
-    rest = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{peer_name}_{subject}").strip("_")
-    return f"mnemos_federation_q_{group_safe}_{rest}"[:128]
+    import hashlib
+
+    group_safe = re.sub(r"[^A-Za-z0-9_-]+", "_", queue_group).strip("_")[:32]
+    rest = re.sub(r"[^A-Za-z0-9_-]+", "_", f"{peer_name}_{subject}").strip("_")[:48]
+    digest = hashlib.sha256(
+        f"{queue_group}|{peer_name}|{subject}".encode("utf-8")
+    ).hexdigest()[:12]
+    name = f"mnemos_federation_q_{group_safe}_{rest}_{digest}"
+    if len(name) > 128:
+        # Worst case: somebody passes pathological input. Always
+        # preserve the leading namespace and the trailing hash; drop
+        # readable middle to fit. The hash is what makes the durable
+        # unique — readability is a debugging convenience.
+        prefix = "mnemos_federation_q_"
+        suffix = f"_{digest}"
+        room = 128 - len(prefix) - len(suffix)
+        middle = (group_safe + "_" + rest)[:room]
+        name = f"{prefix}{middle}{suffix}"
+    return name
 
 
 def _expand_subject(subject: str) -> tuple[str, ...]:

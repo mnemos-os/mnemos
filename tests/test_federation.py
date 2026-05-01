@@ -436,3 +436,75 @@ class TestFederationIntegration:
             assert row is not None, "migration not applied"
         finally:
             await conn.close()
+
+
+class TestStoreMemoriesConcurrency:
+    """v4.2.0a8 round-3: codex Finding 1 — concurrent INSERT race.
+
+    Two federation consumers can deliver the same created event during
+    the partial-fleet rollout window (legacy durable + queue-mode
+    durable both alive). Pre-fix, both would pass the SELECT, both
+    attempt INSERT, and the loser would raise UniqueViolationError
+    out of _store_memories — leaving the message unacked and forcing
+    JetStream to redeliver indefinitely.
+
+    Post-fix, the loser catches UniqueViolationError, re-fetches
+    existing, and falls through to the update-when-newer branch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_unique_violation_on_insert_falls_through_cleanly(self):
+        import asyncpg
+
+        from mnemos.domain.federation import _store_memories
+
+        # Hand-rolled fake connection that simulates the race:
+        #   - SELECT returns None (row not present at start of handler)
+        #   - INSERT raises UniqueViolationError (other consumer won)
+        #   - Re-fetch SELECT returns existing row with older
+        #     federation_remote_updated
+        #   - UPDATE succeeds (we're newer)
+        executes: list[tuple] = []
+        fetchrows: list[tuple] = []
+        select_results = [
+            None,  # initial check: no row
+            {"federation_remote_updated": datetime(2026, 5, 1, tzinfo=timezone.utc)},  # post-conflict refetch
+        ]
+
+        class _FakeConn:
+            async def fetchrow(self, sql, *args):
+                fetchrows.append((sql, args))
+                return select_results.pop(0)
+
+            async def execute(self, sql, *args):
+                executes.append((sql, args))
+                if sql.strip().startswith("INSERT"):
+                    raise asyncpg.UniqueViolationError(
+                        "duplicate key value violates unique constraint memories_pkey"
+                    )
+                return "UPDATE 1"
+
+        # Real feed rows ship ISO strings; _feed_row uses datetime
+        # objects for the feed-pagination tests. Build a payload that
+        # matches the on-the-wire format _store_memories actually parses.
+        feed = [{
+            "id": "mem_race",
+            "content": "content mem_race",
+            "category": "facts",
+            "verbatim_content": "content mem_race",
+            "namespace": "default",
+            "metadata": {"source": "test"},
+            "quality_rating": 75,
+            "updated": "2026-05-01T01:00:00Z",
+            "created": "2026-05-01T01:00:00Z",
+        }]
+
+        new_n, upd_n = await _store_memories(_FakeConn(), "pythia", feed)
+
+        assert new_n == 0, "INSERT lost the race; no row counted as new"
+        assert upd_n == 1, "post-conflict refetch + update-when-newer must apply"
+        # First execute call was the INSERT that raised; second was the UPDATE.
+        assert len(executes) == 2
+        assert executes[0][0].strip().startswith("INSERT")
+        assert executes[1][0].strip().startswith("UPDATE")
+        assert len(fetchrows) == 2  # initial check + post-conflict refetch

@@ -257,6 +257,44 @@ async def test_fake_jetstream_subscription_uses_deliver_policy_new_shape():
         assert getattr(config_obj, "deliver_group", None) is None
 
 
+async def test_queue_durable_name_distinct_namespace_from_legacy():
+    """Queue-mode durable lives in a separate namespace so legacy and
+    queue-mode consumers never collide on the same JetStream consumer
+    object during a partial-fleet rollout."""
+    legacy = consumer._durable_name("pythia", "mnemos.memory.created.>")
+    q1 = consumer._queue_durable_name("fed_pool", "pythia", "mnemos.memory.created.>")
+    assert legacy != q1
+    assert q1.startswith("mnemos_federation_q_fed_pool_")
+    assert not legacy.startswith("mnemos_federation_q_")
+
+
+async def test_queue_durable_name_collision_resistant_under_long_inputs():
+    """v4.2.0a8 round-3: codex Finding 2 — naive truncation could
+    cut the subject suffix off and merge created/updated/deleted
+    consumers for the same peer. Hash suffix preserves uniqueness
+    even when the readable middle gets truncated."""
+    long_group = "a_very_long_team_pool_for_demo_2026_q4_runtime"
+    long_peer = "us-west-2-prod-cluster-3-shard-pythia-tier-1"
+    d_created = consumer._queue_durable_name(long_group, long_peer, "mnemos.memory.created.>")
+    d_updated = consumer._queue_durable_name(long_group, long_peer, "mnemos.memory.updated.>")
+    d_deleted = consumer._queue_durable_name(long_group, long_peer, "mnemos.memory.deleted.>")
+
+    # All three subjects must produce DISTINCT durable names — even
+    # though the readable prefix overlaps heavily.
+    assert d_created != d_updated
+    assert d_updated != d_deleted
+    assert d_created != d_deleted
+
+    # All within the 128-char NATS durable cap.
+    assert len(d_created) <= 128
+    assert len(d_updated) <= 128
+    assert len(d_deleted) <= 128
+
+    # Distinct peers must also produce distinct durables.
+    other = consumer._queue_durable_name(long_group, "different-peer", "mnemos.memory.created.>")
+    assert d_created != other
+
+
 async def test_subscribe_with_queue_group_sets_queue_and_deliver_group():
     """v4.2.0a8: Audit Finding 5 — multi-replica federation receiver
     via JetStream queue-group sharding.

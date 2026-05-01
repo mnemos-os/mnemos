@@ -35,8 +35,11 @@ numpy>=1.26.0
 psutil>=5.9.0
 typer>=0.9.0
 
-# v4.2 NATS JetStream substrate (event bus, federation push, MCP push)
-nats-py>=2.6.0
+# v4.2 NATS JetStream substrate (event bus, federation push, MCP push).
+# v4.2.0a8+ queue-group support depends on nats-py 2.14+ subscribe
+# semantics (queue==durable enforcement). Older versions silently
+# accepted mismatched queue/durable values — keep the floor here.
+nats-py>=2.14.0
 
 # Optional: Intel OpenVINO / phi_server.py (local GPU inference)
 # Install on GPU systems only: pip install mnemos-os[phi]
