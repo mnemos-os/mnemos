@@ -76,6 +76,54 @@ async def _fetch_winning_variant(conn, memory_id: str) -> Optional[dict]:
     )
 
 
+async def build_narration_body(memory_row: dict, format: str) -> str:
+    """Build just the narrated body string from a pre-fetched memory row.
+
+    Used by ``GET /v1/memories/{id}`` content negotiation, where the
+    visibility-gated memory lookup is already done by the canonical
+    JSON path (``backend.memories.get_memory`` under
+    ``VisibilityFilter.for_read``). This helper does NOT re-check
+    tenancy — that is the caller's responsibility — and only fetches
+    the winning compressed variant before delegating to the same
+    prose / dense / passthrough branches as ``compute_narrate``.
+
+    ``memory_row`` must be a mapping that exposes ``id`` and
+    ``content`` keys (matches both the asyncpg Row shape and the
+    persistence backend's row shape). ``format`` must be
+    ``"prose"`` or ``"dense"``.
+
+    Returns the body string only — the caller wraps it in whichever
+    Response shape the chosen Accept media type requires. Raises
+    HTTPException(503) when the variant pool is unavailable; the
+    body is best-effort and will fall back to ``memory_row["content"]``
+    when no winning variant exists.
+    """
+    memory_id = memory_row["id"]
+    raw_content = memory_row.get("content") or ""
+
+    if not _lc._pool:
+        # The variant lookup needs the asyncpg pool. The memory row
+        # itself was already fetched through whichever backend the
+        # caller uses, so a missing pool here is a real config
+        # problem (503) rather than a graceful no-variant fall-back.
+        raise HTTPException(status_code=503, detail="Database pool not available")
+
+    async with _lc.get_pool_manager().acquire() as conn:
+        variant_row = await _fetch_winning_variant(conn, memory_id)
+
+    if format == "dense":
+        if variant_row is None:
+            return raw_content
+        return variant_row["compressed_content"] or ""
+
+    # Prose: APOLLO → narrate; non-APOLLO → passthrough; missing → raw.
+    if variant_row is None:
+        return raw_content
+    if variant_row["engine_id"] != "apollo":
+        return variant_row["compressed_content"] or ""
+    return narrate_encoded(variant_row["compressed_content"])
+
+
 # ── endpoint ──────────────────────────────────────────────────────────────
 
 

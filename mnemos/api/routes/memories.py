@@ -323,32 +323,16 @@ async def get_memory(
         variant content (APOLLO dense form), identical to
         ``?format=dense`` on the narrate endpoint.
 
-    Non-default Accept values still go through the same tenancy and
-    404 visibility checks as the JSON path; falling back to default
-    JSON when negotiation does not pick a non-default media type
-    keeps legacy clients unaffected.
+    All representations honour the same ``VisibilityFilter.for_read``
+    read contract — owner, federated, world-readable, and group-
+    readable memories are returned identically across Accept values,
+    so a memory the caller could read as JSON cannot 404 under
+    ``Accept: text/plain``. ``Vary: Accept`` is set on every
+    representation so caches keyed on URL alone never replay a JSON
+    body to a text/plain caller (or vice-versa).
     """
     accept = request.headers.get("accept", "") if request else ""
     narrate_format = negotiate_narrate_format(accept)
-    if narrate_format is not None:
-        # Lazy import keeps the route module's import surface stable
-        # even when narrate.py grows further deps over the v3.3 S-III
-        # cached-LLM cutover.
-        from mnemos.api.routes.narrate import compute_narrate
-
-        narrate_response = await compute_narrate(memory_id, user, narrate_format)
-        media_type = (
-            "text/plain"
-            if narrate_format == "prose"
-            else "application/x-apollo-dense"
-        )
-        return PlainTextResponse(
-            narrate_response.content,
-            media_type=media_type,
-            # Vary so caches do not serve a JSON body to a text/plain
-            # caller (and vice-versa).
-            headers={"Vary": "Accept"},
-        )
 
     backend = _backend_or_503()
     # Root callers see everything (namespace=None); non-root callers
@@ -365,7 +349,40 @@ async def get_memory(
         )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
-    return _row_to_memory(row, include_compressed=True)
+
+    # Vary: Accept on every successful representation. Unifies cache
+    # behaviour even when the negotiated branch was not taken (a
+    # JSON-first response cached without Vary could otherwise be
+    # replayed to a later text/plain caller). Setting on the JSONResponse
+    # path requires building it explicitly so the header is on the
+    # serialised response — relying on FastAPI's response_model would
+    # bypass our header injection.
+    if narrate_format is not None:
+        # Lazy import keeps the route module's import surface stable
+        # even when narrate.py grows further deps over the v3.3 S-III
+        # cached-LLM cutover.
+        from mnemos.api.routes.narrate import build_narration_body
+
+        body = await build_narration_body(row, narrate_format)
+        media_type = (
+            "text/plain"
+            if narrate_format == "prose"
+            else "application/x-apollo-dense"
+        )
+        return PlainTextResponse(
+            body,
+            media_type=media_type,
+            headers={"Vary": "Accept"},
+        )
+
+    from fastapi.encoders import jsonable_encoder
+    from fastapi.responses import JSONResponse
+
+    memory_item = _row_to_memory(row, include_compressed=True)
+    return JSONResponse(
+        content=jsonable_encoder(memory_item),
+        headers={"Vary": "Accept"},
+    )
 
 
 def _render_content_preview(content: Optional[str], include_content: bool) -> Optional[str]:
