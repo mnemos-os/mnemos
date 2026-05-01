@@ -56,19 +56,43 @@ What lands on each subject:
 
 | Subject family               | Payload                                                                                                        | Sensitivity |
 |------------------------------|----------------------------------------------------------------------------------------------------------------|-------------|
-| `mnemos.memory.created.*`    | Full memory body — `id`, `content`, `verbatim_content`, `category`, `metadata`, `owner_id`, `namespace`        | **HIGH**    |
-| `mnemos.memory.updated.*`    | Same shape as `created` (full body of the post-update row)                                                     | **HIGH**    |
-| `mnemos.memory.deleted.*`    | `id` + tombstone metadata only (no content)                                                                    | low         |
-| `mnemos.consultation.*`      | Consultation `id`, `prompt`, `task_type`, model selection, response excerpts                                   | medium-high |
-| `mnemos.webhook.*`           | Delivery `id`, `subscription_id`, `event_type`, target URL, payload hash (NOT the payload body)                | medium      |
-| MCP SSE summaries (`/sse`)   | Filtered subset by default: `subject`, `memory_id`, `namespace`, `category`, `source_node`. Full content only when `MNEMOS_MCP_NATS_RAW=true` | medium      |
+| `mnemos.memory.created.*`    | NUDGE only: `memory_id`, `namespace`, `category`, `source_node`. NO content body.                              | low-medium  |
+| `mnemos.memory.updated.*`    | Same shape as `created` — id + namespace + category + source_node, no body.                                    | low-medium  |
+| `mnemos.memory.deleted.*`    | `memory_id` + tombstone metadata.                                                                              | low         |
+| `mnemos.consultation.*`      | Consultation `id`, `task_type`, model selection. Prompt/response excerpts NOT published — backends fetch via `/v1/consultations/{id}` for the body. | low-medium |
+| `mnemos.webhook.*`           | Delivery `id`, `subscription_id`, `event_type`, target URL, payload hash. NOT the payload body.                | medium      |
+| MCP SSE summaries (`/sse`)   | Filtered subset by default: `subject`, `memory_id`, `namespace`, `category`, `source_node`. Full content only when `MNEMOS_MCP_NATS_RAW=true`. | medium |
 
-**Operator implication:** every NATS broker that receives
-``mnemos.memory.created.*`` or ``mnemos.memory.updated.*`` traffic
-holds a copy of every memory body that flowed through during the
-30-day retention window. Treat the broker's storage as authoritative-
-data-tier, not as a "cache". Encrypt at rest, restrict the
-filesystem, and back up alongside Postgres.
+**Architectural note — why no full content on the bus.** The
+shipped subjects are NUDGES, not content carriers. Federation push
+receivers receive the nudge, then fetch the content via the
+authorized HTTP federation feed (``GET
+/v1/federation/feed?since=...&memory_id=...``) which enforces
+per-peer ``namespace_filter`` / ``category_filter`` /
+``auth_token`` — the same authorization predicate as the HTTP-pull
+path. This means:
+
+  * The broker does NOT hold a 30-day copy of every memory body.
+    The streams retain 30 days of nudges (small JSON blobs); the
+    body itself only lives in Postgres and travels over the
+    authenticated HTTP feed when peers actually need it.
+  * Per-peer authorization runs server-side at content fetch
+    time, NOT at NATS subscribe time. A peer subscribed to
+    ``mnemos.memory.created.*`` sees that an event happened (id +
+    namespace + category) but cannot retrieve the body unless the
+    HTTP feed authorizes the pull.
+  * The metadata fields shipped on the bus (namespace, category,
+    source_node) are themselves operator-classified data — a
+    rogue subscriber learns WHAT topics are flowing, not WHAT was
+    written. Rate-limit + ACL the bus accordingly (see next
+    section), but don't treat broker storage as a content vault.
+
+**Operator implication:** the broker's stream files are still
+operationally important — they hold the activity audit trail and
+nudge backlog. Encrypt at rest, restrict the filesystem, and
+back up alongside Postgres. They're NOT, however, a parallel
+content tier you have to encrypt with the same care as the
+database itself, because no body is on them.
 
 ## NATS ACL recommendations
 
