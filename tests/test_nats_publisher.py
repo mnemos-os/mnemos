@@ -181,13 +181,14 @@ def test_ensure_streams_returns_false_when_existing_drifts(monkeypatch, caplog):
             raise RuntimeError("nats: stream name already in use")
 
         async def stream_info(self, name):
-            # The running stream has the OLD config; we tried to
-            # ship max_bytes=10GB but broker has 1GB.
+            # Running stream has the OLD max_age (15 days); operator's
+            # redeploy ships 30 days. This is real config drift, not
+            # the documented insufficient-storage fallback.
             return SimpleNamespace(
                 config=_stream_config_obj(
                     name=name,
                     subjects=_CANONICAL_SUBJECTS[name],
-                    max_bytes=1024**3,
+                    max_age=15 * 24 * 60 * 60,
                 )
             )
 
@@ -202,9 +203,95 @@ def test_ensure_streams_returns_false_when_existing_drifts(monkeypatch, caplog):
     # Operator-facing log must name the field that drifted so they
     # know what to fix. Don't be picky about exact wording — just
     # the field name.
-    assert any("max_bytes" in rec.message for rec in caplog.records), (
+    assert any("max_age" in rec.message for rec in caplog.records), (
         f"drift log must name the drifted field. caplog: "
         f"{[r.message for r in caplog.records]}"
+    )
+
+
+def test_ensure_streams_max_bytes_smaller_treated_as_storage_fallback(monkeypatch, caplog):
+    """The 1GB insufficient-storage fallback is documented runtime
+    behavior; on next boot the existing 1GB stream must NOT trip the
+    drift-disables-publishing branch. Otherwise operators who ever
+    hit insufficient-storage permanently lose NATS publishing on
+    every subsequent restart.
+    """
+    import logging
+
+    caplog.set_level(logging.INFO)
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            raise RuntimeError("nats: stream name already in use")
+
+        async def stream_info(self, name):
+            # Existing stream has 1GB max_bytes — the fallback that
+            # ensure_streams itself created on a previous boot under
+            # insufficient-storage. ensure_streams' canonical config
+            # asks for 10GB.
+            return SimpleNamespace(
+                config=_stream_config_obj(
+                    name=name,
+                    subjects=_CANONICAL_SUBJECTS[name],
+                    max_bytes=1024**3,
+                )
+            )
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is True, (
+        "max_bytes-smaller-than-desired must be treated as the "
+        "documented insufficient-storage fallback path, not as drift "
+        "that disables publishing"
+    )
+    # Should leave an INFO log naming the fallback explicitly.
+    assert any(
+        "fallback" in rec.message.lower() and "max_bytes" in rec.message.lower()
+        for rec in caplog.records
+    ), (
+        "fallback path must log info naming the field. caplog: "
+        f"{[r.message for r in caplog.records]}"
+    )
+
+
+def test_ensure_streams_storage_or_retention_drift_disables_publishing(monkeypatch, caplog):
+    """Codex round-6 finding: retention and storage policies must be
+    part of the drift surface. A broker with MEMORY storage where
+    we declare FILE has different durability semantics — silently
+    enabling publishing against it is a correctness bug.
+    """
+    import logging
+
+    caplog.set_level(logging.ERROR, logger="mnemos.nats.client")
+
+    class _Js:
+        async def add_stream(self, config=None, **_):
+            raise RuntimeError("nats: stream name already in use")
+
+        async def stream_info(self, name):
+            # All numeric/subject fields match. Storage drifts to
+            # MEMORY (broker won't survive restart) — must catch.
+            return SimpleNamespace(
+                config=SimpleNamespace(
+                    name=name,
+                    subjects=_CANONICAL_SUBJECTS[name],
+                    max_age=30 * 24 * 60 * 60,
+                    max_bytes=10 * 1024**3,
+                    duplicate_window=2 * 60,
+                    retention=SimpleNamespace(value="LIMITS"),
+                    storage=SimpleNamespace(value="MEMORY"),  # drift
+                )
+            )
+
+    js = _Js()
+    monkeypatch.setattr(nats_client, "_jetstream", None)
+    result = asyncio.run(nats_client.ensure_streams(js))
+
+    assert result is False, "storage-policy drift must disable publishing"
+    assert any("storage" in rec.message for rec in caplog.records), (
+        f"drift log must name 'storage'. caplog: {[r.message for r in caplog.records]}"
     )
 
 

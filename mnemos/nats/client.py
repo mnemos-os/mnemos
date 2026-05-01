@@ -119,61 +119,117 @@ async def ensure_streams(js) -> bool:
         _stream_config("MNEMOS_CONSULTATION", ["mnemos.consultation.>"]),
         _stream_config("MNEMOS_WEBHOOK", ["mnemos.webhook.>"]),
     ]
+    # Lazy-import the structured error class so the absence of the
+    # nats-py JetStream API at import-time doesn't crash this module.
+    try:
+        from nats.js.errors import BadRequestError  # type: ignore
+    except ImportError:
+        BadRequestError = type("BadRequestError", (Exception,), {})  # type: ignore[misc, assignment]
+
     for cfg in streams:
+        exc: Exception | None = None
         try:
             await js.add_stream(config=cfg)
             logger.info("NATS stream %s declared", cfg.name)
-        except Exception as exc:
-            msg = str(exc)
-            if "10047" in msg or "insufficient storage resources" in msg.lower():
-                try:
-                    fallback = _stream_config(cfg.name, list(cfg.subjects), 1024**3)
-                    await js.add_stream(config=fallback)
-                    logger.info("NATS stream %s declared with 1GB max_bytes", cfg.name)
-                    continue
-                except Exception as fallback_exc:
-                    exc = fallback_exc
-                    msg = str(fallback_exc)
-            # add_stream is idempotent for matching configs and raises
-            # BadRequestError for mismatched configs. Both paths surface
-            # text like "already in use" / "stream name already" — so
-            # we MUST disambiguate by reading back the existing config
-            # and comparing. Otherwise a redeploy with a drifted
-            # max_bytes / max_age / duplicate_window silently leaves the
-            # broker on the old retention/dedup settings while
-            # ensure_streams reports success.
-            # Audit Finding 11 / codex round-5 (2026-05-01).
-            if "already in use" in msg or "stream name already" in msg.lower():
-                drift = await _stream_config_drift(js, cfg)
-                if not drift:
-                    logger.debug("NATS stream %s already exists (config matches)", cfg.name)
-                    continue
-                logger.error(
-                    "NATS stream %s config drift detected; broker keeps OLD "
-                    "config. Drift: %s. Operator must `nats stream update %s` "
-                    "or delete+recreate to apply the new config.",
-                    cfg.name,
-                    drift,
-                    cfg.name,
+            continue
+        except Exception as caught:
+            exc = caught
+
+        assert exc is not None  # the only path here is through the except above
+        msg = str(exc)
+        if "10047" in msg or "insufficient storage resources" in msg.lower():
+            try:
+                await js.add_stream(
+                    config=_stream_config(cfg.name, list(cfg.subjects), 1024**3)
                 )
-                return False
-            else:
-                logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
-                return False
+                logger.info("NATS stream %s declared with 1GB max_bytes", cfg.name)
+                continue
+            except Exception as fallback_exc:
+                exc = fallback_exc
+                msg = str(fallback_exc)
+
+        # add_stream is idempotent for matching configs and raises
+        # BadRequestError for mismatched configs. Both paths can
+        # surface text like "already in use" — so disambiguate via
+        # the structured exception class first, falling back to
+        # message text for older nats-py releases. We then call
+        # stream_info to compare the running config against `cfg`
+        # and log field-level drift.
+        # Audit Finding 11 / codex rounds 5 + 6 (2026-05-01).
+        looks_like_existing = (
+            isinstance(exc, BadRequestError)
+            or "already in use" in msg
+            or "stream name already" in msg.lower()
+        )
+        if looks_like_existing:
+            drift = await _stream_config_drift(js, cfg)
+            if not drift:
+                logger.debug("NATS stream %s already exists (config matches)", cfg.name)
+                continue
+            # Special-case: if the ONLY drift is max_bytes AND the
+            # running stream is smaller than what we asked for, the
+            # broker took the documented insufficient-storage
+            # fallback on a previous boot. Don't disable publishing
+            # — operator can grow the stream out-of-band when they
+            # have the space. Log info so it's visible.
+            if (
+                set(drift.keys()) == {"max_bytes"}
+                and isinstance(drift["max_bytes"][0], (int, float))
+                and isinstance(drift["max_bytes"][1], (int, float))
+                and drift["max_bytes"][0] < drift["max_bytes"][1]
+            ):
+                logger.info(
+                    "NATS stream %s running on smaller max_bytes than requested "
+                    "(running=%s, requested=%s) — likely the documented "
+                    "insufficient-storage fallback path. Publishing stays enabled.",
+                    cfg.name,
+                    drift["max_bytes"][0],
+                    drift["max_bytes"][1],
+                )
+                continue
+            logger.error(
+                "NATS stream %s config drift detected; broker keeps OLD "
+                "config. Drift: %s. Operator must `nats stream update %s` "
+                "or delete+recreate to apply the new config.",
+                cfg.name,
+                drift,
+                cfg.name,
+            )
+            return False
+        else:
+            logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
+            return False
     return True
+
+
+def _normalize_enum_value(v):
+    """Normalize a nats-py enum-or-string field for cross-version
+    comparison. Newer nats-py returns enum objects; older code paths
+    sometimes pass plain strings. Compare on uppercase string form."""
+    if v is None:
+        return None
+    val = getattr(v, "value", v)  # enum.value on enums; str otherwise
+    return str(val).upper()
 
 
 async def _stream_config_drift(js, desired) -> dict[str, tuple]:
     """Compare desired StreamConfig vs the running stream's actual config.
 
     Returns a dict of ``{field: (running_value, desired_value)}`` for
-    every retention dimension that has drifted. Empty dict means
-    configs match — safe to treat the redeclare as idempotent.
+    every operator-facing retention dimension that has drifted. Empty
+    dict means configs match — safe to treat the redeclare as
+    idempotent.
 
-    Only the operator-facing retention dimensions are checked
-    (max_age, max_bytes, duplicate_window, retention, storage,
-    subjects). Internal nats-py defaults that vary across versions
-    are not part of the drift surface.
+    Surface compared:
+      * subjects
+      * max_age
+      * max_bytes
+      * duplicate_window
+      * retention (LIMITS / WORK_QUEUE / INTEREST)
+      * storage   (FILE / MEMORY)
+
+    Internal nats-py defaults that vary across versions (replicas,
+    discard policy, etc.) are NOT part of the drift surface.
     """
     try:
         info = await js.stream_info(desired.name)
@@ -184,16 +240,16 @@ async def _stream_config_drift(js, desired) -> dict[str, tuple]:
         return {"_stream_info_error": (str(exc), None)}
 
     current = info.config
-    fields = ("max_age", "max_bytes", "duplicate_window")
     drift: dict[str, tuple] = {}
-    for f in fields:
+
+    # Numeric retention fields — float-tolerant compare for the
+    # seconds-encoded ones (max_age / duplicate_window read back as
+    # float from nats-py 2.14's StreamInfo).
+    for f in ("max_age", "max_bytes", "duplicate_window"):
         cur = getattr(current, f, None)
         des = getattr(desired, f, None)
         if cur is None or des is None:
             continue
-        # max_age/duplicate_window: stream_info reads back as float
-        # seconds (nats-py 2.14 converts from ns); desired is int
-        # seconds. Compare with a tiny tolerance.
         if isinstance(cur, float) or isinstance(des, float):
             if abs(float(cur) - float(des)) > 1e-3:
                 drift[f] = (cur, des)
@@ -201,7 +257,17 @@ async def _stream_config_drift(js, desired) -> dict[str, tuple]:
             if cur != des:
                 drift[f] = (cur, des)
 
+    # Subjects — list compare.
     if list(getattr(current, "subjects", []) or []) != list(getattr(desired, "subjects", []) or []):
         drift["subjects"] = (current.subjects, desired.subjects)
+
+    # Retention + storage policies — enum-or-string normalized.
+    for f in ("retention", "storage"):
+        cur = _normalize_enum_value(getattr(current, f, None))
+        des = _normalize_enum_value(getattr(desired, f, None))
+        if cur is None or des is None:
+            continue
+        if cur != des:
+            drift[f] = (cur, des)
 
     return drift
