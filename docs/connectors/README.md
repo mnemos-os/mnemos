@@ -39,40 +39,53 @@ these EXACT names when building per-tool allow/deny lists in the
 host agent's config (Cline ``autoApprove``, ChatGPT custom
 connector permissions, etc.) — partial matches don't fire.
 
-Source of truth: ``mnemos/mcp/tools/__init__.py`` +
-``mnemos/mcp/tools/kg.py``.
+Source of truth: ``mnemos/mcp/tools/{memory,kg,dag,models}.py``.
 
-**Read tools (safe to auto-approve on any key):**
+**Read tools (safe to auto-approve on any key) — 10:**
 
-| Tool                | Purpose                                        |
-|---------------------|------------------------------------------------|
-| ``search_memories`` | Full-text + vector search                      |
-| ``list_memories``   | Paginated list, optionally scoped              |
-| ``get_memory``      | Fetch by id                                    |
-| ``get_stats``       | Operator stats (counts, namespaces)            |
-| ``kg_search``       | Subject/predicate/object KG search             |
-| ``kg_timeline``     | Temporal KG query                              |
+| Tool                    | Surface  | Purpose                                  |
+|-------------------------|----------|------------------------------------------|
+| ``search_memories``     | memory   | Full-text + vector search                |
+| ``list_memories``       | memory   | Paginated list, optionally scoped        |
+| ``get_memory``          | memory   | Fetch by id                              |
+| ``get_stats``           | memory   | Operator stats (counts, namespaces)      |
+| ``kg_search``           | kg       | Subject/predicate/object KG search       |
+| ``kg_timeline``         | kg       | Temporal KG query                        |
+| ``log_memory``          | dag      | Per-memory version history               |
+| ``diff_memory_commits`` | dag      | Diff between two commits                 |
+| ``checkout_memory``     | dag      | Fetch a specific commit (read-only view) |
+| ``recommend_model``     | models   | Provider/model catalog query             |
 
-**Write tools (require approval; see per-connector guidance):**
+**Write tools (require approval; see per-connector guidance) — 8:**
 
-| Tool                    | Mutation shape                              |
-|-------------------------|---------------------------------------------|
-| ``create_memory``       | INSERT new row                              |
-| ``update_memory``       | UPDATE existing row by id                   |
-| ``delete_memory``       | DELETE existing row by id (DAG tombstone)   |
-| ``bulk_create_memories``| INSERT N new rows                           |
-| ``kg_create_triple``    | INSERT new KG triple                        |
-| ``update_triple``       | UPDATE existing KG triple. **No ``kg_`` prefix in MCP registry.** |
-| ``delete_triple``       | DELETE existing KG triple. **No ``kg_`` prefix in MCP registry.** |
+| Tool                    | Surface  | Mutation shape                          |
+|-------------------------|----------|------------------------------------------|
+| ``create_memory``       | memory   | INSERT new row                           |
+| ``update_memory``       | memory   | UPDATE existing row by id                |
+| ``delete_memory``       | memory   | DELETE existing row by id (DAG tombstone)|
+| ``bulk_create_memories``| memory   | INSERT N new rows                        |
+| ``kg_create_triple``    | kg       | INSERT new KG triple                     |
+| ``update_triple``       | kg       | UPDATE existing KG triple. **No ``kg_`` prefix in MCP registry.** |
+| ``delete_triple``       | kg       | DELETE existing KG triple. **No ``kg_`` prefix in MCP registry.** |
+| ``branch_memory``       | dag      | INSERT new branch on a memory's DAG      |
 
-The ``kg_``-prefix asymmetry on update/delete vs the rest of the
-KG tools is a registry quirk — autoApprove / deny-list configs
-match exact names, so listing ``kg_delete_triple`` does NOTHING
-while leaving ``delete_triple`` available.
+The ``kg_``-prefix asymmetry on ``update_triple`` / ``delete_triple``
+vs the rest of the KG tools is a registry quirk — autoApprove /
+deny-list configs match exact names, so listing ``kg_delete_triple``
+does NOTHING while leaving ``delete_triple`` available.
+
+The ``branch_memory`` DAG tool is a write — it creates a new
+branch. ``checkout_memory`` and ``diff_memory_commits`` are
+read-only despite the "DAG" naming.
 
 The MCP server may add tools across releases; check
 ``/v1/mcp/discovery`` on a running instance OR
 ``mnemos serve mcp-stdio --print-schema`` for the live count.
+
+**Important: the ``mnemos_`` UI prefix some agents add (e.g.,
+Cursor's tool drawer shows ``mnemos_search_memories``) is
+display-only.** The autoApprove / deny-list configs all match
+EXACT registry names — strip the prefix when configuring.
 
 ## Surfaces supported
 

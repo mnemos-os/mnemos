@@ -74,8 +74,17 @@ Open Cursor's chat panel, type:
 ```
 
 The `@mnemos` mention should auto-complete to the MCP server
-once Cursor sees it. Tools `mnemos_search_memories`,
-`mnemos_create_memory`, etc. should appear in the tool drawer.
+once Cursor sees it. Tools should appear in the tool drawer
+under names like ``mnemos_search_memories``,
+``mnemos_create_memory``, etc.
+
+**The ``mnemos_`` prefix is Cursor's UI display convention.**
+The actual MCP registry names (used in config / autoApprove
+arrays / per-tool permissions) are bare:
+``search_memories``, ``create_memory``, etc. — see the
+[canonical tool surface table](./README.md#canonical-mcp-tool-surface-v420a13).
+Strip the ``mnemos_`` prefix when configuring per-tool
+controls.
 
 If you don't see `@mnemos`, check Cursor's MCP server panel
 (Settings → Cursor Settings → MCP) — it should show the
