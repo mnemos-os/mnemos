@@ -577,3 +577,129 @@ class TestStoreMemoriesConcurrency:
         assert "federation_remote_updated < $9::timestamptz" in update_sql, (
             "the UPDATE must carry a freshness WHERE-clause guard"
         )
+
+
+class TestFederationFeedPreferCompressed:
+    """v4.2.0a14 round-2: codex round-10 finding — prefer_compressed
+    must REPLACE the raw payload, not add to it. Pre-round-2 the
+    branch only appended ``compressed_content`` as an extra field
+    while still selecting raw m.content + m.verbatim_content, so an
+    opt-in peer received BOTH (wire bytes UP, not down).
+
+    These tests pin the post-fix shape:
+      * prefer_compressed=true + variant present → content carries
+        the compressed text; compressed_content non-None;
+        verbatim_content NULL.
+      * prefer_compressed=true + variant absent → content is raw;
+        compressed_content None; verbatim_content present.
+      * prefer_compressed=false (default) → unchanged behavior.
+    """
+
+    @pytest.mark.asyncio
+    async def test_compressed_branch_replaces_raw_content(self, monkeypatch):
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+
+        updated = datetime(2026, 5, 1, 0, 0, 0)
+        # Simulate the LEFT JOIN result: a row that has a compressed
+        # variant. The handler's SQL uses COALESCE so the row's
+        # ``content`` comes back as the compressed text + the
+        # separate compressed_content field also populated.
+        row = _feed_row("00000000-0000-0000-0000-000000000010", updated)
+        row["content"] = "<<COMPRESSED PAYLOAD>>"  # COALESCE result
+        row["compressed_content"] = "<<COMPRESSED PAYLOAD>>"
+        row["verbatim_content"] = None  # CASE WHEN NULLed it
+        pool = _FeedPool([row])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        resp = await handler.federation_feed(
+            None, None,
+            since=None, namespace=None, category=None,
+            limit=10,
+            prefer_compressed=True,
+        )
+
+        # SQL shape verification: handler must have built a
+        # COALESCE-against-LEFT-JOIN query, not the default one.
+        seen = pool.conn.queries[-1]
+        assert "COALESCE(v.compressed_content, m.content)" in seen, (
+            f"prefer_compressed branch must use COALESCE; got SQL: {seen[:300]}"
+        )
+        assert "LEFT JOIN memory_compressed_variants" in seen
+        assert "WHEN v.compressed_content IS NOT NULL THEN NULL" in seen, (
+            "verbatim_content must be NULLed when a compressed variant exists"
+        )
+
+        # Wire shape verification: the MemoryItem should carry the
+        # compressed payload as its content + compressed_content
+        # populated + verbatim_content None.
+        assert len(resp.memories) == 1
+        m = resp.memories[0]
+        assert m.content == "<<COMPRESSED PAYLOAD>>"
+        assert m.compressed_content == "<<COMPRESSED PAYLOAD>>"
+        assert m.verbatim_content is None
+
+    @pytest.mark.asyncio
+    async def test_compressed_branch_falls_through_when_no_variant(self, monkeypatch):
+        """When prefer_compressed=true but the LEFT JOIN finds no
+        variant for a row, the COALESCE picks raw m.content and
+        compressed_content stays None. Operators get the fallback
+        behavior they'd see with prefer_compressed=false."""
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+
+        updated = datetime(2026, 5, 1, 0, 0, 0)
+        row = _feed_row("00000000-0000-0000-0000-000000000011", updated)
+        # COALESCE picks raw, NULL on the v.* side
+        row["compressed_content"] = None
+        # verbatim_content stays present because CASE picks the raw
+        # value when v.compressed_content IS NULL.
+        pool = _FeedPool([row])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        resp = await handler.federation_feed(
+            None, None,
+            since=None, namespace=None, category=None,
+            limit=10,
+            prefer_compressed=True,
+        )
+
+        m = resp.memories[0]
+        assert m.content == row["content"]  # raw
+        assert m.compressed_content is None
+        assert m.verbatim_content == row["verbatim_content"]
+
+    @pytest.mark.asyncio
+    async def test_default_off_preserves_legacy_shape(self, monkeypatch):
+        """prefer_compressed=False (default) must produce identical
+        SQL + MemoryItem shape to v4.2.0a13 — no LEFT JOIN, no
+        COALESCE, raw content + verbatim_content + compressed_content
+        as None."""
+        import mnemos.core.lifecycle as lc
+        from mnemos.api.routes import federation as handler
+
+        updated = datetime(2026, 5, 1, 0, 0, 0)
+        row = _feed_row("00000000-0000-0000-0000-000000000012", updated)
+        pool = _FeedPool([row])
+        monkeypatch.setattr(lc, "_pool", pool)
+
+        # Explicit False — the function signature uses
+        # ``prefer_compressed: bool = Query(False, ...)`` and a
+        # direct call without the kwarg passes the Query MARKER
+        # object (truthy), not False. Other test sites in this
+        # module hit the same convention by passing all params
+        # explicitly.
+        resp = await handler.federation_feed(
+            None, None,
+            since=None, namespace=None, category=None,
+            limit=10,
+            prefer_compressed=False,
+        )
+
+        seen = pool.conn.queries[-1]
+        assert "LEFT JOIN memory_compressed_variants" not in seen, (
+            "default branch must NOT join memory_compressed_variants"
+        )
+        assert "COALESCE(v.compressed_content" not in seen
+        m = resp.memories[0]
+        assert m.compressed_content is None

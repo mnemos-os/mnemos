@@ -476,32 +476,51 @@ async def federation_feed(
     args.append(limit + 1)   # request one extra to detect has_more
     where_clause = " AND ".join(query_parts)
 
-    # When prefer_compressed=True we LEFT JOIN memory_compressed_variants
-    # so the receiver can pick up the compressed payload in the same
-    # request — saves a follow-up round trip per memory and reduces
-    # wire bytes on the cross-cluster federation hot path. The raw
-    # content + verbatim_content are still in the row so receivers
-    # that ignore compressed_content fall through to the original
-    # shape with no behavior change.
-    select_compressed_col = (
-        "v.compressed_content AS compressed_content,"
-        if prefer_compressed
-        else "NULL::text AS compressed_content,"
-    )
-    join_compressed = (
-        "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
-        if prefer_compressed
-        else ""
-    )
+    # prefer_compressed contract:
+    #   * The SELECT returns COALESCE(v.compressed_content, m.content)
+    #     as the row's ``content`` — the peer SEES the compressed
+    #     payload as content when a variant exists, raw content
+    #     otherwise. Wire bytes go DOWN proportional to the
+    #     compression ratio.
+    #   * ``compressed_content`` field on MemoryItem stays populated
+    #     (only when a variant exists) so the peer can distinguish
+    #     "this content is compressed" from "this content is raw."
+    #     compressed_content == None → got raw; non-None → got
+    #     compressed and the same value also lives in ``content``.
+    #   * ``verbatim_content`` is OMITTED (NULL) on compressed rows
+    #     to avoid double-shipping the original payload, which
+    #     would defeat the bytes-reduction goal.
+    # Default path (prefer_compressed=False) is unchanged — same
+    # SQL shape, same MemoryItem fields, identical behavior peers
+    # see today.
+    if prefer_compressed:
+        content_select = "COALESCE(v.compressed_content, m.content) AS content,"
+        compressed_select = "v.compressed_content AS compressed_content,"
+        # NULL out verbatim_content when we have a compressed variant
+        # — peer can fetch the original via /v1/federation/memory/{id}
+        # if they need it and the wire-bytes savings only apply when
+        # we don't double-ship.
+        verbatim_select = (
+            "CASE WHEN v.compressed_content IS NOT NULL THEN NULL "
+            "ELSE m.verbatim_content END AS verbatim_content,"
+        )
+        join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
+    else:
+        content_select = "m.content,"
+        compressed_select = "NULL::text AS compressed_content,"
+        verbatim_select = "m.verbatim_content,"
+        join_compressed = ""
 
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT m.id, m.content, m.category, m.subcategory, m.metadata,
-                   m.quality_rating, m.verbatim_content, m.owner_id, m.namespace,
+            SELECT m.id, {content_select}
+                   m.category, m.subcategory, m.metadata,
+                   m.quality_rating, {verbatim_select}
+                   m.owner_id, m.namespace,
                    m.permission_mode, m.source_model, m.source_provider,
                    m.source_session, m.source_agent, m.created, m.updated,
-                   {select_compressed_col.rstrip(',')}
+                   {compressed_select.rstrip(',')}
             FROM memories m
             {join_compressed}
             WHERE {where_clause}
