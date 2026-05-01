@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 
 try:
     from docling.document_converter import DocumentConverter
@@ -320,7 +321,7 @@ async def import_memories_from_document(
                     len(pending_delivery_ids), exc_info=True,
                 )
 
-    return {
+    payload = {
         "source_file": file.filename,
         "memories_created": len(memory_ids),
         "memory_ids": memory_ids,
@@ -329,6 +330,24 @@ async def import_memories_from_document(
         "metadata": doc_metadata,
         "total_text_length": len(full_text),
     }
+    # Status-code contract (round-48 / codex round-1 follow-up):
+    #   * All chunks committed → 200 OK.
+    #   * Some chunks committed, some rolled back → 207 Multi-Status.
+    #     Round-47 made the per-chunk INSERT atomic with the
+    #     webhook outbox row, so a webhook-table failure rolls the
+    #     memory back too. Returning 200 hid that from clients
+    #     that only check HTTP status; 207 surfaces the
+    #     partial-success state and the ``errors`` list still
+    #     itemises which chunks failed. Codex round-1 of round-47
+    #     caught this hide.
+    #   * Zero chunks committed (all rolled back) → 502 Bad
+    #     Gateway. The whole document import effectively failed;
+    #     the ``errors`` field carries the per-chunk reasons.
+    if errors and not memory_ids:
+        return JSONResponse(status_code=502, content=payload)
+    if errors:
+        return JSONResponse(status_code=207, content=payload)
+    return payload
 
 
 # Route: POST /v1/documents/import
