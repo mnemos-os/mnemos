@@ -2,6 +2,235 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [4.2.0a14] — 2026-05-01
+
+Pre-release alpha consolidating five overnight waves of work
+between 2026-04-30 and 2026-05-01: NATS multi-replica federation
++ webhook receivers, partial-outage test infrastructure, latent
+bug fixes (RLS SQL, pool acquire timeouts), Accept-header content
+negotiation, MCP get_memory format parameter, /metrics auth gate,
+path-traversal hardening across MCP tools, TimeoutPool wrap, and
+an OpenAPI-export CLI for Custom GPT / Actions consumers.
+
+A single ``v4.2.0a14`` tag bundles work from a2 through a14;
+intermediate alphas were tagged but not released. Release notes
+group by area rather than by intermediate version.
+
+### Added
+
+- **NATS multi-replica receivers (`a8`)**: queue-group sharding
+  on JetStream consumers so federation + webhook receivers scale
+  horizontally without duplicate processing.
+- **Live-broker integration test harness (`a9`,
+  `tests/integration_nats/`)**: ``ManagedBroker`` fixture spawns
+  a real ``nats-server`` per test, with ``--server_name=<uuid>``
+  identity check that rejects port-race squatters; partial-
+  outage tests drive the production ``consumer_loop`` reconnect
+  + backoff path against true broker restarts. Skips cleanly
+  when no ``nats-server`` binary is present.
+- **Federation feed compressed-variant payloads (`a14`)**: new
+  ``GET /v1/federation/feed?prefer_compressed=true`` query
+  param emits the winning ``memory_compressed_variants`` row in
+  place of raw content when the variant is strictly smaller on
+  the JSON wire (gated via Postgres ``to_json(text)::text``
+  exact-byte measurement). Bytes-on-wire reduction up to 4–6×
+  for variant-bearing memories. v3.6 charter §2.5 surface 1.
+- **Accept-header content negotiation on
+  ``GET /v1/memories/{id}`` (`a14`)**:
+  - ``Accept: text/plain`` → prose narration body (same as
+    ``/v1/memories/{id}/narrate?format=prose``).
+  - ``Accept: application/x-apollo-dense`` → raw winning-
+    variant content (same as ``?format=dense``).
+  - Default (``application/json``, ``*/*``, missing) → existing
+    JSON ``MemoryItem``.
+  ``Vary: Accept`` set on every representation so caches do not
+  conflate types. Both branches honour the same
+  ``VisibilityFilter.for_read`` contract — federated / world /
+  group-readable memories are returned identically across
+  Accept values. v3.6 charter §2.5 surface 2.
+- **MCP ``get_memory`` ``format=prose|dense`` (`a14`)**: stdio
+  + HTTP-SSE MCP clients can request the compressed variant
+  representations through the same content-negotiation paths
+  the HTTP API exposes. v3.6 charter §2.5 surface 3.
+- **``MNEMOS_METRICS_REQUIRE_AUTH`` (`a14`)**: optional Bearer-
+  token gate on ``/metrics``. Default off (network-scope
+  convention preserved). When enabled, the request must carry
+  a valid Bearer token from an ``api_keys`` row whose owning
+  user has ``role='root'``; non-root keys return 403,
+  unknown / revoked keys return 401, and a settings-read
+  failure fails closed (503).
+- **``mnemos dump-openapi`` CLI (`a14`)**: emits the FastAPI
+  OpenAPI spec without booting the server. ``--output PATH``,
+  ``--indent N`` (0..8), ``--title T`` overrides, and
+  ``--target {full|gpt-actions}``. The ``gpt-actions`` target
+  truncates endpoint summary/description fields to 300 chars
+  and parameter description fields to 700 chars per OpenAI's
+  Custom GPT Actions production limits, so the artifact
+  imports cleanly into a Custom GPT or OpenAI Actions bridge.
+  v4.1 connector deliverable.
+- **``mnemos doctor`` CLI (`a13`)**: pure-stdlib accelerator
+  detection (NVIDIA CUDA / Tegra, Intel iGPU, Apple Silicon)
+  that names the recommended ``mnemos-os[ml|gpu|phi]`` extra.
+- **Connector documentation gallery (`a13–a14`)**: per-surface
+  Markdown guides (``docs/connectors/{claude-code,cursor,
+  codex-cli,continue-dev,cline}.md``) with mechanically-
+  verified config snippets. Canonical MCP tool surface table
+  in the README enumerates 18 tools with R/W classification
+  and the ``kg_``-prefix asymmetry called out (``kg_create_triple``
+  has the prefix; ``update_triple`` / ``delete_triple`` do
+  not). The ``mnemos_`` UI prefix some agents add (Cursor's
+  tool drawer) is documented as display-only.
+- **Memory architecture design paper
+  (``docs/MEMORY_ARCHITECTURE.md``, `a13`)**: 3000-word
+  description of identity, provenance, version DAG,
+  compression/synthesis, federation, persistence, and
+  observability.
+- **Operator observability guide
+  (``docs/OBSERVABILITY.md``, `a13`)**: Prometheus scrape
+  config, the live metric set, optional metrics auth, and the
+  shipped Grafana dashboard
+  (``docs/observability/grafana/mnemos-overview.json``).
+- **TimeoutPool proxy wrap (`a14`)**: wraps the asyncpg pool
+  at lifecycle creation so the 86+ legacy ``_lc._pool.acquire()``
+  call sites inherit ``DEFAULT_ACQUIRE_TIMEOUT`` uniformly,
+  without per-site migration. The distillation worker's pool
+  also routes through ``wrap_pool_with_timeout`` at start +
+  reconnect.
+- **``mnemos.core.pool.is_infrastructure_error`` predicate
+  (`a14`)**: distinguishes pool / connection-loss class
+  errors (asyncio.TimeoutError + asyncpg connection family)
+  from content / processing failures, used by the compression
+  worker's broad-except handlers to avoid converting pool
+  pressure into terminal MARK_FAILED rows.
+- **Compression queue infra-retry semantics (`a14`)**: when
+  the worker hits a pool / connection error, the affected
+  rows are reset to ``status='pending'`` with ``attempts``
+  decremented (``GREATEST(attempts - 1, 0)``) and an
+  ``error='infra_retry: ...'`` breadcrumb. The stale-running
+  sweep refuses to terminalize rows whose ``error`` is
+  ``NULL`` or starts with ``infra_retry:`` regardless of
+  ``attempts``, so sustained pool pressure cannot terminalize
+  a content-OK row. ``counts['infra_errors']`` is the new
+  telemetry bucket.
+- **MNEMOS_DEFAULT_NAMESPACE write-stamp (`a13`)**: MCP
+  create/search/list/bulk tools stamp the configured
+  namespace on writes. Documented as a write-stamp / search-
+  filter ergonomic, NOT enforced isolation; root keys cross.
+
+### Fixed
+
+- **LATENT BUG: ``SET LOCAL <name> = $1`` SQL on RLS-enabled
+  Postgres (`a14`)**: PostgreSQL ``SET`` syntax does NOT
+  accept bind parameters (per the official docs). The
+  ``maybe_set_pg_rls`` helper and the parallel ``_rls_context``
+  in ``mnemos/api/routes/memories.py`` had been using this
+  shape since at least v3.0. The bug was latent because the
+  live deployment runs ``MNEMOS_RLS_ENABLED=false``; the day
+  someone flipped RLS on, every authenticated read would have
+  500'd with a Postgres syntax error before the protected
+  query ran. Both call sites now use ``SELECT
+  set_config('<name>', $1, true)``.
+- **Path-traversal across MCP / Knossos / KG tool surfaces
+  (`a14`)**: caller-controlled ``memory_id`` / ``commit_hash``
+  / ``triple_id`` / ``drawer_id`` / ``subject`` values
+  spliced into REST paths could escape the
+  ``/v1/memories/`` (and similar) prefix via httpx dot-
+  segment normalization. With the new ``_rest_get_text``
+  helper returning raw text, this widened to an
+  exfiltration vector for any text endpoint
+  (e.g. ``/metrics``). Validation + URL-encoding helpers
+  ``_safe_path_segment`` (strict alphanum + ``_:-`` whitelist
+  for IDs; admits documented federated id grammar
+  ``fed:<peer>:<remote>``) and ``_safe_path_value`` (looser
+  whitelist for free-form fields like KG entity names; rejects
+  ``..`` traversal + URL-rewrite chars) applied at every
+  splice site across ``mnemos/mcp/tools/{memory,dag,kg}.py``
+  and ``mnemos/tools/knossos_mcp.py``.
+- **Compression worker turning pool pressure into terminal
+  failed rows (`a14`)**: pre-fix, every post-dequeue
+  ``Exception`` ran ``MARK_FAILED``. After the round-28
+  TimeoutPool wrap, asyncio.TimeoutError reached that
+  handler and converted transient pool pressure into
+  permanent failed compression rows. Eight-round
+  iterative fix split infrastructure errors from content
+  errors, reset un-processed batch tails before re-raising,
+  unified all post-dequeue infra exit paths through one
+  tail-reset site, and rewrote the stale-running sweep to
+  refuse terminalization without a recorded content-error
+  breadcrumb.
+- **MORPHEUS / DAG endpoints (`a13`)**: cross-namespace
+  telemetry leak on MORPHEUS read endpoints and DAG read /
+  visibility skew with memory CRUD already-fixed in
+  ``v4.1.3``; v4.2.0a14 verifies the pre-existing fixes.
+- **Federation peer URL validation aligned with webhook SSRF
+  policy (`v4.1.3`)**: peer registration runs through the
+  same private-IP / metadata-host validator as webhooks.
+- **Connector documentation honesty (`a12–a13`)**: 5 connector
+  doc files refactored after 12+ rounds of codex review
+  caught doc-overstating-code patterns: enforced isolation
+  (which is not enforced; docs now say "write stamp"); per-
+  key ``default_namespace`` (no such column; namespace lives
+  on ``users``); CLI shape (real CLI is
+  ``mnemos serve mcp-stdio``, not ``mnemos mcp serve --stdio``;
+  endpoint is ``/sse``, not ``/v1/mcp/sse``); SSH inline-env
+  caveat (``env VAR=val cmd`` is not shell-safe for tokens
+  with metacharacters); MCP tool-name registry asymmetry
+  (kg_create_triple has the prefix; update_triple /
+  delete_triple do not — autoApprove takes the bare name).
+- **fastembed semantic-similarity scoring (`a12`)**: the
+  ``QualityAnalyzer`` previously called ``model.encode()``
+  on fastembed which silently returned 85.0 for every pair.
+  Switched to ``model.embed([text1, text2])`` returning an
+  iterator of ndarrays. Added a ``-1.0`` sentinel for failed
+  embeddings + a ``HEURISTIC_ONLY_CAP=70`` so high-trust
+  task types cannot auto-approve from heuristic-only signal.
+- **Heuristic compression auto-approve floor (`a12`)**:
+  approve threshold dropped from 100 to 70 when no semantic
+  signal is available, so a memory cannot reach
+  ``approved`` purely on heuristics.
+
+### Changed
+
+- **psycopg dropped from default install (`a12`)**: psycopg's
+  LGPL-licensed transitives don't fit MNEMOS's
+  Apache/MIT/BSD/MPL closure. asyncpg-only by default;
+  installer's ``create_api_key`` falls back through asyncpg
+  → psycopg → psycopg2 → ``psql`` CLI when the optional
+  shim is installed.
+- **psutil + spacy removed from default deps (`a12`)**: zero
+  imports across ``mnemos/``; both unused since the v4.0
+  refactor.
+- **torch removed from required deps (`a12`)**: heavyweight
+  ML deps moved behind opt-in extras
+  (``mnemos-os[ml|gpu|phi]``); fastembed (Apache-2.0,
+  ~20MB) replaces sentence-transformers (which depended on
+  torch). ``mnemos doctor`` recommends the right extra
+  per host accelerator.
+- **/narrate endpoint visibility (`a14`)**: lifted to
+  ``VisibilityFilter.for_read`` so federated / world /
+  group-readable memories render identically to the JSON
+  ``GET /v1/memories/{id}`` path. RLS context (``SET LOCAL
+  ...``) applied inside the transaction to match the JSON
+  path's defense-in-depth.
+
+### Operational
+
+- **No-op for v4.1.3 deployments**: every change in this
+  alpha is additive or replaces internal mechanism without
+  changing the existing on-the-wire contract. The federation
+  feed ``prefer_compressed`` query, MCP ``format`` parameter,
+  Accept-header dispatch, and dump-openapi CLI are all
+  opt-in.
+- **Variant write-time wire-byte measurement
+  (``federation_feed``)**: the byte gate uses
+  ``2 * octet_length(to_json(v.compressed_content)::text)``
+  vs ``octet_length(to_json(m.content)::text) +
+  COALESCE(octet_length(to_json(m.verbatim_content)::text), 0)``.
+  ``to_json(text)::text`` returns the exact JSON-escaped
+  serialization Postgres emits on the wire, so the gate is
+  conservative without false positives on control-character-
+  heavy content.
+
 ## [4.2.0a1] — 2026-04-30
 
 NATS JetStream substrate alpha — first slice of the v4.2 MQ work
