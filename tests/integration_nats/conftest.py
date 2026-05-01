@@ -23,22 +23,36 @@ def _broker_token() -> str | None:
     return os.environ.get("MNEMOS_NATS_TEST_TOKEN", "").strip() or None
 
 
-# Collection hook: skip ONLY the live-broker tests in this directory
-# when MNEMOS_NATS_TEST_URL is unset. Critically, this filters by
-# item path because pytest's plugin contract says
-# pytest_collection_modifyitems in a subdirectory conftest still
-# sees ALL collected items (not just items "below" the conftest).
-# Without the path filter the hook would skip the entire test suite.
+# Collection hook: skip live-broker tests when there's no broker
+# to talk to. Two acceptable broker sources:
+#   1. MNEMOS_NATS_TEST_URL — operator-managed external broker.
+#   2. nats-server binary on PATH (or MNEMOS_NATS_SERVER_BIN) —
+#      managed-broker tests spawn their own subprocess.
+#
+# If EITHER source is available, don't blanket-skip the directory.
+# Tests that depend on the static URL skip via the ``nats_url``
+# fixture; tests that depend on the spawned subprocess skip via
+# the ``managed_broker`` fixture. So the per-fixture skip logic
+# routes each test to the right outcome.
 #
 # Path containment uses pathlib's relative_to / commonpath rather
 # than string prefix — `tests/integration_nats_extra/` would match
 # `startswith("tests/integration_nats")` and silently get skipped.
+# pytest_collection_modifyitems in a subdirectory conftest sees
+# ALL collected items (not just items "below" the conftest), so
+# the path filter is required.
 def pytest_collection_modifyitems(config, items):
-    if _broker_url():
+    have_url = _broker_url() is not None
+    have_bin = _nats_server_bin() is not None
+    if have_url or have_bin:
         return
     here = Path(__file__).resolve().parent
     skip = pytest.mark.skip(
-        reason="MNEMOS_NATS_TEST_URL not set — live-broker tests require a real NATS server"
+        reason=(
+            "no NATS broker source available. Set MNEMOS_NATS_TEST_URL "
+            "for operator-managed-broker tests, OR install nats-server "
+            "(brew/apt/release) for managed-subprocess tests."
+        )
     )
     for item in items:
         raw_path = getattr(item, "path", None) or getattr(item, "fspath", None)
@@ -127,3 +141,148 @@ async def stream_cleanup(js, test_stream_name: str):
         await js.delete_stream(test_stream_name)
     except NotFoundError:
         pass
+
+
+# --- Managed-broker fixture (Audit Finding 11) --------------------------------
+#
+# Some outage-control tests (broker shutdown mid-consume, durable
+# consumer deletion, partial outage) need to OWN the broker
+# subprocess so they can stop/start/kill it. The static
+# ``MNEMOS_NATS_TEST_URL`` path doesn't fit because the broker is
+# operator-managed. The fixture below tries to spawn a
+# ``nats-server`` subprocess on a free port. It skips with a clear
+# message when the binary isn't available — operators install
+# nats-server (`brew install nats-server` / NATS GitHub releases /
+# `apt install nats-server`) to enable these tests.
+
+
+import shutil  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
+import time  # noqa: E402
+from contextlib import closing  # noqa: E402
+
+
+def _free_port() -> int:
+    """Pick a free TCP port by binding+closing a transient socket."""
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _nats_server_bin() -> str | None:
+    """Resolve nats-server binary path or None.
+
+    Honors ``MNEMOS_NATS_SERVER_BIN`` env override for operators
+    with a non-PATH install (Yocto edge images, custom builds).
+    """
+    override = os.environ.get("MNEMOS_NATS_SERVER_BIN", "").strip()
+    if override and Path(override).is_file() and os.access(override, os.X_OK):
+        return override
+    return shutil.which("nats-server")
+
+
+class ManagedBroker:
+    """Pytest-owned nats-server subprocess.
+
+    Exposes broker-lifecycle controls so partial-outage tests can
+    exercise the consume-loop reconnect+backoff path against a real
+    JetStream broker (not a fake). Methods:
+
+      * pause()   — SIGSTOP. Connections stay open but no progress.
+      * resume()  — SIGCONT. Continues from paused state.
+      * kill()    — SIGKILL + waitpid. Use for hard-shutdown tests.
+      * restart() — kill + spawn a new instance on the same port +
+                    JetStream store dir, so durable consumers and
+                    streams persist across the cycle.
+
+    JetStream is enabled with a per-test ``--store_dir`` so multiple
+    tests on the same dev box don't share state, and so a hard kill
+    doesn't leak state into the next run.
+    """
+
+    def __init__(self, bin_path: str, port: int, store_dir: Path):
+        self.bin_path = bin_path
+        self.port = port
+        self.store_dir = store_dir
+        self.proc: subprocess.Popen | None = None
+        self.url = f"nats://127.0.0.1:{port}"
+
+    def _spawn(self) -> None:
+        store_str = str(self.store_dir)
+        self.store_dir.mkdir(parents=True, exist_ok=True)
+        self.proc = subprocess.Popen(
+            [
+                self.bin_path,
+                "-a", "127.0.0.1",
+                "-p", str(self.port),
+                "-js",
+                "--store_dir", store_str,
+                # Quiet logging so the test output isn't drowned.
+                "-l", "/dev/null",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        # Wait for the broker to start listening (up to 5s).
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+                    s.settimeout(0.2)
+                    s.connect(("127.0.0.1", self.port))
+                    return
+            except OSError:
+                time.sleep(0.1)
+        raise RuntimeError(
+            f"nats-server at {self.url} did not start within 5s"
+        )
+
+    def pause(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGSTOP)
+
+    def resume(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGCONT)
+
+    def kill(self) -> None:
+        if self.proc and self.proc.poll() is None:
+            self.proc.send_signal(signal.SIGKILL)
+            self.proc.wait(timeout=2.0)
+
+    def restart(self) -> None:
+        """Hard-kill the broker and spawn a fresh one on the same
+        port + store_dir. JetStream durable consumers + streams
+        persist via the store_dir, so an active consumer can
+        reconnect after the cycle and pick up where it left off."""
+        self.kill()
+        self._spawn()
+
+
+@pytest.fixture
+def managed_broker(tmp_path: Path):
+    """Pytest-owned nats-server lifecycle for outage tests.
+
+    Each test gets its own broker subprocess + store_dir, so tests
+    are independent. The fixture skips with a clear message if
+    nats-server isn't installed (most operators won't have it on
+    a default mnemos dev box).
+    """
+    bin_path = _nats_server_bin()
+    if bin_path is None:
+        pytest.skip(
+            "managed-broker tests need a nats-server binary. Install via "
+            "`brew install nats-server` (macOS), `apt install nats-server` "
+            "(Debian/Ubuntu), or a release from "
+            "github.com/nats-io/nats-server. Or set "
+            "MNEMOS_NATS_SERVER_BIN to an absolute path."
+        )
+    port = _free_port()
+    broker = ManagedBroker(bin_path, port, tmp_path / "jetstream")
+    broker._spawn()
+    try:
+        yield broker
+    finally:
+        broker.kill()
