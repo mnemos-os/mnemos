@@ -300,37 +300,58 @@ metrics_router = APIRouter(tags=["observability"])
 
 
 def _metrics_auth_required() -> bool:
-    """Read the runtime metrics-auth setting through ``get_settings``
-    so operators can flip it via env var without restarting. Imports
-    are kept lazy to avoid a circular at module-load time."""
-    try:
-        return bool(get_settings().observability.metrics_require_auth)
-    except Exception:
-        # Settings not yet built (test bootstrap, importlib reloads,
-        # etc.). Fail open — same default as the env-unset case.
-        return False
+    """Read the runtime metrics-auth setting.
+
+    Returns True when ``MNEMOS_METRICS_REQUIRE_AUTH`` is set; False
+    when the setting reads as a clean False. A settings-read failure
+    is NOT swallowed back to ``False`` — that would silently
+    fail-open for the protected endpoint if a config regression or
+    bootstrap edge case landed in production. The caller propagates
+    the exception so ``_verify_metrics_token`` can convert it to a
+    503 (fail-closed) response.
+    """
+    return bool(get_settings().observability.metrics_require_auth)
 
 
 async def _verify_metrics_token(request: Request) -> None:
-    """Reject /metrics scrapes that don't carry a valid Bearer token.
+    """Reject /metrics scrapes that don't carry a valid Bearer token
+    from a root-role API key.
 
-    Only runs when ``MNEMOS_METRICS_REQUIRE_AUTH`` is True. Uses the
-    same ``api_keys`` table check the other read endpoints use; bound
-    to a single SHA-256 lookup so the scrape latency cost is one
+    Only runs when ``MNEMOS_METRICS_REQUIRE_AUTH`` is True. The
+    endpoint surfaces global process and traffic telemetry across
+    every tenant, so a regular tenant key MUST NOT pass the gate —
+    only the operator (root) role is admitted. The check joins
+    ``api_keys`` with ``users`` so the role lookup happens in one
     indexed query.
 
     Returning ``None`` means the request is authorized (or auth is
     disabled at the metrics layer). Anything else raises
-    ``HTTPException`` with the appropriate status code.
+    ``HTTPException`` with the appropriate status code:
+      * 401 — missing / non-Bearer / unknown / revoked token, OR
+              the token resolves to a non-root user.
+      * 503 — settings read failed, or auth is required but the DB
+              pool isn't installed (fail-closed for both).
     """
-    if not _metrics_auth_required():
+    from fastapi import HTTPException
+
+    try:
+        require_auth = _metrics_auth_required()
+    except Exception:
+        # Settings unavailable while auth is supposed to gate the
+        # endpoint → fail closed. Surfaces as 503 so an operator
+        # debugging a config drift sees a clear signal instead of
+        # the gate silently degrading to no-auth.
+        raise HTTPException(
+            status_code=503,
+            detail="Metrics auth setting unavailable; failing closed",
+        )
+
+    if not require_auth:
         return None
 
     auth_header = request.headers.get("authorization", "")
     parts = auth_header.split(" ", 1)
     if len(parts) != 2 or parts[0].lower() != "bearer" or not parts[1].strip():
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=401,
             detail="Bearer token required for /metrics",
@@ -342,8 +363,6 @@ async def _verify_metrics_token(request: Request) -> None:
     if pool is None:
         # Auth is required but no DB pool — fail closed rather than
         # silently letting the scrape through.
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=503, detail="Database pool not available for auth check",
         )
@@ -353,15 +372,27 @@ async def _verify_metrics_token(request: Request) -> None:
     key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            "SELECT revoked FROM api_keys WHERE key_hash = $1", key_hash,
+            "SELECT ak.revoked, u.role "
+            "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+            "WHERE ak.key_hash = $1",
+            key_hash,
         )
     if row is None or row["revoked"]:
-        from fastapi import HTTPException
-
         raise HTTPException(
             status_code=401,
             detail="Invalid or revoked API key",
             headers={"WWW-Authenticate": "Bearer"},
+        )
+    if row["role"] != "root":
+        # /metrics surfaces cross-tenant process telemetry; non-root
+        # keys can be authentic but still must not see global
+        # latency / error / counter data they didn't generate.
+        # 403 (not 401) communicates "we know who you are; you
+        # can't have this resource" — same convention the rest of
+        # the API uses for role-gated endpoints.
+        raise HTTPException(
+            status_code=403,
+            detail="Operator (root) role required for /metrics",
         )
     return None
 

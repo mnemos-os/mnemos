@@ -428,7 +428,10 @@ def test_metrics_auth_required_rejects_revoked_token(monkeypatch):
     raw_token = "revoked-token-xyz"
     key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     app = _auth_app(require_auth=True)
-    _install_auth_pool(app, key_hash_to_row={key_hash: {"revoked": True}})
+    _install_auth_pool(
+        app,
+        key_hash_to_row={key_hash: {"revoked": True, "role": "root"}},
+    )
     client = TestClient(app)
     with _override_metrics_auth(True):
         resp = client.get(
@@ -437,12 +440,54 @@ def test_metrics_auth_required_rejects_revoked_token(monkeypatch):
     assert resp.status_code == 401
 
 
-def test_metrics_auth_required_admits_valid_token(monkeypatch):
-    """Happy path: gate on, valid Bearer token, /metrics returns 200."""
+def test_metrics_auth_required_rejects_non_root_role(monkeypatch):
+    """A non-revoked tenant API key (role='user') must NOT be admitted —
+    /metrics surfaces cross-tenant process telemetry that only operators
+    should see. Codex round-22 caught this gap (any non-revoked key
+    passed). 403 (not 401) signals 'authenticated but not authorized'."""
+    raw_token = "tenant-token-123"
+    key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    app = _auth_app(require_auth=True)
+    _install_auth_pool(
+        app,
+        key_hash_to_row={key_hash: {"revoked": False, "role": "user"}},
+    )
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": f"Bearer {raw_token}"},
+        )
+    assert resp.status_code == 403
+
+
+def test_metrics_auth_required_rejects_admin_non_root_role(monkeypatch):
+    """Even a notional 'admin' role short of 'root' is rejected —
+    the gate is exclusively root for now."""
+    raw_token = "admin-token-456"
+    key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+    app = _auth_app(require_auth=True)
+    _install_auth_pool(
+        app,
+        key_hash_to_row={key_hash: {"revoked": False, "role": "admin"}},
+    )
+    client = TestClient(app)
+    with _override_metrics_auth(True):
+        resp = client.get(
+            "/metrics", headers={"Authorization": f"Bearer {raw_token}"},
+        )
+    assert resp.status_code == 403
+
+
+def test_metrics_auth_required_admits_root_role(monkeypatch):
+    """Happy path: gate on, valid Bearer token, root role,
+    /metrics returns 200."""
     raw_token = "good-token-abc"
     key_hash = hashlib.sha256(raw_token.encode()).hexdigest()
     app = _auth_app(require_auth=True)
-    _install_auth_pool(app, key_hash_to_row={key_hash: {"revoked": False}})
+    _install_auth_pool(
+        app,
+        key_hash_to_row={key_hash: {"revoked": False, "role": "root"}},
+    )
     client = TestClient(app)
     with _override_metrics_auth(True):
         resp = client.get(
@@ -451,6 +496,25 @@ def test_metrics_auth_required_admits_valid_token(monkeypatch):
     assert resp.status_code == 200
     # Body shape is the standard prometheus exposition.
     assert "text/plain" in resp.headers["content-type"]
+
+
+def test_metrics_auth_settings_failure_fails_closed(monkeypatch):
+    """If reading the metrics-auth setting raises, the gate fails
+    CLOSED (503) rather than fail-open (would silently degrade to
+    no-auth). Codex round-22 flagged the prior swallow-and-return-
+    False pattern as a regression-prone fail-open path."""
+    from mnemos.core import observability as obs_mod
+
+    def _broken_settings_reader():
+        raise RuntimeError("settings backend unavailable")
+
+    monkeypatch.setattr(obs_mod, "_metrics_auth_required", _broken_settings_reader)
+
+    app = _auth_app(require_auth=True)
+    client = TestClient(app)
+    resp = client.get("/metrics")
+    assert resp.status_code == 503
+    assert "failing closed" in resp.text.lower()
 
 
 # ---- OpenTelemetry tracing (v3.2 observability slice 3) --------------------

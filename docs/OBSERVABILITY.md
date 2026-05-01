@@ -54,10 +54,13 @@ scrape_configs:
 
 If you can't network-scope (shared cloud Prometheus, public-internet-
 routed clusters), set `MNEMOS_METRICS_REQUIRE_AUTH=true` on the
-mnemos process. The endpoint then requires the same Bearer token
-the rest of the API uses (looked up against the `api_keys` table —
-revoked keys are rejected). Add the credential to Prometheus's
-scrape config:
+mnemos process. The endpoint then requires a Bearer token from
+the `api_keys` table whose owning user has `role='root'` —
+`/metrics` surfaces cross-tenant process telemetry, so a regular
+tenant API key cannot pass the gate (returns 403). Revoked keys
+return 401. Mint a dedicated root key for the scraper rather than
+re-using an interactive operator key. Add the credential to
+Prometheus's scrape config:
 
 ```yaml
 scrape_configs:
