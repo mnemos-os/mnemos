@@ -316,6 +316,122 @@ async def test_worker_log_stats_reraises_infrastructure_error(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_process_one_does_not_mark_failed_on_infra_error_in_persist(
+    monkeypatch,
+):
+    """Codex round-3 of round-29 caught that the round-30 fix only
+    handled infra errors that ESCAPED _process_one. _process_one
+    has its own broad except around the persist transaction +
+    fallback mark-failed acquire that ran MARK_FAILED on any
+    Exception. An asyncio.TimeoutError from acquire() / persist /
+    done-update would still be converted to a terminal failed row.
+
+    Pin: when persist_contest raises TimeoutError, the row is NOT
+    marked failed and the error re-raises to the worker loop.
+    """
+    from mnemos.domain.compression import worker_contest
+
+    # Stub the persist call to raise a fresh TimeoutError —
+    # simulates the post-dequeue acquire / persist transaction
+    # hitting a pool timeout.
+    async def _fake_persist(*args, **kwargs):
+        raise asyncio.TimeoutError("simulated persist-tx timeout")
+
+    monkeypatch.setattr(
+        worker_contest, "persist_contest", _fake_persist,
+    )
+
+    # Stub run_contest to produce a benign outcome so persist
+    # gets called with a normal payload.
+    async def _fake_run_contest(*args, **kwargs):
+        # The actual outcome shape is irrelevant — persist_contest
+        # raises before reading it.
+        return MagicMock(winner=MagicMock(), candidates=[])
+
+    monkeypatch.setattr(
+        worker_contest, "run_contest", _fake_run_contest,
+    )
+
+    # Build a pool whose acquire() yields a conn that returns a
+    # non-empty memory row, satisfies the precondition fingerprint,
+    # but persist_contest raises before the queue update lands.
+    fake_memory = {
+        "content": "lorem ipsum dolor sit amet",
+        "category": "facts",
+        "task_type": "facts",
+    }
+    fake_precondition = {
+        "status": "running",
+        "attempts": 1,
+    }
+
+    executes: list[tuple] = []
+
+    async def _record_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    async def _fetchrow(sql, *args):
+        # _MEMORY_CONTENT_SQL → return memory row
+        # _PRECONDITION_SQL → return matching fingerprint
+        # the test only needs the dispatch by SQL prefix to be sane.
+        if "FROM memories" in sql:
+            return fake_memory
+        return fake_precondition
+
+    class _Tx:
+        async def __aenter__(self_):
+            return None
+
+        async def __aexit__(self_, *args):
+            return None
+
+    conn = MagicMock()
+    conn.fetch = MagicMock()
+    conn.fetchrow = _fetchrow
+    conn.execute = _record_execute
+    conn.transaction = lambda *a, **kw: _Tx()
+
+    class _AsyncCtx:
+        async def __aenter__(self_):
+            return conn
+
+        async def __aexit__(self_, *args):
+            return None
+
+    pool = MagicMock()
+    pool.acquire = MagicMock(return_value=_AsyncCtx())
+
+    counts: dict = {}
+    from collections import Counter as _Counter
+    counts = _Counter()
+
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest._process_one(
+            pool,
+            queue_id="queue-1",
+            memory_id="mem_1",
+            owner_id="alice",
+            scoring_profile="default",
+            engines=[object()],
+            counts=counts,
+            judge_model=None,
+            judge=None,
+            min_content_length=0,
+            expected_attempts=1,
+        )
+
+    # No MARK_FAILED was written.
+    assert not any(
+        "memory_compression_queue" in sql and "failed" in sql.lower()
+        for sql, _ in executes
+    ), f"unexpected MARK_FAILED on infra error inside _process_one: {executes!r}"
+    # Counts reflect the infrastructure-error bucket, not 'failed'.
+    assert counts.get("infra_errors", 0) == 1
+    assert counts.get("failed", 0) == 0
+
+
+@pytest.mark.asyncio
 async def test_worker_log_stats_swallows_content_error(monkeypatch):
     """Stats failures from a malformed row, missing column, etc.
     stay debug-logged."""

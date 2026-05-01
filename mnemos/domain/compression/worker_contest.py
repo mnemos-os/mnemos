@@ -511,10 +511,33 @@ async def _process_one(
                     mark_result = ("winner",)
     except Exception as exc:
         # Atomic rollback: no partial contest rows, no queue update —
-        # the row stays 'running'. Mark it failed in a FRESH transaction
-        # (separate connection, since the failed txn's connection is
-        # being released). The dequeue's next pass won't touch it
-        # because status is now 'failed' not 'pending'.
+        # the row stays 'running'. Two cases to distinguish:
+        #
+        # 1. Infrastructure error (pool acquire timeout, asyncpg
+        #    connection loss). The row's content didn't fail; the
+        #    DB pool / connection did. Re-raise so the worker
+        #    loop's reconnect path fires and the row stays
+        #    retryable via the stale-running sweep. Marking it
+        #    failed here would convert pool pressure into a
+        #    terminal failed compression row.
+        #
+        # 2. Content / persist-validation failure. Mark the row
+        #    failed in a FRESH transaction (separate connection,
+        #    since the failed txn's connection is being released).
+        #    The dequeue's next pass won't touch it because status
+        #    is now 'failed' not 'pending'.
+        from mnemos.core.pool import is_infrastructure_error
+
+        if is_infrastructure_error(exc):
+            logger.warning(
+                "contest_queue[%s]: persist transaction hit infrastructure "
+                "error %s; row left at 'running' for stale-recovery, "
+                "re-raising to worker loop",
+                memory_id, type(exc).__name__,
+            )
+            counts["infra_errors"] += 1
+            raise
+
         logger.exception(
             "contest_queue[%s]: contest persistence failed, rolled back", memory_id
         )
@@ -525,7 +548,21 @@ async def _process_one(
                     queue_id,
                     f"persist failed: {type(exc).__name__}: {exc}",
                 )
-        except Exception:
+        except Exception as mark_exc:
+            # The fallback mark-failed acquire also failed. If THAT
+            # is infrastructure, surface it to the worker loop too —
+            # silently swallowing it would leave the row stranded
+            # at 'running' AND prevent reconnect.
+            if is_infrastructure_error(mark_exc):
+                logger.warning(
+                    "contest_queue[%s]: persist failed AND fallback "
+                    "mark-failed acquire timed out (%s); re-raising for "
+                    "worker reconnect; original error: %s",
+                    memory_id, type(mark_exc).__name__,
+                    type(exc).__name__,
+                )
+                counts["infra_errors"] += 1
+                raise mark_exc from exc
             logger.exception(
                 "contest_queue[%s]: mark-failed also failed; row stranded at 'running' — "
                 "recovery on next worker start via stale-running sweep (v3.1.1)",
