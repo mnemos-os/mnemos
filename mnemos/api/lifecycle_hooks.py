@@ -74,6 +74,34 @@ def _federation_sync_worker(pool: Any):
     return federation_worker_loop(pool)
 
 
+async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
+    """Launch one federation NATS consumer per configured peer.
+
+    Optional and additive: HTTP federation polling remains active for
+    backfill and safety regardless of NATS availability.
+    """
+    from mnemos.federation.nats_consumer import (
+        configured_nats_peers,
+        consumer_loop,
+    )
+
+    for peer in configured_nats_peers(settings):
+        logger.info("Launching federation nats consumer for peer %s", peer.name)
+        lifecycle.schedule_worker(consumer_loop(pool, peer))
+
+
+async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
+    """Launch the webhook NATS push trigger.
+
+    Optional and additive: the polling recovery worker remains the
+    durable fallback path regardless of NATS availability.
+    """
+    from mnemos.webhooks.nats_trigger import consumer_loop as webhook_nats_trigger_loop
+
+    logger.info("Launching webhook nats trigger consumer")
+    lifecycle.schedule_worker(webhook_nats_trigger_loop(pool, settings=settings))
+
+
 def register_lifespan_hooks() -> None:
     """Register high-level integrations once per process."""
     global _registered
@@ -89,4 +117,10 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)
     lifecycle.register_lifespan_worker("federation sync worker", _federation_sync_worker)
+    lifecycle.register_post_db_startup_hook(
+        "federation nats consumers", _federation_nats_post_db_hook
+    )
+    lifecycle.register_post_db_startup_hook(
+        "webhook nats trigger", _webhook_nats_post_db_hook
+    )
     _registered = True

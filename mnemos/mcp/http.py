@@ -31,7 +31,6 @@ import asyncio
 import hashlib
 import json
 import logging
-import os
 import sys
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -51,7 +50,7 @@ except ImportError:  # pragma: no cover - exercised only by lightweight test stu
     StreamingResponse = None  # type: ignore[assignment]
 from starlette.routing import Mount, Route
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, mcp_nats_raw_enabled
 # Reuse the exact same Server instance + tool registrations from
 # the stdio entry point. Importing for the side effect of having
 # tools registered against `app`.
@@ -457,7 +456,7 @@ def _nats_msg_data(msg: Any) -> str:
 
 
 def _nats_sse_raw_enabled() -> bool:
-    return os.getenv("MNEMOS_MCP_NATS_RAW", "").strip().lower() in {"1", "true", "yes", "on"}
+    return mcp_nats_raw_enabled()
 
 
 def _nats_sse_data(msg: Any) -> str:

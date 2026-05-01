@@ -68,4 +68,4 @@ def test_mnemos_version_subcommand_smoke_does_not_touch_network(monkeypatch: pyt
 
     assert result.exit_code == 0, result.output
     assert result.output.strip() == __version__
-    assert "4.2.0a2" in result.output
+    assert "4.2.0a3" in result.output

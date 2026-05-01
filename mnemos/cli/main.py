@@ -3,7 +3,6 @@
 import asyncio
 import inspect
 import json
-import os
 import sys
 from contextlib import contextmanager
 from enum import Enum
@@ -14,7 +13,7 @@ from typing import Any, Callable, Optional, Sequence
 import httpx
 import typer
 
-from mnemos.core.config import get_settings, reload_settings
+from mnemos.core.config import get_settings, set_profile_override
 
 
 def _patch_typer_click_compat() -> None:
@@ -337,9 +336,7 @@ def _parse_consult_mode(mode: str) -> ConsultMode:
 def _apply_profile_flag(profile: Optional[DeploymentProfile]) -> None:
     if profile is None:
         return
-    os.environ["MNEMOS_PROFILE_OVERRIDE"] = profile.value
-    os.environ["MNEMOS_PROFILE"] = profile.value
-    reload_settings()
+    set_profile_override(profile.value)
 
 
 def _adapter_source_args(import_from: ImportSource, source: Path) -> list[str]:

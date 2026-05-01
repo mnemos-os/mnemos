@@ -1159,7 +1159,13 @@ def test_recoverable_predicate_requires_current_writer_revision():
     source = _webhook_module_source("workers", "lease", "types")
     compact = " ".join(source.split())
 
-    assert "NEW_CODE_WRITER_REVISION = 1" in source
+    # NEW_CODE_WRITER_REVISION canonically lives in mnemos.core.webhook_constants
+    # so the persistence layer can reference it without importing webhooks
+    # (per the import-linter "persistence has no upward deps" contract).
+    # webhooks/types.py re-exports the symbol; verify the source-of-truth.
+    repo_root = Path(__file__).resolve().parents[1]
+    constants_source = (repo_root / "mnemos" / "core" / "webhook_constants.py").read_text()
+    assert "NEW_CODE_WRITER_REVISION = 1" in constants_source
     assert "AND d.status NOT IN ('succeeded', 'abandoned') AND NOT d.superseded" in compact
     assert "AND NOT d.superseded AND d.status IN ('pending', 'retrying')" in compact
     assert "AND d.writer_revision = $3" in compact

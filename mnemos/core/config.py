@@ -587,6 +587,30 @@ def reload_settings() -> Settings:
     return _settings
 
 
+def set_profile_override(profile_value: str) -> Settings:
+    """Pin the active deployment profile and refresh settings.
+
+    Centralised so the CLI doesn't have to write os.environ directly
+    (the env-discipline lint allowlists writes only in this module).
+    Sets BOTH MNEMOS_PROFILE_OVERRIDE (the takes-precedence override)
+    and MNEMOS_PROFILE (the default-from-env path) so any subprocess
+    spawned afterwards inherits the same selection.
+    """
+    os.environ["MNEMOS_PROFILE_OVERRIDE"] = profile_value
+    os.environ["MNEMOS_PROFILE"] = profile_value
+    return reload_settings()
+
+
+def mcp_nats_raw_enabled() -> bool:
+    """True if MNEMOS_MCP_NATS_RAW is set to a truthy value.
+
+    Bypass for the JSON-summary path on NATS-backed MCP SSE streams —
+    when set, the raw NATS message body is forwarded verbatim instead
+    of being re-shaped into a {subject, summary} envelope.
+    """
+    return os.getenv("MNEMOS_MCP_NATS_RAW", "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _reset_settings_for_tests() -> None:
     """Clear the singleton and refresh compatibility dicts.
 

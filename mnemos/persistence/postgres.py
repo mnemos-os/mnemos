@@ -41,7 +41,7 @@ from mnemos.persistence.base import (
 )
 from mnemos.persistence.types import Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
-from mnemos.webhooks import types as webhook_types
+from mnemos.core import webhook_constants
 
 
 def _render_postgres_visibility(
@@ -875,9 +875,9 @@ class PostgresWebhookRepository(WebhookRepository):
                 event_type,
                 body,
                 body_hash,
-                webhook_types.NEW_CODE_WRITER_REVISION,
+                webhook_constants.NEW_CODE_WRITER_REVISION,
             )
-            from mnemos.webhooks.nats_events import publish_delivery_queued
+            from mnemos.nats.webhook_events import publish_delivery_queued
             await publish_delivery_queued(
                 delivery_id=delivery_id,
                 subscription_id=sub["id"],

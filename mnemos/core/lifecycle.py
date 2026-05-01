@@ -95,6 +95,46 @@ def register_lifespan_worker(name: str, factory, *, honor_worker_enabled: bool =
     _lifespan_worker_factories[name] = (factory, honor_worker_enabled)
 
 
+_post_db_startup_hooks: dict = {}
+
+
+def register_post_db_startup_hook(name: str, hook) -> None:
+    """Register an awaitable startup hook to run AFTER the DB pool is up.
+
+    The hook signature is ``async def hook(pool, settings) -> None``. It
+    may use :func:`schedule_worker` to spawn additional perpetual loops
+    (e.g. one consumer per federation peer). Errors raised by hooks are
+    logged with the registered name and do NOT block startup — startup
+    optionality is the contract for NATS-backed extensions.
+
+    Idempotent on ``name`` — re-registering with the same name replaces
+    the previous hook rather than appending. This matches
+    :func:`register_lifespan_worker` semantics and prevents duplicate
+    NATS consumers / webhook trigger loops if the api hook module is
+    reloaded mid-process.
+
+    Why this exists: lets api/webhook/federation/etc layers register
+    their boot wiring against core/lifecycle without core needing to
+    import those modules. Closes the import-linter "core does not
+    import api/domain/db/webhooks/mcp/etc" contract that NATS slice 1-4
+    work had broken with module-load-time federation + webhook imports
+    inside the lifespan generator.
+    """
+    _post_db_startup_hooks[name] = hook
+
+
+def schedule_worker(coro):
+    """Public alias for the perpetual-worker scheduler.
+
+    Registered post-DB hooks (federation NATS consumers, webhook NATS
+    triggers, etc.) need to spawn long-lived loops alongside what
+    register_lifespan_worker covers. The underscore-prefixed
+    _schedule_worker remains the in-module name; this public alias
+    is the supported API for hooks living outside core.
+    """
+    return _schedule_worker(coro)
+
+
 async def _run_distillation_worker(pool=None):
     """Compatibility shim for the registered distillation worker supervisor."""
     factory_entry = _lifespan_worker_factories.get("distillation_worker")
@@ -585,31 +625,16 @@ async def lifespan(app):
     except Exception:
         logger.exception("[NATS] startup hook failed; publishing disabled")
 
-    # Federation NATS push consumers (v4.2 slice 2). Optional and additive:
-    # HTTP federation polling remains active for backfill and safety.
+    # Post-DB startup hooks (federation NATS consumers, webhook NATS
+    # triggers, etc.). Hooks register at API-layer boot time via
+    # register_post_db_startup_hook so core/lifecycle does not need
+    # to import federation / webhook modules at runtime.
     if _pool:
-        try:
-            from mnemos.federation.nats_consumer import (
-                configured_nats_peers as _configured_nats_peers,
-                consumer_loop as _federation_nats_consumer_loop,
-            )
-
-            for _peer in _configured_nats_peers(settings):
-                logger.info("Launching federation nats consumer for peer %s", _peer.name)
-                _schedule_worker(_federation_nats_consumer_loop(_pool, _peer))
-        except Exception:
-            logger.exception("[NATS] federation consumer startup hook failed")
-
-    # Webhook NATS push trigger (v4.2 slice 4). Optional and additive:
-    # the polling recovery worker remains the durable fallback path.
-    if _pool:
-        try:
-            from mnemos.webhooks.nats_trigger import consumer_loop as _webhook_nats_trigger_loop
-
-            logger.info("Launching webhook nats trigger consumer")
-            _schedule_worker(_webhook_nats_trigger_loop(_pool, settings=settings))
-        except Exception:
-            logger.exception("[NATS] webhook trigger startup hook failed")
+        for hook_name, hook in _post_db_startup_hooks.items():
+            try:
+                await hook(_pool, settings)
+            except Exception:
+                logger.exception("[startup] %s hook failed", hook_name)
 
     yield
 
