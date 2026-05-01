@@ -56,10 +56,19 @@ extension UI and edit the `mcpServers` block visually.
 The ``autoApprove`` field is a Cline-specific feature: tools
 listed there don't trigger the per-call approval prompt that
 Cline normally puts in front of every tool invocation. The list
-above auto-approves READ-only tools while keeping write tools
-(`create_memory`, `update_memory`, `delete_memory`,
-`kg_create_triple`, `bulk_create_memories`) gated on operator
-confirmation. Adjust to taste.
+above auto-approves READ-only tools (``search_memories``,
+``list_memories``, ``get_memory``, ``get_stats``) while keeping
+ALL write tools gated on operator confirmation:
+
+* memory writes — ``create_memory``, ``update_memory``,
+  ``delete_memory``, ``bulk_create_memories``
+* KG writes — ``kg_create_triple``, ``update_triple``,
+  ``delete_triple`` *(note: the two ``triple`` tools have no
+  ``kg_`` prefix in the MCP registry — autoApprove matches
+  exact names)*
+
+See "Auto-approving write tools? Provision a non-root user
+first" further down before extending this list.
 
 ## Setup — HTTP/SSE (remote MNEMOS)
 
@@ -118,10 +127,29 @@ approval, re-search to confirm.
 ## Cline-specific: keep destructive tools manually-approved
 
 Even when you trust Cline to autonomously edit code,
-auto-approving `delete_memory` or `kg_delete_triple` is a
-footgun — a single hallucinated tool call can wipe useful
-context. The recommendation in the example config near the top
-of this page keeps write/delete tools manually-approved.
+auto-approving any of MNEMOS's write tools on a root API key
+is a footgun — a single hallucinated tool call can wipe or
+corrupt useful context. The recommendation in the example
+config near the top of this page keeps **all** write tools
+manually-approved.
+
+The MNEMOS MCP write surface, listed under their actual tool
+names (matches ``mnemos/mcp/tools/__init__.py``):
+
+* ``create_memory`` — insert a new memory.
+* ``update_memory`` — modify an existing memory by id.
+* ``delete_memory`` — soft-delete a memory by id (DAG tombstone).
+* ``bulk_create_memories`` — batch insert.
+* ``kg_create_triple`` — insert a KG triple.
+* ``update_triple`` — modify a KG triple. *Note: no ``kg_``
+  prefix on this one — the MCP tool registry uses the bare
+  name.*
+* ``delete_triple`` — delete a KG triple. *Same — no ``kg_``
+  prefix.*
+
+Read-only tools (safe to auto-approve on any key):
+``search_memories``, ``list_memories``, ``get_memory``,
+``get_stats``, ``kg_search``, ``kg_timeline``.
 
 ### Auto-approving write tools? Provision a non-root user first
 
@@ -138,7 +166,13 @@ permission boundary is enforced server-side. Setup:
    -- direct INSERT into api_keys with user_id='cline-sandbox-user'
    ```
 2. **Client side**, bind the new key + namespace stamp to the
-   MCP server:
+   MCP server. The autoApprove list below covers every read +
+   write tool the non-root user can reach in its namespace; KG
+   write tools (``kg_create_triple`` / ``update_triple`` /
+   ``delete_triple``) and ``delete_memory`` are NOT in this list
+   — those are explicit-approval-only even with the per-user
+   sandbox, because a bad call wastes the rollback budget.
+
    ```json
    {
      "mcpServers": {
@@ -151,13 +185,20 @@ permission boundary is enforced server-side. Setup:
            "MNEMOS_DEFAULT_NAMESPACE": "cline-sandbox"
          },
          "autoApprove": [
-           "search_memories", "create_memory", "update_memory",
-           "list_memories", "get_memory"
+           "search_memories", "list_memories", "get_memory", "get_stats",
+           "kg_search", "kg_timeline",
+           "create_memory", "update_memory", "bulk_create_memories",
+           "kg_create_triple"
          ]
        }
      }
    }
    ```
+
+   The DELETE / UPDATE-on-existing-rows tools are missing from
+   the array on purpose — they survive across sandbox sessions
+   (tombstones in the DAG, edits on prior memories) so a hallucinated
+   call has out-of-sandbox blast-radius even on a non-root key.
 
 With the non-root key + ``users.namespace``, the server enforces
 the scope: even a hallucinated `update_memory` call against a
