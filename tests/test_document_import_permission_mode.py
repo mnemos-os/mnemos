@@ -58,6 +58,29 @@ async def test_import_document_persists_explicit_permission_mode(
     mock_importer_class.return_value = mock_importer
 
     mock_conn = AsyncMock()
+
+    # Round-47 added a per-chunk ``async with conn.transaction():``
+    # wrapper inside document_import. asyncpg's
+    # Connection.transaction() is a SYNCHRONOUS factory returning
+    # an async-context-manager — give the mock a stub that
+    # returns one explicitly so the route's ``async with`` works.
+    class _TxCtx:
+        async def __aenter__(self_):
+            return None
+
+        async def __aexit__(self_, *args):
+            return None
+
+    mock_conn.transaction = MagicMock(return_value=_TxCtx())
+
+    # Stub the in-transaction webhook dispatch so it returns an
+    # empty delivery_ids list without touching webhook_subscriptions.
+    monkeypatch.setattr(
+        "mnemos.api.routes.document_import._dispatch_webhook"
+        if False else "mnemos.webhooks.dispatcher.dispatch",
+        AsyncMock(return_value=[]),
+    )
+
     mock_pool_manager = MagicMock()
     mock_pool_manager.acquire.return_value.__aenter__.return_value = mock_conn
     mock_pool_manager.acquire.return_value.__aexit__.return_value = None
@@ -103,6 +126,29 @@ async def test_import_document_defaults_to_600(
     mock_importer_class.return_value = mock_importer
 
     mock_conn = AsyncMock()
+
+    # Round-47 added a per-chunk ``async with conn.transaction():``
+    # wrapper inside document_import. asyncpg's
+    # Connection.transaction() is a SYNCHRONOUS factory returning
+    # an async-context-manager — give the mock a stub that
+    # returns one explicitly so the route's ``async with`` works.
+    class _TxCtx:
+        async def __aenter__(self_):
+            return None
+
+        async def __aexit__(self_, *args):
+            return None
+
+    mock_conn.transaction = MagicMock(return_value=_TxCtx())
+
+    # Stub the in-transaction webhook dispatch so it returns an
+    # empty delivery_ids list without touching webhook_subscriptions.
+    monkeypatch.setattr(
+        "mnemos.api.routes.document_import._dispatch_webhook"
+        if False else "mnemos.webhooks.dispatcher.dispatch",
+        AsyncMock(return_value=[]),
+    )
+
     mock_pool_manager = MagicMock()
     mock_pool_manager.acquire.return_value.__aenter__.return_value = mock_conn
     mock_pool_manager.acquire.return_value.__aexit__.return_value = None

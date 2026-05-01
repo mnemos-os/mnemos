@@ -221,9 +221,23 @@ async def import_memories_from_document(
     # AFTER INSERT trigger writes memory_versions v1 automatically.
     memory_ids = []
     errors = []
+    # Webhook delivery_ids accumulated INSIDE the per-chunk
+    # transactions; the post-commit loop below schedules send
+    # tasks for each. This is the transactional-outbox pattern:
+    # the webhook_deliveries row is atomic with the memory INSERT
+    # (so a failure rolls back BOTH and we don't get
+    # phantom-event-without-data or vice versa), then the send
+    # task is dispatched only after commit so a failed-to-fire
+    # send doesn't lose the event — the durable outbox row stays
+    # 'pending' for the worker to pick up. Closes
+    # corpus-review-2026-04-29 #2 for this route.
+    pending_delivery_ids: list[str] = []
+
+    from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
 
     async with _lc.get_pool_manager().acquire() as conn:
         for chunk in chunks:
+            chunk_delivery_ids: list[str] = []
             try:
                 memory_id = new_memory_id()
                 chunk_metadata = {
@@ -232,22 +246,41 @@ async def import_memories_from_document(
                     "chunk_title": chunk["title"],
                 }
 
-                await conn.execute(
-                    "INSERT INTO memories "
-                    "(id, content, category, subcategory, metadata, quality_rating, "
-                    " verbatim_content, owner_id, namespace, permission_mode) "
-                    "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9)",
-                    memory_id,
-                    chunk["content"],
-                    category,
-                    subcategory,
-                    json.dumps(chunk_metadata),
-                    chunk["content"],            # verbatim_content == content for chunks
-                    user.user_id,
-                    user.namespace,
-                    perm_mode,
-                )
+                async with conn.transaction():
+                    await conn.execute(
+                        "INSERT INTO memories "
+                        "(id, content, category, subcategory, metadata, quality_rating, "
+                        " verbatim_content, owner_id, namespace, permission_mode) "
+                        "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9)",
+                        memory_id,
+                        chunk["content"],
+                        category,
+                        subcategory,
+                        json.dumps(chunk_metadata),
+                        chunk["content"],            # verbatim_content == content for chunks
+                        user.user_id,
+                        user.namespace,
+                        perm_mode,
+                    )
+                    # Webhook delivery rows go into the SAME
+                    # transaction as the memory INSERT.
+                    chunk_delivery_ids = await _dispatch_webhook(
+                        "memory.created",
+                        {
+                            "memory_id": memory_id,
+                            "category": category,
+                            "subcategory": subcategory,
+                            "content": chunk["content"],
+                            "owner_id": user.user_id,
+                            "namespace": user.namespace,
+                            "source": "document_import",
+                        },
+                        conn=conn,
+                        owner_id=user.user_id,
+                        namespace=user.namespace,
+                    )
                 memory_ids.append(memory_id)
+                pending_delivery_ids.extend(str(did) for did in chunk_delivery_ids)
                 logger.debug(f"[DOCLING] Created memory {memory_id} from chunk {chunk['chunk_num']}")
 
             except Exception as e:
@@ -255,10 +288,10 @@ async def import_memories_from_document(
                 errors.append({"chunk": chunk["chunk_num"], "error": str(e)})
 
     # Side-effects done outside the per-chunk acquire so the connection isn't
-    # held while we contact Redis / dispatch webhooks. Cache is invalidated
-    # ONCE after the whole document — a 100-chunk document would otherwise
-    # thrash search cache N times. Webhooks fire per-memory to stay
-    # consistent with the single-create endpoint's semantics.
+    # held while we contact Redis / schedule webhook send tasks. Cache is
+    # invalidated ONCE after the whole document — a 100-chunk document would
+    # otherwise thrash search cache N times. Send tasks for the deliveries
+    # whose outbox rows are already committed get scheduled here.
     if memory_ids:
         if _lc._cache:
             try:
@@ -270,28 +303,22 @@ async def import_memories_from_document(
                     pass
             except Exception:
                 pass
-        try:
-            from mnemos.webhooks.dispatcher import dispatch as _dispatch_webhook
-            for mid, chunk in zip(memory_ids, chunks):
-                await _dispatch_webhook(
-                    "memory.created",
-                    {
-                        "memory_id": mid,
-                        "category": category,
-                        "subcategory": subcategory,
-                        "content": chunk["content"],
-                        "owner_id": user.user_id,
-                        "namespace": user.namespace,
-                        "source": "document_import",
-                    },
-                    owner_id=user.user_id,
-                    namespace=user.namespace,
+        if pending_delivery_ids:
+            try:
+                from mnemos.core.lifecycle import _schedule_delivery_attempt
+                from mnemos.webhooks.sender import _attempt_delivery
+                for delivery_id in pending_delivery_ids:
+                    _schedule_delivery_attempt(_attempt_delivery(delivery_id))
+            except Exception:
+                # Schedule failure is benign — the delivery rows
+                # are already committed in webhook_deliveries with
+                # status='pending'; the recovery worker will pick
+                # them up on its next pass.
+                logger.warning(
+                    "document_import: send-task scheduling failed for %d "
+                    "deliveries (recovery worker will pick them up)",
+                    len(pending_delivery_ids), exc_info=True,
                 )
-        except Exception:
-            logger.warning(
-                "webhook dispatch failed for document_import (%d memories)",
-                len(memory_ids), exc_info=True,
-            )
 
     return {
         "source_file": file.filename,
