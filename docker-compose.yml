@@ -50,6 +50,8 @@ services:
       - ./db/migrations_v3_5_session_compression_ratio_drop.sql:/docker-entrypoint-initdb.d/36-session-compression-ratio-drop.sql
       - ./db/migrations_v3_5_session_compression_legacy_drop.sql:/docker-entrypoint-initdb.d/37-session-compression-legacy-drop.sql
       - ./db/migrations_v3_5_sessions_consultations_namespace.sql:/docker-entrypoint-initdb.d/38-sessions-consultations-namespace.sql
+      - ./db/migrations_v4_2_users_username.sql:/docker-entrypoint-initdb.d/39-users-username.sql
+      - ./db/migrations_v4_2_compression_candidates_nullable_tokens.sql:/docker-entrypoint-initdb.d/40-compression-candidates-nullable-tokens.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
@@ -81,6 +83,8 @@ services:
       - ./db/migrations_v3_5_session_compression_ratio_drop.sql:/migrations/36-session-compression-ratio-drop.sql:ro
       - ./db/migrations_v3_5_session_compression_legacy_drop.sql:/migrations/37-session-compression-legacy-drop.sql:ro
       - ./db/migrations_v3_5_sessions_consultations_namespace.sql:/migrations/38-sessions-consultations-namespace.sql:ro
+      - ./db/migrations_v4_2_users_username.sql:/migrations/39-users-username.sql:ro
+      - ./db/migrations_v4_2_compression_candidates_nullable_tokens.sql:/migrations/40-compression-candidates-nullable-tokens.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -98,7 +102,9 @@ services:
       -f /migrations/35-state-journal-namespace.sql
       -f /migrations/36-session-compression-ratio-drop.sql
       -f /migrations/37-session-compression-legacy-drop.sql
-      -f /migrations/38-sessions-consultations-namespace.sql"
+      -f /migrations/38-sessions-consultations-namespace.sql
+      -f /migrations/39-users-username.sql
+      -f /migrations/40-compression-candidates-nullable-tokens.sql"
     restart: "no"
 
   ollama:
