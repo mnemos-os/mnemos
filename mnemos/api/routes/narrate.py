@@ -23,6 +23,7 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.security import is_root
 from mnemos.domain.compression.apollo import narrate_encoded
+from mnemos.persistence.visibility import VisibilityFilter
 
 router = APIRouter(prefix="/v1/memories", tags=["narrate"])
 
@@ -49,74 +50,34 @@ class NarrateResponse(BaseModel):
     engine_version: Optional[str] = None
 
 
-async def _fetch_memory(conn, memory_id: str, user: UserContext) -> Optional[dict]:
-    """Fetch a memory subject to the two-axis tenancy gate. Root
-    bypasses both owner_id and namespace filters."""
-    if is_root(user):
-        return await conn.fetchrow(
-            "SELECT id, content FROM memories WHERE id = $1",
-            memory_id,
-        )
-    return await conn.fetchrow(
-        "SELECT id, content FROM memories "
-        "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
-        memory_id, user.user_id, user.namespace,
-    )
+def _backend_or_503():
+    """Resolve the active persistence backend; 503 when uninstalled.
 
-
-async def _fetch_winning_variant(conn, memory_id: str) -> Optional[dict]:
-    """Return the current winning variant row or None."""
-    return await conn.fetchrow(
-        """
-        SELECT engine_id, engine_version, compressed_content
-        FROM memory_compressed_variants
-        WHERE memory_id = $1
-        """,
-        memory_id,
-    )
-
-
-async def build_narration_body(memory_row: dict, format: str) -> str:
-    """Build just the narrated body string from a pre-fetched memory row.
-
-    Used by ``GET /v1/memories/{id}`` content negotiation, where the
-    visibility-gated memory lookup is already done by the canonical
-    JSON path (``backend.memories.get_memory`` under
-    ``VisibilityFilter.for_read``). This helper does NOT re-check
-    tenancy — that is the caller's responsibility — and only fetches
-    the winning compressed variant before delegating to the same
-    prose / dense / passthrough branches as ``compute_narrate``.
-
-    ``memory_row`` must be a mapping that exposes ``id`` and
-    ``content`` keys (matches both the asyncpg Row shape and the
-    persistence backend's row shape). ``format`` must be
-    ``"prose"`` or ``"dense"``.
-
-    Returns the body string only — the caller wraps it in whichever
-    Response shape the chosen Accept media type requires. Raises
-    HTTPException(503) when the variant pool is unavailable; the
-    body is best-effort and will fall back to ``memory_row["content"]``
-    when no winning variant exists.
+    Local helper instead of importing from ``api.routes.memories`` to
+    avoid the circular ``memories ↔ narrate`` import the round-12
+    structure introduced.
     """
-    memory_id = memory_row["id"]
+    backend = getattr(_lc, "_persistence_backend", None)
+    if backend is None:
+        raise HTTPException(
+            status_code=503, detail="Persistence backend not available",
+        )
+    return backend
+
+
+def _render_narration(memory_row: dict, variant_row: dict | None, format: str) -> str:
+    """Pure dispatch — no I/O. Picks raw / passthrough / narrated
+    based on (variant present, engine, format).
+
+    Pulled out so both the backend-neutral helpers and tests can
+    share the same branch logic without duplicating it.
+    """
     raw_content = memory_row.get("content") or ""
-
-    if not _lc._pool:
-        # The variant lookup needs the asyncpg pool. The memory row
-        # itself was already fetched through whichever backend the
-        # caller uses, so a missing pool here is a real config
-        # problem (503) rather than a graceful no-variant fall-back.
-        raise HTTPException(status_code=503, detail="Database pool not available")
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        variant_row = await _fetch_winning_variant(conn, memory_id)
-
     if format == "dense":
         if variant_row is None:
             return raw_content
         return variant_row["compressed_content"] or ""
-
-    # Prose: APOLLO → narrate; non-APOLLO → passthrough; missing → raw.
+    # prose
     if variant_row is None:
         return raw_content
     if variant_row["engine_id"] != "apollo":
@@ -124,7 +85,96 @@ async def build_narration_body(memory_row: dict, format: str) -> str:
     return narrate_encoded(variant_row["compressed_content"])
 
 
+async def build_narration_body(
+    backend, tx, memory_row: dict, format: str,
+) -> str:
+    """Build just the narrated body string from a pre-fetched memory row.
+
+    Used by ``GET /v1/memories/{id}`` content negotiation, where the
+    visibility-gated memory lookup is already done by the canonical
+    JSON path (``backend.memories.get_memory`` under
+    ``VisibilityFilter.for_read``). This helper does NOT re-check
+    tenancy — that is the caller's responsibility — and only fetches
+    the winning compressed variant before dispatching prose / dense
+    / passthrough through ``_render_narration``.
+
+    ``memory_row`` must be a mapping that exposes ``id`` and
+    ``content`` keys (matches both the asyncpg Row shape and the
+    backend-neutral row shape). ``format`` must be
+    ``"prose"`` or ``"dense"``.
+
+    Backend-neutral: uses ``backend.compression.fetch_compressed_
+    variant_by_memory_id(tx, memory_id)`` under the caller's
+    transaction so SQLite-backed profiles (no asyncpg pool) work
+    identically to Postgres-backed profiles.
+    """
+    variant_row = await backend.compression.fetch_compressed_variant_by_memory_id(
+        tx, memory_row["id"],
+    )
+    return _render_narration(memory_row, variant_row, format)
+
+
 # ── endpoint ──────────────────────────────────────────────────────────────
+
+
+def _build_narrate_response(
+    memory_id: str,
+    memory_row: dict,
+    variant_row: dict | None,
+    format: str,
+) -> NarrateResponse:
+    """Compose the rich NarrateResponse model.
+
+    Same dispatch as ``_render_narration`` but emits the structured
+    response object that ``/v1/memories/{id}/narrate`` returns
+    (``source`` discriminator + engine metadata included).
+    """
+    raw_content = memory_row.get("content") or ""
+
+    if format == "dense":
+        if variant_row is None:
+            return NarrateResponse(
+                memory_id=memory_id,
+                format="dense",
+                content=raw_content,
+                source="raw",
+            )
+        return NarrateResponse(
+            memory_id=memory_id,
+            format="dense",
+            content=variant_row["compressed_content"] or "",
+            source="variant_dense",
+            engine_id=variant_row["engine_id"],
+            engine_version=variant_row["engine_version"],
+        )
+
+    if variant_row is None:
+        return NarrateResponse(
+            memory_id=memory_id,
+            format="prose",
+            content=raw_content,
+            source="raw",
+        )
+
+    engine_id = variant_row["engine_id"]
+    if engine_id != "apollo":
+        return NarrateResponse(
+            memory_id=memory_id,
+            format="prose",
+            content=variant_row["compressed_content"] or "",
+            source="variant_passthrough",
+            engine_id=engine_id,
+            engine_version=variant_row["engine_version"],
+        )
+
+    return NarrateResponse(
+        memory_id=memory_id,
+        format="prose",
+        content=narrate_encoded(variant_row["compressed_content"]),
+        source="narrated",
+        engine_id=engine_id,
+        engine_version=variant_row["engine_version"],
+    )
 
 
 async def compute_narrate(
@@ -134,81 +184,38 @@ async def compute_narrate(
 ) -> NarrateResponse:
     """Build the narrate response for a memory + caller + format.
 
-    Pulled out of the HTTP handler so other endpoints can reuse the
-    dispatch (notably GET /v1/memories/{id} content negotiation on
-    ``Accept: text/plain`` / ``Accept: application/x-apollo-dense``,
-    where the same prose / dense variants are surfaced via header
-    negotiation rather than a query string).
+    Used by GET /v1/memories/{id}/narrate. Goes through the same
+    backend-neutral read contract as GET /v1/memories/{id}: the
+    memory lookup is gated by ``VisibilityFilter.for_read`` (admits
+    owner, federated, world-readable, and group-readable memories),
+    not the narrower owner+namespace gate the v3.3 S-II handler used.
+    The winning-variant lookup uses the persistence backend's
+    compression repo so SQLite-backed profiles work identically to
+    Postgres-backed profiles.
 
     ``format`` must be ``"prose"`` or ``"dense"``. The caller is
     responsible for validating that — narrate's own pydantic Query
     pattern enforces it on the HTTP edge.
 
-    Raises HTTPException(503) if the DB pool is missing and
-    HTTPException(404) when the memory is not visible under the
-    caller's tenancy scope. Otherwise the return value mirrors the
-    NarrateResponse model.
+    Raises HTTPException(503) when the persistence backend is
+    unavailable and HTTPException(404) when the memory is not
+    visible under the caller's READABLE scope.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-
-    async with _lc.get_pool_manager().acquire() as conn:
-        memory_row = await _fetch_memory(conn, memory_id, user)
+    backend = _backend_or_503()
+    visibility = VisibilityFilter.for_read(
+        user, namespace=None if is_root(user) else user.namespace,
+    )
+    async with backend.transactional() as tx:
+        memory_row = await backend.memories.get_memory(
+            tx, memory_id, visibility=visibility,
+        )
         if memory_row is None:
             raise HTTPException(status_code=404, detail="Memory not found")
-
-        variant_row = await _fetch_winning_variant(conn, memory_id)
-
-        # Dense-form request: either return the raw winning variant or
-        # fall back to raw memory content when no variant exists.
-        if format == "dense":
-            if variant_row is None:
-                return NarrateResponse(
-                    memory_id=memory_id,
-                    format="dense",
-                    content=memory_row["content"] or "",
-                    source="raw",
-                )
-            return NarrateResponse(
-                memory_id=memory_id,
-                format="dense",
-                content=variant_row["compressed_content"] or "",
-                source="variant_dense",
-                engine_id=variant_row["engine_id"],
-                engine_version=variant_row["engine_version"],
-            )
-
-        # Prose-form request: narrate APOLLO outputs; pass through
-        # ARTEMIS (already prose-shaped); fall back to raw on
-        # missing variant.
-        if variant_row is None:
-            return NarrateResponse(
-                memory_id=memory_id,
-                format="prose",
-                content=memory_row["content"] or "",
-                source="raw",
-            )
-
-        engine_id = variant_row["engine_id"]
-        if engine_id != "apollo":
-            return NarrateResponse(
-                memory_id=memory_id,
-                format="prose",
-                content=variant_row["compressed_content"] or "",
-                source="variant_passthrough",
-                engine_id=engine_id,
-                engine_version=variant_row["engine_version"],
-            )
-
-        narrated = narrate_encoded(variant_row["compressed_content"])
-        return NarrateResponse(
-            memory_id=memory_id,
-            format="prose",
-            content=narrated,
-            source="narrated",
-            engine_id=engine_id,
-            engine_version=variant_row["engine_version"],
+        variant_row = await backend.compression.fetch_compressed_variant_by_memory_id(
+            tx, memory_id,
         )
+
+    return _build_narrate_response(memory_id, memory_row, variant_row, format)
 
 
 @router.get("/{memory_id}/narrate", response_model=NarrateResponse)

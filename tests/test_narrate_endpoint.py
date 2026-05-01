@@ -2,17 +2,23 @@
 
 Covers the rule-based narration dispatcher and the HTTP handler's
 branching on (variant present|absent) × (engine apollo|other) ×
-(format prose|dense) × (tenancy root|non-root).
+(format prose|dense) × (visibility scope).
 
-Helpers directly in mnemos.domain.compression.apollo get unit-tested separately;
-this file validates the HTTP surface + handler logic.
+Helpers directly in mnemos.domain.compression.apollo get unit-tested
+separately; this file validates the HTTP surface + handler logic.
+
+After v4.2.0a14 round-14 the handler goes through the same
+``VisibilityFilter.for_read`` backend lookup as
+``GET /v1/memories/{id}`` (admits owner / federated / world / group
+reads), and the winning-variant lookup runs through the persistence
+backend's compression repo (no asyncpg pool requirement). Tests use
+``install_fake_backend`` to assert both contracts.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
-
 import pytest
 
+from mnemos.api.dependencies import UserContext
 from mnemos.api.routes.narrate import narrate
 from mnemos.domain.compression.apollo import (
     _narrate_fallback_form,
@@ -20,35 +26,15 @@ from mnemos.domain.compression.apollo import (
     looks_like_portfolio,
     narrate_encoded,
 )
+from mnemos.persistence.visibility import VisibilityScope
 
-# ── async-context test double (matches the fixture shape used by
-# test_admin_user_namespace / test_admin_federation_role) ────────────────
-
-
-class _AsyncContext:
-    def __init__(self, value):
-        self._value = value
-
-    async def __aenter__(self):
-        return self._value
-
-    async def __aexit__(self, *args):
-        return None
+from tests._fake_backend import install_fake_backend
 
 
-def _mock_pool(monkeypatch, memory_row=None, variant_row=None):
-    from mnemos.core import lifecycle
-
-    mock_conn = MagicMock()
-    mock_conn.fetchrow = AsyncMock(side_effect=[memory_row, variant_row])
-    mock_pool = MagicMock()
-    mock_pool.acquire = MagicMock(return_value=_AsyncContext(mock_conn))
-    monkeypatch.setattr(lifecycle, "_pool", mock_pool)
-    return mock_pool, mock_conn
-
-
-def _memory_row(memory_id="m1", content="raw prose content"):
-    return {"id": memory_id, "content": content}
+def _memory_row(memory_id="m1", content="raw prose content", **extra):
+    base = {"id": memory_id, "content": content}
+    base.update(extra)
+    return base
 
 
 def _variant_row(engine_id="apollo", engine_version="0.2",
@@ -61,11 +47,26 @@ def _variant_row(engine_id="apollo", engine_version="0.2",
 
 
 def _user(role="root", user_id="root", namespace="default"):
-    u = MagicMock()
-    u.role = role
-    u.user_id = user_id
-    u.namespace = namespace
-    return u
+    if role == "root":
+        return UserContext(
+            user_id=user_id, group_ids=[], role="root",
+            namespace=namespace, authenticated=True,
+        )
+    return UserContext(
+        user_id=user_id, group_ids=[], role=role,
+        namespace=namespace, authenticated=True,
+    )
+
+
+def _wire_backend(monkeypatch, memory_row, variant_row):
+    """Install a fake backend with the requested memory + variant
+    rows wired to the relevant repo methods."""
+    backend = install_fake_backend(monkeypatch)
+    backend.memories.configure_return("get_memory", memory_row)
+    backend.compression.configure_return(
+        "fetch_compressed_variant_by_memory_id", variant_row,
+    )
+    return backend
 
 
 # ── helper: dispatcher sniffs ──────────────────────────────────────────────
@@ -165,7 +166,7 @@ def test_narrate_encoded_empty_input_safe():
 
 @pytest.mark.asyncio
 async def test_handler_404_when_memory_missing(monkeypatch):
-    _mock_pool(monkeypatch, memory_row=None, variant_row=None)
+    _wire_backend(monkeypatch, memory_row=None, variant_row=None)
     from fastapi import HTTPException
     with pytest.raises(HTTPException) as exc:
         await narrate(memory_id="m1", format="prose", user=_user())
@@ -175,7 +176,7 @@ async def test_handler_404_when_memory_missing(monkeypatch):
 @pytest.mark.asyncio
 async def test_handler_raw_when_no_variant(monkeypatch):
     """No winning variant → return raw memory content, source='raw'."""
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(content="the unprocessed memory text"),
         variant_row=None,
@@ -189,7 +190,7 @@ async def test_handler_raw_when_no_variant(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_handler_apollo_portfolio_narrated(monkeypatch):
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=_variant_row(
@@ -206,7 +207,7 @@ async def test_handler_apollo_portfolio_narrated(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_handler_apollo_fallback_narrated(monkeypatch):
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=_variant_row(
@@ -226,7 +227,7 @@ async def test_handler_apollo_fallback_narrated(monkeypatch):
 @pytest.mark.asyncio
 async def test_handler_non_apollo_variant_passthrough(monkeypatch):
     """Non-APOLLO output is already prose — don't narrate."""
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=_variant_row(
@@ -243,7 +244,7 @@ async def test_handler_non_apollo_variant_passthrough(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_handler_dense_format_returns_variant_verbatim(monkeypatch):
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=_variant_row(
@@ -261,7 +262,7 @@ async def test_handler_dense_format_returns_variant_verbatim(monkeypatch):
 async def test_handler_dense_format_falls_back_to_raw_when_no_variant(monkeypatch):
     """`format=dense` with no variant returns raw memory content —
     always-safe-to-call contract."""
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(content="raw body"),
         variant_row=None,
@@ -276,7 +277,7 @@ async def test_handler_unknown_apollo_shape_passes_through(monkeypatch):
     """Defense-in-depth: an APOLLO variant whose encoded form doesn't
     match any known schema sniff should render verbatim rather than
     404'ing or raising."""
-    _mock_pool(
+    _wire_backend(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=_variant_row(
@@ -289,15 +290,21 @@ async def test_handler_unknown_apollo_shape_passes_through(monkeypatch):
     assert resp.content == "future-schema-payload-not-yet-released"
 
 
-# ── tenancy: non-root uses owner+namespace filter ─────────────────────────
+# ── visibility contract: same VisibilityFilter shape as GET /memories/{id} ──
+#
+# Codex round-2 of the round-12 thread surfaced that the explicit
+# /narrate endpoint kept the old narrower owner+namespace gate while
+# /memories/{id} content negotiation was lifted onto VisibilityFilter
+# .for_read. These tests pin /narrate's new contract against the
+# fake backend's captured calls so the visibility surface cannot
+# regress to the v3.3 owner-only shape.
 
 
 @pytest.mark.asyncio
-async def test_handler_non_root_uses_namespace_scoped_query(monkeypatch):
-    """Verify the handler sends an owner_id + namespace filter on the
-    memory lookup for non-root callers. The mock records the SQL
-    invoked so we can assert the gate is in place."""
-    _, conn = _mock_pool(
+async def test_narrate_uses_visibility_filter_for_read_for_non_root(monkeypatch):
+    """Non-root callers must reach the backend with VisibilityFilter
+    .for_read (READABLE scope, namespace pinned to user)."""
+    backend = _wire_backend(
         monkeypatch,
         memory_row=_memory_row(),
         variant_row=None,
@@ -305,10 +312,66 @@ async def test_handler_non_root_uses_namespace_scoped_query(monkeypatch):
     user = _user(role="user", user_id="alice", namespace="tenant-a")
     await narrate(memory_id="m1", format="prose", user=user)
 
-    # First fetchrow call is the memory lookup.
-    call = conn.fetchrow.await_args_list[0]
-    sql = call.args[0]
-    assert "owner_id" in sql, "non-root memory lookup must filter by owner_id"
-    assert "namespace" in sql, "non-root memory lookup must filter by namespace"
-    assert "alice" in call.args, "owner_id value must be bound"
-    assert "tenant-a" in call.args, "namespace value must be bound"
+    last_call = next(
+        (kw for name, kw in reversed(backend.memories.calls) if name == "get_memory"),
+        None,
+    )
+    assert last_call is not None, "get_memory was never called"
+    visibility = last_call["visibility"]
+    assert visibility.scope == VisibilityScope.READABLE
+    assert visibility.namespace == "tenant-a"
+    assert visibility.user_id == "alice"
+
+
+@pytest.mark.asyncio
+async def test_narrate_root_uses_root_bypass_filter(monkeypatch):
+    """Root callers reach the backend with ROOT_BYPASS + namespace=None
+    so cross-tenant narration works the same as cross-tenant JSON
+    reads via GET /v1/memories/{id}."""
+    backend = _wire_backend(
+        monkeypatch,
+        memory_row=_memory_row(),
+        variant_row=None,
+    )
+    await narrate(memory_id="m1", format="prose", user=_user(role="root"))
+
+    last_call = next(
+        (kw for name, kw in reversed(backend.memories.calls) if name == "get_memory"),
+        None,
+    )
+    assert last_call is not None
+    visibility = last_call["visibility"]
+    assert visibility.scope == VisibilityScope.ROOT_BYPASS
+    assert visibility.namespace is None
+
+
+@pytest.mark.asyncio
+async def test_narrate_admits_readable_row_independent_of_owner(monkeypatch):
+    """A row returned by the backend (which it would only have done
+    after passing the READABLE predicate) is rendered to the caller
+    even when the row's owner_id and namespace differ from the
+    caller — exactly the federated/world/group case codex round-2
+    asked us to verify."""
+    backend = _wire_backend(
+        monkeypatch,
+        memory_row=_memory_row(
+            content="federated body",
+            owner_id="bob",
+            namespace="other-tenant",
+            permission_mode=644,  # world-readable
+        ),
+        variant_row=None,
+    )
+    user = _user(role="user", user_id="alice", namespace="tenant-a")
+    resp = await narrate(memory_id="m1", format="prose", user=user)
+    assert resp.source == "raw"
+    assert resp.content == "federated body"
+    # And the visibility filter at the gate is still the broader
+    # READABLE shape — the test_narrate_uses_visibility_filter_for_
+    # read_for_non_root case verified the call site, this one
+    # verifies the response is built off the row backend admitted.
+    last_call = next(
+        (kw for name, kw in reversed(backend.memories.calls) if name == "get_memory"),
+        None,
+    )
+    assert last_call["visibility"].scope == VisibilityScope.READABLE

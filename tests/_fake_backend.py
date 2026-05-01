@@ -193,9 +193,20 @@ class _FakeWebhookRepo:
 class _FakeCompressionRepo:
     def __init__(self) -> None:
         self._stats = None
+        self._returns: dict[str, Any] = {}
 
     def configure_stats(self, value: Any) -> None:
         self._stats = value
+
+    def configure_return(self, method: str, value: Any) -> None:
+        """Stub a return value for an arbitrary compression-repo method.
+
+        Mirrors ``_FakeMemoryRepo.configure_return``. Callers that
+        configure a method get a stable async function that returns
+        the configured value; methods that aren't configured fall
+        through to AsyncMock as before.
+        """
+        self._returns[method] = value
 
     async def gather_stats(self, tx):
         from mnemos.persistence.base import CompressionStatsRow
@@ -205,7 +216,16 @@ class _FakeCompressionRepo:
             unreviewed_compressions=0,
         )
 
-    def __getattr__(self, name: str) -> AsyncMock:
+    def __getattr__(self, name: str) -> Any:
+        # __getattr__ is only consulted for misses, so configured
+        # methods stored on _returns are routed via this path.
+        if "_returns" in self.__dict__ and name in self._returns:
+            value = self._returns[name]
+
+            async def _stub(*args, **kwargs):
+                return value
+
+            return _stub
         return AsyncMock()
 
 

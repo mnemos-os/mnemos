@@ -342,13 +342,26 @@ async def get_memory(
     visibility = VisibilityFilter.for_read(
         user, namespace=None if is_root(user) else user.namespace,
     )
+    body: Optional[str] = None
+    row = None
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
         row = await backend.memories.get_memory(
             tx, memory_id, visibility=visibility,
         )
-    if not row:
-        raise HTTPException(status_code=404, detail="Memory not found")
+        if not row:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        # Variant lookup must run inside the same transaction as the
+        # memory fetch so a SQLite backend (single shared connection)
+        # sees a consistent view, and so the visibility-gated row and
+        # the variant we narrate from it cannot drift across a
+        # concurrent compression-write boundary.
+        if narrate_format is not None:
+            from mnemos.api.routes.narrate import build_narration_body
+
+            body = await build_narration_body(
+                backend, tx, row, narrate_format,
+            )
 
     # Vary: Accept on every successful representation. Unifies cache
     # behaviour even when the negotiated branch was not taken (a
@@ -358,19 +371,13 @@ async def get_memory(
     # serialised response — relying on FastAPI's response_model would
     # bypass our header injection.
     if narrate_format is not None:
-        # Lazy import keeps the route module's import surface stable
-        # even when narrate.py grows further deps over the v3.3 S-III
-        # cached-LLM cutover.
-        from mnemos.api.routes.narrate import build_narration_body
-
-        body = await build_narration_body(row, narrate_format)
         media_type = (
             "text/plain"
             if narrate_format == "prose"
             else "application/x-apollo-dense"
         )
         return PlainTextResponse(
-            body,
+            body or "",
             media_type=media_type,
             headers={"Vary": "Accept"},
         )
