@@ -11,4 +11,4 @@ without a re-install. A literal Python constant is what every runtime
 caller imports — no install-state coupling.
 """
 
-__version__ = "4.2.0a8"
+__version__ = "4.2.0a9"

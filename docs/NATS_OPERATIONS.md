@@ -362,12 +362,43 @@ If the burst lands entirely on one replica, check:
   brain across two brokers means each broker has its own consumer
   with its own queue group.
 
+## Live-broker integration tests
+
+`v4.2.0a9` added `tests/integration_nats/` — a pytest suite that
+runs against a real NATS broker. It is SKIPPED by default; set
+`MNEMOS_NATS_TEST_URL=nats://host:4222` (and optionally
+`MNEMOS_NATS_TEST_TOKEN`) to enable. The runtime contracts the
+suite proves:
+
+* `add_stream` is idempotent on a matching config.
+* `add_stream` raises (does not silently mutate) on a drifted
+  config; the existing stream keeps its old config.
+* `ensure_streams()` is safe to re-run — second-call no-op.
+* Queue-group subscriptions actually load-balance: two replicas
+  joined to the same group both receive some traffic and JetStream
+  does not duplicate messages across them.
+
+Operators rolling out queue-group support can use this as a
+pre-prod smoke check against their cluster:
+
+```
+MNEMOS_NATS_TEST_URL=nats://staging-broker:4222 \
+  pytest tests/integration_nats/ -v
+```
+
+The suite creates per-test isolated streams (random suffix) and
+deletes them in finalizers, so it is safe to point at a shared
+broker — though running against a quiet staging cluster is
+preferable.
+
 ## Known limitations
 
-* Broker-failure test depth — current tests cover happy-path
-  publish/subscribe, the reconnect backoff scheduler, the three-
-  scope `_consume_subscription` policy, and the queue-group
-  subscribe shape, but do NOT exercise stream-drift scenarios
-  (config mismatch on redeploy) or partial-broker-outage paths
-  against a LIVE broker. Audit Finding 11 — open candidate for
-  a future slice once a real-broker test harness is in place.
+* Partial-broker-outage paths (broker shutdown mid-consume,
+  durable consumer deletion mid-consume) are still only proved
+  via the unit-level fakes in `tests/test_federation_nats_consumer.py`
+  and `tests/test_webhook_nats_trigger.py`. A live-broker
+  outage test would need a fixture that can stop+restart the
+  broker subprocess; deferred candidate for v4.2.0a9+ once a
+  test-managed broker fixture lands. The shipped
+  ``MNEMOS_NATS_TEST_URL`` path expects the broker is operator-
+  managed and stays up across the test session.

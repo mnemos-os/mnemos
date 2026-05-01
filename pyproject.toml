@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemos-os"
-version = "4.2.0a8"
+version = "4.2.0a9"
 description = "MNEMOS-OS v4: multi-backend memory operating system with GRAEAE reasoning, profiles, single-binary edge deploys, and multi-worker support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -221,7 +221,11 @@ forbidden_modules = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "--ignore=tests/test_live_e2e.py"
+# tests/integration_nats/ requires a live NATS broker
+# (MNEMOS_NATS_TEST_URL); the conftest skips them when the env var
+# is absent. The --ignore here is belt-and-suspenders for default
+# `pytest` invocations on dev boxes without the env var set.
+addopts = "--ignore=tests/test_live_e2e.py --ignore=tests/integration_nats"
 markers = [
   "integration: integration tests requiring MNEMOS_TEST_DB (postgres://...)",
 ]
