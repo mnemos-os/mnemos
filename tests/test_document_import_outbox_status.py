@@ -282,6 +282,39 @@ async def test_batch_import_total_failure_returns_502(
 
 
 @patch("mnemos.api.routes.document_import.DOCLING_AVAILABLE", True)
+async def test_batch_import_all_empty_files_returns_207_not_502(
+    client,
+    auth_headers,
+):
+    """Codex round-3 of round-47 caught that the previous 502
+    aggregation conflated genuine infra-rollback (502) with
+    client-error 4xx — every empty file would have produced
+    ``memories_created=0`` and the batch would have returned
+    502 (retryable gateway failure) when the right answer is
+    207 with per-file 400 entries that clients should NOT retry."""
+    resp = await client.post(
+        "/v1/documents/batch-import",
+        files=[
+            ("files", ("empty1.pdf", b"")),
+            ("files", ("empty2.pdf", b"")),
+        ],
+        data={"category": "documents"},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 207, (
+        f"all-empty-files batch must NOT return 502; got "
+        f"{resp.status_code}: {resp.text}"
+    )
+    results = resp.json()
+    assert len(results) == 2
+    # Per-file entries carry the actual 400 client-error code so
+    # client-side retry logic can do the right thing.
+    for entry in results:
+        assert entry["status_code"] == 400
+        assert entry["memories_created"] == 0
+
+
+@patch("mnemos.api.routes.document_import.DOCLING_AVAILABLE", True)
 @patch("mnemos.api.routes.document_import.DoclingImporter")
 async def test_batch_import_all_success_returns_200(
     mock_importer_class,

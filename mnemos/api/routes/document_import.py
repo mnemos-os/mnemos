@@ -432,16 +432,30 @@ async def batch_import_documents(
                 "status_code": e.status_code,
             })
             has_partial_or_full_failure = True
-    # Top-level batch HTTP status mirrors the single-file rules:
-    # 200 if every file fully imported, 207 if any file had any
-    # failure (partial or full). 502 reserved for the unusual
-    # "every file totally failed" case.
+    # Top-level batch HTTP status — codex round-3 of round-47
+    # caught that "all files had memories_created=0" wasn't the
+    # right 502 trigger: empty-file 400s, Docling-missing 501s,
+    # database-unavailable 503s would all match that condition
+    # and falsely look like retryable gateway failures.
+    #
+    # Aggregate from per-file ``status_code`` instead:
+    #   * 200 — every file fully imported.
+    #   * 502 — every file had status_code=502 (full batch
+    #          import rollback; retryable infrastructure issue).
+    #   * 207 — any other mixed failure shape (clients SHOULD
+    #          inspect per-file ``status_code`` to decide retry
+    #          policy per file; in particular a 4xx in a per-file
+    #          entry means "fix the input, don't retry").
     if has_partial_or_full_failure:
-        all_zero = all(
-            r.get("memories_created", 0) == 0 for r in results
+        per_file_statuses = [
+            int(r.get("status_code", 0)) for r in results
+        ]
+        all_502 = (
+            len(per_file_statuses) > 0
+            and all(code == 502 for code in per_file_statuses)
         )
         return JSONResponse(
-            status_code=502 if all_zero else 207,
+            status_code=502 if all_502 else 207,
             content=results,
         )
     return results
