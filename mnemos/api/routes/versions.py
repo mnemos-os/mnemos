@@ -9,6 +9,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
 from mnemos.domain.models import MemoryItem, row_to_memory as _row_to_memory
@@ -148,8 +149,7 @@ async def list_versions(
 
     Query parameter branch defaults to 'main'. For feature branches, specify branch=name.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/versions")
     async with _lc.get_pool_manager().acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
         # Per-snapshot tenancy: filter the version rows by THEIR own
@@ -198,8 +198,7 @@ async def get_version(
     user: UserContext = Depends(get_current_user),
 ):
     """Retrieve memory content at a specific version on a branch."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/versions/{version_num}")
     async with _lc.get_pool_manager().acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
         if is_root(user):
@@ -247,8 +246,7 @@ async def diff_versions(
 
     Both versions must exist on the specified branch.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}/diff")
     async with _lc.get_pool_manager().acquire() as conn:
         await _assert_memory_readable(conn, memory_id, user)
         if is_root(user):
@@ -304,8 +302,7 @@ async def revert_memory(
     Creates a new version snapshot on the same branch so the revert itself
     is part of the audit trail. Updates the live memory record.
     """
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/memories/{memory_id}/revert/{version_num}")
     async with _lc.get_pool_manager().acquire() as conn:
         # Tenancy gate first — fail-closed before any version SELECT.
         await _assert_memory_readable(conn, memory_id, user)

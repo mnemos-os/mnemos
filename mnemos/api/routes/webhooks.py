@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain.models import (
     VALID_WEBHOOK_EVENTS,
@@ -68,8 +69,7 @@ async def create_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     """Create a webhook subscription. Returns the HMAC secret exactly once."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/webhooks")
 
     await _validate_url(request.url)
     _validate_events(request.events)
@@ -144,8 +144,7 @@ async def list_webhooks(
     include_revoked: bool = False,
 ):
     """List the caller's webhook subscriptions. Secrets are never returned."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/webhooks")
 
     # v3.2 Tier 3: scope by owner_id + namespace. Root sees all
     # (no owner / namespace filter) so ops can audit cross-tenant.
@@ -197,8 +196,7 @@ async def get_webhook(
     user: UserContext = Depends(get_current_user),
 ):
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/webhooks/{webhook_id}")
 
     # v3.2 Tier 3: non-root must match owner AND namespace.
     # Root reads any webhook.
@@ -237,8 +235,7 @@ async def revoke_webhook(
 ):
     """Soft-delete: marks the subscription revoked. Delivery log preserved."""
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="DELETE /v1/webhooks/{webhook_id}")
 
     # v3.2 Tier 3: non-root must match owner AND namespace. Root
     # can revoke any webhook.
@@ -280,8 +277,7 @@ async def list_deliveries(
 ):
     """List recent delivery attempts for a subscription."""
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/webhooks/{webhook_id}/deliveries")
 
     # v3.2 Tier 3: subscription must belong to caller's owner AND
     # namespace. Root bypasses both.

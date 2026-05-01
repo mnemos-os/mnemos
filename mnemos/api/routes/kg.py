@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import is_root
 from mnemos.domain.models import KGTriple, KGTripleCreate, KGTripleListResponse, KGTripleUpdate
 
@@ -47,8 +48,7 @@ def _row_to_triple(row) -> KGTriple:
 
 @router.post("/triples", response_model=KGTriple, status_code=201)
 async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_current_user)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/kg/triples")
     triple_id = f"kg_{uuid.uuid4().hex[:12]}"
 
     valid_from = None
@@ -109,8 +109,7 @@ async def list_triples(
     offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
 ):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/kg/triples")
 
     conditions = []
     filter_params = []
@@ -155,8 +154,7 @@ async def list_triples(
 @router.get("/timeline/{subject}", response_model=KGTripleListResponse)
 async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), user: UserContext = Depends(get_current_user)):
     """Get all triples for a subject ordered by valid_from (chronological history)."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/kg/timeline/{subject}")
     async with _lc.get_pool_manager().acquire() as conn:
         if is_root(user):
             rows = await conn.fetch(
@@ -175,8 +173,7 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
 async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext = Depends(get_current_user)):
     """Partially update a KG triple. Non-owners see 404 to avoid
     leaking existence of triples they don't own."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="PATCH /v1/kg/triples/{triple_id}")
     updates: dict = {}
     for field in ("subject", "predicate", "object", "subject_type", "object_type", "confidence"):
         val = getattr(req, field)
@@ -213,8 +210,7 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
 
 @router.delete("/triples/{triple_id}", status_code=204)
 async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_user)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="DELETE /v1/kg/triples/{triple_id}")
     async with _lc.get_pool_manager().transactional() as conn:
         row = await conn.fetchrow(
             "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
