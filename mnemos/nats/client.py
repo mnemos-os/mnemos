@@ -127,17 +127,18 @@ async def ensure_streams(js) -> bool:
         BadRequestError = type("BadRequestError", (Exception,), {})  # type: ignore[misc, assignment]
 
     for cfg in streams:
-        exc: Exception | None = None
         try:
             await js.add_stream(config=cfg)
             logger.info("NATS stream %s declared", cfg.name)
             continue
         except Exception as caught:
-            exc = caught
+            exc: Exception = caught
 
-        assert exc is not None  # the only path here is through the except above
         msg = str(exc)
         if "10047" in msg or "insufficient storage resources" in msg.lower():
+            # Fresh declare: broker can't fit the canonical 10 GiB.
+            # Fall back to a 1 GiB stream so a small dev/test broker
+            # can still bootstrap.
             try:
                 await js.add_stream(
                     config=_stream_config(cfg.name, list(cfg.subjects), 1024**3)
@@ -145,77 +146,73 @@ async def ensure_streams(js) -> bool:
                 logger.info("NATS stream %s declared with 1GB max_bytes", cfg.name)
                 continue
             except Exception as fallback_exc:
-                exc = fallback_exc
-                msg = str(fallback_exc)
+                logger.error(
+                    "NATS stream %s declaration failed (canonical + fallback both rejected): %s",
+                    cfg.name,
+                    fallback_exc,
+                )
+                return False
 
-        # add_stream is idempotent for matching configs and raises
-        # BadRequestError for mismatched configs. Both paths can
-        # surface text like "already in use" — so disambiguate via
-        # the structured exception class first, falling back to
-        # message text for older nats-py releases. We then call
-        # stream_info to compare the running config against `cfg`
-        # and log field-level drift.
-        # Audit Finding 11 / codex rounds 5 + 6 (2026-05-01).
+        # add_stream raised. nats-py 2.14 silently accepts a TRUE
+        # matching-config redeclare (no raise); BadRequestError /
+        # "already in use" only appears when the existing config
+        # diverges. So we know: existing stream is NOT cfg.
+        #
+        # Distinguish the two acceptable diverging cases from real
+        # drift by re-trying the SAME stream with the fallback
+        # config. If that one is also accepted silently, the
+        # existing stream IS the 1 GiB fallback we ourselves
+        # create; publishing is safe. If it ALSO raises, neither
+        # canonical nor fallback matches → real drift, fail closed.
+        #
+        # Crucially, this approach uses the broker's full config
+        # comparator (which knows about every field — max_msg_size,
+        # replicas, discard, no_ack, ...) instead of our partial
+        # field-by-field drift detector. Codex rounds 6/7/8.
         looks_like_existing = (
             isinstance(exc, BadRequestError)
             or "already in use" in msg
             or "stream name already" in msg.lower()
         )
-        if looks_like_existing:
-            drift = await _stream_config_drift(js, cfg)
-            if not drift:
-                # The broker rejected add_stream as a duplicate but
-                # OUR partial drift comparison sees no mismatch. That
-                # means the rejection is over a field we don't check
-                # (max_msg_size, no_ack, discard, replicas, ...). Fail
-                # closed: the broker has already signalled the configs
-                # diverge, so an empty partial-comparison result is
-                # not proof of safety. Codex round-7 finding.
-                logger.error(
-                    "NATS stream %s rejected as duplicate but no drift "
-                    "detected in compared dimensions (max_age, max_bytes, "
-                    "duplicate_window, subjects, retention, storage). The "
-                    "broker is signalling a config mismatch in a field "
-                    "this code does not compare — fail closed. Operator "
-                    "must inspect via `nats stream info %s` and reconcile "
-                    "(nats stream update or delete+recreate).",
-                    cfg.name,
-                    cfg.name,
-                )
-                return False
-            # Special-case: if the ONLY drift is max_bytes AND the
-            # running stream is EXACTLY the 1 GiB this code creates
-            # under insufficient-storage, the broker took the documented
-            # fallback on a previous boot. Don't disable publishing —
-            # operator can grow the stream out-of-band when they have
-            # the space. Anything else (operator manually shrunk to 5GB,
-            # legacy 256MB stream, etc.) IS drift.
-            # Codex round-7 finding: pre-fix accepted any smaller value.
-            FALLBACK_MAX_BYTES = 1024**3
-            if (
-                set(drift.keys()) == {"max_bytes"}
-                and drift["max_bytes"][0] == FALLBACK_MAX_BYTES
-            ):
-                logger.info(
-                    "NATS stream %s running on 1 GiB max_bytes (the documented "
-                    "insufficient-storage fallback path) — requested %s. "
-                    "Publishing stays enabled. Operator can grow the stream "
-                    "out-of-band when storage is available.",
-                    cfg.name,
-                    drift["max_bytes"][1],
-                )
-                continue
-            logger.error(
-                "NATS stream %s config drift detected; broker keeps OLD "
-                "config. Drift: %s. Operator must `nats stream update %s` "
-                "or delete+recreate to apply the new config.",
+        if not looks_like_existing:
+            logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
+            return False
+
+        try:
+            await js.add_stream(
+                config=_stream_config(cfg.name, list(cfg.subjects), 1024**3)
+            )
+            # Fallback config matched silently → existing stream IS
+            # the 1 GiB fallback. Publishing is safe.
+            logger.info(
+                "NATS stream %s running on 1 GiB fallback path (configured "
+                "max_bytes=%s could not be applied to the running stream). "
+                "Publishing stays enabled. Operator can grow the stream "
+                "out-of-band with `nats stream update %s` when storage is "
+                "available.",
                 cfg.name,
-                drift,
+                cfg.max_bytes,
                 cfg.name,
             )
-            return False
-        else:
-            logger.error("NATS stream %s declaration error: %s", cfg.name, exc)
+            continue
+        except Exception:
+            # Neither canonical nor fallback config matches the
+            # running stream → real drift. Run the drift detector
+            # for an operator-facing diagnostic log of the SHAPE of
+            # drift we can see, then fail closed regardless of what
+            # it returns.
+            drift = await _stream_config_drift(js, cfg)
+            logger.error(
+                "NATS stream %s config drift detected (running stream "
+                "matches neither the canonical nor the 1 GiB fallback "
+                "config). Visible drift fields: %s. Operator must "
+                "`nats stream update %s` or delete+recreate to apply "
+                "the new config; field list above is partial — broker "
+                "may also differ on un-compared fields.",
+                cfg.name,
+                drift or "(none in compared dimensions; see broker)",
+                cfg.name,
+            )
             return False
     return True
 

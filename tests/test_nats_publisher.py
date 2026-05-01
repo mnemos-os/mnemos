@@ -216,6 +216,12 @@ def test_ensure_streams_max_bytes_smaller_treated_as_storage_fallback(monkeypatc
     drift-disables-publishing branch. Otherwise operators who ever
     hit insufficient-storage permanently lose NATS publishing on
     every subsequent restart.
+
+    Round-8 redesign: ensure_streams now uses the broker itself as
+    the comparator. On a duplicate-rejection of the canonical config,
+    it retries with the 1 GiB fallback config. If THAT redeclare is
+    silently accepted, the existing stream is the fallback and
+    publishing stays enabled.
     """
     import logging
 
@@ -223,36 +229,26 @@ def test_ensure_streams_max_bytes_smaller_treated_as_storage_fallback(monkeypatc
 
     class _Js:
         async def add_stream(self, config=None, **_):
+            # Canonical (10 GiB) → broker rejects (existing differs).
+            # Fallback (1 GiB) → broker silently accepts (matches).
+            if config.max_bytes == 1024**3:
+                return SimpleNamespace(config=config)
             raise RuntimeError("nats: stream name already in use")
-
-        async def stream_info(self, name):
-            # Existing stream has 1GB max_bytes — the fallback that
-            # ensure_streams itself created on a previous boot under
-            # insufficient-storage. ensure_streams' canonical config
-            # asks for 10GB.
-            return SimpleNamespace(
-                config=_stream_config_obj(
-                    name=name,
-                    subjects=_CANONICAL_SUBJECTS[name],
-                    max_bytes=1024**3,
-                )
-            )
 
     js = _Js()
     monkeypatch.setattr(nats_client, "_jetstream", None)
     result = asyncio.run(nats_client.ensure_streams(js))
 
     assert result is True, (
-        "max_bytes-smaller-than-desired must be treated as the "
-        "documented insufficient-storage fallback path, not as drift "
-        "that disables publishing"
+        "broker silently accepting the 1 GiB fallback redeclare proves "
+        "the existing stream IS the fallback — publishing stays enabled"
     )
-    # Should leave an INFO log naming the fallback explicitly.
+    # Should leave an INFO log naming the fallback path.
     assert any(
-        "fallback" in rec.message.lower() and "max_bytes" in rec.message.lower()
+        "fallback" in rec.message.lower()
         for rec in caplog.records
     ), (
-        "fallback path must log info naming the field. caplog: "
+        "fallback path must log info naming the path. caplog: "
         f"{[r.message for r in caplog.records]}"
     )
 
@@ -297,15 +293,14 @@ def test_ensure_streams_storage_or_retention_drift_disables_publishing(monkeypat
 
 
 def test_ensure_streams_fail_closed_on_unexplained_rejection(monkeypatch, caplog):
-    """Codex round-7: if add_stream raises duplicate-config rejection
-    but our drift detector returns {} because the diff is in a field
-    we DON'T compare (e.g. max_msg_size, no_ack, discard, replicas),
-    we must fail closed — not silently green-light publishing.
+    """Codex rounds 7+8: if add_stream raises duplicate-rejection on
+    BOTH the canonical config AND the 1 GiB fallback config, the
+    running stream matches neither — fail closed.
 
-    The reasoning: the broker has already signalled the configs
-    diverge. An empty partial-comparison result from us is not
-    proof of safety, only proof that we didn't look at the right
-    field.
+    Round-8 redesign uses the broker itself as the comparator
+    instead of our partial _stream_config_drift, so this test
+    exercises the case where neither shape we know how to declare
+    is accepted by the broker.
     """
     import logging
 
@@ -313,11 +308,16 @@ def test_ensure_streams_fail_closed_on_unexplained_rejection(monkeypatch, caplog
 
     class _Js:
         async def add_stream(self, config=None, **_):
+            # Reject EVERY add_stream attempt — canonical and
+            # fallback both come back duplicate.
             raise RuntimeError("nats: stream name already in use")
 
         async def stream_info(self, name):
-            # Every field we KNOW to compare matches. Diff is in a
-            # field we don't compare — drift detector returns {}.
+            # Every field we know how to compare matches; the broker
+            # is signalling diff in a field we don't compare. After
+            # the round-8 redesign this no longer changes the
+            # outcome (broker rejection of fallback is enough), but
+            # the diagnostic log uses stream_info anyway.
             return SimpleNamespace(
                 config=_stream_config_obj(
                     name=name,
@@ -330,15 +330,16 @@ def test_ensure_streams_fail_closed_on_unexplained_rejection(monkeypatch, caplog
     result = asyncio.run(nats_client.ensure_streams(js))
 
     assert result is False, (
-        "broker-signalled duplicate + empty partial drift must fail "
-        "closed (not silently enable publishing on stale config)"
+        "double-rejection (canonical + fallback both raise) must "
+        "fail closed regardless of what our partial drift detector sees"
     )
     assert any(
-        "fail closed" in rec.message.lower() or "does not compare" in rec.message.lower()
+        "matches neither" in rec.message.lower()
+        or "delete+recreate" in rec.message.lower()
         for rec in caplog.records
     ), (
-        "fail-closed log should mention 'fail closed' or 'does not "
-        f"compare'. caplog: {[r.message for r in caplog.records]}"
+        f"fail-closed log should reference the matches-neither logic. "
+        f"caplog: {[r.message for r in caplog.records]}"
     )
 
 
