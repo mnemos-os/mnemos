@@ -31,7 +31,13 @@ dependencies = [
   "pydantic-settings>=2.0.0",
   "python-multipart>=0.0.9",
   "asyncpg>=0.29.0",
-  "psycopg[binary]>=3.1.0",
+  # NB: psycopg/psycopg2 are deliberately NOT default deps. Both are
+  # LGPL-3.0; we keep mnemos's runtime closure on permissive licenses
+  # (Apache/MIT/BSD/MPL). The installer's API-key path uses asyncpg
+  # if it's a real Postgres + falls back to invoking the operator's
+  # psql binary via subprocess (which is the operator's external GPL
+  # tool, not bundled with mnemos). Operators who want the psycopg-
+  # based installer path can `pip install psycopg[binary]` separately.
   "httpx>=0.27.0",
   "slowapi>=0.1.9",
   "limits>=3.6.0",
@@ -39,7 +45,8 @@ dependencies = [
   "python-dotenv>=1.0.0",
   "mcp>=1.0.0",
   "numpy>=1.26.0",
-  "psutil>=5.9.0",
+  # psutil dropped 2026-05-01: zero import sites in mnemos/ source
+  # (was a leftover from an earlier health-check experiment).
   "authlib>=1.3.0",
   "itsdangerous>=2.2.0",
   "prometheus_client>=0.20.0",
@@ -91,13 +98,14 @@ gpu = ["fastembed-gpu>=0.3.0"]
 # [phi] — Intel-iGPU-accelerated path: OpenVINO + FastEmbed, used
 # in production at PYTHIA. Apache-2.0 across the board, no torch.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
-# [full] — legacy alias for the spacy + networkx text-processing
-# extras. sentence-transformers (and its torch transitive) was
-# removed in v4.2.0a11 — that path is now [ml] (fastembed).
-# Operators on a [full] install who wanted semantic-similarity
-# scoring should switch to [ml] OR install both: pip install
-# 'mnemos-os[full,ml]'.
-full = ["spacy>=3.7.0", "networkx>=3.3"]
+# [full] — networkx for the ARTEMIS TextRank graph centrality
+# fallback (imported in mnemos/domain/compression/artemis.py).
+# spacy was historically declared here but has ZERO import sites in
+# mnemos/ source — dropped 2026-05-01.
+# sentence-transformers + its torch transitive was removed in
+# v4.2.0a11; semantic-similarity is now in [ml] (fastembed).
+# Operators wanting both: pip install 'mnemos-os[full,ml]'.
+full = ["networkx>=3.3"]
 dev = [
   "import-linter>=2.0.0",
   "pytest>=8.0.0",

@@ -30,7 +30,7 @@ or `%APPDATA%\Cursor\User\globalStorage\anysphere.cursor\mcp.json`
   "mcpServers": {
     "mnemos": {
       "command": "mnemos",
-      "args": ["mcp", "serve", "--stdio"],
+      "args": ["serve", "mcp-stdio"],
       "env": {
         "MNEMOS_BASE": "http://localhost:5002",
         "MNEMOS_API_KEY": "<your bearer token>"
@@ -48,7 +48,7 @@ For a remote MNEMOS, change `MNEMOS_BASE` to the LAN URL.
 {
   "mcpServers": {
     "mnemos": {
-      "url": "https://mnemos.example.com/v1/mcp/sse",
+      "url": "https://mnemos.example.com/sse",
       "headers": {
         "Authorization": "Bearer <your bearer token>"
       }
@@ -96,14 +96,14 @@ If you don't see `@mnemos`, check Cursor's MCP server panel
 
 If Cursor runs on the Windows side but MNEMOS runs inside WSL2,
 the stdio path doesn't work cleanly (Cursor would need to
-`wsl.exe mnemos mcp serve --stdio` which has quoting hazards).
+`wsl.exe mnemos serve mcp-stdio` which has quoting hazards).
 Two cleaner options:
 
 1. **Run Cursor inside WSL2** — open Cursor from inside the WSL
    distro shell. The stdio shape works normally.
 2. **Use HTTP/SSE** — bring up the MCP HTTP/SSE bridge inside
    WSL2 (it auto-forwards to `localhost:5004` on the Windows
-   side). Point Cursor's config at `http://localhost:5004/v1/mcp/sse`.
+   side). Point Cursor's config at `http://localhost:5004/sse`.
 
 The HTTP/SSE path is preferred for most Windows users because it
 doesn't require any WSL2 plumbing on Cursor's side.
@@ -111,15 +111,19 @@ doesn't require any WSL2 plumbing on Cursor's side.
 ## Memory namespace per-workspace
 
 If you want different Cursor projects to have isolated memory
-scopes:
+scopes, set ``MNEMOS_DEFAULT_NAMESPACE`` per server entry:
 
 ```json
 {
   "mcpServers": {
     "mnemos-this-project": {
       "command": "mnemos",
-      "args": ["mcp", "serve", "--stdio", "--namespace", "<project-name>"],
-      "env": {"MNEMOS_BASE": "...", "MNEMOS_API_KEY": "..."}
+      "args": ["serve", "mcp-stdio"],
+      "env": {
+        "MNEMOS_BASE": "...",
+        "MNEMOS_API_KEY": "...",
+        "MNEMOS_DEFAULT_NAMESPACE": "<project-name>"
+      }
     }
   }
 }
@@ -127,7 +131,7 @@ scopes:
 
 Drop a `.cursor/mcp.json` at the project root with the per-project
 config; Cursor merges it with the global one. Cross-namespace
-search is opt-in via `--include-namespaces` on the search tool.
+search is operator-controlled via the underlying REST API filters.
 
 ## Cross-references
 

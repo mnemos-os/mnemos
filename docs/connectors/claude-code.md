@@ -4,7 +4,7 @@
 > MNEMOS MCP layer; the integration has shipped and run continuously
 > since v3.x. The recipe below is the recommended path; legacy
 > SSH-spawn shapes from earlier releases still work but the local
-> `mnemos mcp serve --stdio` path has fewer moving parts.
+> `mnemos serve mcp-stdio` path has fewer moving parts.
 
 ## What this gets you
 
@@ -45,7 +45,7 @@ block looks like:
   "mcpServers": {
     "mnemos": {
       "command": "mnemos",
-      "args": ["mcp", "serve", "--stdio"],
+      "args": ["serve", "mcp-stdio"],
       "env": {
         "MNEMOS_BASE": "http://localhost:5002",
         "MNEMOS_API_KEY": "<your bearer token>"
@@ -106,7 +106,7 @@ MNEMOS's MCP HTTP/SSE bridge:
 {
   "mcpServers": {
     "mnemos": {
-      "url": "https://mnemos.example.com/v1/mcp/sse",
+      "url": "https://mnemos.example.com/sse",
       "headers": {
         "Authorization": "Bearer <your bearer token>"
       }
@@ -147,39 +147,50 @@ Then re-search. The new memory should appear.
 
 | Symptom                                          | Likely cause                                   | Fix                                                    |
 |--------------------------------------------------|------------------------------------------------|--------------------------------------------------------|
-| `mnemos` not found in `/mcp`                     | MCP server failed to start                     | Run `mnemos mcp serve --stdio` directly; read errors   |
+| `mnemos` not found in `/mcp`                     | MCP server failed to start                     | Run `mnemos serve mcp-stdio` directly; read errors   |
 | All tool calls return `MNEMOS UNREACHABLE`       | `MNEMOS_BASE` URL wrong or MNEMOS not running  | `curl <MNEMOS_BASE>/health` from the same shell        |
 | Tool calls return 401 / 403                      | Bearer token wrong or expired                  | Verify with `curl -H "Authorization: Bearer $TOKEN" <base>/v1/memories` |
 | `ssh:` shape: hangs at MCP connect               | SSH would have prompted for password           | Set up pubkey auth: `ssh-copy-id user@host`            |
-| HTTP/SSE shape: 502 errors                       | Reverse proxy buffering SSE                    | Disable buffering for `/v1/mcp/sse` in nginx/Caddy     |
+| HTTP/SSE shape: 502 errors                       | Reverse proxy buffering SSE                    | Disable buffering for `/sse` in nginx/Caddy     |
 | Random tool call timeouts                        | Slow downstream (LLM consultation, federation) | Check MNEMOS `/metrics` for p99 latency on the route   |
 
 ## Memory-namespace isolation per-project
 
 If you want your work-related Claude Code memories isolated from
-your personal ones, use distinct MNEMOS namespaces:
+your personal ones, use distinct MNEMOS namespaces by setting
+``MNEMOS_DEFAULT_NAMESPACE`` per MCP server entry. The server
+treats this as the default namespace stamp on every memory
+created through that stdio bridge:
 
 ```json
 {
   "mcpServers": {
     "mnemos-work": {
       "command": "mnemos",
-      "args": ["mcp", "serve", "--stdio", "--namespace", "work"],
-      "env": {"MNEMOS_BASE": "...", "MNEMOS_API_KEY": "..."}
+      "args": ["serve", "mcp-stdio"],
+      "env": {
+        "MNEMOS_BASE": "...",
+        "MNEMOS_API_KEY": "...",
+        "MNEMOS_DEFAULT_NAMESPACE": "work"
+      }
     },
     "mnemos-personal": {
       "command": "mnemos",
-      "args": ["mcp", "serve", "--stdio", "--namespace", "personal"],
-      "env": {"MNEMOS_BASE": "...", "MNEMOS_API_KEY": "..."}
+      "args": ["serve", "mcp-stdio"],
+      "env": {
+        "MNEMOS_BASE": "...",
+        "MNEMOS_API_KEY": "...",
+        "MNEMOS_DEFAULT_NAMESPACE": "personal"
+      }
     }
   }
 }
 ```
 
-Search and create in `work` only see `work` rows; the same for
-`personal`. The MNEMOS server enforces the scope at the SQL
-level — there's no path for an agent to escape its namespace
-short of explicit operator-tier auth.
+Search defaults to the same namespace too, so each connector
+sees only its own scope. The MNEMOS server enforces the scope
+at the SQL level — there's no path for an agent to escape its
+namespace short of explicit operator-tier auth.
 
 ## Cross-references
 

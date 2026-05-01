@@ -31,7 +31,7 @@ Codex CLI's MCP config goes in `~/.codex/config.toml` under
 ```toml
 [mcp.servers.mnemos]
 command = "mnemos"
-args = ["mcp", "serve", "--stdio"]
+args = ["serve", "mcp-stdio"]
 env = {
   MNEMOS_BASE = "http://localhost:5002",
   MNEMOS_API_KEY = "<your bearer token>",
@@ -45,7 +45,7 @@ If `mnemos` is not on PATH, use the absolute path in the
 
 ```toml
 [mcp.servers.mnemos]
-url = "https://mnemos.example.com/v1/mcp/sse"
+url = "https://mnemos.example.com/sse"
 headers = { Authorization = "Bearer <your bearer token>" }
 ```
 
@@ -99,7 +99,7 @@ review-provenance backend:
 ```toml
 [mcp.servers.mnemos]
 command = "mnemos"
-args = ["mcp", "serve", "--stdio"]
+args = ["serve", "mcp-stdio"]
 env = {
   MNEMOS_BASE = "http://localhost:5002",
   MNEMOS_API_KEY = "<token>",
@@ -121,7 +121,7 @@ LLM call fires.
 | Symptom                                | Likely cause                                | Fix                                                    |
 |----------------------------------------|---------------------------------------------|--------------------------------------------------------|
 | `codex /mcp list` shows no servers     | Config path wrong / not parsed              | `codex --debug-config-path` to see the active path     |
-| `mnemos` shows status `failed`         | Stdio command not found                     | Run `mnemos mcp serve --stdio` directly; read the error |
+| `mnemos` shows status `failed`         | Stdio command not found                     | Run `mnemos serve mcp-stdio` directly; read the error |
 | Tool calls return `MNEMOS UNREACHABLE` | Wrong `MNEMOS_BASE`                         | `curl <MNEMOS_BASE>/health` from the same shell        |
 | Tool calls return 401                  | Bearer token wrong                          | Verify with curl                                       |
 | Codex hangs on long tool calls         | MCP transport timeout                       | Set `[mcp] timeout = 120` in `~/.codex/config.toml`    |

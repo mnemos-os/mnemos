@@ -143,8 +143,17 @@ class QualityAnalyzer:
         compressed_token_count = len(compressed_tokens)
         compression_ratio = compressed_token_count / original_token_count if original_token_count > 0 else 0
 
-        # 2. Semantic analysis (if available)
-        semantic_similarity = 100.0  # Default (no semantic analysis)
+        # 2. Semantic analysis (if available).
+        #
+        # ``-1.0`` is the "unavailable" sentinel from
+        # _compute_semantic_similarity — either fastembed isn't
+        # installed (semantic_available=False at __init__) or the
+        # compute failed. Pre-fix this branch defaulted to 100.0 which
+        # let unrelated text pairs sail past with full semantic
+        # credit; codex round-1 audit (2026-05-01) flagged the silent
+        # over-rating. Now we drop the component from the weighted
+        # average instead of treating "no signal" as "perfect signal."
+        semantic_similarity: float = -1.0
         if self.semantic_available:
             try:
                 semantic_similarity = self._compute_semantic_similarity(
@@ -168,23 +177,39 @@ class QualityAnalyzer:
         )
 
         # 5. Calculate quality rating
-        quality_components = {
-            'semantic_similarity': semantic_similarity,  # 0-100
-            'entity_preservation': (len(preserved_entities) / len(original_entities) * 100)
-                                   if original_entities else 100,
-            'structure_preservation': structure_similarity,
-        }
-
-        # Weighted average
-        quality_rating = int(
-            quality_components['semantic_similarity'] * 0.4 +
-            quality_components['entity_preservation'] * 0.3 +
-            quality_components['structure_preservation'] * 0.3
+        entity_preservation = (
+            (len(preserved_entities) / len(original_entities) * 100)
+            if original_entities
+            else 100.0
         )
+
+        # Weighted average — but when semantic is unavailable
+        # (sentinel -1.0), redistribute its weight between entity and
+        # structure rather than treating "missing" as "perfect."
+        # Default weights: 0.4 / 0.3 / 0.3. With semantic missing the
+        # remaining components carry the full rating at 0.5 / 0.5.
+        if semantic_similarity < 0:
+            quality_rating = int(
+                entity_preservation * 0.5 + structure_similarity * 0.5
+            )
+            # Surface to quality_summary that semantic was unavailable
+            # so consumers don't read "100% content preserved" off a
+            # stale default.
+            semantic_summary_value = None  # type: ignore[assignment]
+        else:
+            quality_rating = int(
+                semantic_similarity * 0.4
+                + entity_preservation * 0.3
+                + structure_similarity * 0.3
+            )
+            semantic_summary_value = round(semantic_similarity, 1)
 
         # 6. Generate qualitative summary
         quality_summary = {
-            'content_preserved': round(semantic_similarity, 1),
+            # ``content_preserved`` is None when semantic analysis was
+            # unavailable — surface "we don't know" instead of a
+            # number that looks like a high score.
+            'content_preserved': semantic_summary_value,
             'structure_preserved': round(structure_similarity, 1),
             'key_entities_preserved': len(preserved_entities),
             'total_entities': len(original_entities),
@@ -243,20 +268,55 @@ class QualityAnalyzer:
         return text.split()
 
     def _compute_semantic_similarity(self, text1: str, text2: str) -> float:
-        """Compute semantic similarity using embeddings (0-100)"""
+        """Compute semantic similarity using embeddings (0-100).
+
+        ``self.embedding_model`` is set during __init__ to a fastembed
+        ``TextEmbedding`` instance. fastembed's API is ``embed(texts)``
+        which returns an iterable of numpy arrays — not ``encode(text)``
+        (that's the sentence-transformers API). Both texts are batched
+        in a single embed() call so the ONNX session reuses its
+        warm-loaded weights.
+
+        Returns ``-1.0`` to signal "embedding compute failed" — the
+        caller (analyze()) treats that as "semantic component
+        unavailable" and drops the component's weight from the final
+        rating instead of treating it as a high score. Pre-fix this
+        function returned 85.0 (a non-failure-looking default) which
+        let unrelated texts pass through with full semantic credit.
+        """
         try:
             import numpy as np
 
-            emb1 = np.asarray(self.embedding_model.encode(text1))
-            emb2 = np.asarray(self.embedding_model.encode(text2))
+            # fastembed.embed(list) -> iterator[ndarray]; batch the two
+            # texts so the ONNX session runs once.
+            embeddings = list(self.embedding_model.embed([text1, text2]))
+            if len(embeddings) != 2:
+                logger.warning(
+                    "fastembed returned %d embeddings, expected 2; "
+                    "dropping semantic component for this comparison",
+                    len(embeddings),
+                )
+                return -1.0
+            emb1 = np.asarray(embeddings[0])
+            emb2 = np.asarray(embeddings[1])
             # cosine similarity via numpy (avoids sklearn dependency)
             norm = np.linalg.norm(emb1) * np.linalg.norm(emb2)
-            similarity = float(np.dot(emb1, emb2) / norm) if norm > 0 else 0.0
-
-            return float(similarity * 100)
-        except Exception as e:
-            logger.warning(f"Embedding failed: {e}")
-            return 85.0  # Conservative default
+            if norm <= 0:
+                return -1.0
+            similarity = float(np.dot(emb1, emb2) / norm)
+            # Map [-1, 1] cosine to [0, 100] so identical texts → 100,
+            # orthogonal → 50, opposite → 0. Pre-fix mapping (* 100)
+            # treated negative cosines as negative percentages, which
+            # downstream rounding clamped silently.
+            return float((similarity + 1.0) * 50.0)
+        except Exception as exc:
+            logger.warning(
+                "fastembed semantic-similarity compute failed: %s. "
+                "Treating semantic component as unavailable for this "
+                "comparison (rating reweights without it).",
+                exc,
+            )
+            return -1.0
 
     def _extract_entities(self, text: str) -> List[str]:
         """Extract named entities (simple heuristic)"""

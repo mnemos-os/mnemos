@@ -573,7 +573,7 @@ docling   = [docling >=2.5.0, docling-core >=2.0.0, pillow >=10.0.0]
 ml        = [fastembed >=0.3.0]                                    # CPU embeddings, ONNX, no torch
 gpu       = [fastembed-gpu >=0.3.0]                                # NVIDIA CUDA EP via fastembed-gpu
 phi       = [openvino-genai >=2024.4.0, fastembed >=0.3.0]         # Intel iGPU via OpenVINO
-full      = [spacy >=3.7.0, networkx >=3.3]                        # NLP/graph extras (no embeddings)
+full      = [networkx >=3.3]                                       # ARTEMIS TextRank fallback (graph centrality)
 sqlite    = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
 dev       = [pytest >=8.0.0, pytest-asyncio >=0.23.0, pytest-cov >=5.0.0, ruff >=0.5.0]
 ```

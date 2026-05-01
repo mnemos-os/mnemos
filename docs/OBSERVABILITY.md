@@ -33,9 +33,11 @@ scrape_configs:
   - job_name: mnemos
     scrape_interval: 30s
     metrics_path: /metrics
-    # If MNEMOS_AUTH_ENABLED is on, the metrics endpoint stays open
-    # by default; set MNEMOS_METRICS_REQUIRE_AUTH=true to require
-    # the same Bearer token. Add bearer_token below if so.
+    # /metrics is intentionally unauthenticated — it carries no
+    # secrets, only counters and histograms. Network-level controls
+    # (private VPC, firewall rules, mesh ACLs) are the right gate.
+    # If you DO need bearer auth on the metrics endpoint, terminate
+    # at a reverse proxy (Caddy / nginx with auth_basic + Bearer).
     static_configs:
       - targets:
           - mnemos-prod-1:5002
