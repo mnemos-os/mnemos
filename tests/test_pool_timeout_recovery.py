@@ -165,19 +165,34 @@ async def test_process_contest_queue_does_not_mark_failed_on_pool_timeout(
             stale_threshold_secs=0,  # skip sweep
         )
 
-    # The dequeue acquire ran (1). The fixed code's re-raise
-    # prevented any subsequent MARK_FAILED acquire. Without the
-    # fix, a second acquire would have happened to write the
-    # MARK_FAILED row.
-    assert pool.acquire_calls == 1, (
-        f"expected exactly one acquire (dequeue only); got "
-        f"{pool.acquire_calls} — broad-except may be marking failed"
+    # Two acquires: dequeue (1) + infra-reset (2).
+    # The infra-reset sets status='pending' so the row stays
+    # retryable AND decrements attempts so this infra cycle
+    # doesn't consume the content-attempts budget — codex round-4
+    # of round-30 caught that without the reset, repeated infra
+    # errors would still terminalize the row via the stale sweep.
+    assert pool.acquire_calls == 2
+    # The reset SQL must NOT mark failed — pin the breadcrumb
+    # shape: status='pending', error LIKE 'infra_retry%'.
+    reset_sqls = [(sql, args) for sql, args in executes]
+    assert any(
+        "status" in sql and "pending" in sql.lower()
+        for sql, _ in reset_sqls
+    ), (
+        f"expected infra-reset to set status='pending'; got {reset_sqls!r}"
     )
-    # And no MARK_FAILED execute should have been issued.
-    assert all(
-        "memory_compression_queue" not in sql or "UPDATE" not in sql.upper()
-        for sql, _ in executes
-    ), f"unexpected MARK_FAILED SQL on infra error: {executes!r}"
+    assert any(
+        any("infra_retry" in str(arg) for arg in args)
+        for _, args in reset_sqls
+    ), (
+        f"expected infra-reset to write 'infra_retry' breadcrumb; got "
+        f"{reset_sqls!r}"
+    )
+    # And no MARK_FAILED execute (the persist-error SQL with
+    # status='failed') should be issued on a pure infra path.
+    assert not any(
+        "status" in sql and "= 'failed'" in sql for sql, _ in reset_sqls
+    ), f"unexpected MARK_FAILED SQL on infra error: {reset_sqls!r}"
 
 
 @pytest.mark.asyncio
@@ -313,6 +328,67 @@ async def test_worker_log_stats_reraises_infrastructure_error(monkeypatch):
 
     with pytest.raises(asyncio.TimeoutError):
         await worker.log_stats()
+
+
+@pytest.mark.asyncio
+async def test_repeated_infra_errors_do_not_consume_attempts_budget(monkeypatch):
+    """Codex round-4 of round-30 caught: even with the round-30
+    fix, repeated infra errors would let attempts climb on each
+    dequeue cycle until the stale sweep terminalized the row.
+    Round-32 fixes this by RESETTING the row before re-raising —
+    status back to 'pending', attempts decremented (GREATEST 0),
+    so the dequeue's bump nets to zero on infra cycles. This test
+    pins that contract: the reset SQL is issued and decrements
+    attempts."""
+    from mnemos.domain.compression import worker_contest
+
+    async def _fake_process_one(*args, **kwargs):
+        raise asyncio.TimeoutError("simulated acquire timeout")
+
+    monkeypatch.setattr(
+        worker_contest, "_process_one", _fake_process_one,
+    )
+
+    fake_row = {
+        "id": "queue-1",
+        "memory_id": "mem_1",
+        "owner_id": "alice",
+        "scoring_profile": "default",
+        "attempts": 1,  # already had one cycle
+    }
+
+    executes: list[tuple] = []
+
+    async def _record_execute(sql, *args):
+        executes.append((sql, args))
+        return None
+
+    pool = _build_fake_pool_for_contest(
+        dequeue_rows=[fake_row], on_execute=_record_execute,
+    )
+
+    with pytest.raises(asyncio.TimeoutError):
+        await worker_contest.process_contest_queue(
+            pool,
+            engines=[],
+            batch_size=1,
+            max_attempts=3,
+            stale_threshold_secs=0,
+        )
+
+    # The reset SQL is the only UPDATE on memory_compression_queue
+    # in this path. It must:
+    #   1. Set status='pending'  (so dequeue picks it up next)
+    #   2. Decrement attempts via GREATEST(attempts - 1, 0)
+    #   3. Use 'infra_retry:' as the error prefix
+    reset_calls = [
+        (sql, args) for sql, args in executes
+        if "memory_compression_queue" in sql and "pending" in sql.lower()
+    ]
+    assert len(reset_calls) == 1, f"expected one reset call; got {reset_calls!r}"
+    reset_sql, reset_args = reset_calls[0]
+    assert "GREATEST(attempts - 1, 0)" in reset_sql
+    assert any("infra_retry" in str(a) for a in reset_args)
 
 
 @pytest.mark.asyncio

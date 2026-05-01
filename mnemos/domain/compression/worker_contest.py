@@ -180,6 +180,73 @@ FOR UPDATE
 """
 
 
+# Infrastructure-retry reset SQL.
+#
+# When _process_one or process_contest_queue catches a pool /
+# connection-loss class error, the row is sitting at 'running' with
+# attempts bumped by the dequeue. Without a reset, three things go
+# wrong:
+#   1. The row stays 'running' until the stale-running sweep picks
+#      it up — at best the next batch's sweep, at worst stale_
+#      threshold_secs later.
+#   2. Each retake bumps attempts; after max_attempts cycles of
+#      pure infrastructure outages the sweep terminalizes the row
+#      with 'stranded_running' even though no content failure ever
+#      occurred. Codex round-4 of round-30 caught this:
+#      pool-pressure-as-terminal-failure, just delayed.
+#   3. Operators have no breadcrumb that THIS row was infra-
+#      retried (the queue's error column is empty).
+#
+# The reset SQL below addresses all three: status back to
+# 'pending' so the next dequeue picks it up immediately,
+# attempts decremented (GREATEST 0) so the dequeue's bump nets
+# to zero on infra retries, started_at cleared so the sweep
+# ignores it, error set to an 'infra_retry' breadcrumb for
+# operator visibility.
+_INFRA_RESET_SQL = """
+UPDATE memory_compression_queue
+SET status      = 'pending',
+    attempts    = GREATEST(attempts - 1, 0),
+    started_at  = NULL,
+    finished_at = NULL,
+    error       = $2
+WHERE id = $1
+  AND status = 'running'
+"""
+
+
+async def _reset_row_for_infra_retry(
+    pool: Any, queue_id: Any, error_marker: str,
+) -> None:
+    """Reset a 'running' queue row to 'pending' with attempts
+    decremented, so an infrastructure-class outage does NOT consume
+    the row's content-attempts budget.
+
+    Best-effort: if the reset itself raises an infra error (truly
+    wedged pool), swallow + log — the stale-running sweep will
+    still pick the row up eventually. Other reset failures
+    (content-class) are logged but otherwise ignored; the worker's
+    primary infra-error re-raise still surfaces to the reconnect
+    path.
+    """
+    from mnemos.core.pool import is_infrastructure_error
+
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute(_INFRA_RESET_SQL, queue_id, error_marker)
+    except Exception as reset_exc:
+        if is_infrastructure_error(reset_exc):
+            logger.warning(
+                "contest_queue[%s]: infra-reset acquire timed out (%s); "
+                "row left at 'running' for stale-recovery",
+                queue_id, type(reset_exc).__name__,
+            )
+        else:
+            logger.exception(
+                "contest_queue[%s]: infra-reset failed unexpectedly", queue_id,
+            )
+
+
 async def _sweep_stale_running(
     pool: Any,
     *,
@@ -356,6 +423,16 @@ async def process_contest_queue(
                     "retryable, re-raising to worker loop",
                     memory_id, type(exc).__name__,
                 )
+                # Reset the row before re-raising so this infra
+                # outage doesn't consume the content-attempts budget.
+                # Without the reset, repeated pool pressure burns
+                # max_attempts cycles and the sweep terminalizes
+                # the row even though no content failure occurred.
+                await _reset_row_for_infra_retry(
+                    pool,
+                    queue_id,
+                    f"infra_retry: {type(exc).__name__}: {str(exc)[:200]}",
+                )
                 counts["infra_errors"] += 1
                 raise
 
@@ -531,8 +608,9 @@ async def _process_one(
         if is_infrastructure_error(exc):
             logger.warning(
                 "contest_queue[%s]: persist transaction hit infrastructure "
-                "error %s; row left at 'running' for stale-recovery, "
-                "re-raising to worker loop",
+                "error %s; re-raising to worker loop (outer caller resets "
+                "the row to 'pending' so this retry doesn't burn a "
+                "content-attempts cycle)",
                 memory_id, type(exc).__name__,
             )
             counts["infra_errors"] += 1
