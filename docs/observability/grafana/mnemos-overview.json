@@ -1,0 +1,229 @@
+{
+  "__comment": "Grafana dashboard for the MNEMOS HTTP surface. Import via Grafana → Dashboards → Import → paste this JSON. Built against the metric names shipped by mnemos/core/observability.py as of v4.2.0a11. As more metrics land (compression queue, federation lag, NATS consumer pending), additional panels go in the dashboard via panel append; the layout reserves the right column for future surface coverage.",
+  "title": "MNEMOS — Overview",
+  "uid": "mnemos-overview",
+  "schemaVersion": 38,
+  "version": 1,
+  "editable": true,
+  "tags": ["mnemos", "memory"],
+  "timezone": "browser",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(mnemos_http_requests_total, instance)",
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      },
+      {
+        "name": "route",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "query": "label_values(mnemos_http_requests_total, route)",
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "HTTP requests per second (by status class)",
+      "description": "Per-status-class request rate. A spike in 5xx is the operator alert; persistent 4xx may be agent-config drift.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "targets": [
+        {
+          "expr": "sum by (status) (rate(mnemos_http_requests_total{instance=~\"$instance\", route=~\"$route\"}[5m]))",
+          "legendFormat": "{{status}}",
+          "refId": "A"
+        }
+      ],
+      "options": {
+        "legend": {"showLegend": true, "displayMode": "table", "placement": "right"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Request duration p50 / p95 / p99",
+      "description": "Latency percentiles across the HTTP surface. p99 spikes that don't track p50 are tail-only — usually a slow downstream (LLM provider, peer fetch).",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(mnemos_http_request_duration_seconds_bucket{instance=~\"$instance\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(mnemos_http_request_duration_seconds_bucket{instance=~\"$instance\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(mnemos_http_request_duration_seconds_bucket{instance=~\"$instance\", route=~\"$route\"}[5m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Error rate (5xx, %)",
+      "description": "5xx responses as a percentage of total. Healthy baseline is <0.1%. Sustained >1% is operator-wake.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "targets": [
+        {
+          "expr": "100 * (sum(rate(mnemos_http_requests_total{instance=~\"$instance\", status=\"5xx\"}[5m])) / sum(rate(mnemos_http_requests_total{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "5xx %",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.1},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Top 10 routes by request rate",
+      "description": "Identifies which endpoints are hot. Use to target compression hot-path expansion + cache tuning.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "targets": [
+        {
+          "expr": "topk(10, sum by (route) (rate(mnemos_http_requests_total{instance=~\"$instance\"}[5m])))",
+          "legendFormat": "{{route}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": {"drawStyle": "line", "lineWidth": 1, "fillOpacity": 5}
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Total requests (last 1h)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 16},
+      "targets": [
+        {
+          "expr": "sum(increase(mnemos_http_requests_total{instance=~\"$instance\"}[1h]))",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "graphMode": "area", "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "short"}}
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Avg request duration (last 1h)",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 16},
+      "targets": [
+        {
+          "expr": "sum(rate(mnemos_http_request_duration_seconds_sum{instance=~\"$instance\"}[1h])) / sum(rate(mnemos_http_request_duration_seconds_count{instance=~\"$instance\"}[1h]))",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "graphMode": "area", "colorMode": "value"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 0.5},
+              {"color": "red", "value": 2}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "Process — RSS",
+      "description": "Resident set size from process_resident_memory_bytes (prometheus_client built-in).",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 16},
+      "targets": [
+        {
+          "expr": "process_resident_memory_bytes{instance=~\"$instance\", job=\"mnemos\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {"defaults": {"unit": "bytes"}}
+    },
+    {
+      "id": 8,
+      "type": "stat",
+      "title": "Process — open FDs",
+      "description": "Open file descriptors from process_open_fds. A monotonic climb suggests a leak — most often a socket not being closed in a federation peer or LLM-provider client.",
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 16},
+      "targets": [
+        {
+          "expr": "process_open_fds{instance=~\"$instance\", job=\"mnemos\"}",
+          "refId": "A"
+        }
+      ],
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"]}, "colorMode": "value"},
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "yellow", "value": 500},
+              {"color": "red", "value": 4000}
+            ]
+          }
+        }
+      }
+    }
+  ]
+}
