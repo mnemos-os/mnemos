@@ -480,9 +480,9 @@ async def lifespan(app):
                 "max_size": PG_CONFIG["pool_max_size"],
             }
             if database_dsn:
-                _pool = await asyncpg.create_pool(database_dsn, **pool_kwargs)
+                _raw_pool = await asyncpg.create_pool(database_dsn, **pool_kwargs)
             else:
-                _pool = await asyncpg.create_pool(
+                _raw_pool = await asyncpg.create_pool(
                     user=PG_CONFIG["user"],
                     password=PG_CONFIG["password"],
                     database=PG_CONFIG["database"],
@@ -490,6 +490,15 @@ async def lifespan(app):
                     port=PG_CONFIG["port"],
                     **pool_kwargs,
                 )
+            # Wrap the raw asyncpg pool so direct ``_pool.acquire()``
+            # call sites inherit the configured acquire timeout
+            # uniformly. PoolManager already applies the timeout on
+            # its ``.acquire()`` method; the wrap closes the gap for
+            # the 86+ legacy paths that still touch ``_lc._pool``
+            # directly. See mnemos.core.pool.TimeoutPool docstring.
+            from mnemos.core.pool import wrap_pool_with_timeout
+
+            _pool = wrap_pool_with_timeout(_raw_pool)
             _pool_manager = PoolManager(_pool)
             _persistence_backend = _build_postgres_backend(_pool, settings)
             app.state.pool = _pool   # auth.py reads this via request.app.state.pool

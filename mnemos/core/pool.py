@@ -20,6 +20,59 @@ _TRANSIENT_ERRORS = (
     ConnectionResetError,
 )
 
+
+class TimeoutPool:
+    """Thin proxy around an asyncpg pool that injects a default
+    acquire timeout on every ``.acquire()`` call.
+
+    Background. ``PoolManager.acquire()`` already applies
+    ``timeout=DEFAULT_ACQUIRE_TIMEOUT`` so every code path that goes
+    through ``get_pool_manager().acquire()`` is bounded under pool
+    pressure. But many legacy hot paths still call
+    ``_lc._pool.acquire()`` directly; those calls inherit asyncpg's
+    default of ``None`` (wait forever) and pile up indefinitely
+    when the pool is exhausted, snowballing latency across the
+    fleet.
+
+    Wrapping the raw pool at lifecycle creation with this proxy
+    closes the gap uniformly — every ``.acquire()`` call on
+    ``_lc._pool`` now inherits the configured timeout — without
+    requiring a migration of the 86+ direct call sites. Callers
+    that DO need a different timeout still pass it explicitly and
+    the proxy honours their value.
+
+    Everything else on the pool (release, terminate, close,
+    fetchval, transactional helpers, etc.) is delegated via
+    ``__getattr__``.
+    """
+
+    def __init__(self, pool: asyncpg.Pool, *, default_timeout: float | None = None):
+        self._pool = pool
+        self._default_timeout = (
+            default_timeout if default_timeout is not None else DEFAULT_ACQUIRE_TIMEOUT
+        )
+
+    def acquire(self, *, timeout: float | None = None):
+        """Acquire a connection. Applies the default timeout when
+        the caller does not specify one explicitly. Returns the
+        same context-manager shape as ``asyncpg.Pool.acquire``."""
+        effective = timeout if timeout is not None else self._default_timeout
+        return self._pool.acquire(timeout=effective)
+
+    def __getattr__(self, name: str) -> Any:
+        # Delegate every non-acquire attribute (release, close,
+        # terminate, _holders, get_size, etc.) to the wrapped pool.
+        return getattr(self._pool, name)
+
+
+def wrap_pool_with_timeout(
+    pool: asyncpg.Pool, *, default_timeout: float | None = None,
+) -> "TimeoutPool":
+    """Wrap a freshly-created ``asyncpg.Pool`` with the
+    timeout-injecting proxy so legacy raw ``.acquire()`` call sites
+    inherit the default acquire timeout."""
+    return TimeoutPool(pool, default_timeout=default_timeout)
+
 _ISOLATION_LEVELS = {
     "read_uncommitted": "READ UNCOMMITTED",
     "read_committed": "READ COMMITTED",
