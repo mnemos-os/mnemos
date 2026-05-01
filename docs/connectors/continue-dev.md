@@ -118,6 +118,11 @@ Wire ``MNEMOS_DEFAULT_NAMESPACE`` into the per-server env:
 Drop a ``.continuerc.json`` (or ``.continue/config.json``) at
 the project root to override the global config per-workspace.
 
+The env var is a **write stamp**, not an enforced scope (see
+[claude-code.md](./claude-code.md) for details). For enforced
+project isolation, provision per-project non-root API keys with
+server-side ``default_namespace`` instead of relying on the env.
+
 ## Cross-references
 
 - [README.md](./README.md) — connector subsystem framing.

@@ -147,6 +147,15 @@ any damage is bounded:
 JSON config; you'd need to set the namespace once per session
 or have a wrapper script generate the config.)
 
+The env var is a **write stamp** for default-namespace ergonomics,
+not an enforced scope (see [claude-code.md](./claude-code.md) for
+the security caveat). A root API key with the env stamp will
+write into ``cline-sandbox-…`` by default but can still
+read/update/delete any memory by ID across namespaces. For real
+sandbox isolation, provision a non-root API key with
+server-side ``default_namespace=cline-sandbox`` and bind that
+key to the connector.
+
 ## Cross-references
 
 - [README.md](./README.md) — connector subsystem framing.

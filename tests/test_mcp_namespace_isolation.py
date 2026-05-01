@@ -79,23 +79,47 @@ def test_list_with_env_stamps_namespace(monkeypatch):
     assert params.get("namespace") == "sandbox"
 
 
-def test_bulk_with_env_stamps_each_row_unless_caller_supplied(monkeypatch):
+def test_bulk_env_wins_over_per_row_namespace(monkeypatch):
+    """Codex round-3 audit (2026-05-01): when MNEMOS_DEFAULT_NAMESPACE
+    is set, it must override any per-row namespace the caller
+    supplies. Otherwise the env-stamp boundary is bypassable just by
+    including ``"namespace": ...`` in each bulk row.
+
+    Power users who need cross-namespace bulk creation hit the REST
+    API directly OR run the connector without the env stamp.
+    """
     monkeypatch.setenv("MNEMOS_DEFAULT_NAMESPACE", "work")
     fake = AsyncMock(return_value={"created": 2})
     payload = [
         {"content": "row 1", "category": "facts"},
-        {"content": "row 2", "category": "facts", "namespace": "explicit"},
+        {"content": "row 2", "category": "facts", "namespace": "tries-to-escape"},
     ]
     with patch.object(mcp_memory, "_rest_post", fake):
         asyncio.run(mcp_memory.tool_bulk_create_memories(memories=payload))
     body = fake.call_args.args[1]
     rows = body["memories"]
-    assert rows[0]["namespace"] == "work", (
-        "row without explicit namespace gets the env stamp"
+    assert rows[0]["namespace"] == "work"
+    assert rows[1]["namespace"] == "work", (
+        "per-row namespace MUST be overwritten by the env stamp; "
+        f"got: {rows[1]['namespace']}"
     )
-    assert rows[1]["namespace"] == "explicit", (
-        "caller-supplied namespace wins over env stamp"
-    )
+
+
+def test_bulk_no_env_preserves_per_row_namespace(monkeypatch):
+    """Inverse: when env is unset, per-row namespace is preserved
+    so power users can hit cross-namespace bulk creation."""
+    monkeypatch.delenv("MNEMOS_DEFAULT_NAMESPACE", raising=False)
+    fake = AsyncMock(return_value={"created": 2})
+    payload = [
+        {"content": "row 1", "category": "facts", "namespace": "alpha"},
+        {"content": "row 2", "category": "facts", "namespace": "beta"},
+    ]
+    with patch.object(mcp_memory, "_rest_post", fake):
+        asyncio.run(mcp_memory.tool_bulk_create_memories(memories=payload))
+    body = fake.call_args.args[1]
+    rows = body["memories"]
+    assert rows[0]["namespace"] == "alpha"
+    assert rows[1]["namespace"] == "beta"
 
 
 def test_blank_env_treated_as_unset(monkeypatch):

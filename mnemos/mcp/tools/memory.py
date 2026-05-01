@@ -139,14 +139,15 @@ async def tool_bulk_create_memories(
 ) -> dict[str, Any]:
     ns = _connector_namespace()
     if ns:
-        # Stamp the namespace on each row that didn't carry one
-        # explicitly. Caller-supplied namespace per-row wins so an
-        # operator can still override on a per-memory basis if they
-        # genuinely need to.
-        memories = [
-            {**m, "namespace": m.get("namespace", ns)}
-            for m in memories
-        ]
+        # Connector-scope env wins over per-row namespace. The
+        # alternative (per-row wins) creates a footgun where a
+        # bulk caller could bypass the connector's documented
+        # write-stamp scope just by including ``"namespace": ...``
+        # in each row. Codex round-3 audit: the env-stamp must be
+        # the boundary if it's a boundary at all. Power users who
+        # need cross-namespace bulk creation should hit the REST
+        # API directly OR run without the env stamp.
+        memories = [{**m, "namespace": ns} for m in memories]
     return await _rest_post("/v1/memories/bulk", {"memories": memories})
 
 

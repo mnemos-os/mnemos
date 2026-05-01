@@ -71,7 +71,10 @@ The MCP tools should now appear in `claude /mcp` list output.
 ## Setup — remote MNEMOS via SSH (legacy / multi-host fleets)
 
 If your dev box runs Claude Code but MNEMOS lives on a fleet host,
-SSH-spawn the MCP server on the remote host:
+SSH-spawn the MCP server on the remote host. **OpenSSH does NOT
+forward arbitrary client env vars by default** — to be safe, pass
+them on the remote command line so the MCP server starts with the
+right config:
 
 ```json
 {
@@ -80,25 +83,29 @@ SSH-spawn the MCP server on the remote host:
       "command": "ssh",
       "args": [
         "user@mnemos-host",
+        "env",
+        "MNEMOS_BASE=http://localhost:5002",
+        "MNEMOS_API_KEY=<your bearer token>",
         "/opt/mnemos/venv/bin/mnemos",
         "serve",
         "mcp-stdio"
-      ],
-      "env": {
-        "MNEMOS_BASE": "http://localhost:5002",
-        "MNEMOS_API_KEY": "<your bearer token>"
-      }
+      ]
     }
   }
 }
 ```
 
-The MNEMOS_BASE here is `localhost` because the MCP server runs
-ON the remote host; the env vars travel through SSH's environment.
-You'll need pubkey auth set up so SSH doesn't prompt for a
-password each Claude session start (it would block forever).
+The ``env`` prefix is what actually plumbs the variables into the
+remote process. MNEMOS_BASE here is ``localhost`` because the MCP
+server runs ON the remote host. You'll need pubkey auth set up so
+SSH doesn't prompt for a password each Claude session start (it
+would block forever).
+
 If the remote host has a system-wide ``mnemos`` on PATH you can
-omit the ``/opt/mnemos/venv/bin/`` prefix.
+omit the ``/opt/mnemos/venv/bin/`` prefix. If the remote host has
+the env vars baked into a shell profile / systemd unit / pam
+session, you can drop the ``env`` prefix — but the inline form
+above always works.
 
 ## Setup — remote MNEMOS via HTTP/SSE (multi-machine, no SSH)
 
@@ -190,10 +197,25 @@ created through that stdio bridge:
 }
 ```
 
-Search defaults to the same namespace too, so each connector
-sees only its own scope. The MNEMOS server enforces the scope
-at the SQL level — there's no path for an agent to escape its
-namespace short of explicit operator-tier auth.
+``MNEMOS_DEFAULT_NAMESPACE`` is a **WRITE STAMP**, not an
+enforced scope. The MCP bridge stamps it on every
+create/search/list/bulk request so memories created via the
+``mnemos-work`` connector default to ``namespace=work``. By-id
+operations (get/update/delete) and bulk per-row override are
+NOT scoped by the env var.
+
+For ENFORCED per-connector isolation:
+* Provision two distinct non-root API keys on MNEMOS, each with
+  its own ``default_namespace`` set server-side (auth.users +
+  api_keys table). Each key only sees memories in its bound
+  namespace; cross-namespace access requires root.
+* Pair each MCP connector entry with the matching key.
+
+A root API key with the env stamp will write into the configured
+namespace by default but can still read/update/delete any memory
+ID across namespaces — that's the cost of running a root key.
+Use the env stamp on a root key as a CONVENIENCE for default-
+write-to-this-namespace ergonomics, not as a security boundary.
 
 ## Cross-references
 

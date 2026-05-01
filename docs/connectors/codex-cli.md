@@ -136,13 +136,23 @@ the MCP server config. That means:
 - The same bearer token is used across foreground and background
   modes — there's no per-mode key separation.
 
-If you need per-task scoping, set `MNEMOS_NAMESPACE` differently
-per env:
+If you need per-task scoping, set ``MNEMOS_DEFAULT_NAMESPACE``
+differently per env. The MCP bridge stamps this on every write
+through the connector (see "Memory namespace per-workspace" in
+[claude-code.md](./claude-code.md) for the underlying mechanism):
 
 ```bash
-MNEMOS_NAMESPACE=task-foo codex exec 'do work'
-MNEMOS_NAMESPACE=task-bar codex exec 'do other work'
+MNEMOS_DEFAULT_NAMESPACE=task-foo codex exec 'do work'
+MNEMOS_DEFAULT_NAMESPACE=task-bar codex exec 'do other work'
 ```
+
+Note: this stamps the namespace on writes but does NOT enforce
+isolation against a root-scope API key — a root key can still
+read/update/delete by-id across namespaces. For ENFORCED
+isolation, provision distinct non-root API keys with per-key
+``default_namespace`` set on the server side; the env var is
+the convenience for stamping connector-scoped writes onto an
+already-scoped key.
 
 ## Cross-references
 
