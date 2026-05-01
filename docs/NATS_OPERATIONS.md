@@ -126,17 +126,34 @@ exponential window so collisions are rare.
 
 ## Resource cleanup on subscribe failure
 
-`_drain_partial(nc, subscriptions)` runs in BOTH consumer loops on
-ANY non-cancellation exception in connect/subscribe/consume:
+`_drain_partial(nc, subscriptions)` runs in BOTH consumer loops on:
+
+1. Cancellation (`asyncio.CancelledError`)
+2. Connect-level exceptions before `_consume_subscription` starts
+3. Subscribe-level exceptions (durable name collision, stream
+   drift, consumer-group recovery)
+4. Connection-level exceptions DURING consume (`next_msg` raising
+   non-timeout NATS errors). These are re-raised out of
+   `_consume_subscription` so they reach the outer drain handler.
+
+`_drain_partial` itself does:
 
 1. Best-effort `await sub.unsubscribe()` for each successful
    subscription.
 2. Best-effort `await nc.drain()` (falls back to `nc.close()`).
 
-Pre-fix, a subscribe failure leaked one TCP connection per retry.
-With backoff bounding the rate AND drain bounding the total, a
-sustained subscribe failure now stays in a bounded steady state
-instead of accumulating sockets.
+Handler-level errors during message processing (e.g.
+`asyncpg.PostgresError` from a DB hiccup in `handle_message`) are
+caught locally INSIDE `_consume_subscription`: log + don't ack
+(JetStream redelivers after the ack-wait window) + continue. A
+transient DB error does not force a NATS reconnect.
+
+Pre-fix, a subscribe failure leaked one TCP connection per retry,
+and a connection-level error mid-consume left the loop spinning
+on a dead subscription forever. With backoff bounding the rate,
+drain bounding the total, and consume-time errors escaping for
+reconnect, a sustained NATS failure now stays in a bounded steady
+state instead of accumulating sockets or wedging.
 
 ## Operator runbook
 
@@ -199,15 +216,31 @@ or delete + recreate the stream (latter loses retained messages).
 
 ## Known limitations
 
-* Federation NATS consumer uses **per-node durable** names (not a
-  cross-node queue group). Every peer-side fan-out delivers to
-  every receiving node, and each node's `SKIP LOCKED` claim
-  decides who actually persists. Wasteful but correct. The
-  cross-node sharding fix (`add_consumer` + `bind_subscribe`
-  pattern) is the original handoff's "deferred-with-caveat"
-  Audit Finding 5 — flagged for v4.2.0a7+. See the docstring of
-  `mnemos/webhooks/nats_trigger.py:_node_durable` for the same
-  pattern on the webhook side.
+* **Federation durable name is per-(peer, subject), NOT per-node.**
+  `_durable_name(peer.name, subject)` in
+  `mnemos/federation/nats_consumer.py` builds the consumer name
+  from peer and subject only — the local node identity is NOT in
+  the durable name. Operational implications:
+  - **Single-replica federation receiver** — the canonical and
+    intended deployment. The durable consumer tracks
+    delivered/acked messages on the broker and survives restarts.
+  - **Multi-replica federation receiver** — NOT correctly
+    supported by this naming scheme. Two replicas configured
+    against the same peer collide on the same durable consumer;
+    only one is the active subscriber at a time, and re-election
+    flaps can cause apparent delivery gaps. Operators running
+    multiple mnemos replicas behind a load balancer should run
+    federation consumers from EXACTLY ONE replica until the
+    cross-node queue-group fix lands.
+  - The webhook NATS trigger side has the same shape — see the
+    `_node_durable` docstring in `mnemos/webhooks/nats_trigger.py`
+    which calls the queue-group attempt out as deferred for the
+    same reason.
+  - Principled fix: `add_consumer` + `bind_subscribe` pattern
+    with a JetStream queue-group, allowing N replicas to share
+    one durable consumer with workload sharding. Original
+    handoff's "deferred-with-caveat" Audit Finding 5 — flagged
+    for v4.2.0a7+.
 * Broker-failure test depth — current tests cover happy-path
   publish/subscribe and the reconnect backoff scheduler, but do
   NOT exercise stream-drift scenarios (config mismatch on

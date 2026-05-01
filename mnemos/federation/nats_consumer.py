@@ -373,10 +373,31 @@ async def _consume_subscription(pool: asyncpg.Pool, peer: FederationNatsPeer, su
             )
             if msg is not None:
                 await _ack(msg)
+        except asyncpg.PostgresError as exc:
+            # Handler-level DB error: log and DON'T ack (so JetStream
+            # redelivers after the ack-wait window). Stay in the
+            # consume loop — a transient DB hiccup should not force
+            # a NATS reconnect.
+            logger.exception(
+                "federation nats peer=%s db error: %s", peer.name, exc
+            )
+            continue
         except Exception as exc:
             if _is_timeout(exc):
                 continue
-            logger.exception("federation nats peer=%s event error: %s", peer.name, exc)
+            # Connection-level / unknown failure: escape so
+            # consumer_loop can drain the NATS connection and
+            # reconnect with backoff. Without this, errors like
+            # broker shutdown mid-consume or durable consumer
+            # deletion leave the consume loop spinning on the same
+            # dead subscription forever. (Audit Finding from
+            # v4.2.0a7 round 2.)
+            logger.exception(
+                "federation nats peer=%s subscription error (escaping for reconnect): %s",
+                peer.name,
+                exc,
+            )
+            raise
 
 
 async def _ack(msg: Any) -> None:

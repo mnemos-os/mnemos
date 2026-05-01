@@ -157,10 +157,25 @@ async def _consume_subscription(pool: asyncpg.Pool, sub: Any) -> None:
             )
             if msg is not None:
                 await _ack(msg)
+        except asyncpg.PostgresError as exc:
+            # Handler-level DB error: log and don't ack (JetStream
+            # redelivers after the ack-wait window). Transient DB
+            # hiccups should not force a NATS reconnect.
+            logger.exception("webhook nats trigger db error: %s", exc)
+            continue
         except Exception as exc:
             if _is_timeout(exc):
                 continue
-            logger.exception("webhook nats trigger event error: %s", exc)
+            # Connection-level / unknown failure: escape so
+            # consumer_loop can drain the NATS connection and
+            # reconnect with backoff. Without this, broker shutdown
+            # mid-consume or durable consumer deletion would leave
+            # the consume loop spinning on the dead subscription.
+            logger.exception(
+                "webhook nats trigger subscription error (escaping for reconnect): %s",
+                exc,
+            )
+            raise
 
 
 async def _connect(settings: Settings):
