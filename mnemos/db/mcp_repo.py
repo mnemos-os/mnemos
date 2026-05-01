@@ -402,16 +402,27 @@ async def fetch_recommended_model(
     }
     required_caps = capability_map.get(task_type, ["reasoning"])
 
+    # Budgeted selection EXCLUDES rows with NULL costs. An unknown
+    # cost cannot legally satisfy a "<= $cost_budget" constraint —
+    # COALESCEing it to 0 would silently bypass the budget and rank
+    # partially-synced rows ahead of real priced models. The
+    # graeae_weight COALESCE stays: missing weight as 0 fails a
+    # ">= floor" check, which is the conservative behaviour. Python-
+    # side safe_float defends against any NULL that slips past the
+    # predicate.
     models = await conn.fetch(
         """
         SELECT
             provider, model_id, display_name,
             input_cost_per_mtok, output_cost_per_mtok,
-            graeae_weight, context_window
+            COALESCE(graeae_weight, 0) AS graeae_weight,
+            context_window
         FROM model_registry
         WHERE available = true
         AND deprecated = false
-        AND graeae_weight >= $1
+        AND input_cost_per_mtok IS NOT NULL
+        AND output_cost_per_mtok IS NOT NULL
+        AND COALESCE(graeae_weight, 0) >= $1
         AND (input_cost_per_mtok + output_cost_per_mtok) / 2.0 <= $2
         AND capabilities @> $3
         ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
@@ -423,15 +434,21 @@ async def fetch_recommended_model(
     )
 
     if not models:
+        # Degraded fallback: no priced model met the budget. Allow
+        # NULL-cost rows here so the user gets *some* model rather
+        # than a 404, but order priced models first via NULLS LAST
+        # and keep the cost field unmunged so the response can
+        # signal "unknown" via None.
         models = await conn.fetch(
             """
             SELECT
                 provider, model_id, display_name,
                 input_cost_per_mtok, output_cost_per_mtok,
-                graeae_weight, context_window
+                COALESCE(graeae_weight, 0) AS graeae_weight,
+                context_window
             FROM model_registry
             WHERE available = true AND deprecated = false
-            ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+            ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC NULLS LAST
             LIMIT 1
             """
         )
@@ -440,15 +457,24 @@ async def fetch_recommended_model(
         return None, required_caps
 
     model = models[0]
-    avg_cost = (
-        _row_get(model, "input_cost_per_mtok")
-        + _row_get(model, "output_cost_per_mtok")
-    ) / 2.0
+    # Cast to float at the seam: PG returns NUMERIC columns as
+    # decimal.Decimal, SQLite returns them as float. cost_per_mtok
+    # comes back None when EITHER cost column was NULL — the
+    # degraded-fallback path may return such a row and we surface
+    # the unknown cost honestly to the caller rather than fabricate
+    # a 0.0 that bypasses budget semantics elsewhere.
+    from mnemos.core.numeric import safe_float
+    in_cost = _row_get(model, "input_cost_per_mtok")
+    out_cost = _row_get(model, "output_cost_per_mtok")
+    if in_cost is None or out_cost is None:
+        avg_cost: float | None = None
+    else:
+        avg_cost = (safe_float(in_cost) + safe_float(out_cost)) / 2.0
     return {
         "provider": _row_get(model, "provider"),
         "model_id": _row_get(model, "model_id"),
         "display_name": _row_get(model, "display_name"),
-        "cost_per_mtok": float(avg_cost),
-        "quality_score": float(_row_get(model, "graeae_weight")),
+        "cost_per_mtok": avg_cost,
+        "quality_score": safe_float(_row_get(model, "graeae_weight")),
         "context_window": _row_get(model, "context_window"),
     }, required_caps

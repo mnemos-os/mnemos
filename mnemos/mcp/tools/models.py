@@ -32,11 +32,21 @@ async def tool_recommend_model(
         )
         recommended = recommendation.get("recommended") or {}
         cost = recommended.get("cost_per_mtok")
+        # ``cost is None`` means the recommendation came from the
+        # degraded fallback (no priced model met the budget). An
+        # unknown cost CANNOT satisfy a budget — surface budget_met
+        # as False (not True) so callers do not silently treat
+        # "unknown" as "free". The recommendation itself is still
+        # returned so the caller can decide.
+        if cost is None:
+            budget_met = False
+        else:
+            budget_met = cost <= cost_budget
         return {
             "success": True,
             "task_type": task_type,
             **recommendation,
-            "budget_met": cost is None or cost <= cost_budget,
+            "budget_met": budget_met,
         }
 
     pool = _lc._pool
@@ -56,6 +66,15 @@ async def tool_recommend_model(
                 return {"success": False, "error": "No models available"}
 
             avg_cost = model["cost_per_mtok"]
+            # avg_cost is None when fetch_recommended_model returns
+            # a degraded-fallback row whose cost columns were NULL.
+            # Comparing None <= cost_budget would TypeError; surface
+            # budget_met=False so callers treat unknown cost as
+            # NOT meeting the budget rather than crashing.
+            if avg_cost is None:
+                budget_met = False
+            else:
+                budget_met = avg_cost <= cost_budget
             return {
                 "success": True,
                 "task_type": task_type,
@@ -64,7 +83,7 @@ async def tool_recommend_model(
                     f"Cheapest model with {', '.join(required_caps)} capability "
                     f"above quality floor {quality_floor}"
                 ),
-                "budget_met": avg_cost <= cost_budget,
+                "budget_met": budget_met,
             }
 
     except Exception as e:

@@ -65,7 +65,19 @@ async def get_state(
             )
         if not row:
             raise HTTPException(status_code=404, detail=f"State key '{key}' not found")
-        return dict(row)
+        result = dict(row)
+        # StateManager.set persists the value as
+        # ``MNEMOS_SM:v1:<json>`` so the in-process get/set round-
+        # trip can disambiguate StateManager-written rows from
+        # legacy opaque TEXT or REST-written objects. That marker
+        # is INTERNAL — REST clients expect ``value`` to be the
+        # JSON payload they posted, not the storage envelope.
+        # Strip the prefix on read; pre-envelope rows pass through.
+        from mnemos.domain.memory_categorization.state import _SM_ENVELOPE_PREFIX
+        raw_value = result.get("value")
+        if isinstance(raw_value, str) and raw_value.startswith(_SM_ENVELOPE_PREFIX):
+            result["value"] = raw_value[len(_SM_ENVELOPE_PREFIX):]
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -87,10 +99,14 @@ async def set_state(
     try:
         async with _lc.get_pool_manager().transactional() as conn:
             row = await conn.fetchrow(
+                # state.value is TEXT (post v4.2.0a5 migration). The
+                # route still wraps caller payloads in json.dumps so
+                # consumers can re-parse with json.loads at read time;
+                # the column type just no longer enforces JSON shape.
                 '''INSERT INTO state (owner_id, namespace, key, value, updated)
-                   VALUES ($1, $2, $3, $4::jsonb, NOW())
+                   VALUES ($1, $2, $3, $4, NOW())
                    ON CONFLICT (owner_id, namespace, key) DO UPDATE
-                   SET value = $4::jsonb, updated = NOW(), version = state.version + 1
+                   SET value = $4, updated = NOW(), version = state.version + 1
                    RETURNING key, value, updated::text, version''',
                 target_owner, target_ns, key, json.dumps(req.value),
             )

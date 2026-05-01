@@ -529,7 +529,8 @@ psql -U mnemos -d mnemos -v ON_ERROR_STOP=1 \
   -f db/migrations_v3_5_session_compression_legacy_drop.sql \
   -f db/migrations_v3_5_sessions_consultations_namespace.sql \
   -f db/migrations_v4_2_users_username.sql \
-  -f db/migrations_v4_2_compression_candidates_nullable_tokens.sql
+  -f db/migrations_v4_2_compression_candidates_nullable_tokens.sql \
+  -f db/migrations_v4_2_state_value_text.sql
 
 # Verify
 psql -U mnemos -d mnemos -c "SELECT version();"

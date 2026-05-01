@@ -93,14 +93,20 @@ async def _tier_lineup(tier: str) -> dict:
         """
         params = ()
     elif tier == "budget":
+        # NULL costs are EXCLUDED from the budget tier — an unknown
+        # cost cannot legally satisfy a "cheapest" semantics, and
+        # COALESCEing to 0 would let partially-synced rows rank
+        # ahead of priced models. Same invariant as the budget
+        # selection in mcp_repo / providers route / openai_compat.
         sql = """
             SELECT DISTINCT ON (provider) provider, model_id
             FROM model_registry
             WHERE available = true AND deprecated = false
               AND graeae_weight >= 0.75
+              AND input_cost_per_mtok IS NOT NULL
+              AND output_cost_per_mtok IS NOT NULL
             ORDER BY provider,
-                     (COALESCE(input_cost_per_mtok, 0)
-                      + COALESCE(output_cost_per_mtok, 0)) ASC
+                     (input_cost_per_mtok + output_cost_per_mtok) ASC
         """
         params = ()
     else:

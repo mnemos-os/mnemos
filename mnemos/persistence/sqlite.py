@@ -1714,18 +1714,42 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
             "FROM model_registry WHERE available = 1 AND deprecated = 0",
         )
 
-        def _avg_cost(row: Row) -> float:
-            return (float(row["input_cost_per_mtok"] or 0) + float(row["output_cost_per_mtok"] or 0)) / 2.0
+        def _has_priced(row: Row) -> bool:
+            return (
+                row["input_cost_per_mtok"] is not None
+                and row["output_cost_per_mtok"] is not None
+            )
 
+        def _avg_cost_or_none(row: Row) -> float | None:
+            if not _has_priced(row):
+                return None
+            return (
+                float(row["input_cost_per_mtok"]) + float(row["output_cost_per_mtok"])
+            ) / 2.0
+
+        # Budget tier EXCLUDES rows with NULL costs — an unknown
+        # cost cannot legally satisfy a "<= budget" constraint;
+        # treating NULL as 0 would let partially-synced rows rank
+        # ahead of priced ones. Mirrors the Postgres invariant in
+        # mnemos/db/mcp_repo.py and friends.
         eligible = [
             row for row in rows
             if float(row["graeae_weight"] or 0) >= quality_floor
-            and _avg_cost(row) <= cost_budget
+            and _has_priced(row)
+            and (_avg_cost_or_none(row) or 0.0) <= cost_budget
             and all(cap in _json_list(row["capabilities"]) for cap in required_caps)
         ]
-        chosen_rows = sorted(eligible, key=_avg_cost)
+        chosen_rows = sorted(eligible, key=lambda r: _avg_cost_or_none(r) or 0.0)
         if not chosen_rows:
-            chosen_rows = sorted(rows, key=_avg_cost)
+            # Degraded fallback: no priced model met the budget.
+            # Allow NULL-cost rows here but sort priced ones first
+            # via "(unknown=infinity)" key — matches PG's NULLS LAST.
+            chosen_rows = sorted(
+                rows,
+                key=lambda r: (
+                    _avg_cost_or_none(r) if _avg_cost_or_none(r) is not None else float("inf")
+                ),
+            )
         if not chosen_rows:
             return None, required_caps
         model = chosen_rows[0]
@@ -1733,7 +1757,10 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
             "provider": model["provider"],
             "model_id": model["model_id"],
             "display_name": model["display_name"],
-            "cost_per_mtok": _avg_cost(model),
+            # cost_per_mtok is None when either cost column is NULL.
+            # Surface unknown honestly rather than fabricate 0.0
+            # which would silently lie about pricing semantics.
+            "cost_per_mtok": _avg_cost_or_none(model),
             "quality_score": float(model["graeae_weight"] or 0),
             "context_window": model["context_window"],
         }, required_caps

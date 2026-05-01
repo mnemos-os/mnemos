@@ -84,16 +84,25 @@ async def recommend_model(
             }
             required_caps = capability_map.get(task_type, ["reasoning"])
 
-            # Find models meeting criteria
+            # Budgeted selection EXCLUDES rows with NULL costs — an
+            # unknown cost cannot legally satisfy a budget; COALESCEing
+            # it to 0 would silently bypass the constraint and rank
+            # partially-synced rows ahead of priced models. Same
+            # invariant in mnemos/db/mcp_repo.py and openai_compat_repo.
             models = await conn.fetch(
                 """
                 SELECT
-                    provider, model_id, display_name, input_cost_per_mtok,
-                    output_cost_per_mtok, capabilities, graeae_weight, context_window
+                    provider, model_id, display_name,
+                    input_cost_per_mtok, output_cost_per_mtok,
+                    capabilities,
+                    COALESCE(graeae_weight, 0) AS graeae_weight,
+                    context_window
                 FROM model_registry
                 WHERE available = true
                 AND deprecated = false
-                AND graeae_weight >= $1
+                AND input_cost_per_mtok IS NOT NULL
+                AND output_cost_per_mtok IS NOT NULL
+                AND COALESCE(graeae_weight, 0) >= $1
                 AND (input_cost_per_mtok + output_cost_per_mtok) / 2.0 <= $2
                 AND capabilities @> $3
                 ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
@@ -105,7 +114,11 @@ async def recommend_model(
             )
 
             if not models:
-                # Fallback: cheapest model available (ignore budget)
+                # Degraded fallback: no priced model met the budget.
+                # Allow NULL-cost rows so the caller gets *something*
+                # rather than a 404, but priced models still win via
+                # NULLS LAST. cost_per_mtok in the response is None
+                # when costs are unknown.
                 logger.info(
                     f"[PROVIDERS] No model found for {task_type} "
                     f"(budget=${cost_budget}/MTok, quality>={quality_floor}), "
@@ -114,11 +127,14 @@ async def recommend_model(
                 models = await conn.fetch(
                     """
                     SELECT
-                        provider, model_id, display_name, input_cost_per_mtok,
-                        output_cost_per_mtok, capabilities, graeae_weight, context_window
+                        provider, model_id, display_name,
+                        input_cost_per_mtok, output_cost_per_mtok,
+                        capabilities,
+                        COALESCE(graeae_weight, 0) AS graeae_weight,
+                        context_window
                     FROM model_registry
                     WHERE available = true AND deprecated = false
-                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC NULLS LAST
                     LIMIT 1
                     """
                 )
@@ -166,11 +182,21 @@ async def recommend_model(
                 raise HTTPException(status_code=404, detail="No models available")
 
             model = models[0]
-            avg_cost = (model["input_cost_per_mtok"] + model["output_cost_per_mtok"]) / 2.0
+            # cost_per_mtok is None when EITHER cost column is NULL
+            # (only reachable via the degraded fallback). Surface
+            # the unknown cost honestly rather than fabricate 0.0.
+            from mnemos.core.numeric import safe_float
+            in_cost = model["input_cost_per_mtok"]
+            out_cost = model["output_cost_per_mtok"]
+            if in_cost is None or out_cost is None:
+                avg_cost: float | None = None
+            else:
+                avg_cost = (safe_float(in_cost) + safe_float(out_cost)) / 2.0
 
+            cost_label = f"${avg_cost:.2f}/MTok" if avg_cost is not None else "unknown"
             logger.info(
                 f"[PROVIDERS] Recommended {model['provider']}/{model['model_id']} "
-                f"for {task_type} (cost=${avg_cost:.2f}/MTok)"
+                f"for {task_type} (cost={cost_label})"
             )
 
             return {
@@ -182,7 +208,7 @@ async def recommend_model(
                 },
                 "reasoning": f"Cheapest model with {', '.join(required_caps)} capability "
                 f"above quality floor {quality_floor}",
-                "quality_score": model["graeae_weight"],
+                "quality_score": safe_float(model["graeae_weight"]),
                 "context_window": model.get("context_window"),
             }
 

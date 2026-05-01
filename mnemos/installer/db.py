@@ -307,6 +307,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v3_5_sessions_consultations_namespace.sql",
         repo_path / "db" / "migrations_v4_2_users_username.sql",
         repo_path / "db" / "migrations_v4_2_compression_candidates_nullable_tokens.sql",
+        repo_path / "db" / "migrations_v4_2_state_value_text.sql",
     ]
 
     print("[db] Running migrations...")

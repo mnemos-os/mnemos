@@ -85,9 +85,19 @@ async def backend_case(request, tmp_path, monkeypatch):
             await conn.execute("DELETE FROM memory_compressed_variants WHERE owner_id LIKE $1", f"{prefix}%")
             await conn.execute("DELETE FROM memory_compression_candidates WHERE owner_id LIKE $1", f"{prefix}%")
             await conn.execute("DELETE FROM kg_triples WHERE owner_id LIKE $1", f"{prefix}%")
-            await conn.execute("DELETE FROM memory_branches WHERE memory_id LIKE $1", f"{prefix}%")
-            await conn.execute("DELETE FROM memory_versions WHERE owner_id LIKE $1", f"{prefix}%")
-            await conn.execute("DELETE FROM memories WHERE owner_id LIKE $1", f"{prefix}%")
+            # Memory deletion order: branches deleted first leaves dangling
+            # versions referencing missing branch rows. The DELETE trigger
+            # on memories then fires and raises "branch main missing" when
+            # it looks up the branch HEAD it expects to update. Suppress
+            # the version-snapshot trigger for THIS cleanup transaction
+            # via SET LOCAL (custom GUC, no superuser required) so the
+            # delete-cascade can proceed without re-materialising rows
+            # we are deleting.
+            async with conn.transaction():
+                await conn.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
+                await conn.execute("DELETE FROM memory_branches WHERE memory_id LIKE $1", f"{prefix}%")
+                await conn.execute("DELETE FROM memory_versions WHERE owner_id LIKE $1", f"{prefix}%")
+                await conn.execute("DELETE FROM memories WHERE owner_id LIKE $1", f"{prefix}%")
             await conn.execute("DELETE FROM model_registry WHERE provider LIKE $1", f"{prefix}%")
             await conn.execute("DELETE FROM users WHERE id LIKE $1", f"{prefix}%")
         monkeypatch.setattr(lifecycle, "_pool", old_pool)
@@ -244,7 +254,33 @@ async def _insert_version(
 
 
 async def _seed_versioned_memory(case: BackendCase, tx: Any) -> tuple[str, str, str]:
-    memory_id = await _insert_memory(case, tx)
+    # The PG memory INSERT trigger (mnemos_version_snapshot) already
+    # creates a v1 row + memory_branches main HEAD on every memory
+    # INSERT (db/migrations_v3_5_trigger_same_memory_parent.sql:64-85).
+    # The test wants to seed v1 with a known version_id, so isolate
+    # the suppress in a SAVEPOINT scope so it does not leak to the
+    # rest of the test transaction. Without this, a later
+    # _insert_memory in the same test would also skip the trigger
+    # and mask real failures the parity suite exists to catch.
+    if case.name == "postgres":
+        await tx.conn.execute("SAVEPOINT mnemos_seed_suppress")
+        try:
+            await case.backend.memories.set_suppress_version_snapshot(tx)
+            memory_id = await _insert_memory(case, tx)
+        except BaseException:
+            await tx.conn.execute("ROLLBACK TO SAVEPOINT mnemos_seed_suppress")
+            raise
+        # Commit the savepoint, but reset the GUC explicitly so the
+        # outer transaction's snapshot trigger fires on subsequent
+        # inserts. RESET drops the SET LOCAL value back to the session
+        # default (unset/empty), which re-arms the trigger.
+        await tx.conn.execute("RELEASE SAVEPOINT mnemos_seed_suppress")
+        await tx.conn.execute("RESET mnemos.suppress_version_snapshot")
+    else:
+        # SQLite has no version trigger; suppression is a no-op here
+        # and there is nothing to scope.
+        memory_id = await _insert_memory(case, tx)
+
     version_id, commit_hash = await _insert_version(case, tx, memory_id, version_num=1, content="v1 content")
     await case.backend.memory_branches.upsert_memory_branch_head(
         tx,

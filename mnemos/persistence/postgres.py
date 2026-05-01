@@ -991,6 +991,14 @@ class PostgresFederationRepository(FederationRepository):
 
 
 class PostgresStateRepository(StateRepository):
+    """state.value is now TEXT on PG (migrations_v4_2_state_value_text.sql).
+
+    Pass-through with no JSON shape coupling — the column matches
+    SqliteStateRepository's TEXT contract exactly. Callers who want
+    JSON shape (e.g. the HTTP /v1/state route) wrap their payloads
+    in json.dumps at the API edge.
+    """
+
     async def get(
         self,
         tx: Transaction,

@@ -105,15 +105,25 @@ async def fetch_model_recommendation(
             }
             required_caps = capability_map.get(task_type, ["reasoning"])
 
+            # Budgeted selection EXCLUDES rows with NULL costs.
+            # COALESCEing them to 0 would silently bypass the budget
+            # and rank partially-synced rows ahead of priced models.
+            # Same invariant in mnemos/db/mcp_repo.py and
+            # mnemos/api/routes/providers.py.
             models = await conn.fetch(
                 """
                 SELECT
-                    provider, model_id, display_name, input_cost_per_mtok,
-                    output_cost_per_mtok, capabilities, graeae_weight, context_window
+                    provider, model_id, display_name,
+                    input_cost_per_mtok, output_cost_per_mtok,
+                    capabilities,
+                    COALESCE(graeae_weight, 0) AS graeae_weight,
+                    context_window
                 FROM model_registry
                 WHERE available = true
                 AND deprecated = false
-                AND graeae_weight >= $1
+                AND input_cost_per_mtok IS NOT NULL
+                AND output_cost_per_mtok IS NOT NULL
+                AND COALESCE(graeae_weight, 0) >= $1
                 AND (input_cost_per_mtok + output_cost_per_mtok) / 2.0 <= $2
                 AND capabilities @> $3
                 ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
@@ -126,8 +136,8 @@ async def fetch_model_recommendation(
 
             if not models:
                 logger.info(
-                    "[OPTIMIZER] No model found for %s "
-                    "(budget=$%s/MTok, quality>=%s), using fallback cheapest model",
+                    "[OPTIMIZER] No priced model met %s budget "
+                    "(budget=$%s/MTok, quality>=%s), trying degraded fallback",
                     task_type,
                     cost_budget,
                     quality_floor,
@@ -135,11 +145,14 @@ async def fetch_model_recommendation(
                 models = await conn.fetch(
                     """
                     SELECT
-                        provider, model_id, display_name, input_cost_per_mtok,
-                        output_cost_per_mtok, capabilities, graeae_weight, context_window
+                        provider, model_id, display_name,
+                        input_cost_per_mtok, output_cost_per_mtok,
+                        capabilities,
+                        COALESCE(graeae_weight, 0) AS graeae_weight,
+                        context_window
                     FROM model_registry
                     WHERE available = true AND deprecated = false
-                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC
+                    ORDER BY (input_cost_per_mtok + output_cost_per_mtok) ASC NULLS LAST
                     LIMIT 1
                     """
                 )
@@ -149,17 +162,25 @@ async def fetch_model_recommendation(
                 return None
 
             model = models[0]
-            avg_cost = (
-                _row_get(model, "input_cost_per_mtok", 0)
-                + _row_get(model, "output_cost_per_mtok", 0)
-            ) / 2.0
+            # cost_per_mtok is None when EITHER cost column is NULL —
+            # only reachable via the degraded fallback. Surface the
+            # unknown cost honestly rather than fabricate 0.0 which
+            # would silently lie about pricing semantics.
+            from mnemos.core.numeric import safe_float
+            in_cost = _row_get(model, "input_cost_per_mtok")
+            out_cost = _row_get(model, "output_cost_per_mtok")
+            if in_cost is None or out_cost is None:
+                avg_cost: float | None = None
+            else:
+                avg_cost = (safe_float(in_cost) + safe_float(out_cost)) / 2.0
 
+            cost_label = f"${avg_cost:.2f}/MTok" if avg_cost is not None else "unknown"
             logger.info(
-                "[OPTIMIZER] Recommended %s/%s for %s (cost=$%.2f/MTok)",
+                "[OPTIMIZER] Recommended %s/%s for %s (cost=%s)",
                 _row_get(model, "provider"),
                 _row_get(model, "model_id"),
                 task_type,
-                avg_cost,
+                cost_label,
             )
 
             return {
@@ -167,7 +188,7 @@ async def fetch_model_recommendation(
                 "model_id": _row_get(model, "model_id"),
                 "display_name": _row_get(model, "display_name"),
                 "cost_per_mtok": avg_cost,
-                "quality_score": _row_get(model, "graeae_weight"),
+                "quality_score": safe_float(_row_get(model, "graeae_weight")),
                 "context_window": _row_get(model, "context_window"),
             }
 
