@@ -631,12 +631,12 @@ class TestFederationFeedPreferCompressed:
         # less than content + verbatim. The double accounts for
         # the variant being emitted twice (content + compressed_
         # content); the COALESCE handles NULL/empty verbatim rows.
-        assert "4 * octet_length(v.compressed_content)" in seen, (
+        assert "2 * octet_length(to_json(v.compressed_content)::text)" in seen, (
             "prefer_compressed gate must double the variant byte "
             "count to reflect dual emission; got SQL: "
             f"{seen[:400]}"
         )
-        assert "COALESCE(octet_length(m.verbatim_content), 0)" in seen, (
+        assert "COALESCE(octet_length(to_json(m.verbatim_content)::text), 0)" in seen, (
             "gate must COALESCE-with-0 verbatim length so NULL/empty "
             f"rows don't slip through; got SQL: {seen[:400]}"
         )
@@ -717,12 +717,12 @@ class TestFederationFeedPreferCompressed:
         # Doubling + COALESCE-with-0 are the round-12 hardening:
         # account for the variant emitted twice + handle NULL or
         # empty verbatim_content rows.
-        assert "4 * octet_length(v.compressed_content)" in seen, (
+        assert "2 * octet_length(to_json(v.compressed_content)::text)" in seen, (
             "prefer_compressed gate must DOUBLE the variant's byte "
             "count to reflect that it is emitted twice (content + "
             f"compressed_content). Got SQL:\n{seen[:600]}"
         )
-        assert "COALESCE(octet_length(m.verbatim_content), 0)" in seen, (
+        assert "COALESCE(octet_length(to_json(m.verbatim_content)::text), 0)" in seen, (
             "gate must COALESCE-with-0 the verbatim_content length "
             "so NULL/empty-verbatim rows don't slip through with a "
             f"medium-ratio variant. Got SQL:\n{seen[:600]}"

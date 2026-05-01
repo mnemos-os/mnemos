@@ -500,40 +500,32 @@ async def federation_feed(
     if prefer_compressed:
         # Byte gate predicate (reused 3x below). Truthy iff
         # swapping to the variant produces a STRICTLY SMALLER
-        # serialized JSON response than the legacy raw shape,
-        # under any JSON encoding (including pathological
-        # all-backslash / all-quote / control-char strings).
+        # serialized JSON response than the legacy raw shape.
         #
-        # Worst-case JSON escape multipliers per byte:
-        #   * plain ASCII   : 1.0×
-        #   * `\` and `"`   : 2.0× (each → `\\` / `\"`)
-        #   * 0x00 control  : 6.0× (each escapes to a 6-byte form)
+        # We measure ACTUAL JSON-escaped bytes using Postgres
+        # ``to_json(text)::text``, which produces the on-the-wire
+        # form a JSON serializer would emit. Worst-case JSON
+        # escape multipliers per input byte:
+        #   * plain ASCII printable: 1.0×  (a → "a")
+        #   * `\` and `"`           : 2.0× (\ → \\, " → \")
+        #   * 0x00 control byte     : 6.0× (\u0000 / \u0001 etc.)
+        # Pre-round-6 the gate used a heuristic 4× factor on the
+        # raw octet count, which fell short for variants
+        # containing control characters (codex round-14 audit:
+        # `` escapes to 6 bytes and the 4× factor allowed
+        # response growth on those rows). The to_json measurement
+        # makes the predicate exact for any legal text input.
         #
-        # The 2.0× multiplier covers everything except control
-        # chars, and mnemos compresses text-typed memories where
-        # control bytes are rare. We assume up to 2× expansion on
-        # the variant side (it can be backslash-heavy after
-        # compression) and 1× expansion on the raw side (plain
-        # text). Combined with dual emission of the variant
-        # (content + compressed_content fields), worst-case
-        # variant-mode bytes = 4 * octet_length(variant), and
-        # legacy-mode bytes >= 1 * (octet + verbatim). So we
-        # require:
-        #     4 * octet_length(variant)
-        #         < octet_length(content) + COALESCE(verbatim, 0)
-        #
-        # This is conservative — typical text variants land around
-        # 0.3-0.5 compression ratio so the gate still passes for
-        # the common case. Pathological inputs (rare in real
-        # MNEMOS data) fall back to the raw branch.
-        # Codex round-13 audit (2026-05-01) — pre-fix the gate
-        # was 2*variant < raw which let backslash-heavy variants
-        # slip through and grow the JSON response.
+        # Variant emitted twice (content + compressed_content);
+        # the predicate is:
+        #     2 * octet_length(to_json(variant)::text)
+        #         < octet_length(to_json(m.content)::text)
+        #           + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0)
         use_variant = (
             "v.compressed_content IS NOT NULL "
-            "AND (4 * octet_length(v.compressed_content)) "
-            "  < (octet_length(m.content) "
-            "     + COALESCE(octet_length(m.verbatim_content), 0))"
+            "AND (2 * octet_length(to_json(v.compressed_content)::text)) "
+            "  < (octet_length(to_json(m.content)::text) "
+            "     + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0))"
         )
         content_select = (
             f"CASE WHEN {use_variant} THEN v.compressed_content "
