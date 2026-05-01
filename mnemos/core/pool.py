@@ -21,6 +21,30 @@ _TRANSIENT_ERRORS = (
 )
 
 
+# Pool exhaustion / acquire timeout / connection loss are
+# infrastructure-class errors that callers must distinguish from
+# content/processing failures: a contest-queue row whose
+# ``acquire()`` timed out is RETRYABLE — the row's content didn't
+# fail, the DB is wedged. Callers that mark rows failed on every
+# Exception need to consult this predicate so they don't convert
+# transient pool pressure into terminal data state.
+INFRASTRUCTURE_ERRORS: tuple[type[BaseException], ...] = (
+    *_TRANSIENT_ERRORS,
+    asyncio.TimeoutError,
+)
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """True if the exception is an asyncpg connection-loss / pool-
+    timeout class error rather than a content / processing failure.
+
+    Use to gate broad-except handlers that would otherwise mark
+    durable state (e.g., ``memory_compression_queue.failed``) — pool
+    timeouts must not be treated as terminal content failures.
+    """
+    return isinstance(exc, INFRASTRUCTURE_ERRORS)
+
+
 class TimeoutPool:
     """Thin proxy around an asyncpg pool that injects a default
     acquire timeout on every ``.acquire()`` call.

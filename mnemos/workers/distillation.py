@@ -264,9 +264,16 @@ class MemoryDistillationWorker:
         """Drain up to BATCH_SIZE rows from memory_compression_queue via
         the contest path. No-op if contest engines aren't configured.
 
-        Failures here do not propagate. Errors are logged and the next
-        loop iteration tries again.
+        Content / contest failures are swallowed and the next loop
+        iteration retries. Infrastructure errors (pool exhaustion,
+        asyncpg disconnect, asyncio.TimeoutError from the
+        TimeoutPool wrap) are RE-RAISED so the worker loop's
+        reconnect path can replace the wedged pool — codex round-2
+        of round-28 caught that swallowing here masked acquire
+        timeouts and kept a broken pool alive indefinitely.
         """
+        from mnemos.core.pool import is_infrastructure_error
+
         if not self._contest_engines:
             return
         try:
@@ -283,10 +290,25 @@ class MemoryDistillationWorker:
             if counts:
                 logger.info("contest queue drain: %s", counts)
         except Exception as e:
+            if is_infrastructure_error(e):
+                logger.warning(
+                    "contest queue drain infrastructure error %s; "
+                    "propagating to worker loop for reconnect",
+                    type(e).__name__,
+                )
+                raise
             logger.error("contest queue drain error: %s", e, exc_info=True)
 
     async def log_stats(self):
-        """Log current progress"""
+        """Log current progress.
+
+        Same infra-vs-content split as process_contest_queue_batch:
+        infrastructure errors propagate so the worker loop reconnects;
+        anything else is debug-logged and ignored (stats are best-effort
+        — we don't want a transient stats query to take down the worker).
+        """
+        from mnemos.core.pool import is_infrastructure_error
+
         try:
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow("""
@@ -308,6 +330,13 @@ class MemoryDistillationWorker:
                 row["failed"], variants,
             )
         except Exception as e:
+            if is_infrastructure_error(e):
+                logger.warning(
+                    "log_stats infrastructure error %s; propagating to "
+                    "worker loop for reconnect",
+                    type(e).__name__,
+                )
+                raise
             logger.debug(f"Could not log stats: {e}")
 
 

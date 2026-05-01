@@ -339,15 +339,49 @@ async def process_contest_queue(
                 expected_attempts=attempts,
             )
         except Exception as exc:
+            # Distinguish infrastructure errors (pool exhaustion,
+            # asyncpg disconnect, asyncio.TimeoutError from the
+            # round-28 TimeoutPool wrap) from content / contest
+            # failures. Marking a row failed on a transient pool
+            # timeout would convert pool pressure into an
+            # irreversible failed compression row — the worker's
+            # retry/stale-recovery flow exists to handle the
+            # transient case. Re-raise so the worker loop's
+            # reconnect path sees the error.
+            from mnemos.core.pool import is_infrastructure_error
+
+            if is_infrastructure_error(exc):
+                logger.warning(
+                    "contest_queue[%s]: infrastructure error %s; row left "
+                    "retryable, re-raising to worker loop",
+                    memory_id, type(exc).__name__,
+                )
+                counts["infra_errors"] += 1
+                raise
+
             logger.exception(
                 "contest_queue[%s]: unhandled exception", memory_id
             )
-            async with pool.acquire() as conn:
-                await conn.execute(
-                    _MARK_FAILED_SQL,
-                    queue_id,
-                    f"{type(exc).__name__}: {exc}",
-                )
+            try:
+                async with pool.acquire() as conn:
+                    await conn.execute(
+                        _MARK_FAILED_SQL,
+                        queue_id,
+                        f"{type(exc).__name__}: {exc}",
+                    )
+            except Exception as mark_exc:
+                # If we can't even acquire to mark failed, that's
+                # also infrastructure — bubble up rather than
+                # silently leaving the row in-flight.
+                if is_infrastructure_error(mark_exc):
+                    logger.warning(
+                        "contest_queue[%s]: failed-mark acquire timed out (%s); "
+                        "re-raising original error",
+                        memory_id, type(mark_exc).__name__,
+                    )
+                    counts["infra_errors"] += 1
+                    raise mark_exc from exc
+                raise
             counts["failed"] += 1
 
     return dict(counts)
