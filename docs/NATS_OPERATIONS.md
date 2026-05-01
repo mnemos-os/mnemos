@@ -315,6 +315,53 @@ only one wins. Less to worry about there.
    per legacy durable. JetStream auto-prunes inactive consumers
    after the 30-day age limit if you forget.
 
+### Verifying queue-group rollout
+
+After step 5, confirm the queue-mode consumer exists and has the
+expected `deliver_group`:
+
+```
+nats consumer info MNEMOS_MEMORY \
+  $(nats consumer ls MNEMOS_MEMORY | grep mnemos_federation_q_)
+```
+
+In the output, `Delivery Group:` should match the `_q_<group>_…`
+prefix of the durable name. `Push Bound:` should be `true` while a
+replica is subscribed.
+
+To verify load-balancing across replicas (rather than one replica
+taking everything), publish a small burst on the source side and
+watch the per-replica receive logs:
+
+```
+# On the source node:
+for i in $(seq 1 20); do
+  nats pub mnemos.memory.created.default '{"memory_id":"verify_'"$i"'"}'
+done
+
+# Then on each receiver replica, count distinct verify_N IDs in
+# the last minute of mnemos.federation.nats_consumer logs:
+journalctl -u mnemos -n 1000 | grep "received=" | tail -5
+```
+
+A healthy queue group shows the burst spread across replicas (not
+all 20 on one node). The exact split is not guaranteed even — NATS
+delivers to whichever subscriber is currently free — but it should
+not concentrate on a single replica when traffic is high enough.
+
+If the burst lands entirely on one replica, check:
+
+* All replicas actually have the env var set (`systemctl show
+  mnemos -p Environment | grep QUEUE_GROUP`).
+* All replicas are on `v4.2.0a8` or later
+  (`mnemos --version`).
+* The consumer's `Delivery Group` is set (queue-mode); if it's
+  empty the consumer is in legacy single-subscriber mode and
+  the env var didn't take effect.
+* The replicas are in fact connected to the same broker — split-
+  brain across two brokers means each broker has its own consumer
+  with its own queue group.
+
 ## Known limitations
 
 * Broker-failure test depth — current tests cover happy-path
