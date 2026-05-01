@@ -90,6 +90,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v3_5_session_compression_ratio_drop.sql",
     "migrations_v3_5_session_compression_legacy_drop.sql",
     "migrations_v3_5_sessions_consultations_namespace.sql",
+    "migrations_v4_2_compression_candidates_reject_reason.sql",
 ]
 
 
@@ -1979,7 +1980,23 @@ class SqliteBackend(PersistenceBackend):
             migration_path = migrations_dir / migration_name
             if not migration_path.exists():
                 continue
-            await _executescript(conn, migration_path.read_text())
+            try:
+                await _executescript(conn, migration_path.read_text())
+            except sqlite3.OperationalError as exc:
+                # SQLite ``ALTER TABLE ADD COLUMN`` cannot be wrapped
+                # in IF NOT EXISTS and re-running it on a column that
+                # already exists raises ``duplicate column name``.
+                # Treat that specific error as a no-op so upgrade
+                # migrations stay idempotent — every other operational
+                # error still propagates.
+                if "duplicate column name" in str(exc).lower():
+                    logger.debug(
+                        "sqlite migration %s: column already present, skipping (%s)",
+                        migration_name,
+                        exc,
+                    )
+                    continue
+                raise
 
     async def _create_vec_virtual_table(self, conn: Any) -> None:
         if not self._vec_loaded:

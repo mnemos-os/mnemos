@@ -79,13 +79,31 @@ async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
 
     Optional and additive: HTTP federation polling remains active for
     backfill and safety regardless of NATS availability.
+
+    Audit Finding 9 (handoff queue #3): warn at boot if peers are
+    configured but ``MNEMOS_NODE_NAME`` is unset. Without an
+    explicit name the source-node tag falls back to
+    ``socket.gethostname()``, which is fine for a single host but
+    can collide on identical container hostnames across a federation
+    and cause loop-back filtering to mis-fire. Operators with peers
+    really want a stable, unique node name.
     """
     from mnemos.federation.nats_consumer import (
         configured_nats_peers,
         consumer_loop,
     )
 
-    for peer in configured_nats_peers(settings):
+    peers = list(configured_nats_peers(settings))
+    if peers and not settings.nats.node_name.strip():
+        logger.warning(
+            "[NATS] %d federation peer(s) configured but MNEMOS_NODE_NAME is unset; "
+            "falling back to hostname for source_node tagging. Set MNEMOS_NODE_NAME "
+            "to a stable, deployment-unique value to avoid loop-back filter misses "
+            "if peer hostnames collide.",
+            len(peers),
+        )
+
+    for peer in peers:
         logger.info("Launching federation nats consumer for peer %s", peer.name)
         lifecycle.schedule_worker(consumer_loop(pool, peer))
 

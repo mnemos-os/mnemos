@@ -943,16 +943,24 @@ async def test_compression_candidate_variant_and_export(backend_case: BackendCas
                 "engine",
                 sqlite_sql=(
                     "INSERT INTO memory_compression_candidates "
-                    "(id, memory_id, owner_id, contest_id, engine_id) VALUES (?, ?, ?, ?, ?)"
+                    "(id, memory_id, owner_id, contest_id, engine_id, "
+                    "is_winner, reject_reason) "
+                    "VALUES (?, ?, ?, ?, ?, 0, 'parity_seed_loser')"
                 ),
             )
         else:
+            # PG schema enforces ``mcc_loser_has_reason``: a row with
+            # is_winner=false MUST have a reject_reason. Supply a
+            # placeholder for parity-test seeding (the test body is
+            # exercising candidate_exists / insert_variant flows, not
+            # the loser-reason invariant).
             await _raw_execute(
                 backend_case,
                 tx,
                 "INSERT INTO memory_compression_candidates "
-                "(id, memory_id, owner_id, contest_id, engine_id) "
-                "VALUES ($1::uuid, $2, $3, $4::uuid, $5)",
+                "(id, memory_id, owner_id, contest_id, engine_id, "
+                "is_winner, reject_reason) "
+                "VALUES ($1::uuid, $2, $3, $4::uuid, $5, false, 'parity_seed_loser')",
                 candidate_id,
                 memory_id,
                 owner,

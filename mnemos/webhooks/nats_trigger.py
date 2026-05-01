@@ -9,6 +9,7 @@ from typing import Any, Awaitable, Callable, Mapping
 import asyncpg
 
 from mnemos.core.config import Settings, get_settings
+from mnemos.nats.backoff import ReconnectBackoff
 
 logger = logging.getLogger("mnemos.webhooks.nats_trigger")
 
@@ -31,6 +32,10 @@ async def consumer_loop(
         logger.info("webhook nats trigger disabled (MNEMOS_NATS_URL unset)")
         return
     connect = connect or _connect
+    # Exponential backoff with full jitter capped at the existing
+    # retry_seconds tuning so operator-set ceilings still apply.
+    # Audit Finding 8 / mnemos.nats.backoff.ReconnectBackoff.
+    backoff = ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)
 
     while True:
         try:
@@ -39,17 +44,23 @@ async def consumer_loop(
                 raise RuntimeError("NATS JetStream unavailable")
             logger.info("webhook nats trigger connected subject=%s", SUBJECT)
             sub = await _subscribe(js)
+            # Reset AFTER subscribe succeeds. A broker that accepts
+            # the connection but fails subscribe (stream drift,
+            # consumer-group recovery) would otherwise reset every
+            # iteration and burn through a tight loop.
+            backoff.reset()
             await _consume_subscription(pool, sub)
         except asyncio.CancelledError:
             logger.info("webhook nats trigger cancelled")
             raise
         except Exception as exc:
+            delay = backoff.next_delay()
             logger.warning(
-                "webhook nats trigger unavailable: %s; retrying in %.0fs",
+                "webhook nats trigger unavailable: %s; retrying in %.1fs",
                 exc,
-                retry_seconds,
+                delay,
             )
-            await asyncio.sleep(retry_seconds)
+            await asyncio.sleep(delay)
 
 
 async def handle_message(

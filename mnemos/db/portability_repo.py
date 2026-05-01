@@ -132,15 +132,21 @@ async def fetch_memory_versions_for_export(
     effective_ns: Optional[str],
     hard_limit: int,
 ):
+    # ``id`` and ``parent_version_id`` are PG UUID columns; cast to
+    # text so callers (and the persistence-parity tests) see the
+    # same str shape SQLite returns. Without the casts asyncpg
+    # decodes UUIDs as ``uuid.UUID`` instances and equality against
+    # ``str(uuid)`` fails.
     return await _fetch_sidecar(
         conn,
         table="memory_versions",
         columns=(
-            "id, memory_id, version_num, content, category, "
+            "id::text AS id, memory_id, version_num, content, category, "
             "subcategory, metadata, verbatim_content, owner_id, "
             "namespace, permission_mode, source_model, source_provider, "
             "source_session, source_agent, snapshot_at, snapshot_by, "
-            "change_type, commit_hash, parent_version_id, branch, "
+            "change_type, commit_hash, "
+            "parent_version_id::text AS parent_version_id, branch, "
             "merge_parents"
         ),
         memory_id_column="memory_id",

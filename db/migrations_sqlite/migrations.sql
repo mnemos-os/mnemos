@@ -439,6 +439,11 @@ CREATE TABLE IF NOT EXISTS memory_compression_candidates (
   quality_score REAL,
   composite_score REAL,
   is_winner INTEGER NOT NULL DEFAULT 0,
+  -- reject_reason is required by PG when is_winner=false (mcc_loser_has_reason
+  -- check constraint in db/migrations_v3_1_compression.sql). SQLite mirrors
+  -- the column so persistence-parity tests can seed an explicit loser reason
+  -- on both backends without branching.
+  reject_reason TEXT,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

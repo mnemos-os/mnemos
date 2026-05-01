@@ -87,18 +87,17 @@ async def fetch_memory_log(
             INNER JOIN commit_walk cw
                 ON mv.id = cw.parent_version_id
                AND mv.memory_id = cw.memory_id
-            WHERE cw.depth < $4
+            WHERE cw.depth < $3
         )
         SELECT
             commit_hash, version_num, branch, category, change_type,
             snapshot_at, snapshot_by, owner_id, namespace, permission_mode
         FROM commit_walk
         ORDER BY depth ASC
-        LIMIT $4
+        LIMIT $3
         """,
         memory_id,
         branch,
-        memory_id,
         limit,
     )
 

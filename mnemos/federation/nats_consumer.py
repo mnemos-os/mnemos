@@ -19,6 +19,7 @@ import asyncpg
 
 from mnemos.core.config import Settings, get_settings
 from mnemos.domain.federation import FEDERATION_ID_PREFIX, _store_memories, pull_memory_by_id
+from mnemos.nats.backoff import ReconnectBackoff
 from mnemos.nats.client import get_node_name
 
 logger = logging.getLogger("mnemos.federation.nats_consumer")
@@ -102,8 +103,14 @@ async def consumer_loop(
     retry_seconds: float = 30.0,
     connect: Callable[[FederationNatsPeer], Awaitable[Any]] | None = None,
 ) -> None:
-    """Connect to one upstream peer and consume memory events forever."""
+    """Connect to one upstream peer and consume memory events forever.
+
+    Reconnect backoff is exponential with full jitter (cap at the
+    legacy ``retry_seconds`` ceiling so existing tuning is honoured).
+    See ``mnemos.nats.backoff.ReconnectBackoff`` — Audit Finding 8.
+    """
     connect = connect or _connect_peer
+    backoff = ReconnectBackoff(base_seconds=1.0, cap_seconds=retry_seconds)
 
     while True:
         try:
@@ -115,6 +122,12 @@ async def consumer_loop(
                 ",".join(peer.subjects),
             )
             subscriptions = [await _subscribe(js, peer, subject) for subject in peer.subjects]
+            # Reset AFTER all subscriptions succeed. A broker that
+            # accepts the connection but fails JetStream subscribe
+            # (stream drift, consumer-group recovery) would otherwise
+            # reset the window every iteration and burn through a
+            # tight reconnect loop instead of backing off.
+            backoff.reset()
             async with _SubscriptionGroup(pool, peer, subscriptions) as group:
                 async for _ in group:
                     pass
@@ -122,13 +135,14 @@ async def consumer_loop(
             logger.info("federation nats consumer cancelled peer=%s", peer.name)
             raise
         except Exception as exc:
+            delay = backoff.next_delay()
             logger.warning(
-                "federation nats consumer peer=%s unavailable: %s; retrying in %.0fs",
+                "federation nats consumer peer=%s unavailable: %s; retrying in %.1fs",
                 peer.name,
                 exc,
-                retry_seconds,
+                delay,
             )
-            await asyncio.sleep(retry_seconds)
+            await asyncio.sleep(delay)
 
 
 async def handle_message(
