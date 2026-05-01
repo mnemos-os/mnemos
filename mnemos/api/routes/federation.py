@@ -15,6 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
+from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
 from mnemos.domain.models import (
@@ -211,8 +212,7 @@ async def register_peer(
             status_code=422,
             detail="compat_mode must be 'strict' or 'permissive'",
         )
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/federation/peers")
 
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
@@ -237,8 +237,7 @@ async def register_peer(
 
 @router.get("/peers", response_model=FederationPeerListResponse)
 async def list_peers(_: UserContext = Depends(require_root)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/federation/peers")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch("SELECT * FROM federation_peers ORDER BY name")
     peers = [_to_peer(r) for r in rows]
@@ -248,8 +247,7 @@ async def list_peers(_: UserContext = Depends(require_root)):
 @router.get("/peers/{peer_id}", response_model=FederationPeer)
 async def get_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/federation/peers/{peer_id}")
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             "SELECT * FROM federation_peers WHERE id = $1::uuid", peer_id,
@@ -266,8 +264,7 @@ async def update_peer(
     _: UserContext = Depends(require_root),
 ):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="PATCH /v1/federation/peers/{peer_id}")
     updates = {k: v for k, v in request.model_dump().items() if v is not None}
     if not updates:
         raise HTTPException(status_code=422, detail="no fields to update")
@@ -304,8 +301,7 @@ async def update_peer(
 @router.delete("/peers/{peer_id}", status_code=204)
 async def delete_peer(peer_id: str, _: UserContext = Depends(require_root)):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="DELETE /v1/federation/peers/{peer_id}")
     async with _lc.get_pool_manager().acquire() as conn:
         result = await conn.execute(
             "DELETE FROM federation_peers WHERE id = $1::uuid", peer_id,
@@ -321,8 +317,7 @@ async def trigger_sync(
 ):
     """Run a sync against a peer right now (blocks on completion)."""
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="POST /v1/federation/peers/{peer_id}/sync")
     try:
         pulled, new, updated = await _fed.sync_peer(_lc._pool, peer_id)
     except _fed.FederationSchemaIncompatible as e:
@@ -355,8 +350,7 @@ async def peer_sync_log(
     limit: int = 50,
 ):
     peer_id = parse_uuid_or_404(peer_id, "peer")
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/federation/peers/{peer_id}/log")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             """
@@ -389,8 +383,7 @@ async def peer_sync_log(
 
 @router.get("/status", response_model=FederationStatusResponse)
 async def federation_status(_: UserContext = Depends(require_root)):
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/federation/status")
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch("SELECT * FROM federation_peers ORDER BY name")
     peers = [_to_peer(r) for r in rows]
@@ -428,8 +421,7 @@ async def federation_feed(
     ),
 ):
     """Serve memories for a remote peer to pull. Requires role='federation' or 'root'."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/federation/feed")
 
     since_ts: Optional[datetime] = None
     since_id: Optional[str] = None
@@ -589,8 +581,7 @@ async def federation_memory(
     category: Optional[str] = Query(None, description="Comma-separated category filter"),
 ):
     """Serve one visible memory for a remote peer. Requires role='federation' or 'root'."""
-    if not _lc._pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
+    require_postgres_pool_or_503(route_label="GET /v1/federation/memory/{memory_id}")
 
     namespaces = [s.strip() for s in namespace.split(",") if s.strip()] if namespace else []
     categories = [s.strip() for s in category.split(",") if s.strip()] if category else []
