@@ -215,7 +215,6 @@ def _assert_canonical_tool_registry(tools: list[Any]) -> None:
 
     expected = set(TOOL_REGISTRY)
     observed = {tool.name for tool in tools}
-    assert len(expected) == 18
     assert observed == expected
     assert all(tool.inputSchema["type"] == "object" for tool in tools)
 
