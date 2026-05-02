@@ -228,7 +228,7 @@ Deliverables:
 - 🔵 v4.1: one Markdown per surface with exact config snippets.
 - ✅ v4.1: `mnemos-openapi.json` artifact for Custom GPTs and OpenAPI-aware clients — landed v4.2.0a14 round-36/37 as the new ``mnemos dump-openapi [-o PATH] [--indent N] [--title TITLE] [--target full|gpt-actions]`` CLI command. Builds the FastAPI OpenAPI spec without booting the server; suitable for CI / static-distribution workflows. ``--target gpt-actions`` truncates endpoint summary/description (300 chars) and parameter description (700 chars) per OpenAI's Custom GPT Actions production limits, so a Custom GPT importing the artifact does not silently truncate or fail. Operators with a running server can also continue to ``curl /openapi.json``.
 - 🔵 v4.1: Gemini and OpenAI Actions bridge packages if demand holds.
-- 🔵 v4.1: smoke tests per surface where automatable.
+- ✅ v4.1: smoke tests per surface where automatable — landed v4.2.0a14 in `tests/test_connector_smoke.py`, with operator runbook notes in `docs/connectors/README.md`.
 
 ---
 

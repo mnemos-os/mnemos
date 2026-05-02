@@ -115,6 +115,25 @@ Builder doesn't currently support file-watch / auto-refresh, so
 this is a manual step on each MNEMOS upgrade that adds new
 endpoints.
 
+## Smoke testing
+
+This surface is intentionally not covered by
+`tests/test_connector_smoke.py`: it is not MCP, has no `tools/list`
+handshake, and true end-to-end verification requires ChatGPT's hosted
+GPT Builder plus a public HTTPS endpoint.
+
+Local automation covers the OpenAPI artifact shape instead:
+
+```bash
+python -m pytest tests/test_cli_dump_openapi.py -q
+mnemos dump-openapi --target gpt-actions --server-url https://mnemos.example.com -o mnemos-openapi.json
+jq . mnemos-openapi.json
+```
+
+Manual end-to-end verification remains the GPT Builder preview-pane
+test in Step 3. Watch MNEMOS logs for a `POST /v1/memories/search`
+request with the bearer token you configured on the Action.
+
 ## Operational notes
 
 - **Read scope is the bearer token's scope.** Anything the token

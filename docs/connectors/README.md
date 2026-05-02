@@ -148,6 +148,65 @@ conflict resolution via the existing version DAG. Power users can also use SSH
 port-forwarding or Tailscale to point a local agent at a remote MNEMOS; the MCP
 server does not care which transport delivers the bytes.
 
+## Smoke testing
+
+Automated connector smoke coverage lives in
+`tests/test_connector_smoke.py`. It launches the documented stdio MCP
+subcommand for Claude Code, Claude Desktop, Cursor, Codex CLI,
+Continue.dev, and Cline, plus the HTTP/SSE bridge used by ChatGPT
+Pro Developer Mode. The tests use a loopback mock MNEMOS REST backend,
+send MCP `tools/list`, assert the canonical 18-tool registry, then call
+`search_memories` with a benign query and verify the success envelope.
+
+Run the connector smoke directly:
+
+```bash
+python -m pytest tests/test_connector_smoke.py -q
+```
+
+Run it with the normal pre-release suite:
+
+```bash
+python -m pytest tests/ -q --ignore=tests/test_live_e2e.py
+lint-imports --config pyproject.toml
+```
+
+Manual stdio verification for Claude Code, Claude Desktop, Cursor,
+Codex CLI, Continue.dev, and Cline:
+
+```bash
+export MNEMOS_BASE=http://localhost:5002
+export MNEMOS_API_KEY=<your bearer token>
+mnemos serve mcp-stdio
+```
+
+The stdio process must keep stdout reserved for JSON-RPC frames; errors
+and diagnostics go to stderr. In the host agent, look for the `mnemos`
+server in the MCP panel or `/mcp` output with status `connected` or
+`ready`, then ask it to search MNEMOS for `smoke test`.
+
+Manual HTTP/SSE verification for ChatGPT Pro Developer Mode:
+
+```bash
+export MNEMOS_BASE=http://localhost:5002
+export MNEMOS_API_KEY=<backend bearer token>
+export MNEMOS_MCP_TOKENS="alice:<connector bearer token>:<backend bearer token>"
+mnemos serve mcp-http --host 127.0.0.1 --port 5004
+```
+
+Expected bridge checks:
+
+```bash
+curl http://localhost:5004/healthz
+curl http://localhost:5004/sse
+curl -H "Authorization: Bearer <connector bearer token>" http://localhost:5004/sse
+```
+
+The first command returns `ok`; the unauthenticated SSE request returns
+401 with `WWW-Authenticate: Bearer realm="mnemos-mcp"`; the authenticated
+SSE request opens a `text/event-stream`. In logs, look for `MNEMOS MCP
+HTTP/SSE listening`, `Bearer principals configured`, and `MNEMOS backend`.
+
 ## Why we publish these as experimental
 
 Three reasons:
