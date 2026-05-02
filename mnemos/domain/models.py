@@ -715,3 +715,46 @@ class FederationFeedResponse(BaseModel):
     memories: List[MemoryItem]
     next_cursor: Optional[str] = None
     has_more: bool = False
+
+
+# ── GDPR right-to-be-forgotten (v4.2.0a14 round-77) ───────────
+
+
+class DeletionRequestCreate(BaseModel):
+    """Create a GDPR right-to-be-forgotten request.
+
+    The request is recorded in ``deletion_requests``; the actual
+    soft-delete sweep is performed by the wipe worker once the
+    request transitions to ``confirmed`` (via the
+    ``/admin/deletion-requests/{id}/confirm`` endpoint).
+
+    ``target_namespace`` is optional. When NULL, the wipe covers
+    ALL of the user's namespaces — the standard GDPR shape.
+    Set explicitly to a namespace string to scope the wipe to a
+    single tenant view of the user.
+    """
+    target_user_id: str
+    target_namespace: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class DeletionRequestItem(BaseModel):
+    """A row from ``deletion_requests`` returned by admin
+    endpoints (POST /admin/deletion-requests, GET, list)."""
+    id: str
+    target_user_id: str
+    target_namespace: Optional[str] = None
+    requested_by: str
+    requested_at: str
+    confirmed_at: Optional[str] = None
+    soft_deleted_at: Optional[str] = None
+    restore_by: Optional[str] = None
+    restored_at: Optional[str] = None
+    hard_deleted_at: Optional[str] = None
+    status: str
+    notes: Optional[str] = None
+
+
+class DeletionRequestListResponse(BaseModel):
+    count: int
+    requests: List[DeletionRequestItem]

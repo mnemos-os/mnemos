@@ -351,6 +351,214 @@ def test_import_chunk_key_migration_uses_concurrently_no_begin():
     )
 
 
+def test_deletion_requests_blank_namespace_migration_do_blocks_terminate_with_semicolon():
+    """Codex review-4 of round-80 caught a CATASTROPHIC SQL
+    parse bug: PL/pgSQL DO blocks were closed with ``END``
+    immediately followed by ``$do$;`` (no semicolon after
+    ``END``). PL/pgSQL block terminators require ``END;``
+    inside the dollar-quoted body — without it the migration
+    fails to parse and never runs, leaving legacy dirty data
+    AND no DB-level CHECK guard.
+
+    This invariant pins the ``END;`` terminator on every DO
+    block in
+    ``migrations_v4_2_deletion_requests_blank_namespace_cleanup
+    .sql`` so a future revision that drops a semicolon trips a
+    unit test before it can ship a broken migration.
+    """
+    import re
+
+    path = (
+        REPO_ROOT
+        / "db"
+        / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
+    )
+    sql = path.read_text(encoding="utf-8")
+
+    # Find every DO $do$ ... $do$; block and verify the body
+    # ends with ``END;`` (with semicolon) before the closing
+    # ``$do$;``.
+    do_blocks = re.findall(
+        r"DO \$do\$\s*(.*?)\s*\$do\$;",
+        sql,
+        re.DOTALL,
+    )
+    assert do_blocks, (
+        "no DO blocks found in the migration — file shape "
+        "changed without updating this invariant"
+    )
+    for i, body in enumerate(do_blocks):
+        # The body must end with 'END;' (allowing trailing
+        # whitespace) — not bare 'END'. PL/pgSQL semantics.
+        body_stripped = body.rstrip()
+        assert body_stripped.endswith("END;"), (
+            f"DO block #{i} in migrations_v4_2_deletion_requests"
+            f"_blank_namespace_cleanup.sql does NOT end with "
+            f"``END;``. Postgres will reject the migration with "
+            f"a syntax error before any cleanup runs.\n\n"
+            f"Body tail (last 60 chars):\n"
+            f"{body_stripped[-60:]!r}"
+        )
+
+
+def test_deletion_requests_blank_namespace_migration_has_no_embedded_control_chars():
+    """Codex review-5 of round-81 caught that an embedded
+    literal LF in a comment table broke the comment block —
+    the line after the LF appeared as bare SQL ``: HT LF VT
+    FF CR`` and ``psql -f`` failed to parse the migration
+    with a syntax error before any cleanup ran.
+
+    This invariant scans the migration for embedded control
+    characters (any byte < 0x20 except tab/LF/CR, which are
+    legitimate line/column terminators) anywhere in the file.
+    The smoking gun was a literal U+000A inside a comment
+    intended to enumerate the HT-CR range — it terminated
+    the comment line and exposed the next line as bare SQL.
+    Any embedded VT (U+000B), FF (U+000C), NEL (U+0085),
+    line/paragraph separator (U+2028 / U+2029), etc. would
+    have similar effects.
+
+    Tab / LF / CR are explicitly tolerated since they're the
+    standard line and column separators in source files.
+    """
+    import unicodedata
+
+    path = (
+        REPO_ROOT
+        / "db"
+        / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
+    )
+    raw = path.read_text(encoding="utf-8")
+
+    # Allowlist: characters that are legitimate line/column
+    # separators in source files OR are well-formed legitimate
+    # text. Tab, LF, CR are ASCII control chars but are the
+    # standard line/column terminators psql expects.
+    ALLOWED_CONTROL = {"\t", "\n", "\r"}
+
+    BAD_CHARS: list[tuple[int, int, str]] = []
+    for offset, ch in enumerate(raw):
+        cp = ord(ch)
+
+        # Reject ALL Unicode general-category 'Cc' (control
+        # characters) except the explicitly-allowed line/
+        # column separators. This catches:
+        #   * C0 controls U+0000..U+001F (except tab/LF/CR)
+        #   * DEL (U+007F)
+        #   * C1 controls U+0080..U+009F (including NEL at
+        #     U+0085, which behaves like a line break in many
+        #     parsers — codex review-6 of round-82 caught
+        #     that round-82's narrower predicate let NEL
+        #     pass).
+        if unicodedata.category(ch) == "Cc" and ch not in ALLOWED_CONTROL:
+            BAD_CHARS.append((offset, cp, "Cc"))
+            continue
+
+        # Reject Unicode line/paragraph separators (Zl/Zp)
+        # which terminate lines in many parsers.
+        if unicodedata.category(ch) in ("Zl", "Zp"):
+            BAD_CHARS.append((offset, cp, unicodedata.category(ch)))
+
+    assert not BAD_CHARS, (
+        "embedded control / line-separator characters detected "
+        "in migration source — these can silently break comment "
+        "blocks and expose bare lines to ``psql -f``. Replace "
+        "with the ASCII ``U+XXXX`` codepoint notation in "
+        "comments.\n\nFirst 10 occurrences:\n"
+        + "\n".join(
+            f"  offset {off}: U+{cp:04X} (category={cat})"
+            for (off, cp, cat) in BAD_CHARS[:10]
+        )
+    )
+
+
+def test_no_embedded_control_chars_invariant_catches_nel(tmp_path, monkeypatch):
+    """Codex review-6 of round-82 specifically requested a
+    negative test: prove the no-control-chars invariant
+    actually flags U+0085 (NEL — a C1 control character that
+    can break psql comment blocks similarly to U+000A).
+
+    This test injects a literal NEL into a copy of the
+    migration, runs the invariant scan against the modified
+    file, and asserts the scan flags the byte. Codex
+    correctly noted that the round-82 implementation only
+    rejected codepoints < 0x20 + U+2028/U+2029, missing the
+    C1 control range (U+0080..U+009F) entirely.
+
+    The round-83 fix uses ``unicodedata.category(ch) == 'Cc'``
+    to cover both C0 and C1 controls.
+    """
+    import unicodedata
+
+    real_path = (
+        REPO_ROOT
+        / "db"
+        / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
+    )
+    raw = real_path.read_text(encoding="utf-8")
+    # Inject U+0085 NEL into the middle of the file.
+    poisoned = raw[:100] + "" + raw[100:]
+    target = tmp_path / "poisoned_migration.sql"
+    target.write_text(poisoned, encoding="utf-8")
+
+    # Run the same logic used by the production invariant
+    # against the poisoned file.
+    bad_offsets = []
+    for offset, ch in enumerate(target.read_text(encoding="utf-8")):
+        if (
+            unicodedata.category(ch) == "Cc" and ch not in {"\t", "\n", "\r"}
+        ) or unicodedata.category(ch) in ("Zl", "Zp"):
+            bad_offsets.append((offset, ord(ch)))
+
+    assert any(cp == 0x85 for (_, cp) in bad_offsets), (
+        f"the round-83 control-char invariant failed to flag a "
+        f"NEL (U+0085) injected into the migration source. "
+        f"Bad offsets: {bad_offsets[:5]!r}"
+    )
+
+
+def test_deletion_requests_blank_namespace_uses_unicode_aware_predicate():
+    """Round-81 closure of codex review-4 finding #3: the
+    blank-namespace predicate must use the
+    ``mnemos_is_blank_namespace`` SQL helper function (which
+    enumerates ASCII + Unicode whitespace via ``\\uXXXX``
+    escapes) everywhere it's needed — not POSIX ``[[:space:]]``
+    (which only matches ASCII) or ``BTRIM(...) = ''``
+    (which only trims spaces).
+
+    This invariant pins the helper-function pattern in the
+    migration AND the runtime overlap SELECT so a future
+    revision that re-introduces an ASCII-only predicate trips
+    a unit test.
+    """
+    migration_path = (
+        REPO_ROOT
+        / "db"
+        / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql"
+    )
+    migration_sql = migration_path.read_text(encoding="utf-8")
+    assert "mnemos_is_blank_namespace" in migration_sql, (
+        "migration must define and use the "
+        "``mnemos_is_blank_namespace`` helper function for "
+        "Unicode-aware whitespace normalization"
+    )
+    # The helper's regex must use ``\uXXXX`` Unicode escapes
+    # so the codepoints are auditable in source.
+    assert "\\u00A0" in migration_sql or "\\u00a0" in migration_sql, (
+        "helper function regex must use ``\\uXXXX`` Unicode "
+        "escapes (auditable codepoints) instead of embedded "
+        "literal Unicode whitespace bytes"
+    )
+
+    admin_path = REPO_ROOT / "mnemos" / "api" / "routes" / "admin.py"
+    admin_src = admin_path.read_text(encoding="utf-8")
+    assert "mnemos_is_blank_namespace" in admin_src, (
+        "create_deletion_request overlap SELECT must use the "
+        "``mnemos_is_blank_namespace`` helper function so the "
+        "API and DB agree on what 'blank' means"
+    )
+
+
 def test_legacy_chunk_key_update_is_wrapped_in_savepoint():
     """The round-72 legacy v70 chunk_key UPDATE in
     ``document_import.py`` MUST be wrapped in a nested

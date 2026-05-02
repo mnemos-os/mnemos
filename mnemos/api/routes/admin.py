@@ -13,6 +13,9 @@ from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.domain.models import (
     ApiKeyCreateRequest,
     ApiKeyResponse,
+    DeletionRequestCreate,
+    DeletionRequestItem,
+    DeletionRequestListResponse,
     OAuthIdentity,
     OAuthIdentityListResponse,
     OAuthProviderAdmin,
@@ -535,3 +538,431 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
         n: {"model": cfg["model"], "weight": cfg["weight"]}
         for n, cfg in get_graeae_engine().providers.items()
     }}
+
+
+# ── GDPR right-to-be-forgotten ────────────────────────────────────────────────
+#
+# Scaffold for a 3-step lifecycle: requested → confirmed →
+# soft_deleted → (hard_deleted | restored). The admin endpoints
+# below cover the lifecycle's request-side: creating, listing,
+# inspecting, confirming, and cancelling a request. The actual
+# soft-delete sweep is performed by a worker (round-78+) that
+# scans for ``status = 'confirmed'`` rows. The hard-delete
+# transition runs after ``restore_by`` has passed.
+#
+# The endpoints are root-only. ``deletion_requests`` rows
+# survive the wipe — they're the audit-bearing breadcrumb that
+# proves a deletion happened. Schema details are in
+# ``db/migrations_v4_2_deletion_requests.sql``.
+
+
+def _row_to_deletion_request(row) -> DeletionRequestItem:
+    """Translate a ``deletion_requests`` row to its API
+    representation. ``id`` and ``UUID``-typed timestamps come
+    back from asyncpg as native types; the response model uses
+    ISO strings.
+    """
+    def _ts(value):
+        return value.isoformat() if value is not None else None
+
+    return DeletionRequestItem(
+        id=str(row["id"]),
+        target_user_id=row["target_user_id"],
+        target_namespace=row["target_namespace"],
+        requested_by=row["requested_by"],
+        requested_at=row["requested_at"].isoformat(),
+        confirmed_at=_ts(row["confirmed_at"]),
+        soft_deleted_at=_ts(row["soft_deleted_at"]),
+        restore_by=_ts(row["restore_by"]),
+        restored_at=_ts(row["restored_at"]),
+        hard_deleted_at=_ts(row["hard_deleted_at"]),
+        status=row["status"],
+        notes=row.get("notes"),
+    )
+
+
+def _normalize_deletion_target(
+    target_user_id: str,
+    target_namespace: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """Strip + validate request inputs.
+
+    Codex review of round-77 caught two correctness gaps:
+
+    * Whitespace-only ``target_user_id`` (e.g., ``"   "``)
+      passed the falsy check and persisted as a real
+      identifier nothing would later match.
+    * Empty-string ``target_namespace`` was stored as
+      ``""`` (a real namespace) instead of NULL — the
+      docs say NULL means "wipe all namespaces", so
+      ``""`` collapses the two scopes into an unsafe
+      lookalike.
+
+    The COALESCE sentinel ``'*'`` is reserved for the
+    partial-unique-index encoding; reject it as an
+    explicit namespace too so operators can't accidentally
+    bypass the all-namespaces uniqueness gate.
+    """
+    # ``str.strip()`` trims all Python whitespace including
+    # Unicode characters (NBSP, em-space, narrow no-break,
+    # ideographic space, etc.). The DB's
+    # ``mnemos_is_blank_namespace`` function matches the same
+    # set so API and DB agree on what "blank" means. Codex
+    # review-4 of round-80 caught the prior implementations
+    # that silently accepted Unicode-whitespace namespaces.
+    user = (target_user_id or "").strip()
+    if not user:
+        raise HTTPException(
+            status_code=422,
+            detail="target_user_id is required and must not be blank",
+        )
+
+    if target_namespace is None:
+        ns = None
+    else:
+        stripped = target_namespace.strip()
+        ns = stripped or None  # "" / whitespace → None (all-namespaces).
+
+    if ns == "*":
+        # Sentinel collides with the active-row unique-index
+        # COALESCE encoding. Refuse explicit '*' so a request
+        # for the literal namespace ``"*"`` can't masquerade
+        # as the all-namespaces scope.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "target_namespace='*' is reserved by the "
+                "deletion_requests active-row unique index — "
+                "use null/omit to mean 'all namespaces'."
+            ),
+        )
+
+    return user, ns
+
+
+@router.post(
+    "/deletion-requests",
+    response_model=DeletionRequestItem,
+    status_code=201,
+)
+async def create_deletion_request(
+    request: DeletionRequestCreate,
+    user: UserContext = Depends(require_root),
+):
+    """Record a GDPR right-to-be-forgotten request.
+
+    The endpoint is root-only and does NOT perform any wipe
+    itself — it only records the request in
+    ``deletion_requests``. The wipe is gated behind a separate
+    confirmation step (``POST /admin/deletion-requests/{id}/
+    confirm``) so a typo'd ``target_user_id`` doesn't trigger
+    an irreversible cascade.
+
+    Returns 409 if any existing non-terminal request COVERS
+    OR IS COVERED BY the new request's scope. Concretely:
+
+      * Same user + same explicit namespace → exact overlap.
+      * Same user + new request's namespace IS NULL (all-
+        namespaces) AND any existing namespace-specific
+        request exists → containment overlap.
+      * Same user + new request has an explicit namespace AND
+        an existing all-namespaces (NULL) request exists →
+        reverse containment overlap.
+
+    The partial unique index alone catches only exact-pair
+    overlaps; the SELECT guard inside an advisory-lock
+    transaction catches the NULL-vs-specific containment
+    cases. Codex review of round-77 caught this gap.
+    """
+    require_postgres_pool_or_503(route_label="POST /admin/deletion-requests")
+
+    target_user_id, target_namespace = _normalize_deletion_target(
+        request.target_user_id, request.target_namespace
+    )
+    notes = (request.notes or "").strip() or None
+
+    # Stable signed-int64 advisory-lock key derived from the
+    # target user_id. Serializes concurrent CREATEs for the
+    # same user so the SELECT-guard + INSERT pair is atomic
+    # without holding a row lock on every active request.
+    import hashlib as _hashlib
+
+    digest = _hashlib.blake2b(
+        target_user_id.encode("utf-8"), digest_size=8
+    ).digest()
+    lock_key_unsigned = int.from_bytes(digest, "big", signed=False)
+    # pg_advisory_xact_lock takes a signed bigint. Map the
+    # 64-bit unsigned digest into the signed range.
+    lock_key = lock_key_unsigned - (1 << 63)
+
+    async with _lc.get_pool_manager().acquire() as conn:
+        try:
+            async with conn.transaction():
+                await conn.execute(
+                    "SELECT pg_advisory_xact_lock($1)",
+                    lock_key,
+                )
+
+                # Overlap check: any existing active row with
+                # matching user that covers or is covered by
+                # the new scope. ``mnemos_is_blank_namespace``
+                # (defined in the round-81 cleanup migration)
+                # matches Python's ``str.strip()`` semantics —
+                # ASCII whitespace AND Unicode whitespace
+                # (NBSP, em-space, narrow no-break, etc.). A
+                # legacy round-77 row with whitespace-only
+                # ``target_namespace`` is treated as the
+                # all-namespaces scope at query time, even
+                # before the round-81 migration normalizes the
+                # row. Codex review-3 of round-79 + review-4 of
+                # round-80 walked this gap progressively:
+                # ``BTRIM`` only trimmed spaces; POSIX
+                # ``[[:space:]]`` only matched ASCII; the SQL
+                # function now enumerates the full Python
+                # whitespace set so API + DB agree.
+                overlap = await conn.fetchrow(
+                    """
+                    SELECT id, target_namespace, status
+                      FROM deletion_requests
+                     WHERE target_user_id = $1
+                       AND status IN ('requested', 'confirmed', 'soft_deleted')
+                       AND (
+                            mnemos_is_blank_namespace(target_namespace)
+                         OR $2::text IS NULL
+                         OR target_namespace = $2::text
+                       )
+                     LIMIT 1
+                    """,
+                    target_user_id,
+                    target_namespace,
+                )
+                if overlap is not None:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"deletion request {overlap['id']} (status="
+                            f"{overlap['status']!r}, target_namespace="
+                            f"{overlap['target_namespace']!r}) overlaps "
+                            f"the requested scope. Cancel or progress "
+                            f"the existing request before creating a "
+                            f"new one."
+                        ),
+                    )
+
+                row = await conn.fetchrow(
+                    """
+                    INSERT INTO deletion_requests
+                      (target_user_id, target_namespace, requested_by, notes)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING *
+                    """,
+                    target_user_id,
+                    target_namespace,
+                    user.user_id,
+                    notes,
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            # Defense-in-depth: the partial unique index
+            # ``deletion_requests_active_unique_idx`` still
+            # catches an exact-pair race the advisory lock +
+            # SELECT-guard above shouldn't admit. Surface that
+            # as 409 in case the index ever fires.
+            import asyncpg as _asyncpg
+
+            if isinstance(e, _asyncpg.UniqueViolationError):
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"A non-terminal deletion request already "
+                        f"exists for target_user_id={target_user_id!r} "
+                        f"target_namespace={target_namespace!r}."
+                    ),
+                )
+            raise
+
+    logger.info(
+        "[ADMIN] Created deletion request %s for target_user_id=%s "
+        "target_namespace=%s by %s",
+        row["id"], row["target_user_id"], row["target_namespace"],
+        row["requested_by"],
+    )
+    return _row_to_deletion_request(row)
+
+
+@router.get(
+    "/deletion-requests",
+    response_model=DeletionRequestListResponse,
+)
+async def list_deletion_requests(
+    _: UserContext = Depends(require_root),
+    status: Optional[str] = None,
+    target_user_id: Optional[str] = None,
+    limit: int = 100,
+):
+    """List deletion requests, optionally filtered by status
+    and/or target_user_id. Newest first."""
+    require_postgres_pool_or_503(route_label="GET /admin/deletion-requests")
+    if limit < 1 or limit > 1000:
+        raise HTTPException(
+            status_code=422,
+            detail="limit must be between 1 and 1000",
+        )
+    clauses: List[str] = []
+    args: list = []
+    if status:
+        args.append(status)
+        clauses.append(f"status = ${len(args)}")
+    if target_user_id:
+        args.append(target_user_id)
+        clauses.append(f"target_user_id = ${len(args)}")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    args.append(limit)
+    sql = (
+        "SELECT * FROM deletion_requests"
+        f"{where} ORDER BY requested_at DESC LIMIT ${len(args)}"
+    )
+    async with _lc.get_pool_manager().acquire() as conn:
+        rows = await conn.fetch(sql, *args)
+    items = [_row_to_deletion_request(r) for r in rows]
+    return DeletionRequestListResponse(count=len(items), requests=items)
+
+
+@router.get(
+    "/deletion-requests/{request_id}",
+    response_model=DeletionRequestItem,
+)
+async def get_deletion_request(
+    request_id: str,
+    _: UserContext = Depends(require_root),
+):
+    require_postgres_pool_or_503(
+        route_label="GET /admin/deletion-requests/{request_id}"
+    )
+    async with _lc.get_pool_manager().acquire() as conn:
+        row = await conn.fetchrow(
+            "SELECT * FROM deletion_requests WHERE id = $1::uuid",
+            request_id,
+        )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"deletion request {request_id} not found",
+        )
+    return _row_to_deletion_request(row)
+
+
+@router.post(
+    "/deletion-requests/{request_id}/confirm",
+    response_model=DeletionRequestItem,
+)
+async def confirm_deletion_request(
+    request_id: str,
+    _: UserContext = Depends(require_root),
+):
+    """Confirm a pending deletion request.
+
+    Transitions ``status='requested'`` to ``status='confirmed'``
+    and sets ``confirmed_at = now()``. The wipe worker
+    (round-78+) consumes confirmed rows.
+
+    Idempotent on already-confirmed rows. Refuses to confirm
+    rows in any other state — operators must cancel and
+    re-create if they want to revert a state past 'confirmed'.
+    """
+    require_postgres_pool_or_503(
+        route_label="POST /admin/deletion-requests/{request_id}/confirm"
+    )
+    async with _lc.get_pool_manager().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE deletion_requests
+               SET status = 'confirmed',
+                   confirmed_at = COALESCE(confirmed_at, NOW())
+             WHERE id = $1::uuid
+               AND status IN ('requested', 'confirmed')
+            RETURNING *
+            """,
+            request_id,
+        )
+    if row is None:
+        # Either not found or in a non-confirmable state.
+        async with _lc.get_pool_manager().acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT status FROM deletion_requests WHERE id = $1::uuid",
+                request_id,
+            )
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"deletion request {request_id} not found",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"deletion request {request_id} is in state "
+                f"{existing['status']!r}; only 'requested' or "
+                f"'confirmed' rows can be confirmed"
+            ),
+        )
+    logger.info(
+        "[ADMIN] Confirmed deletion request %s (target_user_id=%s)",
+        row["id"], row["target_user_id"],
+    )
+    return _row_to_deletion_request(row)
+
+
+@router.post(
+    "/deletion-requests/{request_id}/cancel",
+    response_model=DeletionRequestItem,
+)
+async def cancel_deletion_request(
+    request_id: str,
+    _: UserContext = Depends(require_root),
+):
+    """Cancel a deletion request before any wipe has executed.
+
+    Refuses to cancel ``soft_deleted`` / ``hard_deleted`` rows
+    — those have already destroyed (or partially destroyed)
+    data. Operators can still cancel ``requested`` and
+    ``confirmed`` rows that haven't reached the worker yet.
+    """
+    require_postgres_pool_or_503(
+        route_label="POST /admin/deletion-requests/{request_id}/cancel"
+    )
+    async with _lc.get_pool_manager().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            UPDATE deletion_requests
+               SET status = 'cancelled'
+             WHERE id = $1::uuid
+               AND status IN ('requested', 'confirmed')
+            RETURNING *
+            """,
+            request_id,
+        )
+    if row is None:
+        async with _lc.get_pool_manager().acquire() as conn:
+            existing = await conn.fetchrow(
+                "SELECT status FROM deletion_requests WHERE id = $1::uuid",
+                request_id,
+            )
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"deletion request {request_id} not found",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"deletion request {request_id} is in state "
+                f"{existing['status']!r}; only 'requested' or "
+                f"'confirmed' rows can be cancelled"
+            ),
+        )
+    logger.info(
+        "[ADMIN] Cancelled deletion request %s (target_user_id=%s)",
+        row["id"], row["target_user_id"],
+    )
+    return _row_to_deletion_request(row)
