@@ -8,11 +8,17 @@ from typing import Any
 from mnemos.core.auth_context import UserContext
 
 from ._runtime import (
+    MCP_BULK_CREATE_MAX_ITEMS,
+    MCP_DEFAULT_LIMIT_MAX,
+    MCP_OFFSET_MAX,
+    _bounded_int,
+    _bounded_list,
     _rest_delete,
     _rest_get,
     _rest_get_text,
     _rest_post,
     _safe_path_segment,
+    _safe_path_value,
     _tool,
 )
 
@@ -47,7 +53,15 @@ def _connector_namespace() -> str | None:
     to the API key's resolved namespace.
     """
     val = os.environ.get("MNEMOS_DEFAULT_NAMESPACE", "").strip()
+    if val:
+        _safe_path_value(val, label="namespace", max_length=128)
     return val or None
+
+
+def _validate_optional_filter(value: str | None, *, label: str) -> str | None:
+    if value:
+        _safe_path_value(value, label=label, max_length=128)
+    return value
 
 
 async def tool_search_memories(
@@ -58,7 +72,12 @@ async def tool_search_memories(
     semantic: bool = False,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    limit = _bounded_int(
+        limit, label="limit", minimum=1, maximum=MCP_DEFAULT_LIMIT_MAX,
+    )
     body: dict[str, Any] = {"query": query, "limit": limit}
+    category = _validate_optional_filter(category, label="category")
+    subcategory = _validate_optional_filter(subcategory, label="subcategory")
     if category:
         body["category"] = category
     if subcategory:
@@ -81,6 +100,8 @@ async def tool_update_memory(
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     body: dict[str, Any] = {}
+    category = _validate_optional_filter(category, label="category")
+    subcategory = _validate_optional_filter(subcategory, label="subcategory")
     for key, value in {
         "content": content,
         "category": category,
@@ -125,9 +146,7 @@ async def tool_get_memory(
         "dense": "application/x-apollo-dense",
     }
     if format not in accept_map:
-        raise ValueError(
-            f"format must be 'prose' or 'dense', got {format!r}"
-        )
+        raise ValueError("format must be 'prose' or 'dense'")
     body = await _rest_get_text(
         f"/v1/memories/{safe_id}", accept=accept_map[format],
     )
@@ -146,6 +165,8 @@ async def tool_create_memory(
     permission_mode: int | None = None,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    _safe_path_value(category, label="category", max_length=128)
+    subcategory = _validate_optional_filter(subcategory, label="subcategory")
     body: dict[str, Any] = {"content": content, "category": category}
     if subcategory:
         body["subcategory"] = subcategory
@@ -175,6 +196,14 @@ async def tool_list_memories(
     offset: int = 0,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    limit = _bounded_int(
+        limit, label="limit", minimum=1, maximum=MCP_DEFAULT_LIMIT_MAX,
+    )
+    offset = _bounded_int(
+        offset, label="offset", minimum=0, maximum=MCP_OFFSET_MAX,
+    )
+    category = _validate_optional_filter(category, label="category")
+    subcategory = _validate_optional_filter(subcategory, label="subcategory")
     params: dict[str, Any] = {}
     for key, value in {
         "category": category,
@@ -198,18 +227,33 @@ async def tool_bulk_create_memories(
     memories: list[dict[str, Any]],
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    rows = _bounded_list(
+        memories, label="memories", max_items=MCP_BULK_CREATE_MAX_ITEMS,
+    )
+    for i, row in enumerate(rows):
+        if not isinstance(row, dict):
+            raise ValueError(f"memories[{i}] must be an object")
+        if "category" in row and row["category"] is not None:
+            _safe_path_value(row["category"], label=f"memories[{i}].category", max_length=128)
+        if "subcategory" in row and row["subcategory"] is not None:
+            _safe_path_value(
+                row["subcategory"],
+                label=f"memories[{i}].subcategory",
+                max_length=128,
+            )
+        if "namespace" in row and row["namespace"] is not None:
+            _safe_path_value(row["namespace"], label=f"memories[{i}].namespace", max_length=128)
     ns = _connector_namespace()
     if ns:
         # Connector-scope env wins over per-row namespace. The
         # alternative (per-row wins) creates a footgun where a
         # bulk caller could bypass the connector's documented
         # write-stamp scope just by including ``"namespace": ...``
-        # in each row. Codex round-3 audit: the env-stamp must be
-        # the boundary if it's a boundary at all. Power users who
-        # need cross-namespace bulk creation should hit the REST
-        # API directly OR run without the env stamp.
-        memories = [{**m, "namespace": ns} for m in memories]
-    return await _rest_post("/v1/memories/bulk", {"memories": memories})
+        # in each row. Power users who need cross-namespace bulk
+        # creation should hit the REST API directly or run without
+        # the env stamp.
+        rows = [{**m, "namespace": ns} for m in rows]
+    return await _rest_post("/v1/memories/bulk", {"memories": rows})
 
 
 TOOLS: dict[str, dict[str, Any]] = {
@@ -217,7 +261,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "Full-text search across MNEMOS memories. Returns ranked results. Filter by category and/or subcategory.",
         {
             "query": {"type": "string", "description": "Search query"},
-            "limit": {"type": "integer", "default": 10},
+            "limit": {"type": "integer", "default": 10, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
             "category": {"type": "string", "description": "Optional category filter"},
             "subcategory": {"type": "string", "description": "Optional subcategory filter"},
             "semantic": {
@@ -290,8 +334,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         {
             "category": {"type": "string"},
             "subcategory": {"type": "string"},
-            "limit": {"type": "integer", "default": 20},
-            "offset": {"type": "integer", "default": 0},
+            "limit": {"type": "integer", "default": 20, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
+            "offset": {"type": "integer", "default": 0, "minimum": 0, "maximum": MCP_OFFSET_MAX},
         },
         [],
         tool_list_memories,
@@ -307,6 +351,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         {
             "memories": {
                 "type": "array",
+                "maxItems": MCP_BULK_CREATE_MAX_ITEMS,
                 "items": {
                     "type": "object",
                     "properties": {

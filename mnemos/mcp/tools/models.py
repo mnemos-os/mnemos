@@ -9,7 +9,7 @@ import mnemos.core.lifecycle as _lc
 from mnemos.core.auth_context import UserContext
 from mnemos.db import mcp_repo
 
-from ._runtime import _rest_get, _tool
+from ._runtime import _rest_get, _safe_path_segment, _tool
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +21,7 @@ async def tool_recommend_model(
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     """Query model optimizer for cost-aware recommendation."""
+    _safe_path_segment(task_type, label="task_type")
     if user is None and not _lc._pool:
         recommendation = await _rest_get(
             "/v1/providers/recommend",

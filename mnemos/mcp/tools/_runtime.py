@@ -14,6 +14,10 @@ from mnemos.core.config import get_settings
 from mnemos.db.mcp_repo import assert_memory_readable
 
 HTTP_TIMEOUT = 30.0
+MCP_BULK_CREATE_MAX_ITEMS = 100
+MCP_DEFAULT_LIMIT_MAX = 500
+MCP_TIMELINE_LIMIT_MAX = 1000
+MCP_OFFSET_MAX = 100_000
 _MCP_BACKEND_API_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mnemos_mcp_backend_api_key",
     default=None,
@@ -22,30 +26,66 @@ _MCP_BACKEND_USER_ID: contextvars.ContextVar[str | None] = contextvars.ContextVa
     "mnemos_mcp_backend_user_id",
     default=None,
 )
+_MCP_BACKEND_ROLE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mnemos_mcp_backend_role",
+    default=None,
+)
+_MCP_BACKEND_NAMESPACE: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "mnemos_mcp_backend_namespace",
+    default=None,
+)
 
 
 def set_mcp_backend_context(
     *,
     api_key: str | None = None,
     user_id: str | None = None,
-) -> tuple[contextvars.Token[str | None], contextvars.Token[str | None]]:
+    role: str | None = None,
+    namespace: str | None = None,
+) -> tuple[
+    contextvars.Token[str | None],
+    contextvars.Token[str | None],
+    contextvars.Token[str | None],
+    contextvars.Token[str | None],
+]:
     """Attach per-client backend attribution for the current MCP session."""
     api_key_token = _MCP_BACKEND_API_KEY.set(api_key)
     user_id_token = _MCP_BACKEND_USER_ID.set(user_id)
-    return api_key_token, user_id_token
+    role_token = _MCP_BACKEND_ROLE.set(role)
+    namespace_token = _MCP_BACKEND_NAMESPACE.set(namespace)
+    return api_key_token, user_id_token, role_token, namespace_token
 
 
 def reset_mcp_backend_context(
-    tokens: tuple[contextvars.Token[str | None], contextvars.Token[str | None]],
+    tokens: tuple[
+        contextvars.Token[str | None],
+        contextvars.Token[str | None],
+        contextvars.Token[str | None],
+        contextvars.Token[str | None],
+    ],
 ) -> None:
     """Reset context set by set_mcp_backend_context()."""
-    api_key_token, user_id_token = tokens
+    api_key_token, user_id_token, role_token, namespace_token = tokens
     _MCP_BACKEND_API_KEY.reset(api_key_token)
     _MCP_BACKEND_USER_ID.reset(user_id_token)
+    _MCP_BACKEND_ROLE.reset(role_token)
+    _MCP_BACKEND_NAMESPACE.reset(namespace_token)
 
 
 def current_mcp_backend_user_id() -> str | None:
     return _MCP_BACKEND_USER_ID.get()
+
+
+def current_mcp_backend_api_key() -> str | None:
+    return _MCP_BACKEND_API_KEY.get()
+
+
+def current_mcp_backend_role() -> str | None:
+    return _MCP_BACKEND_ROLE.get()
+
+
+def current_mcp_backend_namespace() -> str | None:
+    return _MCP_BACKEND_NAMESPACE.get()
 
 
 def _mnemos_base() -> str:
@@ -79,82 +119,54 @@ _LOOSE_PATH_REJECT_PATTERN = re.compile(
 
 
 def _safe_path_value(value: object, *, label: str = "value", max_length: int = 512) -> str:
-    """Looser variant of ``_safe_path_segment`` for free-form fields
-    (e.g. KG subject identifiers / entity names, which can contain
-    arbitrary characters like URLs, email addresses, natural-language
-    phrases).
-
-    Strict character whitelisting would over-reject these legitimate
-    inputs. Instead this helper:
-
-      1. Type-checks + length-bounds.
-      2. Rejects the actual path-traversal signal ``..`` (consecutive
-         dots) AND the URL-rewrite/control characters ``/`` ``\\``
-         ``?`` ``#`` and any byte in the ASCII control range.
-      3. ``urllib.parse.quote`` with ``safe=""`` so every remaining
-         special character is percent-encoded into a single path
-         segment — including the otherwise-default-safe ``.`` (URL
-         encoding of single dots is harmless; it's only the literal
-         ``..`` that triggers httpx's dot-segment normalization).
-
-    The KG subject splice site is the original motivating case
-    (codex round-4 of the round-24 thread caught
-    ``/v1/kg/timeline/../../export`` reaching ``/v1/export``).
-    """
+    """Validate and encode free-form values before path/filter use."""
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string, got {type(value).__name__}")
     if not value:
         raise ValueError(f"{label} must be non-empty")
     if len(value) > max_length:
-        raise ValueError(
-            f"{label} must be at most {max_length} characters; got {len(value)}"
-        )
+        raise ValueError(f"{label} must be at most {max_length} characters")
     if _LOOSE_PATH_REJECT_PATTERN.search(value):
         raise ValueError(
-            f"{label} contains a path-rewrite character or "
-            f".. traversal sequence; got {value!r}"
+            f"{label} contains a path-rewrite character or traversal sequence"
         )
     return urllib.parse.quote(value, safe="")
 
 
 def _safe_path_segment(value: object, *, label: str = "id") -> str:
-    """Validate + URL-encode an identifier before splicing it into a
-    REST path.
-
-    MCP tools interpolate caller-controlled values such as
-    ``memory_id`` and ``commit_hash`` into ``/v1/memories/{id}`` /
-    ``/v1/memories/{id}/commits/{hash}`` URLs. Without validation, a
-    value like ``../../admin`` lets ``httpx`` normalise dot segments
-    out of the path entirely, so the request escapes the
-    ``/v1/memories`` prefix and reaches other same-origin endpoints.
-    With the ``_rest_get_text`` helper (round-24) returning raw
-    response bodies, that path-traversal is a real exfiltration
-    vector for any text endpoint (e.g. ``/metrics``).
-
-    Defense in depth:
-      1. Type-check + length-bound (1–128 chars).
-      2. Character whitelist ``[A-Za-z0-9_:-]`` — admits the
-         documented MNEMOS ID grammars (canonical ``mem_<...>``,
-         federated ``fed:<peer>:<remote>``, branch / commit-hash
-         shapes) and rejects ``/``, ``\\``, ``.``, ``?``, ``#``,
-         ``%`` and every other character that could split or
-         rewrite the URL on the server side.
-      3. Belt-and-braces URL-encode with ``safe=""`` so even if a
-         future ID format adds new characters, they're guaranteed
-         to land inside the path segment they were spliced into.
-
-    Round-3 of the round-24 thread caught two gaps the v1 helper
-    had: it rejected federated memory IDs (``:`` was missing from
-    the whitelist) and the Knossos MCP server still had unvalidated
-    splices. Both fixed in this commit.
-    """
+    """Validate and encode one path segment before URL interpolation."""
     if not isinstance(value, str):
         raise ValueError(f"{label} must be a string, got {type(value).__name__}")
     if not _PATH_SEGMENT_PATTERN.match(value):
-        raise ValueError(
-            f"{label} must match {_PATH_SEGMENT_PATTERN.pattern} — got {value!r}"
-        )
+        raise ValueError(f"{label} must be a safe path segment")
     return urllib.parse.quote(value, safe=":")
+
+
+def _bounded_int(
+    value: object,
+    *,
+    label: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{label} must be an integer, got {type(value).__name__}")
+    if value < minimum or value > maximum:
+        raise ValueError(f"{label} must be between {minimum} and {maximum}")
+    return value
+
+
+def _bounded_list(
+    value: object,
+    *,
+    label: str,
+    max_items: int,
+) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"{label} must be a list, got {type(value).__name__}")
+    if len(value) > max_items:
+        raise ValueError(f"{label} must contain at most {max_items} items")
+    return value
 
 
 async def _rest_get(path: str, params: dict[str, Any] | None = None) -> Any:
@@ -211,6 +223,7 @@ async def _rest_post(path: str, body: dict[str, Any], method: str = "POST") -> A
 async def _rest_delete(path: str) -> int:
     async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
         response = await client.delete(f"{_mnemos_base()}{path}", headers=_backend_headers())
+        response.raise_for_status()
         return response.status_code
 
 

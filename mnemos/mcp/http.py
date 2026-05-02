@@ -342,9 +342,16 @@ async def handle_sse(request):
     principal_id = getattr(request.state, "mnemos_mcp_principal_id", None)
     if principal_id is None and principal is not None:
         principal_id = _principal_id(principal)
+    principal_context = _principal_context_cache.get(principal_id or "")
     context_tokens = set_mcp_backend_context(
         api_key=principal.api_key if principal else None,
-        user_id=principal.user_id if principal else None,
+        user_id=(
+            principal_context.user_id
+            if principal_context is not None
+            else (principal.user_id if principal else None)
+        ),
+        role=principal_context.role if principal_context is not None else None,
+        namespace=principal_context.namespace if principal_context is not None else None,
     )
     try:
         async with _bound_sse_connection(request, principal_id or "unknown") as streams:

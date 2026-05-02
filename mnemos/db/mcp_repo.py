@@ -30,7 +30,7 @@ async def assert_memory_readable(conn: Any, memory_id: str, user: UserContext) -
             memory_id,
         )
         if not row:
-            raise PermissionError(f"Memory {memory_id} not found")
+            raise PermissionError("Memory not found")
         return
 
     vis_clause, vis_params = read_visibility_predicate(
@@ -48,7 +48,7 @@ async def assert_memory_readable(conn: Any, memory_id: str, user: UserContext) -
         user.namespace,
     )
     if not row:
-        raise PermissionError(f"Memory {memory_id} not found")
+        raise PermissionError("Memory not found")
 
 
 async def fetch_memory_log(
@@ -58,8 +58,23 @@ async def fetch_memory_log(
     limit: int,
     user: UserContext,
 ) -> list[Any]:
+    if _is_root(user):
+        anchor_scope = ""
+        recursive_scope = ""
+        params = (memory_id, branch, limit)
+    else:
+        vis_clause, vis_params = version_visibility_predicate(
+            user.user_id,
+            start_param_idx=4,
+            table_alias="mv",
+        )
+        ns_ph = f"${len(vis_params) + 4}"
+        anchor_scope = f"AND {vis_clause} AND mv.namespace = {ns_ph}"
+        recursive_scope = f"AND {vis_clause} AND mv.namespace = {ns_ph}"
+        params = (memory_id, branch, limit, *vis_params, user.namespace)
+
     rows = await conn.fetch(
-        """
+        f"""
         WITH RECURSIVE commit_walk AS (
             SELECT
                 mv.id, mv.memory_id, mv.commit_hash, mv.parent_version_id,
@@ -76,6 +91,7 @@ async def fetch_memory_log(
             WHERE mv.memory_id = $1
               AND mv.deleted_at IS NULL
               AND mb.deleted_at IS NULL
+              {anchor_scope}
             UNION ALL
             -- Same-memory predicate (mv.memory_id = cw.memory_id)
             -- prevents corrupt parent_version_id from pulling another
@@ -93,6 +109,7 @@ async def fetch_memory_log(
                AND mv.memory_id = cw.memory_id
             WHERE cw.depth < $3
               AND mv.deleted_at IS NULL
+              {recursive_scope}
         )
         SELECT
             commit_hash, version_num, branch, category, change_type,
@@ -101,20 +118,9 @@ async def fetch_memory_log(
         ORDER BY depth ASC
         LIMIT $3
         """,
-        memory_id,
-        branch,
-        limit,
+        *params,
     )
-
-    if _is_root(user):
-        return list(rows)
-
-    def _snap_visible(row: Any) -> bool:
-        if row["namespace"] != user.namespace:
-            return False
-        return row["owner_id"] == user.user_id or (row["permission_mode"] % 10) >= 4
-
-    return [row for row in rows if _snap_visible(row)]
+    return list(rows)
 
 
 async def create_memory_branch(
@@ -143,7 +149,7 @@ async def create_memory_branch(
                 user.namespace,
             )
         if not live:
-            return {"success": False, "error": f"Memory {memory_id} not found"}
+            return {"success": False, "error": "Memory not found"}
 
         if from_commit:
             start = await _fetch_branch_start_by_commit(conn, memory_id, from_commit, user)
@@ -279,8 +285,8 @@ async def _handle_existing_branch(
     return {
         "success": False,
         "error": (
-            f"branch '{name}' already exists at a different "
-            f"head; refusing to silently move it"
+            "branch already exists at a different head; "
+            "refusing to silently move it"
         ),
     }
 

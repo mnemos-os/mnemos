@@ -7,6 +7,9 @@ from typing import Any
 from mnemos.core.auth_context import UserContext
 
 from ._runtime import (
+    MCP_DEFAULT_LIMIT_MAX,
+    MCP_TIMELINE_LIMIT_MAX,
+    _bounded_int,
     _rest_delete,
     _rest_get,
     _rest_post,
@@ -14,6 +17,12 @@ from ._runtime import (
     _safe_path_value,
     _tool,
 )
+
+
+def _validate_optional_filter(value: str | None, *, label: str) -> str | None:
+    if value:
+        _safe_path_value(value, label=label)
+    return value
 
 
 async def tool_kg_create_triple(
@@ -28,6 +37,8 @@ async def tool_kg_create_triple(
     confidence: float = 1.0,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    if memory_id is not None:
+        _safe_path_segment(memory_id, label="memory_id")
     body = {
         "subject": subject,
         "predicate": predicate,
@@ -51,6 +62,14 @@ async def tool_kg_search(
     limit: int = 50,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    limit = _bounded_int(
+        limit, label="limit", minimum=1, maximum=MCP_DEFAULT_LIMIT_MAX,
+    )
+    subject = _validate_optional_filter(subject, label="subject")
+    predicate = _validate_optional_filter(predicate, label="predicate")
+    object = _validate_optional_filter(object, label="object")
+    subject_type = _validate_optional_filter(subject_type, label="subject_type")
+    object_type = _validate_optional_filter(object_type, label="object_type")
     params = {
         "subject": subject,
         "predicate": predicate,
@@ -67,6 +86,9 @@ async def tool_kg_timeline(
     limit: int = 100,
     user: UserContext | None = None,
 ) -> dict[str, Any]:
+    limit = _bounded_int(
+        limit, label="limit", minimum=1, maximum=MCP_TIMELINE_LIMIT_MAX,
+    )
     safe_subject = _safe_path_value(subject, label="subject")
     return await _rest_get(
         f"/v1/kg/timeline/{safe_subject}", params={"limit": limit},
@@ -135,14 +157,17 @@ TOOLS: dict[str, dict[str, Any]] = {
             "object": {"type": "string"},
             "subject_type": {"type": "string"},
             "object_type": {"type": "string"},
-            "limit": {"type": "integer", "default": 50},
+            "limit": {"type": "integer", "default": 50, "minimum": 1, "maximum": MCP_DEFAULT_LIMIT_MAX},
         },
         [],
         tool_kg_search,
     ),
     "kg_timeline": _tool(
         "Get the chronological history of an entity.",
-        {"subject": {"type": "string"}, "limit": {"type": "integer", "default": 100}},
+        {
+            "subject": {"type": "string"},
+            "limit": {"type": "integer", "default": 100, "minimum": 1, "maximum": MCP_TIMELINE_LIMIT_MAX},
+        },
         ["subject"],
         tool_kg_timeline,
     ),

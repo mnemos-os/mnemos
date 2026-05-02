@@ -11,6 +11,8 @@ from mnemos.core.auth_context import UserContext
 from mnemos.db import mcp_repo
 
 from ._runtime import (
+    MCP_DEFAULT_LIMIT_MAX,
+    _bounded_int,
     _mcp_assert_memory_readable,
     _mcp_user_required,
     _rest_get,
@@ -18,8 +20,10 @@ from ._runtime import (
     _safe_path_segment,
     _tool,
 )
+from ._security import _mcp_enforce_write_rate_limit
 
 logger = logging.getLogger(__name__)
+BRANCH_MEMORY_RATE_LIMIT_PER_MINUTE = 30
 
 
 async def tool_log_memory(
@@ -29,8 +33,12 @@ async def tool_log_memory(
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     """Walk commit DAG from branch HEAD to root."""
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    _safe_path_segment(branch, label="branch")
+    limit = _bounded_int(
+        limit, label="limit", minimum=1, maximum=MCP_DEFAULT_LIMIT_MAX,
+    )
     if user is None:
-        safe_id = _safe_path_segment(memory_id, label="memory_id")
         commits = await _rest_get(
             f"/v1/memories/{safe_id}/log",
             params={"branch": branch, "limit": limit},
@@ -100,11 +108,14 @@ async def tool_branch_memory(
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     """Create new branch from HEAD or a specific commit."""
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    _safe_path_segment(name, label="name")
+    if from_commit:
+        _safe_path_segment(from_commit, label="from_commit")
     if user is None:
         body: dict[str, Any] = {"name": name}
         if from_commit:
             body["from_commit"] = from_commit
-        safe_id = _safe_path_segment(memory_id, label="memory_id")
         branch_info = await _rest_post(f"/v1/memories/{safe_id}/branch", body)
         return {
             "success": True,
@@ -116,6 +127,11 @@ async def tool_branch_memory(
 
     try:
         user = _mcp_user_required(user)
+        await _mcp_enforce_write_rate_limit(
+            tool_name="branch_memory",
+            user=user,
+            limit=BRANCH_MEMORY_RATE_LIMIT_PER_MINUTE,
+        )
     except PermissionError as e:
         return {"success": False, "error": str(e)}
 
@@ -139,10 +155,10 @@ async def tool_diff_memory_commits(
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     """Generate unified diff between two commits."""
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    safe_a = _safe_path_segment(commit_a, label="commit_a")
+    safe_b = _safe_path_segment(commit_b, label="commit_b")
     if user is None:
-        safe_id = _safe_path_segment(memory_id, label="memory_id")
-        safe_a = _safe_path_segment(commit_a, label="commit_a")
-        safe_b = _safe_path_segment(commit_b, label="commit_b")
         commit_a_row = await _rest_get(f"/v1/memories/{safe_id}/commits/{safe_a}")
         commit_b_row = await _rest_get(f"/v1/memories/{safe_id}/commits/{safe_b}")
         diff = difflib.unified_diff(
@@ -213,9 +229,9 @@ async def tool_checkout_memory(
     user: UserContext | None = None,
 ) -> dict[str, Any]:
     """Fetch commit content and metadata by hash."""
+    safe_id = _safe_path_segment(memory_id, label="memory_id")
+    safe_hash = _safe_path_segment(commit_hash, label="commit_hash")
     if user is None:
-        safe_id = _safe_path_segment(memory_id, label="memory_id")
-        safe_hash = _safe_path_segment(commit_hash, label="commit_hash")
         row = await _rest_get(f"/v1/memories/{safe_id}/commits/{safe_hash}")
         return {
             "success": True,
@@ -279,8 +295,13 @@ TOOLS: dict[str, dict[str, Any]] = {
         "Walk commit DAG from branch HEAD to root.",
         {
             "memory_id": {"type": "string", "description": "Memory ID"},
-            "branch": {"type": "string", "description": "Branch name (default: main)"},
-            "limit": {"type": "integer", "description": "Max commits (default: 50)"},
+            "branch": {"type": "string", "description": "Branch name (default: main)", "maxLength": 128},
+            "limit": {
+                "type": "integer",
+                "description": "Max commits (default: 50)",
+                "minimum": 1,
+                "maximum": MCP_DEFAULT_LIMIT_MAX,
+            },
         },
         ["memory_id"],
         tool_log_memory,
@@ -289,8 +310,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "Create new branch from HEAD or specific commit.",
         {
             "memory_id": {"type": "string", "description": "Memory ID"},
-            "name": {"type": "string", "description": "New branch name"},
-            "from_commit": {"type": "string", "description": "Commit hash (default: main HEAD)"},
+            "name": {"type": "string", "description": "New branch name", "maxLength": 128},
+            "from_commit": {"type": "string", "description": "Commit hash (default: main HEAD)", "maxLength": 128},
         },
         ["memory_id", "name"],
         tool_branch_memory,
@@ -299,8 +320,8 @@ TOOLS: dict[str, dict[str, Any]] = {
         "Generate unified diff between two commits.",
         {
             "memory_id": {"type": "string", "description": "Memory ID"},
-            "commit_a": {"type": "string", "description": "First commit hash (older)"},
-            "commit_b": {"type": "string", "description": "Second commit hash (newer)"},
+            "commit_a": {"type": "string", "description": "First commit hash (older)", "maxLength": 128},
+            "commit_b": {"type": "string", "description": "Second commit hash (newer)", "maxLength": 128},
         },
         ["memory_id", "commit_a", "commit_b"],
         tool_diff_memory_commits,
@@ -309,7 +330,7 @@ TOOLS: dict[str, dict[str, Any]] = {
         "Fetch commit content and metadata by hash.",
         {
             "memory_id": {"type": "string", "description": "Memory ID"},
-            "commit_hash": {"type": "string", "description": "Commit hash to fetch"},
+            "commit_hash": {"type": "string", "description": "Commit hash to fetch", "maxLength": 128},
         },
         ["memory_id", "commit_hash"],
         tool_checkout_memory,
