@@ -1,7 +1,7 @@
 """FastAPI shim for the OpenAI-compatible MNEMOS gateway."""
 
 from collections.abc import AsyncIterator
-from typing import Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -96,6 +96,39 @@ def _compat_resolver() -> Any:
 
 def _to_http_exception(exc: providers.OpenAICompatError) -> HTTPException:
     return HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+
+def _parse_memory_injection_header(value: Optional[str]) -> Optional[bool]:
+    if value is None:
+        return None
+    normalized = value.strip().lower()
+    if normalized == "false":
+        return False
+    if normalized == "true":
+        return True
+    return None
+
+
+def _memory_injection_enabled(
+    request: schemas.ChatCompletionRequest,
+    header_value: Optional[str],
+) -> bool:
+    header_decision = _parse_memory_injection_header(header_value)
+    if header_decision is False:
+        return False
+    if request.mnemos_inject_memory is False:
+        return False
+    return True
+
+
+def _response_with_mnemos_metadata(
+    response: schemas.ChatCompletionResponse,
+    *,
+    memory_injected: bool,
+) -> JSONResponse:
+    body = response.model_dump(mode="json")
+    body["mnemos_metadata"] = {"memory_injected": memory_injected}
+    return JSONResponse(content=body)
 
 
 async def _prepare_provider_route(
@@ -242,12 +275,18 @@ async def get_model(
 async def chat_completions(
     request: schemas.ChatCompletionRequest,
     authorization: Optional[str] = Header(None),
+    x_mnemos_inject_memory: Annotated[
+        Optional[str],
+        Header(alias="X-Mnemos-Inject-Memory"),
+    ] = None,
     user: UserContext = Depends(get_current_user),
 ):
+    memory_injected = _memory_injection_enabled(request, x_mnemos_inject_memory)
     try:
         response = await domain_router.chat_completion(
             request=request,
             user=user,
+            inject_memory=memory_injected,
             search_context=globals().get(
                 "_search_mnemos_context",
                 domain_router.search_memory_context,
@@ -266,4 +305,9 @@ async def chat_completions(
 
     if isinstance(response, domain_router.StreamingChatCompletion):
         return StreamingResponse(response.events, media_type="text/event-stream")
+    if x_mnemos_inject_memory is not None:
+        return _response_with_mnemos_metadata(
+            response,
+            memory_injected=memory_injected,
+        )
     return response

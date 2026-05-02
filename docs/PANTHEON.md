@@ -1,6 +1,7 @@
 # PANTHEON — Unified LLM Provider Facade
 
-**Status:** Design (target: ships with MNEMOS v4)
+**Status:** Implemented in MNEMOS v5.0.0 for the `/pantheon/v1` slice; this
+document also preserves forward-looking worker-pool design notes.
 **Position in stack:** Above Triton (CERBERUS) + GRAEAE (PYTHIA); below every OpenAI-compatible client.
 **Greek-name fit:** *Temple of all gods.* One facade, many providers behind it. Pairs with CHARON (the ferryman who carries memories across systems): same interop posture, different surface.
 
@@ -70,6 +71,19 @@ data movement.
 - **A new message queue.** PANTHEON uses **NATS JetStream** (Apache 2.0, single binary, ~30MB RAM, native Python client). Building bespoke MQ infrastructure is not the project. Same posture as MNEMOS choosing pgvector over a custom vector store: pick the boring proven option, focus engineering on the layer that's actually novel.
 - **A new provider catalog.** PANTHEON auto-populates from GRAEAE's existing provider/muses database. GRAEAE already knows which providers have keys configured, which models each one offers, and recent health stats. PANTHEON's catalog is a *view* over GRAEAE's provider table plus per-worker advertisements. See "Catalog auto-population" below.
 - **A new auth system.** Tokens map to existing MNEMOS owner_id + namespace identity. The same auth that gates `/v1/memories` gates `/v1/chat/completions` here.
+
+## OpenAI-Compatible Memory Injection Control
+
+The OpenAI-compatible gateway injects MNEMOS memory context by default on
+`POST /v1/chat/completions`. Callers can bypass retrieval for a single request
+without changing gateway configuration:
+
+- Header: `X-Mnemos-Inject-Memory: false`
+- Body extension: `"mnemos_inject_memory": false`
+
+Malformed header values are treated as default-on. When the header is supplied,
+non-streaming JSON responses include `mnemos_metadata.memory_injected` so callers
+can verify whether the gateway searched and injected memory for that request.
 
 ## Position in the fleet
 

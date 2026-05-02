@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from fastapi import HTTPException
@@ -235,6 +235,97 @@ def test_temperature_max_tokens_top_p_propagate(monkeypatch):
         "max_tokens": 100,
         "top_p": 0.9,
     }
+
+
+def test_memory_injection_header_false_skips_context_search(monkeypatch):
+    fake = _FakeGraeae()
+    _install_gateway(monkeypatch, fake)
+    search_context = AsyncMock(return_value=[])
+    monkeypatch.setattr(openai_compat, "_search_mnemos_context", search_context)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+    )
+
+    result = asyncio.run(
+        openai_compat.chat_completions(
+            req,
+            authorization=None,
+            x_mnemos_inject_memory="false",
+            user=_user(),
+        )
+    )
+
+    search_context.assert_not_awaited()
+    payload = json.loads(result.body)
+    assert payload["mnemos_metadata"] == {"memory_injected": False}
+
+
+def test_memory_injection_body_false_skips_context_search(monkeypatch):
+    fake = _FakeGraeae()
+    _install_gateway(monkeypatch, fake)
+    search_context = AsyncMock(return_value=[])
+    monkeypatch.setattr(openai_compat, "_search_mnemos_context", search_context)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+        mnemos_inject_memory=False,
+    )
+
+    result = asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    search_context.assert_not_awaited()
+    assert result.choices[0].message.content == "ok"
+
+
+def test_memory_injection_default_searches_context(monkeypatch):
+    fake = _FakeGraeae()
+    _install_gateway(monkeypatch, fake)
+    search_context = AsyncMock(return_value=[])
+    monkeypatch.setattr(openai_compat, "_search_mnemos_context", search_context)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+    )
+
+    asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
+
+    search_context.assert_awaited_once()
+
+
+@pytest.mark.parametrize(
+    ("header_value", "should_search", "memory_injected"),
+    [
+        ("true", True, True),
+        ("false", False, False),
+        ("not-a-bool", True, True),
+    ],
+)
+def test_memory_injection_header_values(monkeypatch, header_value, should_search, memory_injected):
+    fake = _FakeGraeae()
+    _install_gateway(monkeypatch, fake)
+    search_context = AsyncMock(return_value=[])
+    monkeypatch.setattr(openai_compat, "_search_mnemos_context", search_context)
+    req = openai_compat.ChatCompletionRequest(
+        model="gpt-5.4",
+        messages=[openai_compat.ChatMessage(role="user", content="hello")],
+    )
+
+    result = asyncio.run(
+        openai_compat.chat_completions(
+            req,
+            authorization=None,
+            x_mnemos_inject_memory=header_value,
+            user=_user(),
+        )
+    )
+
+    if should_search:
+        search_context.assert_awaited_once()
+    else:
+        search_context.assert_not_awaited()
+    payload = json.loads(result.body)
+    assert payload["mnemos_metadata"] == {"memory_injected": memory_injected}
 
 
 def test_stream_returns_sse(monkeypatch):

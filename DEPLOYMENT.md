@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v4.0.0 current. v4.0.0 shipped 2026-04-29.
+**Status**: v5.0.0 current. v5.0.0 shipped 2026-05-02.
 
 ---
 
@@ -38,7 +38,7 @@ mnemos serve --profile dev
 ### Installation
 
 ```bash
-python -m pip install mnemos-os==4.0.0
+python -m pip install mnemos-os==5.0.0
 mnemos install --profile dev
 mnemos serve --profile dev
 ```
@@ -48,7 +48,7 @@ The API will be available at `http://localhost:5002`.
 For the no-Python edge path:
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.0/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -361,14 +361,15 @@ modules under `mnemos/tools/`.
 
 MORPHEUS dream-state runs are operator-triggered through
 `POST /admin/morpheus/runs` and inspected through `/v1/morpheus/runs*`.
-Runs are synchronous in v4.0, append generated memories tagged with
-`morpheus_run_id`, and roll back by deleting memories from that run.
+v5.0 runs cover REPLAY, CLUSTER, SYNTHESISE, CONSOLIDATE, and EXTRACT, append
+generated memories tagged with `morpheus_run_id`, and roll back by deleting
+memories from that run.
 
 Compression is operator-batched. Use `POST /admin/compression/enqueue` or
 `POST /admin/compression/enqueue-all` to feed the contest worker. The active
 built-in engines are APOLLO and ARTEMIS; the retired LETHE / ANAMNESIS /
 ALETHEIA engines and the legacy session compression columns are not part of
-the v4.0 runtime.
+the v5.0 runtime.
 
 ---
 
@@ -658,7 +659,7 @@ psql -d mnemos -c "REINDEX TABLE memories;"
 
 ### 409: Memory branch state is inconsistent
 
-v4.0 keeps the v3.5 trigger behavior: SQLSTATE `MN001` maps to HTTP 409 when
+Current releases keep the v3.5 trigger behavior: SQLSTATE `MN001` maps to HTTP 409 when
 `memory_branches` is missing, has `NULL head_version_id`, or points at a
 `memory_versions` row from another memory. Inspect and reconcile the
 branch rows before retrying:

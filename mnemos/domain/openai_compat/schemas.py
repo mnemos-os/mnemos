@@ -66,6 +66,7 @@ class ChatCompletionRequest(BaseModel):
     presence_penalty: Optional[float] = None
     frequency_penalty: Optional[float] = None
     user: Optional[str] = None
+    mnemos_inject_memory: Optional[bool] = Field(default=None, exclude=True)
 
 
 class ChatCompletionStreamRequest(ChatCompletionRequest):

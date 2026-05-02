@@ -1,6 +1,6 @@
 # MNEMOS Single-Binary Distribution
 
-MNEMOS v4.0 publishes platform-native `mnemos` executables that bundle the
+MNEMOS v5.0.0 publishes platform-native `mnemos` executables that bundle the
 Python interpreter, runtime dependencies, and the sqlite-vec native extension.
 Operators can copy one file onto an edge host, mark it executable, and start the
 service without installing Python or running `pip`.
@@ -17,7 +17,7 @@ The single-binary build supports a zero-install edge appliance pattern:
 
 This is meant for operators who want the `edge` or `dev` profiles with no host
 Python lifecycle to manage. Termux-style hosts need a matching Linux ABI; the
-v4.0 official matrix builds glibc Linux and macOS artifacts, not Android-native
+  v5.0 official matrix builds glibc Linux and macOS artifacts, not Android-native
 Termux binaries.
 
 ## Download
@@ -98,7 +98,7 @@ deployments are usually easier to operate from the package or container image.
 - A MNEMOS service running from the binary cannot `pip install` Python plugins
   into itself. Use the `server` profile from a normal Python environment or a
   container image when you need runtime extensibility.
-- The official v4.0 matrix does not include macOS x86_64 or Windows.
+- The official v5.0 matrix does not include macOS x86_64 or Windows.
 
 ## Build From Source
 

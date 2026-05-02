@@ -23,7 +23,7 @@ import mcp.types as types
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
 
-from mnemos.mcp.tools import TOOL_REGISTRY, execute_tool, tool_input_schema
+from mnemos.mcp.tools import TOOL_REGISTRY, execute_tool, tool_input_schema, user_from_context
 
 # Stderr-only logging — stdout is reserved for JSON-RPC frames
 logging.basicConfig(level=logging.WARNING, stream=sys.stderr)
@@ -47,7 +47,7 @@ async def list_tools() -> list[types.Tool]:
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextContent]:
     try:
-        result = await execute_tool(name, arguments or {})
+        result = await execute_tool(name, arguments or {}, user=user_from_context())
         return [types.TextContent(type="text", text=json.dumps(result, indent=2))]
     except httpx.HTTPStatusError as e:
         detail = {}

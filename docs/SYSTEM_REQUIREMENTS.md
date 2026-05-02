@@ -120,4 +120,4 @@ starts.
 
 ---
 
-*Last updated: 2026-04-29 (v4.0.0 doc triage)*
+*Last updated: 2026-05-02 (v5.0.0 doc sync)*

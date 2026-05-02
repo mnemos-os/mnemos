@@ -1,4 +1,4 @@
-# Known limitations — v4.2.0a14
+# Known limitations — v5.0.0
 
 This file lists known operational caveats that aren't bugs in
 the strict sense but are worth surfacing for self-hosting

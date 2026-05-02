@@ -37,7 +37,7 @@ make loss boundaries explicit: compression must prove fidelity, federation must
 preflight schema compatibility, and interchange formats must preserve sidecars
 or say exactly what is dropped.
 
-This paper describes the MNEMOS v4.2 design as implemented in the local
+This paper describes the MNEMOS v5.0.0 design as implemented in the local
 codebase. It is a design paper, not a completed evaluation report. The
 evaluation work described later should be run by the PROTEUS barrage against
 fixed corpora and fixed deployment profiles.
@@ -193,8 +193,8 @@ transaction across slow LLM phases while preserving scoped reversibility.
 
 ## 6. Federation and Portability
 
-MNEMOS federation is pull-based, with an optional NATS fast path in later
-v4.2 work. The schema-compatibility preflight is exposed at
+MNEMOS federation is pull-based, with any NATS fast path treated as later
+work. The schema-compatibility preflight is exposed at
 `GET /v1/federation/schema` in
 [`mnemos/api/routes/federation.py`](../../mnemos/api/routes/federation.py).
 The response includes `mnemos_version`, `schema_signature`, and
@@ -252,7 +252,7 @@ per-session caps for `consultation_only` models, best-effort
 aliases, and route explanation output. The memory writes make model routing
 observable to MNEMOS rather than leaving it as transient gateway state.
 
-IRIS is the discovery role over the model catalog. In the current v4.2 codebase,
+IRIS is the discovery role over the model catalog. In the current v5.0.0 codebase,
 the discovery role is surfaced through unified MCP model tools rather than a
 separate IRIS server. [`mnemos/mcp/tools/models.py`](../../mnemos/mcp/tools/models.py)
 exposes `pantheon_list_models` and `pantheon_route_explain`, giving MCP callers

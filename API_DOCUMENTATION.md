@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v4.0.0 current; shipped 2026-04-29
+**Version**: v5.0.0 current; shipped 2026-05-02
 **Format**: JSON
 
 ---
@@ -61,9 +61,9 @@ Liveness + readiness check (no auth required).
 ```json
 {
   "status": "healthy",
-  "timestamp": "2026-04-29T14:30:00.000Z",
+  "timestamp": "2026-05-02T14:30:00.000Z",
   "database_connected": true,
-  "version": "4.0.0",
+  "version": "5.0.0",
   "profile": "edge",
   "distillation_worker": "idle"
 }
@@ -100,7 +100,7 @@ remain owner+namespace scoped.
 ### POST /v1/memories
 
 Create a memory. This writes the memory row and emits a transactional
-`memory.created` webhook event. Compression is operator-batched in v4.0:
+`memory.created` webhook event. Compression has been operator-batched since v4.0:
 root users enqueue memories through `/admin/compression/enqueue` or
 `/admin/compression/enqueue-all`; the distillation worker then drains
 `memory_compression_queue`.
@@ -146,7 +146,7 @@ Semantic + keyword search.
 
 Search hits update `recall_count` and `last_recalled_at` in the background.
 `compression_applied` and `compression_metadata` are reserved response fields
-on `MemoryListResponse`; v4.0 search responses set
+on `MemoryListResponse`; current search responses set
 `compression_applied=false`. Use `/v1/memories/rehydrate` to receive compressed
 variants when present, or `/v1/memories/{id}/compression-manifests` to inspect
 contest output.
@@ -286,8 +286,11 @@ Field support is intentionally pass-or-reject:
 | `stop`, `n`, penalties | Passed through | `stop` maps to `stop_sequences`; unsupported penalties return 400 | Native `generationConfig` mapping | 400 when not honored |
 | content blocks / images | OpenAI vision-capable models | Claude vision | Gemini vision | 400 |
 
-Memory injection can be enabled per-request via header
-`X-MNEMOS-Inject-Memories: 1`.
+Memory injection is enabled by default. Disable it for one request with either
+header `X-Mnemos-Inject-Memory: false` or the non-OpenAI extension body field
+`"mnemos_inject_memory": false`. Malformed header values are treated as
+default-on. When the header is supplied, non-streaming JSON responses include
+`mnemos_metadata.memory_injected`.
 
 ---
 
@@ -305,9 +308,9 @@ Stateful multi-turn chat with memory injection at turn boundaries.
 
 ## MORPHEUS
 
-Dream-state generation is operator-triggered and append-only in v4.0.
-Generated memories are tagged with `morpheus_run_id`; rollback deletes
-generated memories for that run.
+Dream-state generation is operator-triggered. v5.0.0 includes the REPLAY,
+CLUSTER, SYNTHESISE, CONSOLIDATE, and EXTRACT phases. Generated memories are
+tagged with `morpheus_run_id`; rollback deletes generated memories for that run.
 
 - `GET /v1/morpheus/runs` — list runs
 - `GET /v1/morpheus/runs/{run_id}` — run detail

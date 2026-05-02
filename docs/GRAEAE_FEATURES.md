@@ -1,6 +1,6 @@
 # GRAEAE Feature Surface
 
-**Status:** current v4.0.0 documentation. v4.0.0 shipped on 2026-04-29.
+**Status:** current v5.0.0 documentation. v5.0.0 shipped on 2026-05-02.
 
 GRAEAE is MNEMOS's multi-provider reasoning bus. It fans a prompt out to live
 LLM providers, scores the responses, persists consultations, and writes a
@@ -57,7 +57,7 @@ request validation with HTTP 422.
 
 OpenAI-compatible access is separate but uses the same routing engine:
 `POST /v1/chat/completions`, `GET /v1/models`, and `GET /v1/models/{model_id}`.
-In v4.0, generation controls propagate when the selected provider supports
+In v5.0, generation controls propagate when the selected provider supports
 them; unsupported tools, response formats, and multimodal requests are rejected
 instead of silently ignored.
 
@@ -73,6 +73,6 @@ Committed consultations write three related records in one transaction:
 
 If the audit write fails, consultation persistence fails too. This is the
 current compliance boundary for GRAEAE. MNEMOS does not have one generic
-`audit_log` table for every memory operation in v4.0; memory integrity is
+`audit_log` table for every memory operation in v5.0; memory integrity is
 tracked through the version DAG, webhook delivery rows, compression contest
 records, and subsystem-specific audit tables.

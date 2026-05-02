@@ -181,6 +181,7 @@ async def chat_completion(
     request: ChatCompletionRequest,
     user: Any,
     *,
+    inject_memory: bool = True,
     search_context: Callable[..., Any] = openai_compat_repo.fetch_memory_context,
     get_model_recommendation: Callable[..., Any] = openai_compat_repo.fetch_model_recommendation,
     route_to_provider_response: Callable[..., Any] = _route_to_provider_response,
@@ -205,8 +206,12 @@ async def chat_completion(
     elif any(kw in last_msg.lower() for kw in ["arch", "design", "pattern", "structure", "system"]):
         task_type = "architecture_design"
 
-    logger.info("[MNEMOS] task_type=%s, searching memory...", task_type)
-    mnemos_docs = await search_context(last_msg, user, limit=3)
+    mnemos_docs = []
+    if inject_memory:
+        logger.info("[MNEMOS] task_type=%s, searching memory...", task_type)
+        mnemos_docs = await search_context(last_msg, user, limit=3)
+    else:
+        logger.info("[MNEMOS] task_type=%s, memory injection disabled", task_type)
 
     model = request.model or "gpt-4o"
     if model in MODEL_ALIASES:

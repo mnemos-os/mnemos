@@ -1,6 +1,6 @@
 # MNEMOS Operations — Multi-Node Deployment & Maintenance
 
-**Status:** Canonical (v3.3+ production, updated 2026-04-26)
+**Status:** Canonical (v5.0.0 production line, updated 2026-05-02)
 **Audience:** Operators, SREs, release engineers
 **Scope:** Continuous operation and maintenance of MNEMOS production + staging + test clusters
 
@@ -41,7 +41,7 @@ What this doc does NOT cover:
                      /         \
                     /           \
               PYTHIA (.67)    CERBERUS (.96)
-              v4.0 prod       dark prod / GPU host
+              v5.0 prod       dark prod / GPU host
               pg17 primary    standby + inference
               11,756 memories + Apollo Gemma 4 (ports 8080/8081)
               5,045 compressions
@@ -64,8 +64,8 @@ What this doc does NOT cover:
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v4.0 stable target | ✅ Operational |
-| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v4.0 stable target | ✅ Operational |
+| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v5.0 stable target | ✅ Operational |
+| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v5.0 stable target | ✅ Operational |
 | **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
 | **ARGONAS** | 192.168.207.101 | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
@@ -88,7 +88,7 @@ Production MNEMOS runs on a **canary + ratchet** model: new features bake in sta
 
 | Tier | Host(s) | Version target | Stability | Deployment source |
 |---|---|---|---|---|
-| **Prod** | PYTHIA + CERBERUS | *latest stable* (v4.0.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
+| **Prod** | PYTHIA + CERBERUS | *latest stable* (v5.0.x) | GA, no alpha/beta | git tag, N+1 weeks after staging bake |
 | **Staging** | PROTEUS | *latest cut* / next release branch | alpha/rc, real federation | release branch, merged + tagged |
 | **Test** | docker-compose + mnemos-test-pg on CERBERUS | *feature branches* | ephemeral, parallel | PR builds via CI, cleaned up post-merge |
 
@@ -654,15 +654,15 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 ## 11. Federation health
 
-### 11.1 Architecture (v4.0.0 current)
+### 11.1 Architecture (v5.0.0 current)
 
 Federation (peer-to-peer memory sync) is specified in `mnemos/api/routes/federation.py`. Key points:
 
 - Each MNEMOS node maintains a `federation_peers` table (schema in `db/migrations_v3_federation.sql`)
 - Sync is **pull-based:** node A asks node B for updates since the last sync point
 - Compound-cursor pagination over `(updated, id)` (not full-dump on every sync)
-- **Status as of 2026-04-29:** Schema-compat preflight, restore drills, the
-  stable compound cursor, and v4 package boundaries are validated. Peer
+- **Status as of 2026-05-02:** Schema-compat preflight, restore drills, the
+  stable compound cursor, and v5 package boundaries are validated. Peer
   heartbeat and per-peer ACL remain future work.
 
 ### 11.2 What happens when a peer is unreachable

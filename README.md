@@ -112,10 +112,16 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 ### How we interoperate
 
 1. **MCP (Model Context Protocol).** MNEMOS ships stdio and HTTP/SSE MCP transports (`mnemos.mcp.stdio`, `mnemos.mcp.http`) that expose memory operations — search, create, update, delete, DAG versioning, model optimizer — as first-class tool calls. Register it in any MCP-aware client (Claude Code, OpenClaw, ZeroClaw, Hermes) and the agent gets persistent memory without your framework having to know MNEMOS exists at the code level.
-2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, propagated generation controls (`temperature`, `max_tokens`, `top_p`), streaming SSE, and explicit 400s when the selected provider cannot honor tools, response formats, penalties, or multimodal content. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
+2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, propagated generation controls (`temperature`, `max_tokens`, `top_p`), streaming SSE, and explicit 400s when the selected provider cannot honor tools, response formats, penalties, or multimodal content. Request-level opt-out is available with `X-Mnemos-Inject-Memory: false` or body field `mnemos_inject_memory: false`. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
 3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
 
-Current MCP tools come from one registry shared by stdio and HTTP/SSE: `search_memories`, `list_memories`, `get_memory`, `create_memory`, `update_memory`, `delete_memory`, `bulk_create_memories`, `get_stats`, `kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`, `delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`, `checkout_memory`, and `recommend_model`.
+Current MCP tools come from one registry shared by stdio and HTTP/SSE:
+`search_memories`, `list_memories`, `get_memory`, `create_memory`,
+`update_memory`, `delete_memory`, `bulk_create_memories`, `get_stats`,
+`kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`,
+`delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`,
+`checkout_memory`, `recommend_model`, `pantheon_list_models`,
+`pantheon_route_explain`, `kronos_anomalies`, and `kronos_forecast`.
 
 ### Today's integration inventory
 
@@ -368,6 +374,12 @@ Drop-in replacement for the OpenAI Chat Completions API — so any SDK that spea
 
 Gateway field support is pass-or-reject: OpenAI-style providers receive `temperature`, `max_tokens`, `top_p`, `stop`, `n`, presence/frequency penalties, and `response_format`; OpenAI and Anthropic receive tool schemas where supported; Gemini maps generation controls and JSON response format to its native fields. Providers that cannot honor a requested tool call, response format, penalty, or multimodal content block return a clear HTTP 400 instead of silently dropping it.
 
+Memory injection is enabled by default. Disable it for one request with either
+`X-Mnemos-Inject-Memory: false` or the non-OpenAI extension body field
+`"mnemos_inject_memory": false`; malformed header values are treated as
+default-on. When the header is supplied, non-streaming JSON responses include
+`mnemos_metadata.memory_injected`.
+
 ### Stateful sessions (v3, shipped)
 
 Multi-turn conversation state with memory injection at turn boundaries. Sessions carry accumulated context across requests and are scoped by the same owner+namespace pair as memories. v3.5 removed the legacy per-session compression columns; session history is ordered by deterministic pinned system rows plus recent turns, and compression output comes from `memory_compressed_variants` when a read path explicitly asks for compressed memory.
@@ -566,7 +578,7 @@ The constraints are enforced at the database level. Application bugs cannot viol
 
 ### Compression — the MOIRAI contest
 
-Compression is operator-batched in v4.0. It is not an automatic session-column flag and it no longer uses the retired LETHE / ANAMNESIS / ALETHEIA engines. Operators enqueue work through the admin endpoints; the distillation worker runs a competitive contest over the active engines and persists the winner plus the losing candidates for audit.
+Compression has been operator-batched since v4.0. It is not an automatic session-column flag and it no longer uses the retired LETHE / ANAMNESIS / ALETHEIA engines. Operators enqueue work through the admin endpoints; the distillation worker runs a competitive contest over the active engines and persists the winner plus the losing candidates for audit.
 
 - **ARTEMIS** — CPU-only extractive compression with identifier preservation, labeled-block handling, and evidence-based self-scoring.
 - **APOLLO** — schema-aware dense encoding for LLM-to-LLM wire use. Rule-based schema detection with optional LLM fallback for fact-shaped content that misses a known schema.
@@ -574,7 +586,7 @@ Compression is operator-batched in v4.0. It is not an automatic session-column f
 - Original content always retained; compressed and original stored independently.
 - Configurable quality thresholds per task type (security review: 95%, architecture: 90%, general: 80%).
 - The plugin `CompressionEngine` ABC is open to operator-registered engines. The contest logs the winner plus every loser with its score and rejection reason.
-- `/v1/memories/search` still carries reserved `compression_applied` / `compression_metadata` response fields from the v3.2 API shape; v4.0 search responses set `compression_applied=false`. Use `/v1/memories/rehydrate` or `/v1/memories/{id}/compression-manifests` when you need to know whether a compressed variant was used.
+- `/v1/memories/search` still carries reserved `compression_applied` / `compression_metadata` response fields from the v3.2 API shape; current search responses set `compression_applied=false`. Use `/v1/memories/rehydrate` or `/v1/memories/{id}/compression-manifests` when you need to know whether a compressed variant was used.
 
 ### Memory tier selector (advisory)
 
@@ -758,6 +770,20 @@ curl http://localhost:5002/health
 MNEMOS runs one worker by default. Increase `MNEMOS_WORKERS` only with Redis
 backing shared rate-limit, circuit-breaker, and concurrency state; see
 [`docs/SCALING.md`](./docs/SCALING.md).
+
+### OpenAI-compatible gateway
+
+Point OpenAI SDK clients at MNEMOS:
+
+```bash
+export OPENAI_BASE_URL=http://localhost:5002/v1
+export OPENAI_API_KEY=<mnemos-api-key>
+```
+
+Memory context is injected by default on `POST /v1/chat/completions`. To bypass
+the memory lookup for one request, send either header
+`X-Mnemos-Inject-Memory: false` or body field
+`"mnemos_inject_memory": false`.
 
 ---
 

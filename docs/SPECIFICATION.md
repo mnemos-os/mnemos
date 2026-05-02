@@ -1,7 +1,7 @@
 # MNEMOS Specification
 
-**Version**: v4.0.0 current; shipped 2026-04-29
-**Status**: Authoritative for the checked-out v4.0.0 tree. Behavior not
+**Version**: v5.0.0 current; shipped 2026-05-02
+**Status**: Authoritative for the checked-out v5.0.0 tree. Behavior not
 described here is either undefined (report as a bug) or scoped to a
 future release via `ROADMAP.md`.
 **Purpose**: supply enough structural detail that a scoping tool
@@ -33,13 +33,16 @@ surfaces, a model registry with scheduled sync from provider APIs and Arena.ai
 Elo rankings, request-scoped observability, and an OpenAI-compatible gateway
 that injects memory context on the fly.
 
-v4.0 adds the package restructure, `PersistenceBackend` abstraction,
+v5.0 includes the v4 package restructure, `PersistenceBackend` abstraction,
 Postgres/SQLite backends, deployment profiles, single-binary distribution,
-unified CLI, and Redis-coordinated multi-worker support. Apache-2.0.
+unified CLI, and Redis-coordinated multi-worker support, then adds GDPR
+deletion-request workers, the closed MORPHEUS divergent dream-state pipeline,
+PERSEPHONE archival, PANTHEON, KRONOS, NATS routing-audit substrate, DAG wiring
+for compression derivations, and MCP cross-tenant security gates. Apache-2.0.
 
 ## 2. System Scope
 
-### 2.1 In scope at v4.0.0
+### 2.1 In scope at v5.0.0
 
 - **Memory**: CRUD, search, DAG versioning with branch/merge, knowledge-graph
   triples, categories + namespaces, background compression with persisted audit.
@@ -53,8 +56,11 @@ unified CLI, and Redis-coordinated multi-worker support. Apache-2.0.
   primitives for multi-worker operation.
 - **Gateway**: OpenAI-compatible `/v1/chat/completions` + `/v1/models` with
   registry-backed provider resolution, memory context injection, propagated
-  generation controls, SSE streaming, and explicit pass-or-400 handling for
-  provider-specific tool/format/multimodal support.
+  generation controls, request-level memory-injection opt-out, SSE streaming,
+  and explicit pass-or-400 handling for provider-specific
+  tool/format/multimodal support.
+- **PANTHEON**: `/pantheon/v1` unified LLM facade with adaptive routing,
+  route explanation, agentic-tier caps, and routing-log feedback into MNEMOS.
 - **Sessions**: multi-turn conversation state with memory injection at turn
   boundaries. Legacy session compression columns were removed in v3.5.
 - **Tenancy**: per-user `owner_id` + `namespace` two-axis gate; root bypasses
@@ -72,22 +78,30 @@ unified CLI, and Redis-coordinated multi-worker support. Apache-2.0.
 - **Observability**: request-ID ContextVar, Prometheus `/metrics`,
   OpenTelemetry spans (opt-in), structured JSON logs (opt-in).
 - **MORPHEUS**: operator-triggered dream-state runs with REPLAY / CLUSTER /
-  SYNTHESISE / COMMIT phases, cluster introspection, namespace scoping, and
-  rollback by `morpheus_run_id`.
+  SYNTHESISE / CONSOLIDATE / EXTRACT / COMMIT phases, cluster introspection,
+  namespace scoping, and rollback by `morpheus_run_id`.
+- **PERSEPHONE**: cold-set archival with zstd-compressed archive storage and
+  eligibility forecasting.
+- **Deletion lifecycle**: GDPR right-to-be-forgotten deletion-request lifecycle
+  with soft-delete and hard-delete workers.
+- **KRONOS**: CPU recall-pattern anomaly detection, namespace drift detection,
+  recall-load forecasting, and PERSEPHONE eligibility forecast.
+- **NATS substrate**: bounded v0.2 slice for PANTHEON routing-log publication
+  and optional audit consumer.
 - **Two-protocol surface**: REST over HTTP plus MCP over stdio and HTTP/SSE
   from one tool registry.
 
-### 2.2 Explicitly out of scope at v4.0.0
+### 2.2 Explicitly out of scope at v5.0.0
 
-- Full per-memory deletion-log / GDPR wipe subsystem. v3.5 keeps DELETE
-  tombstone snapshots live in the version DAG, but it does not add a separate
-  deletion-log table.
+- A target-scope write fence for the GDPR final-verify race. The v5.0
+  deletion-request workflow ships with the bounded verify loop documented in
+  `KNOWN_LIMITATIONS.md`.
 - Federation per-peer ACL beyond the current peer credentials, namespace
   filters, category filters, and feed role gate.
-- PERSEPHONE archival and MORPHEUS mutation paths (consolidate / archive /
-  extract). These move to v4.1+ planning.
-- Web UX in `mnemos-web`, mobile native clients, and Rust rewrites. These are
-  post-v4.0 tracks.
+- Redis-backed PANTHEON cap buckets, KRONOS Tesseract GPU integration, Hatchet
+  workflow-engine integration, web UX in `mnemos-web`, mobile native clients,
+  hosted MNEMOS Cloud, and broader Rust rewrites. These are v5.1+ tracks unless
+  `ROADMAP.md` says otherwise.
 
 ### 2.3 Non-goals (permanent)
 
@@ -100,7 +114,7 @@ unified CLI, and Redis-coordinated multi-worker support. Apache-2.0.
 
 ## 3. Architecture And Subsystem Inventory
 
-The v4.0 source tree is organized by boundary:
+The v5.0 source tree is organized by boundary:
 
 ```text
 mnemos/
@@ -701,11 +715,11 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v4.0.0)
+### 10.4 Known gaps (as of v5.0.0)
 
-- Full deletion-log/GDPR wipe workflow is not present. DELETE tombstone
-  snapshots exist in the version DAG when the delete trigger is attached, but
-  no separate deletion-log table ships in v4.0.
+- GDPR deletion requests can still hit the documented final-verify race or
+  sweep-verifying exhaustion under sustained target writes; see
+  `KNOWN_LIMITATIONS.md`.
 - Federation per-peer ACLs beyond bearer identity, role gate, namespace
   filters, and category filters remain future work.
 - No in-process secrets encryption layer (values read from env + config
@@ -748,20 +762,20 @@ circuit-breaker, and concurrency state can drift between processes.
 
 ## 12. Complexity Indicators
 
-Raw metrics at v4.0.0, measured from the checked-out tree unless noted.
+Raw metrics at v5.0.0, measured from the checked-out tree unless noted.
 
 | Metric | Value | Notes |
 |--------|-------|-------|
-| Total Python LOC | ~67,000 | Excludes virtualenvs; simple `wc -l` over Python files |
-| Production LOC | ~40,800 | `mnemos/` package + scripts/tools |
-| Test LOC | ~24,900 | tests/ only |
-| Python files | 185+ | Primary modules + tests |
-| Test files | 86 | Unit + integration + live-gated E2E |
+| Total Python LOC | ~108,000 | Excludes virtualenvs; simple `wc -l` over Python files |
+| Production LOC | ~61,500 | `mnemos/` package + scripts/tools |
+| Test LOC | ~46,600 | tests/ only |
+| Python files | 198+ | Primary modules, excluding tests |
+| Test files | 146 | Unit + integration + live-gated E2E |
 | Test count | 1055+ passing cases in the doc-sweep tier | `pytest` collection includes parametrized cases; DB-gated tests are selectively ignored in CI/doc sweeps |
 | REST endpoints | 102 mounted application routes | Across 21 routers; excludes generated FastAPI docs/openapi routes |
-| MCP tools | 18 | Memory CRUD + KG + stats + DAG + model recommendation |
+| MCP tools | 22 | Memory CRUD + KG + stats + DAG + model recommendation + PANTHEON + KRONOS |
 | DB tables | 32 | See §4.1 |
-| Migrations | 39 Postgres SQL files + SQLite mirror chain | Idempotent, ordered |
+| Migrations | 51 Postgres SQL files + 40-file SQLite mirror chain | Idempotent, ordered |
 | Named concepts | ~40 | See Appendix H |
 | External service protocols | 4 | Postgres wire, HTTP (providers + peers + webhooks + GPU), OAuth/OIDC, MCP stdio |
 | Required Python deps | 18+ | See §8.2 |
@@ -884,6 +898,10 @@ See `CHANGELOG.md` for the authoritative list. Selected milestones:
   deployment profiles, Redis-coordinated multi-worker support, single-binary
   distribution, unified `mnemos` CLI, seven import-linter contracts, Pydantic
   Settings singleton, and seven validated GRAEAE modes.
+- **v5.0.0** — GDPR deletion-request lifecycle, MORPHEUS CONSOLIDATE/EXTRACT,
+  PERSEPHONE archival, PANTHEON v0.1/v0.2, KRONOS v0.1, compression-derivation
+  DAG wiring, NATS routing-audit substrate, MCP cross-tenant security gates,
+  document-import idempotency, connector smoke tests, and release-doc sync.
 
 ---
 

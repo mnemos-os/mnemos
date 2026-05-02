@@ -25,6 +25,7 @@ from ._runtime import (
     current_mcp_backend_user_id,
     reset_mcp_backend_context,
     set_mcp_backend_context,
+    user_from_context,
 )
 from ._security import (
     _mcp_consult_rate_limit,
@@ -134,7 +135,12 @@ async def execute_tool(
     parameters: dict[str, Any],
     user: UserContext | None = None,
 ) -> dict[str, Any]:
-    """Execute an MCP tool."""
+    """Execute an MCP tool.
+
+    ``user`` is provided when an MCP transport authenticated the caller;
+    tools that branch on ``user is None`` must fall back to REST-loopback
+    only when transport context is unauthenticated.
+    """
     audit_parameters = parameters if isinstance(parameters, dict) else {}
     context_caller_id = current_mcp_backend_user_id()
     caller_id = user.user_id if user is not None else context_caller_id
@@ -364,4 +370,5 @@ __all__ = [
     "tool_search_memories",
     "tool_update_memory",
     "tool_update_triple",
+    "user_from_context",
 ]

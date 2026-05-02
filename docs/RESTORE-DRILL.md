@@ -107,10 +107,9 @@ later acts as a federation source for another node and re-emits the
 test data as native).
 
 **Schema gotcha**: `memory_versions` and `memory_branches` still lack a FK
-cascade to `memories`. v3.5.0 added same-memory branch HEAD guards and DELETE
-tombstone snapshots, but it did not add a dedicated deletion-log/GDPR wipe
-subsystem or change restore cleanup semantics. Cleanup still needs explicit
-DELETEs in dependency order, plus an orphan sweep:
+cascade to `memories`. v5.0.0 includes the deletion-request workflow for
+user-scope wipes, but restore-drill cleanup of test imports still needs
+explicit DELETEs in dependency order, plus an orphan sweep:
 
 ```sql
 BEGIN;
@@ -163,8 +162,9 @@ combinations as of 2026-04-26:
 | MNEMOS v3.3.0 | MNEMOS v3.4.0 | 0.1.0 → 0.1.1 | ✅ clean round-trip |
 | MNEMOS v3.4.0 | MNEMOS v3.4.0 | 0.1.1 ↔ 0.1.1 | ✅ clean round-trip |
 
-Cross-major (3.x → 4.x) round-trips are not yet defined; that's a v4.0
-charter item once the v4 envelope shape is decided.
+Cross-major round-trips should be treated as release-drill work until validated
+for the exact source and target versions; do not assume an unlisted 3.x, 4.x,
+or 5.x pair has been exercised.
 
 ## Federation vs MPF — which to use when
 

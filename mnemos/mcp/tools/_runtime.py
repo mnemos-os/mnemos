@@ -88,6 +88,23 @@ def current_mcp_backend_namespace() -> str | None:
     return _MCP_BACKEND_NAMESPACE.get()
 
 
+def user_from_context() -> UserContext | None:
+    """Build the authenticated MCP caller context for the active transport."""
+    api_key = _MCP_BACKEND_API_KEY.get()
+    user_id = _MCP_BACKEND_USER_ID.get()
+    role = _MCP_BACKEND_ROLE.get()
+    namespace = _MCP_BACKEND_NAMESPACE.get()
+    if not all((api_key, user_id, role, namespace)):
+        return None
+    return UserContext(
+        user_id=user_id,
+        group_ids=[],
+        role=role,
+        namespace=namespace,
+        authenticated=True,
+    )
+
+
 def _mnemos_base() -> str:
     return get_settings().server.base.rstrip("/")
 

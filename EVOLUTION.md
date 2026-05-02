@@ -2,7 +2,7 @@
 
 The version numbers on releases are tidy. The actual path was not. This
 document is the honest version — decisions, refactors, mistakes, and the
-reasoning that got us from the original prototype to the current v4.0.0 release line. If you
+reasoning that got us from the original prototype to the current v5.0.0 release line. If you
 are considering MNEMOS for your own stack, you should know where it came
 from; if you are contributing, you should know which doors have been closed
 and why.
@@ -41,12 +41,14 @@ codebase took along the way.
 | 2026-04-28 | **v3.5.0 GA** — the hardening branch ships: webhook retry leases/outbox discipline, federation compound cursor, consultation audit scoping, MCP stdio/HTTP registry parity, faithful OpenAI-compatible gateway behavior, PostgreSQL streaming-replication doctrine, namespace-uniform state/journal/entities/sessions/consultations, bulk webhook parity, compression cleanup, and audit closure. |
 | 2026-04-28 | **v3.5.1** — documentation-triage patch. Version metadata moves to 3.5.1 and docs are reconciled with the shipped v3.5.x state; no product behavior changes from v3.5.0. |
 | 2026-04-29 | **v4.0.0** — structural refactor release. The codebase becomes a coherent `mnemos/` package; `PersistenceBackend` lands with Postgres and SQLite implementations; `server`, `edge`, and `dev` profiles make Pi/laptop/Termux and production deployments first-class; Redis-backed reliability primitives remove the production `workers=1` pin; PyInstaller single-binary artifacts ship for Linux x86_64, Linux aarch64, and macOS aarch64. |
+| 2026-05-02 | **v5.0.0** — v3.6 + v4.x charter closure. GDPR deletion-request lifecycle, MORPHEUS CONSOLIDATE/EXTRACT, PERSEPHONE archival, PANTHEON v0.1/v0.2, KRONOS v0.1, compression-derivation DAG wiring, NATS routing-audit substrate, MCP cross-tenant security gates, document-import idempotency, and connector smoke tests ship as the new GA line. |
 
 Roughly five months. One developer with three reviewers (Codex, GRAEAE
 multi-LLM consensus, occasional Sonnet / Opus passes for design). Several
 rounds of audit-driven rework — every major surface in v3.0.0-beta has had
 its seams moved at least once, on evidence rather than vibes. v4.0 is the point
-where those seams became explicit package boundaries instead of conventions.
+where those seams became explicit package boundaries instead of conventions;
+v5.0 is where the deferred v3.6/v4.x product surfaces closed into one GA line.
 The point of
 the timeline is not the version count; it's that nothing here is a
 two-week-sprint prototype, and every architectural seam has paid for
