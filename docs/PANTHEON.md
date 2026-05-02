@@ -4,6 +4,18 @@
 **Position in stack:** Above Triton (CERBERUS) + GRAEAE (PYTHIA); below every OpenAI-compatible client.
 **Greek-name fit:** *Temple of all gods.* One facade, many providers behind it. Pairs with CHARON (the ferryman who carries memories across systems): same interop posture, different surface.
 
+## v0.1 Implementation Note
+
+This commit ships the bounded PANTHEON v0.1 scaffold: an opt-in `/pantheon/v1`
+OpenAI-shaped facade, a GRAEAE-derived extended model catalog, simple
+`auto:*` alias routing, provider forwarding via existing GRAEAE key storage,
+and IRIS MCP discovery tools for listing models and explaining routes.
+
+The full design below remains the target architecture. The following items are
+explicitly deferred to v0.2: agentic-tier per-session caps/enforcement, the
+MNEMOS routing-log feedback loop, rolling-window routing-policy adaptation, and
+full streaming/tool-use passthrough semantics across every provider adapter.
+
 ---
 
 ## Mission

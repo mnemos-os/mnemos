@@ -1,6 +1,6 @@
 """Security regressions for the canonical MCP tool surface.
 
-The 18 user-callable tools share mnemos.mcp.tools.execute_tool as their
+The 20 user-callable tools share mnemos.mcp.tools.execute_tool as their
 dispatcher. These tests pin the cross-tenant and input-hardening seams
 that are easy to bypass when handlers call REST for one transport and
 direct database helpers for another.
@@ -36,6 +36,8 @@ EXPECTED_USER_TOOLS = [
     "diff_memory_commits",
     "checkout_memory",
     "recommend_model",
+    "pantheon_list_models",
+    "pantheon_route_explain",
 ]
 
 

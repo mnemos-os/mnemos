@@ -57,7 +57,12 @@ from .memory import (
     tool_search_memories,
     tool_update_memory,
 )
-from .models import TOOLS as MODEL_TOOLS, tool_recommend_model
+from .models import (
+    TOOLS as MODEL_TOOLS,
+    tool_pantheon_list_models,
+    tool_pantheon_route_explain,
+    tool_recommend_model,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +89,8 @@ _TOOL_ORDER = [
     "diff_memory_commits",
     "checkout_memory",
     "recommend_model",
+    "pantheon_list_models",
+    "pantheon_route_explain",
 ]
 
 _WRITE_TOOLS = {
@@ -342,6 +349,8 @@ __all__ = [
     "tool_kg_timeline",
     "tool_list_memories",
     "tool_log_memory",
+    "tool_pantheon_list_models",
+    "tool_pantheon_route_explain",
     "tool_recommend_model",
     "tool_search_memories",
     "tool_update_memory",

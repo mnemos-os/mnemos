@@ -22,6 +22,7 @@ from mnemos.api.routes.morpheus import router as morpheus_router
 from mnemos.api.routes.narrate import router as narrate_router
 from mnemos.api.routes.oauth import router as oauth_router
 from mnemos.api.routes.openai_compat import router as openai_compat_router
+from mnemos.api.routes.pantheon import router as pantheon_router
 from mnemos.api.routes.portability import router as portability_router
 from mnemos.api.routes.providers import router as providers_router
 from mnemos.api.routes.sessions import router as sessions_router
@@ -235,6 +236,7 @@ app.include_router(metrics_router)  # v3.2 observability: Prometheus /metrics
 app.include_router(consultations_router)  # v3.0.0: Unified /v1/consultations (GRAEAE reasoning)
 app.include_router(providers_router)  # v3.0.0: Unified /v1/providers (model routing)
 app.include_router(openai_compat_router)  # Phase 0: OpenAI-compatible gateway
+app.include_router(pantheon_router)  # PANTHEON v0.1: unified LLM facade (503-gated when disabled)
 app.include_router(sessions_router)  # Phase 0: Session management for stateful chat
 app.include_router(dag_router)  # Phase 3: DAG versioning (git-like)
 app.include_router(webhooks_router)  # v3.0.0: Outbound webhook subscriptions

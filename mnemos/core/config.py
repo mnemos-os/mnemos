@@ -359,6 +359,23 @@ class _PersephoneSettings(BaseSettings):
         return value if value > 0 else 3600.0
 
 
+class PantheonSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    enabled: bool = Field(False, validation_alias="MNEMOS_PANTHEON_ENABLED")
+    default_quality_floor: float = Field(
+        0.80,
+        validation_alias="MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR",
+    )
+    default_max_cost_usd_per_mtok: float = Field(
+        10.0,
+        validation_alias=AliasChoices(
+            "MNEMOS_PANTHEON_DEFAULT_MAX_COST",
+            "MNEMOS_PANTHEON_DEFAULT_MAX_COST_USD_PER_MTOK",
+        ),
+    )
+
+
 class _FederationNatsPeerSettings(BaseModel):
     name: str
     nats_url: str
@@ -470,6 +487,7 @@ class Settings(BaseSettings):
     compression: _CompressionSettings
     morpheus: _MorpheusSettings
     persephone: _PersephoneSettings
+    pantheon: PantheonSettings
     federation: _FederationSettings
     oauth: _OAuthSettings
     auth: _AuthSettings
@@ -539,6 +557,7 @@ def _build_settings() -> Settings:
         "compression": _CompressionSettings(**_toml_section(toml_config, "compression")),
         "morpheus": _MorpheusSettings(**_toml_section(toml_config, "morpheus")),
         "persephone": _PersephoneSettings(**_toml_section(toml_config, "persephone")),
+        "pantheon": PantheonSettings(**_toml_section(toml_config, "pantheon")),
         "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
         "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
         "auth": _AuthSettings(**_toml_section(toml_config, "auth")),
@@ -560,6 +579,7 @@ def _build_settings() -> Settings:
         compression=groups["compression"],
         morpheus=groups["morpheus"],
         persephone=groups["persephone"],
+        pantheon=groups["pantheon"],
         federation=groups["federation"],
         oauth=groups["oauth"],
         auth=groups["auth"],
