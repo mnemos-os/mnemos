@@ -11,12 +11,14 @@ once an operator is ready for soft mutation paths.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, replace
 import json
 import logging
+import math
 import os
 from datetime import datetime, timedelta, timezone
-from typing import List, Optional, Tuple
-from uuid import UUID
+from typing import Any, List, Optional, Tuple
+from uuid import UUID, uuid4
 
 import asyncpg
 import numpy as np
@@ -151,6 +153,24 @@ def _consolidate_enabled(config: Optional[dict]) -> bool:
     return _truthy(configured) or bool(get_settings().morpheus.consolidate)
 
 
+def _extract_enabled(config: Optional[dict]) -> bool:
+    configured = config.get("extract", False) if isinstance(config, dict) else False
+    return _truthy(configured) or bool(get_settings().morpheus.extract)
+
+
+def _extract_verify_enabled(config: Optional[dict]) -> bool:
+    configured = config.get("extract_verify", False) if isinstance(config, dict) else False
+    return _truthy(configured) or bool(get_settings().morpheus.extract_verify)
+
+
+@dataclass(frozen=True)
+class ExtractedTriple:
+    subject: str
+    predicate: str
+    object: str
+    confidence: float
+
+
 async def begin_run(
     pool: asyncpg.Pool,
     *,
@@ -213,6 +233,8 @@ async def update_counters(
     summaries_created: Optional[int] = None,
     memories_consolidated: Optional[int] = None,
     clusters_consolidated: Optional[int] = None,
+    triples_extracted: Optional[int] = None,
+    memories_processed_for_extraction: Optional[int] = None,
 ) -> None:
     """Bump counters as phases finish. Pass only the fields to update."""
     sets: list[str] = []
@@ -232,6 +254,12 @@ async def update_counters(
     if clusters_consolidated is not None:
         args.append(clusters_consolidated)
         sets.append(f"clusters_consolidated=${len(args)}")
+    if triples_extracted is not None:
+        args.append(triples_extracted)
+        sets.append(f"triples_extracted=${len(args)}")
+    if memories_processed_for_extraction is not None:
+        args.append(memories_processed_for_extraction)
+        sets.append(f"memories_processed_for_extraction=${len(args)}")
     if not sets:
         return
     args.append(run_id)
@@ -278,6 +306,24 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
         raise ValueError(f"invalid run_id: {run_id!r}")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            extract_reset_result = await conn.execute(
+                """
+                WITH deleted_extract_triples AS (
+                    DELETE FROM kg_triples
+                    WHERE extracted_by_run_id=$1::uuid
+                    RETURNING memory_id
+                )
+                UPDATE memories
+                SET triples_extracted_at = NULL
+                WHERE id IN (
+                    SELECT DISTINCT memory_id
+                    FROM deleted_extract_triples
+                    WHERE memory_id IS NOT NULL
+                )
+                """,
+                run_id,
+            )
+            n_extract_reset = _command_count(extract_reset_result)
             restore_result = await conn.execute(
                 """
                 UPDATE memories
@@ -311,8 +357,9 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
             )
             n_run = _command_count(run_result)
     logger.warning(
-        "[MORPHEUS] run %s rolled back: %d memories deleted, %d consolidated rows restored",
-        run_id, n_deleted, n_restored,
+        "[MORPHEUS] run %s rolled back: %d memories deleted, "
+        "%d consolidated rows restored, %d extraction markers reset",
+        run_id, n_deleted, n_restored, n_extract_reset,
     )
     return n_deleted, n_run
 
@@ -697,6 +744,345 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
     return n_created
 
 
+async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
+    """Extract latent KG triples from unprocessed prose memories.
+
+    The phase is opt-in via run config (`extract=true`) or
+    MNEMOS_MORPHEUS_EXTRACT. Each source memory is processed at most
+    once by the `triples_extracted_at` guard. The LLM calls happen
+    outside DB transactions; the timestamp mark and all triple inserts
+    for one memory commit atomically.
+    """
+    settings = get_settings().morpheus
+    min_chars = max(0, int(settings.extract_min_chars))
+
+    async with pool.acquire() as conn:
+        run_row = await conn.fetchrow(
+            "SELECT config, namespace FROM morpheus_runs WHERE id=$1::uuid",
+            run_id,
+        )
+    if run_row is None:
+        await update_counters(
+            pool,
+            run_id,
+            triples_extracted=0,
+            memories_processed_for_extraction=0,
+        )
+        return 0
+
+    config = _parse_run_config(run_row["config"])
+    if not _extract_enabled(config):
+        await update_counters(
+            pool,
+            run_id,
+            triples_extracted=0,
+            memories_processed_for_extraction=0,
+        )
+        return 0
+
+    namespace = run_row["namespace"]
+    verify = _extract_verify_enabled(config)
+    async with pool.acquire() as conn:
+        candidates = await conn.fetch(
+            """
+            SELECT id, verbatim_content, owner_id, namespace
+            FROM memories
+            WHERE deleted_at IS NULL
+              AND triples_extracted_at IS NULL
+              AND verbatim_content IS NOT NULL
+              AND length(verbatim_content) >= $1
+              AND ($2::text IS NULL OR namespace = $2)
+            ORDER BY created
+            """,
+            min_chars, namespace,
+        )
+
+    memories_processed = 0
+    triples_extracted = 0
+
+    for row in candidates:
+        memory_id = str(row["id"])
+        content = str(row["verbatim_content"] or "")
+        triples = await _extract_triples_from_prose(content)
+        if verify and triples:
+            triples = await _verify_extracted_triples(content, triples)
+
+        async with pool.acquire() as conn:
+            async with conn.transaction():
+                marked_id = await conn.fetchval(
+                    """
+                    UPDATE memories
+                    SET triples_extracted_at = NOW()
+                    WHERE id=$1
+                      AND triples_extracted_at IS NULL
+                      AND deleted_at IS NULL
+                      AND ($2::text IS NULL OR namespace = $2)
+                    RETURNING id
+                    """,
+                    memory_id, namespace,
+                )
+                if marked_id is None:
+                    continue
+
+                for triple in triples:
+                    await conn.execute(
+                        """
+                        INSERT INTO kg_triples
+                            (id, subject, predicate, object,
+                             memory_id, confidence, extracted_by_run_id,
+                             owner_id, namespace)
+                        VALUES ($1, $2, $3, $4, $5, $6, $7::uuid, $8, $9)
+                        """,
+                        _new_kg_triple_id(),
+                        triple.subject,
+                        triple.predicate,
+                        triple.object,
+                        memory_id,
+                        triple.confidence,
+                        run_id,
+                        row["owner_id"],
+                        row["namespace"],
+                    )
+
+        memories_processed += 1
+        triples_extracted += len(triples)
+
+    await update_counters(
+        pool,
+        run_id,
+        triples_extracted=triples_extracted,
+        memories_processed_for_extraction=memories_processed,
+    )
+    logger.info(
+        "[MORPHEUS] run %s extracted %d KG triple(s) from %d prose memor%s",
+        run_id,
+        triples_extracted,
+        memories_processed,
+        "y" if memories_processed == 1 else "ies",
+    )
+    return triples_extracted
+
+
+def _new_kg_triple_id() -> str:
+    try:
+        from mnemos.core import ids as _ids
+
+        factory = getattr(_ids, "new_kg_triple_id", None)
+        if callable(factory):
+            return str(factory())
+    except Exception:
+        pass
+    return str(uuid4())
+
+
+async def _extract_triples_from_prose(verbatim_content: str) -> list[ExtractedTriple]:
+    settings = get_settings().morpheus
+    prompt = (
+        "Extract latent knowledge-graph triples from the prose memory below.\n"
+        "Return ONLY strict JSON: an array of objects with exactly these keys: "
+        "subject, predicate, object, confidence.\n"
+        "Rules: subject, predicate, and object must be non-empty strings; "
+        "confidence must be a number from 0 to 1; include only triples directly "
+        "supported by the memory; do not include commentary, markdown, or code fences.\n\n"
+        "Memory:\n"
+        '"""\n'
+        f"{verbatim_content}\n"
+        '"""'
+    )
+    raw = await _call_morpheus_muse(
+        prompt,
+        muse=settings.extract_muse,
+        task_type="kg_extraction",
+        timeout=120,
+    )
+    return _parse_extracted_triples(raw)
+
+
+async def _verify_extracted_triples(
+    verbatim_content: str,
+    triples: list[ExtractedTriple],
+) -> list[ExtractedTriple]:
+    if not triples:
+        return []
+    settings = get_settings().morpheus
+    min_confidence = float(settings.extract_min_confidence)
+    payload = [
+        {
+            "index": idx,
+            "subject": triple.subject,
+            "predicate": triple.predicate,
+            "object": triple.object,
+            "confidence": triple.confidence,
+        }
+        for idx, triple in enumerate(triples)
+    ]
+    prompt = (
+        "Verify whether each proposed knowledge-graph triple is directly supported "
+        "by the prose memory. Return ONLY strict JSON: an array of objects with "
+        "index and confidence keys. Confidence must be a number from 0 to 1. "
+        "Do not include commentary, markdown, or code fences.\n\n"
+        "Memory:\n"
+        '"""\n'
+        f"{verbatim_content}\n"
+        '"""\n\n'
+        "Triples:\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+    raw = await _call_morpheus_muse(
+        prompt,
+        muse=settings.extract_verifier,
+        task_type="kg_extraction_verification",
+        timeout=180,
+    )
+    verified_confidences = _parse_verifier_confidences(raw, len(triples))
+    out: list[ExtractedTriple] = []
+    for idx, triple in enumerate(triples):
+        confidence = verified_confidences.get(idx, triple.confidence)
+        if confidence >= min_confidence:
+            out.append(replace(triple, confidence=confidence))
+    return out
+
+
+async def _call_morpheus_muse(
+    prompt: str,
+    *,
+    muse: str,
+    task_type: str,
+    timeout: int,
+) -> str:
+    try:
+        from mnemos.domain.graeae.engine import get_graeae_engine
+
+        engine = get_graeae_engine()
+        result = await engine.consult(
+            prompt=prompt,
+            task_type=task_type,
+            timeout=timeout,
+            selection=_morpheus_muse_selection(engine, muse),
+            mode="single",
+        )
+        consensus = result.get("consensus_response")
+        if isinstance(consensus, str) and consensus.strip():
+            return consensus.strip()
+        for response in (result.get("all_responses") or {}).values():
+            if response.get("status") in {"success", "ok"} and response.get("response_text"):
+                return str(response["response_text"]).strip()
+    except Exception as exc:  # pragma: no cover - defensive around external LLMs
+        logger.warning("[MORPHEUS] extract muse call failed: %s", exc)
+    return ""
+
+
+def _morpheus_muse_selection(engine: Any, muse: str) -> Optional[dict[str, Optional[str]]]:
+    muse = str(muse or "").strip()
+    if not muse or muse == "auto":
+        return None
+    providers = getattr(engine, "providers", {}) or {}
+    if muse in providers:
+        return {muse: None}
+    for provider_name, cfg in providers.items():
+        if str(cfg.get("model") or "") == muse:
+            return {provider_name: muse}
+
+    from mnemos.core.provider_registry import GRAEAE_REGISTRY_MAP
+
+    registry_to_graeae = {
+        cfg["registry_provider"]: name
+        for name, cfg in GRAEAE_REGISTRY_MAP.items()
+    }
+    provider_name = registry_to_graeae.get(muse)
+    if provider_name in providers:
+        return {provider_name: None}
+
+    logger.warning(
+        "[MORPHEUS] configured muse %r is not in the GRAEAE provider map; "
+        "falling back to single best available muse",
+        muse,
+    )
+    return None
+
+
+def _parse_extracted_triples(raw: object) -> list[ExtractedTriple]:
+    parsed = _json_array(raw)
+    if parsed is None:
+        return []
+    triples: list[ExtractedTriple] = []
+    for item in parsed:
+        triple = _validated_triple(item)
+        if triple is not None:
+            triples.append(triple)
+    return triples
+
+
+def _parse_verifier_confidences(raw: object, n_triples: int) -> dict[int, float]:
+    parsed = _json_array(raw)
+    if parsed is None:
+        return {}
+    confidences: dict[int, float] = {}
+    for fallback_idx, item in enumerate(parsed):
+        if isinstance(item, dict):
+            raw_idx = item.get("index", fallback_idx)
+            raw_confidence = item.get("confidence")
+        else:
+            raw_idx = fallback_idx
+            raw_confidence = item
+        if not isinstance(raw_idx, int) or not 0 <= raw_idx < n_triples:
+            continue
+        confidence = _validated_confidence(raw_confidence)
+        if confidence is None:
+            continue
+        confidences[raw_idx] = confidence
+    return confidences
+
+
+def _json_array(raw: object) -> Optional[list]:
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+    else:
+        parsed = raw
+    return parsed if isinstance(parsed, list) else None
+
+
+def _validated_triple(item: object) -> Optional[ExtractedTriple]:
+    if not isinstance(item, dict):
+        return None
+    required = {"subject", "predicate", "object", "confidence"}
+    if not required.issubset(item):
+        return None
+    subject = _validated_text(item.get("subject"))
+    predicate = _validated_text(item.get("predicate"))
+    obj = _validated_text(item.get("object"))
+    confidence = _validated_confidence(item.get("confidence"))
+    if subject is None or predicate is None or obj is None or confidence is None:
+        return None
+    return ExtractedTriple(
+        subject=subject,
+        predicate=predicate,
+        object=obj,
+        confidence=confidence,
+    )
+
+
+def _validated_text(value: object) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    value = value.strip()
+    return value or None
+
+
+def _validated_confidence(value: object) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    confidence = float(value)
+    if not math.isfinite(confidence) or not 0.0 <= confidence <= 1.0:
+        return None
+    return confidence
+
+
 def _majority(values: List[str]) -> Optional[str]:
     """Return the most-common value, breaking ties by first occurrence.
     Returns None for empty input."""
@@ -808,6 +1194,9 @@ async def run_dream(
             await phase_consolidate(pool, run_id)
         await set_phase(pool, run_id, "synthesise")
         await phase_synthesise(pool, run_id)
+        if _extract_enabled(config):
+            await set_phase(pool, run_id, "extract")
+            await phase_extract(pool, run_id)
         await set_phase(pool, run_id, "commit")
         await finish_run(pool, run_id)
     except Exception as exc:

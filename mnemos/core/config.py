@@ -320,6 +320,12 @@ class _MorpheusSettings(BaseSettings):
     cluster_threshold: float = Field(0.85, validation_alias="MNEMOS_MORPHEUS_CLUSTER_THRESHOLD")
     use_llm: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_USE_LLM")
     consolidate: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_CONSOLIDATE")
+    extract: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_EXTRACT")
+    extract_verify: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFY")
+    extract_min_chars: int = Field(200, validation_alias="MNEMOS_MORPHEUS_EXTRACT_MIN_CHARS")
+    extract_min_confidence: float = Field(0.6, validation_alias="MNEMOS_MORPHEUS_EXTRACT_MIN_CONFIDENCE")
+    extract_muse: str = Field("qwen3-7b", validation_alias="MNEMOS_MORPHEUS_EXTRACT_MUSE")
+    extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
 
 
 class _FederationNatsPeerSettings(BaseModel):

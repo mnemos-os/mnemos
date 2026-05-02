@@ -13,6 +13,7 @@
 
 Slice 1 shipped the surface. Slice 2 filled in
 REPLAY/CLUSTER/SYNTHESISE. Slice 3 adds optional CONSOLIDATE.
+Slice 4 adds optional EXTRACT.
 """
 from __future__ import annotations
 
@@ -47,6 +48,8 @@ class MorpheusRun(BaseModel):
     summaries_created: int
     memories_consolidated: int = 0
     clusters_consolidated: int = 0
+    triples_extracted: int = 0
+    memories_processed_for_extraction: int = 0
     error: Optional[str] = None
     config: dict = Field(default_factory=dict)
     namespace: Optional[str] = None
@@ -66,6 +69,14 @@ class MorpheusTriggerRequest(BaseModel):
             "Enable the optional CONSOLIDATE phase between CLUSTER and "
             "SYNTHESISE for this run."
         ),
+    )
+    extract: bool = Field(
+        False,
+        description="Enable the optional EXTRACT phase after SYNTHESISE for this run.",
+    )
+    extract_verify: bool = Field(
+        False,
+        description="Use the strong verifier muse to re-score extracted triples.",
     )
     config: dict = Field(default_factory=dict)
     namespace: Optional[str] = Field(
@@ -120,6 +131,14 @@ def _row_to_run(r) -> MorpheusRun:
         clusters_consolidated=(
             r["clusters_consolidated"] if "clusters_consolidated" in keys else 0
         ),
+        triples_extracted=(
+            r["triples_extracted"] if "triples_extracted" in keys else 0
+        ),
+        memories_processed_for_extraction=(
+            r["memories_processed_for_extraction"]
+            if "memories_processed_for_extraction" in keys
+            else 0
+        ),
         error=r["error"],
         config=dict(r["config"]) if isinstance(r["config"], dict) else {},
         namespace=r["namespace"] if "namespace" in keys else None,
@@ -149,7 +168,8 @@ async def list_runs(
         "       window_started_at, window_ended_at, window_hours, "
         "       cluster_min_size, memories_scanned, clusters_found, "
         "       summaries_created, memories_consolidated, "
-        "       clusters_consolidated, error, config, namespace "
+        "       clusters_consolidated, triples_extracted, "
+        "       memories_processed_for_extraction, error, config, namespace "
         f"FROM morpheus_runs{where} "
         f"ORDER BY started_at DESC LIMIT ${len(args)}"
     )
@@ -168,7 +188,8 @@ async def get_run(run_id: str, _: UserContext = Depends(require_root)):
             "       window_started_at, window_ended_at, window_hours, "
             "       cluster_min_size, memories_scanned, clusters_found, "
             "       summaries_created, memories_consolidated, "
-            "       clusters_consolidated, error, config, namespace "
+            "       clusters_consolidated, triples_extracted, "
+            "       memories_processed_for_extraction, error, config, namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
@@ -266,6 +287,14 @@ async def trigger_run(
         run_config["consolidate"] = True
     else:
         run_config.setdefault("consolidate", False)
+    if request.extract:
+        run_config["extract"] = True
+    else:
+        run_config.setdefault("extract", False)
+    if request.extract_verify:
+        run_config["extract_verify"] = True
+    else:
+        run_config.setdefault("extract_verify", False)
     run_id = await run_dream(
         _lc._pool,
         triggered_by="api",
@@ -280,7 +309,8 @@ async def trigger_run(
             "       window_started_at, window_ended_at, window_hours, "
             "       cluster_min_size, memories_scanned, clusters_found, "
             "       summaries_created, memories_consolidated, "
-            "       clusters_consolidated, error, config, namespace "
+            "       clusters_consolidated, triples_extracted, "
+            "       memories_processed_for_extraction, error, config, namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
