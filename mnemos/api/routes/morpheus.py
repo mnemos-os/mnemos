@@ -7,12 +7,12 @@
                                              so the caller sees the final
                                              state)
   DELETE /admin/morpheus/runs/{run_id}     — roll back a run by deleting
-                                             every memory tagged with that
-                                             morpheus_run_id (root only)
+                                             run-created rows and restoring
+                                             tagged in-place mutations
+                                             (root only)
 
-Slice 1 ships the surface; phase logic is stubbed in morpheus/runner.py
-so a triggered run produces zero memories but a real run row that can
-be inspected and rolled back. Slice 2 fills in REPLAY/CLUSTER/SYNTHESISE.
+Slice 1 shipped the surface. Slice 2 filled in
+REPLAY/CLUSTER/SYNTHESISE. Slice 3 adds optional CONSOLIDATE.
 """
 from __future__ import annotations
 
@@ -45,6 +45,8 @@ class MorpheusRun(BaseModel):
     memories_scanned: int
     clusters_found: int
     summaries_created: int
+    memories_consolidated: int = 0
+    clusters_consolidated: int = 0
     error: Optional[str] = None
     config: dict = Field(default_factory=dict)
     namespace: Optional[str] = None
@@ -58,6 +60,13 @@ class MorpheusRunList(BaseModel):
 class MorpheusTriggerRequest(BaseModel):
     window_hours: int = Field(168, ge=1, le=8760)        # 1h … 1 year
     cluster_min_size: int = Field(3, ge=2, le=100)
+    consolidate: bool = Field(
+        False,
+        description=(
+            "Enable the optional CONSOLIDATE phase between CLUSTER and "
+            "SYNTHESISE for this run."
+        ),
+    )
     config: dict = Field(default_factory=dict)
     namespace: Optional[str] = Field(
         None,
@@ -88,6 +97,7 @@ class MorpheusClusterList(BaseModel):
 
 
 def _row_to_run(r) -> MorpheusRun:
+    keys = r.keys()
     return MorpheusRun(
         id=str(r["id"]),
         started_at=r["started_at"].isoformat() if r["started_at"] else "",
@@ -104,9 +114,15 @@ def _row_to_run(r) -> MorpheusRun:
         memories_scanned=r["memories_scanned"],
         clusters_found=r["clusters_found"],
         summaries_created=r["summaries_created"],
+        memories_consolidated=(
+            r["memories_consolidated"] if "memories_consolidated" in keys else 0
+        ),
+        clusters_consolidated=(
+            r["clusters_consolidated"] if "clusters_consolidated" in keys else 0
+        ),
         error=r["error"],
         config=dict(r["config"]) if isinstance(r["config"], dict) else {},
-        namespace=r["namespace"] if "namespace" in r.keys() else None,
+        namespace=r["namespace"] if "namespace" in keys else None,
     )
 
 
@@ -132,7 +148,8 @@ async def list_runs(
         "SELECT id, started_at, finished_at, status, phase, triggered_by, "
         "       window_started_at, window_ended_at, window_hours, "
         "       cluster_min_size, memories_scanned, clusters_found, "
-        "       summaries_created, error, config, namespace "
+        "       summaries_created, memories_consolidated, "
+        "       clusters_consolidated, error, config, namespace "
         f"FROM morpheus_runs{where} "
         f"ORDER BY started_at DESC LIMIT ${len(args)}"
     )
@@ -150,7 +167,8 @@ async def get_run(run_id: str, _: UserContext = Depends(require_root)):
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
             "       cluster_min_size, memories_scanned, clusters_found, "
-            "       summaries_created, error, config, namespace "
+            "       summaries_created, memories_consolidated, "
+            "       clusters_consolidated, error, config, namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
@@ -243,12 +261,17 @@ async def trigger_run(
     runner is a no-op so this returns near-instantly.
     """
     _require_postgres_backend()
+    run_config = dict(request.config)
+    if request.consolidate:
+        run_config["consolidate"] = True
+    else:
+        run_config.setdefault("consolidate", False)
     run_id = await run_dream(
         _lc._pool,
         triggered_by="api",
         window_hours=request.window_hours,
         cluster_min_size=request.cluster_min_size,
-        config=request.config,
+        config=run_config,
         namespace=request.namespace,
     )
     async with _lc.get_pool_manager().acquire() as conn:
@@ -256,7 +279,8 @@ async def trigger_run(
             "SELECT id, started_at, finished_at, status, phase, triggered_by, "
             "       window_started_at, window_ended_at, window_hours, "
             "       cluster_min_size, memories_scanned, clusters_found, "
-            "       summaries_created, error, config, namespace "
+            "       summaries_created, memories_consolidated, "
+            "       clusters_consolidated, error, config, namespace "
             "FROM morpheus_runs WHERE id=$1::uuid",
             run_id,
         )
@@ -268,11 +292,13 @@ async def rollback(
     run_id: str,
     _: UserContext = Depends(require_root),
 ):
-    """Roll back a MORPHEUS run by deleting every memory tagged with it.
+    """Roll back a MORPHEUS run.
 
-    Idempotent: running rollback on an already-rolled-back run returns
-    `memories_deleted: 0` and leaves the run status at 'rolled_back'.
-    Returns 404 if the run_id doesn't exist.
+    Run-created synthesis rows are deleted. Consolidated originals are
+    restored in place from their metadata audit. Idempotent: running
+    rollback on an already-rolled-back run returns `memories_deleted: 0`
+    and leaves the run status at 'rolled_back'. Returns 404 if the
+    run_id doesn't exist.
     """
     _require_postgres_backend()
     async with _lc.get_pool_manager().acquire() as conn:

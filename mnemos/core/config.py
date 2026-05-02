@@ -319,6 +319,7 @@ class _MorpheusSettings(BaseSettings):
 
     cluster_threshold: float = Field(0.85, validation_alias="MNEMOS_MORPHEUS_CLUSTER_THRESHOLD")
     use_llm: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_USE_LLM")
+    consolidate: bool = Field(False, validation_alias="MNEMOS_MORPHEUS_CONSOLIDATE")
 
 
 class _FederationNatsPeerSettings(BaseModel):

@@ -3,12 +3,11 @@
 Creates a morpheus_runs row, walks through the configured phases, and
 commits status + counters as it goes. Each phase is a separate async
 function; the runner tags every memory mutation with morpheus_run_id so
-rollback is a single DELETE.
+rollback can delete run-created rows and restore in-place mutations.
 
-The pipeline is REPLAY → CLUSTER → SYNTHESISE → COMMIT. Mutation phases
-(CONSOLIDATE / EXTRACT / ARCHIVE) are intentionally not part of v1 —
-GRAEAE consensus 2026-04-25 deferred them to v3.6+ in favour of the
-append-only synthesis path here.
+The default pipeline is REPLAY → CLUSTER → SYNTHESISE → COMMIT. The
+optional CONSOLIDATE phase can be enabled between CLUSTER and SYNTHESISE
+once an operator is ready for soft mutation paths.
 """
 from __future__ import annotations
 
@@ -26,6 +25,9 @@ from mnemos.core.config import get_settings
 from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
+
+_PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
+_CONSOLIDATED_PERMISSION_MODE = 400
 
 # Optional Rust hot-path accelerator. Loaded lazily so the absence of
 # the wheel on a given build host does NOT break the import - the
@@ -105,6 +107,50 @@ def _parse_pgvector(raw: object) -> Optional[np.ndarray]:
     return None
 
 
+def _parse_run_config(config_raw: object) -> dict:
+    if config_raw is None:
+        return {}
+    if isinstance(config_raw, str):
+        try:
+            parsed = json.loads(config_raw)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return config_raw if isinstance(config_raw, dict) else {}
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _command_count(result: str) -> int:
+    try:
+        return int(str(result).rsplit(" ", 1)[-1])
+    except ValueError:
+        return 0
+
+
+def _metadata_has_key(raw: object, key: str) -> bool:
+    if isinstance(raw, dict):
+        return key in raw
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        return isinstance(parsed, dict) and key in parsed
+    return False
+
+
+def _consolidate_enabled(config: Optional[dict]) -> bool:
+    configured = config.get("consolidate", False) if isinstance(config, dict) else False
+    return _truthy(configured) or bool(get_settings().morpheus.consolidate)
+
+
 async def begin_run(
     pool: asyncpg.Pool,
     *,
@@ -165,6 +211,8 @@ async def update_counters(
     memories_scanned: Optional[int] = None,
     clusters_found: Optional[int] = None,
     summaries_created: Optional[int] = None,
+    memories_consolidated: Optional[int] = None,
+    clusters_consolidated: Optional[int] = None,
 ) -> None:
     """Bump counters as phases finish. Pass only the fields to update."""
     sets: list[str] = []
@@ -178,6 +226,12 @@ async def update_counters(
     if summaries_created is not None:
         args.append(summaries_created)
         sets.append(f"summaries_created=${len(args)}")
+    if memories_consolidated is not None:
+        args.append(memories_consolidated)
+        sets.append(f"memories_consolidated=${len(args)}")
+    if clusters_consolidated is not None:
+        args.append(clusters_consolidated)
+        sets.append(f"clusters_consolidated=${len(args)}")
     if not sets:
         return
     args.append(run_id)
@@ -210,14 +264,13 @@ async def fail_run(pool: asyncpg.Pool, run_id: str, error: str) -> None:
 
 
 async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
-    """Delete every memory tagged with this run + mark the run rolled_back.
+    """Undo every memory mutation tagged with this run and roll it back.
 
     Returns (memories_deleted, run_rows_updated).
 
-    v1 only inserts memories (append-only synthesis), so DELETE is the
-    full undo. v2 mutation paths will also need to restore
-    consolidated_into pointers and undo archive moves — those will
-    extend this function. For now: simple, safe, deterministic.
+    Synthesis rows are run-created and still deleted. Consolidated
+    originals are restored in place from their metadata audit before
+    that delete runs, so rollback never hard-deletes user memories.
     """
     try:
         UUID(run_id)
@@ -225,30 +278,41 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
         raise ValueError(f"invalid run_id: {run_id!r}")
     async with pool.acquire() as conn:
         async with conn.transaction():
+            restore_result = await conn.execute(
+                """
+                UPDATE memories
+                SET consolidated_into = NULL,
+                    permission_mode = COALESCE(
+                        (metadata->>$2)::int,
+                        permission_mode
+                    ),
+                    metadata = COALESCE(metadata, '{}'::jsonb) - $2,
+                    morpheus_run_id = NULL
+                WHERE morpheus_run_id=$1::uuid
+                  AND deleted_at IS NULL
+                  AND COALESCE(metadata, '{}'::jsonb) ? $2
+                """,
+                run_id, _PRE_CONSOLIDATE_PERMISSION_KEY,
+            )
+            n_restored = _command_count(restore_result)
             # Per-row tagging means rollback never crosses runs.
             del_result = await conn.execute(
                 "DELETE FROM memories WHERE morpheus_run_id=$1::uuid "
+                "AND provenance='morpheus_local' "
                 "AND deleted_at IS NULL",
                 run_id,
             )
-            # asyncpg returns "DELETE <n>"; parse the count.
-            try:
-                n_deleted = int(del_result.rsplit(" ", 1)[-1])
-            except ValueError:
-                n_deleted = 0
+            n_deleted = _command_count(del_result)
             run_result = await conn.execute(
                 "UPDATE morpheus_runs "
                 "SET status='rolled_back', finished_at=COALESCE(finished_at, now()) "
                 "WHERE id=$1::uuid",
                 run_id,
             )
-            try:
-                n_run = int(run_result.rsplit(" ", 1)[-1])
-            except ValueError:
-                n_run = 0
+            n_run = _command_count(run_result)
     logger.warning(
-        "[MORPHEUS] run %s rolled back: %d memories deleted",
-        run_id, n_deleted,
+        "[MORPHEUS] run %s rolled back: %d memories deleted, %d consolidated rows restored",
+        run_id, n_deleted, n_restored,
     )
     return n_deleted, n_run
 
@@ -256,9 +320,9 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
 # ── Phases ────────────────────────────────────────────────────────────────────
 #
 # Each phase function below carries out one stage of the REPLAY →
-# CLUSTER → SYNTHESISE → COMMIT pipeline. Every memory the run
-# creates is tagged with its ``morpheus_run_id`` so rollback is a
-# single DELETE and the audit trail in ``morpheus_runs`` stays
+# CLUSTER → optional CONSOLIDATE → SYNTHESISE → COMMIT pipeline. Every
+# memory the run creates or mutates is tagged with its ``morpheus_run_id``
+# so rollback can remain scoped to the run and ``morpheus_runs`` stays
 # authoritative for what the run did.
 
 async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
@@ -386,6 +450,152 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
     return n_clusters
 
 
+async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
+    """Soft-merge duplicate cluster members into a canonical memory.
+
+    Reads the cluster payload written by phase_cluster. For each
+    cluster at or above cluster_min_size, the canonical is the live,
+    unconsolidated member with highest recall_count, tie-broken by the
+    earliest created timestamp. Non-canonical live members are updated
+    in place to point at the canonical, made owner-read-only, and tagged
+    with the run id for rollback.
+
+    Returns the number of memories newly or previously consolidated by
+    this run. Running the phase again for the same run does not mutate
+    rows a second time and leaves counters stable.
+    """
+    async with pool.acquire() as conn:
+        run_row = await conn.fetchrow(
+            "SELECT config, cluster_min_size, namespace "
+            "FROM morpheus_runs WHERE id=$1::uuid",
+            run_id,
+        )
+    if run_row is None:
+        await update_counters(
+            pool,
+            run_id,
+            memories_consolidated=0,
+            clusters_consolidated=0,
+        )
+        return 0
+
+    config = _parse_run_config(run_row["config"])
+    clusters = config.get("clusters", []) if isinstance(config, dict) else []
+    if not clusters:
+        await update_counters(
+            pool,
+            run_id,
+            memories_consolidated=0,
+            clusters_consolidated=0,
+        )
+        return 0
+
+    min_size = int(run_row["cluster_min_size"])
+    namespace = run_row["namespace"]
+    memories_consolidated = 0
+    clusters_consolidated = 0
+
+    for cluster in clusters:
+        member_ids = [str(mid) for mid in cluster.get("member_memory_ids", []) if mid]
+        if len(member_ids) < min_size:
+            continue
+
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT id, recall_count, created, permission_mode,
+                       consolidated_into, morpheus_run_id, metadata
+                FROM memories
+                WHERE id = ANY($1::text[])
+                  AND deleted_at IS NULL
+                  AND ($2::text IS NULL OR namespace = $2)
+                """,
+                member_ids, namespace,
+            )
+        if len(rows) < min_size:
+            continue
+
+        candidates = [row for row in rows if row["consolidated_into"] is None]
+        if not candidates:
+            continue
+
+        canonical = sorted(
+            candidates,
+            key=lambda row: (
+                -int(row["recall_count"] or 0),
+                row["created"],
+                str(row["id"]),
+            ),
+        )[0]
+        canonical_id = str(canonical["id"])
+        cluster_count = 0
+
+        for row in rows:
+            member_id = str(row["id"])
+            if member_id == canonical_id:
+                continue
+            consolidated_into = row["consolidated_into"]
+            if consolidated_into is not None:
+                if (
+                    str(consolidated_into) == canonical_id
+                    and str(row["morpheus_run_id"]) == run_id
+                    and _metadata_has_key(row["metadata"], _PRE_CONSOLIDATE_PERMISSION_KEY)
+                ):
+                    cluster_count += 1
+                continue
+
+            async with pool.acquire() as conn:
+                result = await conn.execute(
+                    """
+                    UPDATE memories
+                    SET consolidated_into=$2,
+                        permission_mode=$5,
+                        morpheus_run_id=$3::uuid,
+                        metadata = CASE
+                            WHEN COALESCE(metadata, '{}'::jsonb)
+                                 ? 'pre_consolidate_permission_mode'
+                            THEN COALESCE(metadata, '{}'::jsonb)
+                            ELSE jsonb_set(
+                                COALESCE(metadata, '{}'::jsonb),
+                                '{pre_consolidate_permission_mode}',
+                                to_jsonb(permission_mode),
+                                true
+                            )
+                        END
+                    WHERE id=$1
+                      AND deleted_at IS NULL
+                      AND consolidated_into IS NULL
+                      AND morpheus_run_id IS NULL
+                      AND ($4::text IS NULL OR namespace=$4)
+                    """,
+                    member_id,
+                    canonical_id,
+                    run_id,
+                    namespace,
+                    _CONSOLIDATED_PERMISSION_MODE,
+                )
+            cluster_count += _command_count(result)
+
+        if cluster_count:
+            memories_consolidated += cluster_count
+            clusters_consolidated += 1
+
+    await update_counters(
+        pool,
+        run_id,
+        memories_consolidated=memories_consolidated,
+        clusters_consolidated=clusters_consolidated,
+    )
+    logger.info(
+        "[MORPHEUS] run %s consolidated %d memor%s across %d cluster(s)",
+        run_id,
+        memories_consolidated,
+        "y" if memories_consolidated == 1 else "ies",
+        clusters_consolidated,
+    )
+    return memories_consolidated
+
+
 async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
     """Generate summary memories per cluster. Returns count created.
 
@@ -404,7 +614,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
            - subcategory            = 'morpheus-synthesis'
 
     All inserts are append-only and tagged with morpheus_run_id, so
-    rollback_run() can DELETE WHERE morpheus_run_id=$1 to undo.
+    rollback_run() can delete them without touching user originals.
     """
     use_llm = get_settings().morpheus.use_llm
 
@@ -415,13 +625,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
     if config_raw is None:
         await update_counters(pool, run_id, summaries_created=0)
         return 0
-    if isinstance(config_raw, str):
-        try:
-            config = json.loads(config_raw)
-        except json.JSONDecodeError:
-            config = {}
-    else:
-        config = config_raw or {}
+    config = _parse_run_config(config_raw)
     clusters = config.get("clusters", []) if isinstance(config, dict) else []
     if not clusters:
         await update_counters(pool, run_id, summaries_created=0)
@@ -440,11 +644,13 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
                 FROM memories
                 WHERE id = ANY($1::text[])
                   AND deleted_at IS NULL
+                  AND consolidated_into IS NULL
                 """,
                 member_ids,
             )
         if not members:
             continue
+        visible_member_ids = [str(m["id"]) for m in members]
 
         summary = await _synthesise_cluster_summary(
             [m["content"] for m in members], use_llm=use_llm,
@@ -473,11 +679,11 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
                 json.dumps({
                     "morpheus_run_id": run_id,
                     "cluster_id": cluster.get("cluster_id"),
-                    "member_count": len(member_ids),
+                    "member_count": len(visible_member_ids),
                     "synthesis_mode": "llm" if use_llm else "extractive",
                 }),
                 owner_id, namespace,
-                run_id, list(member_ids),
+                run_id, visible_member_ids,
             )
         n_created += 1
 
@@ -597,6 +803,9 @@ async def run_dream(
         await phase_replay(pool, run_id)
         await set_phase(pool, run_id, "cluster")
         await phase_cluster(pool, run_id)
+        if _consolidate_enabled(config):
+            await set_phase(pool, run_id, "consolidate")
+            await phase_consolidate(pool, run_id)
         await set_phase(pool, run_id, "synthesise")
         await phase_synthesise(pool, run_id)
         await set_phase(pool, run_id, "commit")

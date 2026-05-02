@@ -14,8 +14,9 @@ NAMING CONVENTION (locked in v3.4):
     not as transitional naming. No rename is planned.
   - When you see "APOLLO S-IVB phase N" in a charter or roadmap, it
     maps to "MORPHEUS slice N" in code. Phases 1-2 ship in v3.4
-    (REPLAY → CLUSTER → SYNTHESISE → COMMIT pipeline). Phases 3-4
-    (CONSOLIDATE, EXTRACT) are queued for v3.5/v3.6 per the charters.
+    (REPLAY → CLUSTER → SYNTHESISE → COMMIT pipeline). Slice 3 adds
+    the optional CONSOLIDATE mutation phase; EXTRACT / ARCHIVE remain
+    queued per the charters.
 
 The off-peak worker that processes accumulated memory into shaped form.
 Named after the Greek god of dreams (μορφεύς, "the one who shapes")
@@ -40,13 +41,14 @@ Architecture per GRAEAE consensus (consultation 2026-04-25):
     * COMMIT: insert with provenance='morpheus_local',
       morpheus_run_id=<run>, source_memories=[<original ids>].
 
-  v2 (mutation paths — risky, ship after v1 is proven)
-    * EXTRACT: KG triples mined from verbatim_content.
+  v2 (mutation paths — operator-gated)
     * CONSOLIDATE: merge near-duplicate clusters into a canonical
       with permission_mode=400 read-only pointers on originals.
+    * EXTRACT: KG triples mined from verbatim_content.
     * ARCHIVE: cold-set rotation (PERSEPHONE subsystem).
 
 Rollback contract: every change tags morpheus_run_id; undo is
-DELETE FROM memories WHERE morpheus_run_id = X. v2 mutation paths
-will additionally restore consolidated_into pointers on rollback.
+DELETE FROM memories WHERE morpheus_run_id = X for run-created rows.
+Mutation paths additionally restore in-place audit state, including
+consolidated_into pointers and pre-consolidation permission modes.
 """
