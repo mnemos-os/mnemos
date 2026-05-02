@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mnemos-os"
 version = "5.0.0"
-description = "MNEMOS-OS v4: multi-backend memory operating system with GRAEAE reasoning, profiles, single-binary edge deploys, and multi-worker support"
+description = "MNEMOS-OS v5: agent memory OS with full divergent dream-state pipeline (REPLAY → CLUSTER → CONSOLIDATE → SYNTHESISE → EXTRACT), GDPR right-to-be-forgotten, PERSEPHONE archival, PANTHEON unified LLM facade, KRONOS recall observability, multi-backend persistence, and multi-worker support"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
