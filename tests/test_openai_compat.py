@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -291,6 +293,69 @@ def test_memory_injection_default_searches_context(monkeypatch):
     asyncio.run(openai_compat.chat_completions(req, authorization=None, user=_user()))
 
     search_context.assert_awaited_once()
+
+
+def test_default_task_classifier_warns_once_and_preserves_keyword_mapping(monkeypatch, caplog):
+    from mnemos.domain.openai_compat import router as domain_router
+
+    monkeypatch.setattr(domain_router, "_DEFAULT_CLASSIFIER_WARNED", False)
+    monkeypatch.setattr(domain_router, "_FACTORY_CLASSIFIER", None)
+    monkeypatch.setattr(domain_router, "_FACTORY_CLASSIFIER_PATH", None)
+    monkeypatch.setattr(domain_router, "get_registered_task_classifier", lambda: None)
+    monkeypatch.setattr(
+        domain_router,
+        "get_settings",
+        lambda: SimpleNamespace(runtime=SimpleNamespace(task_classifier_factory="")),
+    )
+    caplog.set_level("WARNING")
+
+    messages = [openai_compat.ChatMessage(role="user", content="write a Python class")]
+
+    assert domain_router.classify_task(messages) == "code_generation"
+    assert domain_router.classify_task(messages) == "code_generation"
+    assert caplog.text.count("Default English-keyword classifier is opinionated") == 1
+
+
+def test_registered_task_classifier_overrides_default(monkeypatch):
+    from mnemos.core import config as core_config
+    from mnemos.domain.openai_compat import router as domain_router
+
+    class CustomClassifier:
+        def classify(self, messages):
+            return "security_review"
+
+    monkeypatch.setattr(core_config, "_registered_task_classifier", CustomClassifier())
+
+    messages = [openai_compat.ChatMessage(role="user", content="anything")]
+
+    assert domain_router.classify_task(messages) == "security_review"
+
+
+def test_task_classifier_factory_path_overrides_default(monkeypatch):
+    from mnemos.domain.openai_compat import router as domain_router
+
+    class CustomClassifier:
+        def classify(self, messages):
+            return "architecture_design"
+
+    fake_module = SimpleNamespace(make_classifier=lambda: CustomClassifier())
+    monkeypatch.setitem(sys.modules, "fake_classifier_module", fake_module)
+    monkeypatch.setattr(domain_router, "_FACTORY_CLASSIFIER", None)
+    monkeypatch.setattr(domain_router, "_FACTORY_CLASSIFIER_PATH", None)
+    monkeypatch.setattr(domain_router, "get_registered_task_classifier", lambda: None)
+    monkeypatch.setattr(
+        domain_router,
+        "get_settings",
+        lambda: SimpleNamespace(
+            runtime=SimpleNamespace(
+                task_classifier_factory="fake_classifier_module:make_classifier"
+            )
+        ),
+    )
+
+    messages = [openai_compat.ChatMessage(role="user", content="hola")]
+
+    assert domain_router.classify_task(messages) == "architecture_design"
 
 
 @pytest.mark.parametrize(

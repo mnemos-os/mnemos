@@ -97,6 +97,7 @@ def register_lifespan_worker(name: str, factory, *, honor_worker_enabled: bool =
 
 
 _post_db_startup_hooks: dict = {}
+_lifespan_cleanup_hooks: dict = {}
 
 
 def register_post_db_startup_hook(name: str, hook) -> None:
@@ -122,6 +123,18 @@ def register_post_db_startup_hook(name: str, hook) -> None:
     inside the lifespan generator.
     """
     _post_db_startup_hooks[name] = hook
+
+
+def register_lifespan_cleanup_hook(name: str, hook) -> None:
+    """Register an awaitable shutdown hook by name.
+
+    The hook signature is ``async def hook() -> None``. It runs during
+    lifespan teardown after tracked tasks have drained and before the
+    lifecycle-owned database and Redis clients are closed. Re-registering
+    the same name replaces the previous hook to keep module reloads
+    idempotent.
+    """
+    _lifespan_cleanup_hooks[name] = hook
 
 
 def schedule_worker(coro):
@@ -661,6 +674,11 @@ async def lifespan(app):
         label="background",
         timeout=_WORKER_SHUTDOWN_CANCEL_SECONDS,
     )
+    for hook_name, hook in _lifespan_cleanup_hooks.items():
+        try:
+            await hook()
+        except Exception:
+            logger.exception("[shutdown] %s cleanup hook failed", hook_name)
 
     if _persistence_backend is not None:
         await _persistence_backend.close()
@@ -733,15 +751,6 @@ def get_redis_client() -> Optional[aioredis.Redis]:
     return _redis_client
 
 
-_MEMORY_COLS = (
-    "id, content, category, subcategory, created, updated, "
-    "metadata, quality_rating, compressed_content, verbatim_content, "
-    "owner_id, group_id, namespace, permission_mode, "
-    "source_model, source_provider, source_session, source_agent, "
-    "archived_at"
-)
-
-
 async def _get_embedding(text: str) -> list:
     """Get embedding vector from nomic-embed-text. Returns [] on failure.
 
@@ -804,7 +813,7 @@ async def _vector_search(conn, embedding: list, limit: int,
     no group memberships.
     """
     if select_cols is None:
-        select_cols = _MEMORY_COLS
+        select_cols = "*"
     # float() cast guards against non-numeric values in the embedding response
     vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
     # $1 is the vector — referenced in SELECT and ORDER BY, never interpolated
@@ -859,7 +868,7 @@ async def _fts_fetch(conn, query: str, limit: int,
     be an empty list; omitted group_ids are treated as no group memberships.
     """
     if select_cols is None:
-        select_cols = _MEMORY_COLS
+        select_cols = "*"
     clean_query = query.strip()
     rank_col = "ts_rank(to_tsvector('english', content), plainto_tsquery('english', $1)) as rank"
 

@@ -26,7 +26,6 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
 
 from mnemos.core.auth_context import UserContext
 from mnemos.core.config import hot_rs_enabled
-from mnemos.core.lifecycle import _MEMORY_COLS
 from mnemos.persistence.base import (
     BranchRepository,
     CompressionRepository,
@@ -43,7 +42,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
-from mnemos.persistence.types import Row
+from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
 

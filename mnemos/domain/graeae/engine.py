@@ -59,8 +59,8 @@ def _env_var_hint(key_name: str) -> str:
     the Provider Registry File for a given key_name. Used in error
     messages so the hint is actionable."""
     return _PROVIDER_ENV_VARS.get(key_name, f"<{key_name.upper()}_API_KEY>")
-from mnemos.domain.graeae._cache import ResponseCache
-from mnemos.domain.graeae._quality import QualityTracker
+from mnemos.domain.graeae._cache import make_response_cache
+from mnemos.domain.graeae._quality import make_quality_tracker
 from mnemos.domain.graeae.elo_sync import get_elo_weights
 from mnemos.domain.graeae.provider_worker import (
     LocalProviderWorker,
@@ -465,8 +465,9 @@ class GraeaeEngine:
             cooldown_seconds=300,
         )
         self._rate_limiters = make_rate_limiter_pool(self._settings)
-        self._quality = QualityTracker({p: cfg["weight"] for p, cfg in self.providers.items()})
-        self._cache = ResponseCache(ttl_seconds=3600, max_entries=500)
+        provider_weights = {p: cfg["weight"] for p, cfg in self.providers.items()}
+        self._quality = make_quality_tracker(self._settings, provider_weights)
+        self._cache = make_response_cache(self._settings, ttl_seconds=3600, max_entries=500)
         self._concurrency: Optional[Any] = None
         self.provider_worker: ProviderWorker = LocalProviderWorker(self)
 
@@ -631,11 +632,10 @@ class GraeaeEngine:
         # Include the selection (or lack thereof) in the cache key so a
         # Custom Query for "frontier only" doesn't get served the cached
         # all-providers response for the same prompt.
-        cache_tag = _selection_cache_tag(selection) if selection else ""
-        cache_key_task = f"{task_type}{cache_tag}"
-        cached = self._cache.get(prompt, cache_key_task)
+        cache_model = _selection_cache_tag(selection) if selection else "default"
+        cached = await call_maybe_async(self._cache.get, prompt, task_type, cache_model)
         if cached is not None:
-            logger.info(f"[GRAEAE] cache hit (task_type={cache_key_task})")
+            logger.info(f"[GRAEAE] cache hit (task_type={task_type}, model={cache_model})")
             return {"all_responses": cached, "cache_hit": True, **_compute_consensus(cached)}
 
         concurrency = self._get_concurrency()
@@ -715,7 +715,7 @@ class GraeaeEngine:
         for name, result in zip(active, results):
             if isinstance(result, Exception):
                 await call_maybe_async(self._circuit_breakers.record_failure, name)
-                self._quality.record_failure(name)
+                await call_maybe_async(self._quality.record_failure, name)
                 err_msg = f"{type(result).__name__}: {str(result)[:400]}"
                 logger.warning(f"[GRAEAE] muse {name} failed: {err_msg}")
                 all_responses[name] = {
@@ -728,8 +728,8 @@ class GraeaeEngine:
                 }
             else:
                 await call_maybe_async(self._circuit_breakers.record_success, name)
-                self._quality.record_success(name, result.get("latency_ms", 0))
-                result["final_score"] = self._quality.dynamic_weight(name)
+                await call_maybe_async(self._quality.record_success, name, result.get("latency_ms", 0))
+                result["final_score"] = await call_maybe_async(self._quality.dynamic_weight, name)
                 all_responses[name] = result
 
         for name in skipped:
@@ -737,7 +737,7 @@ class GraeaeEngine:
 
         # ── Cache successful result ──────────────────────────────────────────
         if any(r["status"] == "success" for r in all_responses.values()):
-            self._cache.set(prompt, cache_key_task, all_responses)
+            await call_maybe_async(self._cache.set, prompt, task_type, all_responses, cache_model)
 
         # ── Compute consensus fields (v3.2) ──────────────────────────────────
         # ConsultationResponse has exposed consensus_response,
@@ -1049,7 +1049,7 @@ class GraeaeEngine:
                 # gateway-path failures actually trip it, and quality
                 # tracker so the weight reflects reality.
                 await call_maybe_async(self._circuit_breakers.record_failure, provider)
-                self._quality.record_failure(provider)
+                await call_maybe_async(self._quality.record_failure, provider)
                 logger.error(f"[GRAEAE] route({provider}) failed: {e}")
                 return _unavailable(
                     provider_config["model"],
@@ -1059,7 +1059,7 @@ class GraeaeEngine:
             # the gateway's successes count toward reopening a
             # half-open circuit, not just consultations' successes.
             await call_maybe_async(self._circuit_breakers.record_success, provider)
-            self._quality.record_success(provider, result.get("latency_ms", 0))
+            await call_maybe_async(self._quality.record_success, provider, result.get("latency_ms", 0))
             logger.debug(
                 f"[GRAEAE] route({provider}, {model or 'default'}) → {result['status']}"
             )
@@ -1164,11 +1164,11 @@ class GraeaeEngine:
                         yield {"index": 0, "finish_reason": finish_reason}
             except Exception:
                 await call_maybe_async(self._circuit_breakers.record_failure, provider)
-                self._quality.record_failure(provider)
+                await call_maybe_async(self._quality.record_failure, provider)
                 raise
             else:
                 await call_maybe_async(self._circuit_breakers.record_success, provider)
-                self._quality.record_success(provider, 0)
+                await call_maybe_async(self._quality.record_success, provider, 0)
         finally:
             await call_maybe_async(concurrency.release, provider)
 

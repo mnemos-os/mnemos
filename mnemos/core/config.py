@@ -508,6 +508,7 @@ class _RuntimeSettings(BaseSettings):
     worker_shutdown_cancel_seconds: float = Field(10.0, validation_alias="WORKER_SHUTDOWN_CANCEL_SECONDS")
     pool_acquire_timeout: float = Field(10.0, validation_alias="MNEMOS_POOL_ACQUIRE_TIMEOUT")
     loose_timeouts: bool = Field(False, validation_alias="MNEMOS_LOOSE_TIMEOUTS")
+    task_classifier_factory: str = Field("", validation_alias="MNEMOS_TASK_CLASSIFIER_FACTORY")
 
 
 class _ToolSettings(BaseSettings):
@@ -610,6 +611,7 @@ class Settings(BaseSettings):
 
 
 _settings: Settings | None = None
+_registered_task_classifier: Any | None = None
 PG_CONFIG: dict[str, Any] = {}
 GRAEAE_CONFIG: dict[str, Any] = {}
 
@@ -620,6 +622,16 @@ def get_settings() -> Settings:
         _settings = _build_settings()
         _sync_compat_exports(_settings)
     return _settings
+
+
+def register_task_classifier(classifier: Any | None) -> None:
+    """Register a process-local OpenAI-compatible task classifier override."""
+    global _registered_task_classifier
+    _registered_task_classifier = classifier
+
+
+def get_registered_task_classifier() -> Any | None:
+    return _registered_task_classifier
 
 
 def normalize_profile(raw_profile: str | None) -> str:

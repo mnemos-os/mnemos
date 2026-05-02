@@ -1,9 +1,11 @@
+import importlib
 import logging
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Protocol
 
+from mnemos.core.config import get_registered_task_classifier, get_settings
 from mnemos.db import openai_compat_repo
 
 from .content import _content_text, _message_to_dict
@@ -30,6 +32,43 @@ from .streaming import (
 )
 
 logger = logging.getLogger(__name__)
+
+_CODE_KEYWORDS = ("code", "function", "class", "def", "import", "syntax")
+_ARCHITECTURE_KEYWORDS = ("arch", "design", "pattern", "structure", "system")
+_DEFAULT_CLASSIFIER_WARNING = (
+    "Default English-keyword classifier is opinionated and language-specific. "
+    "To customize, set MNEMOS_TASK_CLASSIFIER_FACTORY."
+)
+_DEFAULT_CLASSIFIER_WARNED = False
+_FACTORY_CLASSIFIER: Any | None = None
+_FACTORY_CLASSIFIER_PATH: str | None = None
+
+
+class TaskClassifier(Protocol):
+    def classify(self, messages: List[ChatMessage]) -> str:
+        ...
+
+
+class KeywordTaskClassifier:
+    """English-only exhaustive keyword classifier.
+
+    This default classifier only checks the exact keyword lists in
+    ``_CODE_KEYWORDS`` and ``_ARCHITECTURE_KEYWORDS`` against the last
+    user message. It is intentionally not a language-agnostic heuristic:
+    if no listed English substring matches, it returns ``reasoning``.
+    """
+
+    def classify(self, messages: List[ChatMessage]) -> str:
+        last_msg = _last_user_message_text(messages)
+        lower = last_msg.lower()
+        if any(keyword in lower for keyword in _CODE_KEYWORDS):
+            return "code_generation"
+        if any(keyword in lower for keyword in _ARCHITECTURE_KEYWORDS):
+            return "architecture_design"
+        return "reasoning"
+
+
+_DEFAULT_CLASSIFIER = KeywordTaskClassifier()
 
 
 @dataclass
@@ -106,6 +145,62 @@ def _validate_request_messages(messages: List[ChatMessage]) -> None:
                 status_code=400,
                 detail="message.function_call is deprecated; use tool_calls and tool messages instead",
             )
+
+
+def _last_user_message_text(messages: List[ChatMessage]) -> str:
+    for msg in reversed(messages):
+        if msg.role == "user":
+            return _content_text(msg.content)
+    return ""
+
+
+def _import_from_path(path: str) -> Any:
+    module_path, sep, attr = path.partition(":")
+    if not sep:
+        module_path, _, attr = path.rpartition(".")
+    if not module_path or not attr:
+        raise ValueError(
+            "MNEMOS_TASK_CLASSIFIER_FACTORY must be an import path like "
+            "'package.module:factory'"
+        )
+    module = importlib.import_module(module_path)
+    return getattr(module, attr)
+
+
+def _coerce_task_classifier(candidate: Any) -> TaskClassifier:
+    if isinstance(candidate, type):
+        candidate = candidate()
+    elif not hasattr(candidate, "classify") and callable(candidate):
+        candidate = candidate()
+    if not hasattr(candidate, "classify"):
+        raise TypeError("task classifier must expose classify(messages) -> str")
+    return candidate
+
+
+def _configured_task_classifier() -> TaskClassifier:
+    global _DEFAULT_CLASSIFIER_WARNED, _FACTORY_CLASSIFIER, _FACTORY_CLASSIFIER_PATH
+
+    registered = get_registered_task_classifier()
+    if registered is not None:
+        return _coerce_task_classifier(registered)
+
+    factory_path = get_settings().runtime.task_classifier_factory.strip()
+    if factory_path:
+        if _FACTORY_CLASSIFIER is None or _FACTORY_CLASSIFIER_PATH != factory_path:
+            _FACTORY_CLASSIFIER = _coerce_task_classifier(_import_from_path(factory_path))
+            _FACTORY_CLASSIFIER_PATH = factory_path
+        return _FACTORY_CLASSIFIER
+
+    if not _DEFAULT_CLASSIFIER_WARNED:
+        logger.warning(_DEFAULT_CLASSIFIER_WARNING)
+        _DEFAULT_CLASSIFIER_WARNED = True
+    return _DEFAULT_CLASSIFIER
+
+
+def classify_task(messages: List[ChatMessage]) -> str:
+    """Classify an OpenAI chat request into a MNEMOS task type."""
+    task_type = _configured_task_classifier().classify(messages)
+    return str(task_type or "reasoning")
 
 
 def _is_openai_error_detail(detail: Any) -> bool:
@@ -191,20 +286,12 @@ async def chat_completion(
         raise OpenAICompatError(status_code=400, detail="messages required")
     _validate_request_messages(request.messages)
 
-    last_msg = ""
-    for msg in reversed(request.messages):
-        if msg.role == "user":
-            last_msg = _content_text(msg.content)
-            break
+    last_msg = _last_user_message_text(request.messages)
 
     if not last_msg:
         raise OpenAICompatError(status_code=400, detail="No user message found")
 
-    task_type = "reasoning"
-    if any(kw in last_msg.lower() for kw in ["code", "function", "class", "def", "import", "syntax"]):
-        task_type = "code_generation"
-    elif any(kw in last_msg.lower() for kw in ["arch", "design", "pattern", "structure", "system"]):
-        task_type = "architecture_design"
+    task_type = classify_task(request.messages)
 
     mnemos_docs = []
     if inject_memory:

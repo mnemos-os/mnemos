@@ -1,5 +1,13 @@
 from .providers import MODEL_ALIASES, TASK_CAPABILITY_MAP, OpenAICompatError
-from .router import StreamingChatCompletion, chat_completion, get_model, list_models
+from .router import (
+    KeywordTaskClassifier,
+    StreamingChatCompletion,
+    TaskClassifier,
+    chat_completion,
+    classify_task,
+    get_model,
+    list_models,
+)
 from .schemas import (
     ChatCompletionChoice,
     ChatCompletionDelta,
@@ -22,8 +30,11 @@ __all__ = [
     "MODEL_ALIASES",
     "TASK_CAPABILITY_MAP",
     "OpenAICompatError",
+    "KeywordTaskClassifier",
     "StreamingChatCompletion",
+    "TaskClassifier",
     "chat_completion",
+    "classify_task",
     "get_model",
     "list_models",
     "ChatCompletionChoice",

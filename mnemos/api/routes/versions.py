@@ -13,6 +13,7 @@ from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
 from mnemos.domain.models import MemoryItem, row_to_memory as _row_to_memory
+from mnemos.persistence.types import MEMORY_COLS
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["versions"])
@@ -380,13 +381,13 @@ async def revert_memory(
             # ordering above.
             if is_root(user):
                 live = await conn.fetchrow(
-                    f"SELECT {_lc._MEMORY_COLS} FROM memories "
+                    f"SELECT {MEMORY_COLS} FROM memories "
                     "WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
                     memory_id,
                 )
             else:
                 live = await conn.fetchrow(
-                    f"SELECT {_lc._MEMORY_COLS} FROM memories "
+                    f"SELECT {MEMORY_COLS} FROM memories "
                     "WHERE id=$1 AND owner_id=$2 AND namespace=$3 "
                     "AND deleted_at IS NULL FOR UPDATE",
                     memory_id, user.user_id, user.namespace,
@@ -480,7 +481,7 @@ async def revert_memory(
                         "UPDATE memories SET "
                         "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
                         "verbatim_content=$5, updated=NOW() "
-                        f"WHERE id=$6 AND deleted_at IS NULL RETURNING {_lc._MEMORY_COLS}",
+                        f"WHERE id=$6 AND deleted_at IS NULL RETURNING {MEMORY_COLS}",
                         ver_row["content"],
                         ver_row["category"],
                         ver_row["subcategory"],

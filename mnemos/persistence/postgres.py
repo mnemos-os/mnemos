@@ -19,7 +19,6 @@ from typing import Any
 import asyncpg
 
 from mnemos.core.auth_context import UserContext
-from mnemos.core.lifecycle import _MEMORY_COLS
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
 )
@@ -39,7 +38,7 @@ from mnemos.persistence.base import (
     VersionRepository,
     WebhookRepository,
 )
-from mnemos.persistence.types import Row
+from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
 

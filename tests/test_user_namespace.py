@@ -124,8 +124,8 @@ def test_api_key_path_loads_namespace_from_joined_users_row(monkeypatch):
             "revoked": False,
             "role": "user",
             "namespace": "bob-ns",
+            "group_ids": ["g-2"],
         },
-        group_rows=[{"group_id": "g-2"}],
     )
 
     # Make get_current_user go through the API-key path
@@ -156,3 +156,5 @@ def test_api_key_path_loads_namespace_from_joined_users_row(monkeypatch):
     # against someone "simplifying" the query back to role-only
     key_sql = conn.fetchrow_calls[0][0]
     assert "u.namespace" in key_sql or "namespace" in key_sql
+    assert "array_agg(group_id)" in key_sql
+    assert conn.fetch_calls == []

@@ -59,6 +59,9 @@ _EXPORTS = {
     "_stream_events_for_provider_delta": (streaming, "_stream_events_for_provider_delta"),
     "_search_mnemos_context": (domain_router, "search_memory_context"),
     "_get_model_recommendation": (domain_router, "get_model_recommendation"),
+    "TaskClassifier": (domain_router, "TaskClassifier"),
+    "KeywordTaskClassifier": (domain_router, "KeywordTaskClassifier"),
+    "classify_task": (domain_router, "classify_task"),
 }
 
 __all__ = [

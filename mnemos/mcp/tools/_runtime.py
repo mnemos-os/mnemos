@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import re
 import urllib.parse
@@ -18,6 +19,8 @@ MCP_BULK_CREATE_MAX_ITEMS = 100
 MCP_DEFAULT_LIMIT_MAX = 500
 MCP_TIMELINE_LIMIT_MAX = 1000
 MCP_OFFSET_MAX = 100_000
+_MCP_REST_CLIENT: httpx.AsyncClient | None = None
+_MCP_REST_CLIENT_LOCK = asyncio.Lock()
 _MCP_BACKEND_API_KEY: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "mnemos_mcp_backend_api_key",
     default=None,
@@ -118,6 +121,29 @@ def _backend_headers() -> dict[str, str]:
     return headers
 
 
+async def _get_rest_client() -> httpx.AsyncClient:
+    global _MCP_REST_CLIENT
+    if _MCP_REST_CLIENT is None or getattr(_MCP_REST_CLIENT, "is_closed", False):
+        async with _MCP_REST_CLIENT_LOCK:
+            if _MCP_REST_CLIENT is None or getattr(_MCP_REST_CLIENT, "is_closed", False):
+                _MCP_REST_CLIENT = httpx.AsyncClient(
+                    timeout=httpx.Timeout(HTTP_TIMEOUT, connect=5.0),
+                    limits=httpx.Limits(
+                        max_connections=100,
+                        max_keepalive_connections=50,
+                    ),
+                )
+    return _MCP_REST_CLIENT
+
+
+async def _close_rest_client() -> None:
+    global _MCP_REST_CLIENT
+    client = _MCP_REST_CLIENT
+    _MCP_REST_CLIENT = None
+    if client is not None and not getattr(client, "is_closed", False):
+        await client.aclose()
+
+
 # Whitelist tightened around the actual ID grammar mnemos uses:
 #   * canonical memory IDs: ``mem_<digits>_<hex>`` (alphanum + _)
 #   * federated memory IDs: ``fed:<peer_name>:<remote_id>`` — the
@@ -187,14 +213,14 @@ def _bounded_list(
 
 
 async def _rest_get(path: str, params: dict[str, Any] | None = None) -> Any:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        response = await client.get(
-            f"{_mnemos_base()}{path}",
-            params=params,
-            headers=_backend_headers(),
-        )
-        response.raise_for_status()
-        return response.json() if response.content else {}
+    client = await _get_rest_client()
+    response = await client.get(
+        f"{_mnemos_base()}{path}",
+        params=params,
+        headers=_backend_headers(),
+    )
+    response.raise_for_status()
+    return response.json() if response.content else {}
 
 
 async def _rest_get_text(
@@ -211,37 +237,37 @@ async def _rest_get_text(
     """
     headers = _backend_headers()
     headers["Accept"] = accept
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        response = await client.get(
-            f"{_mnemos_base()}{path}", params=params, headers=headers,
-        )
-        response.raise_for_status()
-        return response.text
+    client = await _get_rest_client()
+    response = await client.get(
+        f"{_mnemos_base()}{path}", params=params, headers=headers,
+    )
+    response.raise_for_status()
+    return response.text
 
 
 async def _rest_post(path: str, body: dict[str, Any], method: str = "POST") -> Any:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        if method == "PATCH":
-            response = await client.patch(
-                f"{_mnemos_base()}{path}",
-                json=body,
-                headers=_backend_headers(),
-            )
-        else:
-            response = await client.post(
-                f"{_mnemos_base()}{path}",
-                json=body,
-                headers=_backend_headers(),
-            )
-        response.raise_for_status()
-        return response.json() if response.content else {}
+    client = await _get_rest_client()
+    if method == "PATCH":
+        response = await client.patch(
+            f"{_mnemos_base()}{path}",
+            json=body,
+            headers=_backend_headers(),
+        )
+    else:
+        response = await client.post(
+            f"{_mnemos_base()}{path}",
+            json=body,
+            headers=_backend_headers(),
+        )
+    response.raise_for_status()
+    return response.json() if response.content else {}
 
 
 async def _rest_delete(path: str) -> int:
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        response = await client.delete(f"{_mnemos_base()}{path}", headers=_backend_headers())
-        response.raise_for_status()
-        return response.status_code
+    client = await _get_rest_client()
+    response = await client.delete(f"{_mnemos_base()}{path}", headers=_backend_headers())
+    response.raise_for_status()
+    return response.status_code
 
 
 def _mcp_user_required(user: UserContext | None) -> UserContext:

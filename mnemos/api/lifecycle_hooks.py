@@ -156,8 +156,11 @@ def register_lifespan_hooks() -> None:
     global _registered
     if _registered:
         return
+    from mnemos.mcp.tools._runtime import _close_rest_client
+
     lifecycle.register_auth_configurer(configure_auth)
     lifecycle.register_provider_manifest_reloader(_reload_provider_manifest)
+    lifecycle.register_lifespan_cleanup_hook("mcp rest client", _close_rest_client)
     lifecycle.register_lifespan_worker(
         "distillation_worker",
         _run_distillation_worker,

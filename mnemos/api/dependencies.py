@@ -105,8 +105,14 @@ async def get_current_user(
         key_hash = hashlib.sha256(raw_key.encode()).hexdigest()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
-                "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace "
+                "SELECT ak.id, ak.user_id, ak.revoked, u.role, u.namespace, "
+                "       ug.group_ids "
                 "FROM api_keys ak JOIN users u ON u.id = ak.user_id "
+                "LEFT JOIN LATERAL ("
+                "    SELECT array_agg(group_id) AS group_ids "
+                "    FROM user_groups "
+                "    WHERE user_id = u.id"
+                ") ug ON TRUE "
                 "WHERE ak.key_hash = $1",
                 key_hash,
             )
@@ -116,13 +122,9 @@ async def get_current_user(
         from mnemos.core.lifecycle import _schedule_background
         _schedule_background(_update_last_used(pool, str(row["id"])))
 
-        async with pool.acquire() as conn:
-            group_rows = await conn.fetch(
-                "SELECT group_id FROM user_groups WHERE user_id = $1", row["user_id"]
-            )
         return UserContext(
             user_id=row["user_id"],
-            group_ids=[r["group_id"] for r in group_rows],
+            group_ids=list(row["group_ids"] or []),
             role=row["role"],
             namespace=row["namespace"],
             authenticated=True,
