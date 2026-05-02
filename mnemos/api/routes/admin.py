@@ -1060,3 +1060,85 @@ async def restore_deletion_request(
         row["id"], row["target_user_id"],
     )
     return _row_to_deletion_request(row)
+
+
+@router.post(
+    "/deletion-requests/{request_id}/force-purge",
+    response_model=DeletionRequestItem,
+)
+async def force_purge_deletion_request(
+    request_id: str,
+    _: UserContext = Depends(require_root),
+):
+    """Immediately hard-delete a soft-deleted request.
+
+    Root-only operator override for urgent legal requests. It bypasses
+    the ``restore_by`` grace-window check but still requires the row to
+    be in ``status='soft_deleted'`` so requested/confirmed/restored
+    lifecycle states cannot be purged accidentally.
+    """
+    require_postgres_pool_or_503(
+        route_label="POST /admin/deletion-requests/{request_id}/force-purge"
+    )
+    from mnemos.workers.deletion_request_worker import (
+        hard_delete_target,
+        invalidate_deletion_scope_caches,
+    )
+
+    purged_target: tuple[str, str | None] | None = None
+    async with _lc.get_pool_manager().transactional() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT *
+              FROM deletion_requests
+             WHERE id = $1::uuid
+             FOR UPDATE
+            """,
+            request_id,
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"deletion request {request_id} not found",
+            )
+        if existing["status"] != "soft_deleted":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"deletion request {request_id} is in state "
+                    f"{existing['status']!r}; only 'soft_deleted' "
+                    f"rows can be force-purged"
+                ),
+            )
+
+        await hard_delete_target(
+            conn,
+            existing["target_user_id"],
+            existing["target_namespace"],
+            invalidate_cache=False,
+        )
+        purged_target = (existing["target_user_id"], existing["target_namespace"])
+        row = await conn.fetchrow(
+            """
+            UPDATE deletion_requests
+               SET status = 'hard_deleted',
+                   hard_deleted_at = NOW()
+             WHERE id = $1::uuid
+               AND status = 'soft_deleted'
+            RETURNING *
+            """,
+            request_id,
+        )
+        if row is None:
+            raise RuntimeError(
+                f"deletion request {request_id} disappeared before hard-delete transition"
+            )
+
+    if purged_target is not None:
+        await invalidate_deletion_scope_caches(*purged_target)
+
+    logger.info(
+        "[ADMIN] Force-purged deletion request %s (target_user_id=%s)",
+        row["id"], row["target_user_id"],
+    )
+    return _row_to_deletion_request(row)

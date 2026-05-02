@@ -76,24 +76,6 @@ Until then, the bounded-retry + manual-recovery shape is
 acceptable for self-hosted MNEMOS where operators have
 direct DB access.
 
-## Hard-delete after `restore_by` — not implemented
-
-**Where:** `deletion_requests` lifecycle.
-
-The 30-day grace period is computed and stored as
-`restore_by = soft_deleted_at + INTERVAL '30 days'`. After
-that timestamp, the spec says the data should be
-hard-deleted (`DELETE FROM memories WHERE owner_id = ...
-AND deleted_at IS NOT NULL`). The hard-delete worker hasn't
-shipped yet — Phase C of the GDPR work is still pending.
-
-**Operator workaround for now:** run the equivalent SQL by
-hand against a deployment with deletion requests past their
-`restore_by`. A scripted hard-delete worker is on the
-roadmap for the next alpha.
-
----
-
 If you hit one of these in your own deployment, please open
 an issue with the specific scenario — operational
 edge-cases benefit from real-world reports, not synthetic

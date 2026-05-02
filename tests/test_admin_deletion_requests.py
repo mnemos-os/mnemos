@@ -9,6 +9,7 @@ Endpoint surface tested:
   POST   /admin/deletion-requests/{id}/confirm transition requested → confirmed
   POST   /admin/deletion-requests/{id}/cancel  transition requested|confirmed → cancelled
   POST   /admin/deletion-requests/{id}/restore reverse soft-delete in grace window
+  POST   /admin/deletion-requests/{id}/force-purge hard-delete operator override
 
 The actual wipe worker that consumes confirmed rows is covered in
 test_deletion_request_worker.py; this file covers the admin
@@ -28,6 +29,7 @@ from mnemos.api.routes.admin import (
     cancel_deletion_request,
     confirm_deletion_request,
     create_deletion_request,
+    force_purge_deletion_request,
     get_deletion_request,
     list_deletion_requests,
     restore_deletion_request,
@@ -646,4 +648,79 @@ async def test_restore_deletion_request_409_after_grace_window(monkeypatch):
 
     assert exc.value.status_code == 409
     assert "restore window expired" in exc.value.detail
+    mock_conn.execute.assert_not_awaited()
+
+
+# ── POST /admin/deletion-requests/{id}/force-purge ───────────
+
+
+@pytest.mark.asyncio
+async def test_force_purge_deletion_request_hard_deletes_before_restore_by(monkeypatch):
+    soft_deleted_at = datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc)
+    restore_by = datetime(2026, 5, 31, 23, 5, 0, tzinfo=timezone.utc)
+    hard_deleted_at = datetime(2026, 5, 2, 0, 0, 0, tzinfo=timezone.utc)
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=[
+            _row(
+                id="00000000-0000-0000-0000-000000000001",
+                target_user_id="alice",
+                target_namespace="tenant-a",
+                status="soft_deleted",
+                soft_deleted_at=soft_deleted_at,
+                restore_by=restore_by,
+            ),
+            _row(
+                id="00000000-0000-0000-0000-000000000001",
+                target_user_id="alice",
+                target_namespace="tenant-a",
+                status="hard_deleted",
+                soft_deleted_at=soft_deleted_at,
+                restore_by=restore_by,
+                hard_deleted_at=hard_deleted_at,
+            ),
+        ]
+    )
+    mock_conn.execute = AsyncMock(return_value="DELETE 1")
+    _wire_pool(monkeypatch, mock_conn)
+
+    result = await force_purge_deletion_request(
+        "00000000-0000-0000-0000-000000000001",
+        _=_root_user(),
+    )
+
+    assert result.id == "00000000-0000-0000-0000-000000000001"
+    assert result.status == "hard_deleted"
+    assert result.hard_deleted_at == hard_deleted_at.isoformat()
+    executed_sql = [call.args[0] for call in mock_conn.execute.await_args_list]
+    assert any(sql.startswith("SET LOCAL mnemos.suppress_version_snapshot") for sql in executed_sql)
+    assert any("DELETE FROM memories" in sql for sql in executed_sql)
+    assert all(call.args[1] == "alice" for call in mock_conn.execute.await_args_list[1:])
+    assert all(call.args[2] == "tenant-a" for call in mock_conn.execute.await_args_list[1:])
+    update_sql = mock_conn.fetchrow.await_args_list[1].args[0]
+    assert "SET status = 'hard_deleted'" in update_sql
+    assert "hard_deleted_at = NOW()" in update_sql
+
+
+@pytest.mark.asyncio
+async def test_force_purge_deletion_request_409_on_non_soft_deleted(monkeypatch):
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_row(
+            id="00000000-0000-0000-0000-000000000001",
+            target_user_id="alice",
+            status="confirmed",
+        )
+    )
+    mock_conn.execute = AsyncMock(return_value="DELETE 1")
+    _wire_pool(monkeypatch, mock_conn)
+
+    with pytest.raises(HTTPException) as exc:
+        await force_purge_deletion_request(
+            "00000000-0000-0000-0000-000000000001",
+            _=_root_user(),
+        )
+
+    assert exc.value.status_code == 409
+    assert "only 'soft_deleted' rows can be force-purged" in exc.value.detail
     mock_conn.execute.assert_not_awaited()

@@ -44,6 +44,7 @@ def test_top_level_help_lists_all_subcommands() -> None:
         ["serve", "mcp-http", "--help"],
         ["worker", "--help"],
         ["worker", "distillation", "--help"],
+        ["worker", "deletion-requests", "--help"],
         ["install", "--help"],
         ["export", "--help"],
         ["import", "--help"],
@@ -86,6 +87,25 @@ def test_dispatch_table_is_complete() -> None:
         "cognee": "mnemos.tools.adapters.cognee",
         "mempalace": "mnemos.tools.adapters.mempalace",
     }
+
+
+def test_deletion_request_worker_dispatches_hard_delete_phase(monkeypatch: pytest.MonkeyPatch) -> None:
+    from mnemos.workers import deletion_request_worker
+
+    calls = []
+
+    async def fake_main(*, phase: str) -> None:
+        calls.append(phase)
+
+    monkeypatch.setattr(deletion_request_worker, "main", fake_main)
+
+    result = runner.invoke(
+        cli_main.app,
+        ["worker", "deletion-requests", "--phase", "hard_delete"],
+    )
+
+    assert result.exit_code == 0
+    assert calls == ["hard_delete"]
 
 
 def test_validate_mpf_dispatches_to_validator(monkeypatch: pytest.MonkeyPatch) -> None:

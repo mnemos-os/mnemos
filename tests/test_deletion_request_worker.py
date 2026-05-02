@@ -51,6 +51,14 @@ def _confirmed_request(namespace=None):
     }
 
 
+def _soft_deleted_request(namespace=None):
+    return {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "target_user_id": "alice",
+        "target_namespace": namespace,
+    }
+
+
 def _marked_request():
     return {
         "id": "00000000-0000-0000-0000-000000000001",
@@ -63,6 +71,18 @@ def _verifying_request():
     return {"id": "00000000-0000-0000-0000-000000000001"}
 
 
+def _hard_deleted_request(namespace=None):
+    return {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "target_user_id": "alice",
+        "target_namespace": namespace,
+        "status": "hard_deleted",
+        "soft_deleted_at": datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc),
+        "restore_by": datetime(2026, 5, 1, 23, 10, 0, tzinfo=timezone.utc),
+        "hard_deleted_at": datetime(2026, 5, 2, 0, 0, 0, tzinfo=timezone.utc),
+    }
+
+
 def _target_labels() -> set[str]:
     return {
         label
@@ -71,6 +91,10 @@ def _target_labels() -> set[str]:
             *worker._SOFT_DELETE_SQL,
         )
     }
+
+
+def _hard_target_labels() -> set[str]:
+    return {label for label, _table, _sql in worker._HARD_DELETE_SQL}
 
 
 class _FakeCache:
@@ -278,6 +302,133 @@ async def test_worker_soft_delete_evicts_primed_search_cache_before_next_search(
 
     assert second.memories == []
     assert any(key.startswith("mnemos:search:") for key in cache.deleted)
+
+
+@pytest.mark.asyncio
+async def test_worker_hard_deletes_expired_soft_deleted_request_happy_path(monkeypatch):
+    monkeypatch.setattr(lifecycle, "_cache", None)
+    memory_exists = {"value": True}
+
+    async def execute(sql, *args):
+        if sql.startswith("SET LOCAL"):
+            return "SET"
+        if "DELETE FROM memories" in sql:
+            memory_exists["value"] = False
+            return "DELETE 1"
+        return "DELETE 1"
+
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            _soft_deleted_request("tenant-a"),
+            _hard_deleted_request("tenant-a"),
+        ]
+    )
+    conn.execute = AsyncMock(side_effect=execute)
+
+    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
+
+    assert result is not None
+    assert result.request_id == "00000000-0000-0000-0000-000000000001"
+    assert result.target_user_id == "alice"
+    assert result.target_namespace == "tenant-a"
+    assert result.status == "hard_deleted"
+    assert result.hard_deleted_at == _hard_deleted_request("tenant-a")["hard_deleted_at"]
+    assert result.row_counts == {label: 1 for label in _hard_target_labels()}
+    assert memory_exists["value"] is False
+
+    dequeue_sql = conn.fetchrow.await_args_list[0].args[0]
+    assert "FOR UPDATE SKIP LOCKED" in dequeue_sql
+    assert "status = 'soft_deleted'" in dequeue_sql
+    assert "restore_by < NOW()" in dequeue_sql
+    mark_sql = conn.fetchrow.await_args_list[1].args[0]
+    assert "SET status = 'hard_deleted'" in mark_sql
+    assert "hard_deleted_at = NOW()" in mark_sql
+
+
+@pytest.mark.asyncio
+async def test_worker_hard_delete_preserves_deletion_request_audit_row(monkeypatch):
+    monkeypatch.setattr(lifecycle, "_cache", None)
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            _soft_deleted_request(),
+            _hard_deleted_request(),
+        ]
+    )
+    conn.execute = AsyncMock(return_value="DELETE 0")
+
+    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
+
+    assert result is not None
+    assert result.status == "hard_deleted"
+    executed_sql = [call.args[0] for call in conn.execute.await_args_list]
+    assert not any("DELETE FROM deletion_requests" in sql for sql in executed_sql)
+    mark_sql = conn.fetchrow.await_args_list[1].args[0]
+    assert "UPDATE deletion_requests" in mark_sql
+
+
+@pytest.mark.asyncio
+async def test_worker_hard_delete_respects_status_and_restore_window_guard(monkeypatch):
+    monkeypatch.setattr(lifecycle, "_cache", None)
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(return_value=None)
+    conn.execute = AsyncMock(return_value="DELETE 1")
+
+    result = await worker.process_one_hard_deletion_request(_pool_for(conn))
+
+    assert result is None
+    conn.execute.assert_not_awaited()
+    dequeue_sql = conn.fetchrow.await_args.args[0]
+    assert "status = 'soft_deleted'" in dequeue_sql
+    assert "restore_by < NOW()" in dequeue_sql
+    assert "FOR UPDATE SKIP LOCKED" in dequeue_sql
+
+
+@pytest.mark.asyncio
+async def test_worker_hard_delete_invalidates_search_and_stats_cache(monkeypatch):
+    cache = _FakeCache()
+    cache.store["mnemos:search:primed"] = '{"count":1,"memories":[]}'
+    cache.store["stats:global"] = "{}"
+    cache.store["stats:global:v2"] = "{}"
+    monkeypatch.setattr(lifecycle, "_cache", cache)
+    conn = AsyncMock()
+    conn.transaction = MagicMock(return_value=_TxContext())
+    conn.fetchrow = AsyncMock(
+        side_effect=[
+            _soft_deleted_request("tenant-a"),
+            _hard_deleted_request("tenant-a"),
+        ]
+    )
+    conn.execute = AsyncMock(return_value="DELETE 0")
+
+    await worker.process_one_hard_deletion_request(_pool_for(conn))
+
+    assert "mnemos:search:primed" in cache.deleted
+    assert "stats:global" in cache.deleted
+    assert "stats:global:v2" in cache.deleted
+
+
+def test_hard_delete_sql_order_keeps_fk_children_before_parents():
+    labels = [label for label, _table, _sql in worker._HARD_DELETE_SQL]
+
+    assert labels[:5] == [
+        "memory_versions",
+        "memory_branches",
+        "session_messages",
+        "session_memory_injections",
+        "graeae_audit_log",
+    ]
+    assert labels[5:8] == [
+        "memories",
+        "sessions",
+        "graeae_consultations",
+    ]
+    assert labels[8:] == ["kg_triples", "journal", "entities", "state"]
+    assert len(labels) == 12
 
 
 @pytest.mark.asyncio

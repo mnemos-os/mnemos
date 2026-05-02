@@ -126,6 +126,11 @@ class DeploymentProfile(str, Enum):
     dev = "dev"
 
 
+class DeletionRequestWorkerPhase(str, Enum):
+    soft_delete = "soft_delete"
+    hard_delete = "hard_delete"
+
+
 EXPORT_DISPATCH: dict[str, str] = {
     "mpf": "mnemos.tools.memory_export",
     "jsonl": "mnemos.tools.memory_export",
@@ -422,9 +427,18 @@ def worker_distillation() -> None:
 
 
 @worker_app.command("deletion-requests")
-def worker_deletion_requests() -> None:
-    """Run the GDPR deletion-request soft-delete worker."""
-    _run_async_module_main("mnemos.workers.deletion_request_worker")
+def worker_deletion_requests(
+    phase: DeletionRequestWorkerPhase = typer.Option(
+        DeletionRequestWorkerPhase.soft_delete,
+        "--phase",
+        help="Deletion-request worker phase: soft_delete or hard_delete.",
+        is_flag=False,
+    ),
+) -> None:
+    """Run the GDPR deletion-request worker."""
+    from mnemos.workers import deletion_request_worker
+
+    _raise_for_int_result(asyncio.run(deletion_request_worker.main(phase=phase.value)))
 
 
 @app.command()
