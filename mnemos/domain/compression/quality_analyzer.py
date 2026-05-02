@@ -4,10 +4,60 @@ Generates quality manifests tracking what was preserved/removed
 """
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
 logger = logging.getLogger(__name__)
+
+# Optional Rust hot-path accelerator. Loaded lazily so the absence of
+# the wheel on a given build host does NOT break the import - the
+# Python implementation below stays the source of truth.
+# Opt-in via env var MNEMOS_HOT_RS_ENABLED=1; default off until soak.
+_HOT_RS = None
+_HOT_RS_ENABLED = os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+if _HOT_RS_ENABLED:
+    try:
+        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+        logger.info(
+            "mnemos_hot Rust accelerator enabled (compression quality will use mnemos_hot %s)",
+            getattr(_HOT_RS, "__version__", "?"),
+        )
+    except ImportError as _exc:
+        logger.warning(
+            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
+            "Falling back to NumPy compression-quality cosine.",
+            _exc,
+        )
+        _HOT_RS = None
+
+
+def _embedding_to_float_list(values: Any) -> list[float]:
+    return [float(value) for value in values]
+
+
+def _has_zero_norm(values: list[float]) -> bool:
+    return sum(value * value for value in values) <= 0.0
+
+
+def _semantic_cosine(emb1: Any, emb2: Any, np_module: Any) -> float | None:
+    if _HOT_RS is not None:
+        try:
+            a = _embedding_to_float_list(emb1)
+            b = _embedding_to_float_list(emb2)
+            # Preserve this caller's sentinel behavior: invalid,
+            # mismatched, empty, or zero-norm embeddings make semantic
+            # scoring unavailable instead of producing a 50/100 score.
+            if not a or not b or len(a) != len(b) or _has_zero_norm(a) or _has_zero_norm(b):
+                return None
+            return float(_HOT_RS.cosine(a, b))
+        except Exception:
+            pass
+
+    norm = np_module.linalg.norm(emb1) * np_module.linalg.norm(emb2)
+    if norm <= 0:
+        return None
+    return float(np_module.dot(emb1, emb2) / norm)
 
 
 @dataclass
@@ -322,11 +372,11 @@ class QualityAnalyzer:
                 return -1.0
             emb1 = np.asarray(embeddings[0])
             emb2 = np.asarray(embeddings[1])
-            # cosine similarity via numpy (avoids sklearn dependency)
-            norm = np.linalg.norm(emb1) * np.linalg.norm(emb2)
-            if norm <= 0:
+            # cosine similarity via optional Rust hot path or NumPy
+            # fallback (avoids sklearn dependency).
+            similarity = _semantic_cosine(emb1, emb2, np)
+            if similarity is None:
                 return -1.0
-            similarity = float(np.dot(emb1, emb2) / norm)
             # Map [-1, 1] cosine to [0, 100] so identical texts → 100,
             # orthogonal → 50, opposite → 0. Pre-fix mapping (* 100)
             # treated negative cosines as negative percentages, which

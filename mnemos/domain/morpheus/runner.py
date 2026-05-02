@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from datetime import datetime, timedelta, timezone
 from typing import List, Optional, Tuple
 from uuid import UUID
@@ -25,6 +26,27 @@ from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
 
+# Optional Rust hot-path accelerator. Loaded lazily so the absence of
+# the wheel on a given build host does NOT break the import - the
+# Python implementation below stays the source of truth.
+# Opt-in via env var MNEMOS_HOT_RS_ENABLED=1; default off until soak.
+_HOT_RS = None
+_HOT_RS_ENABLED = os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+if _HOT_RS_ENABLED:
+    try:
+        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+        logger.info(
+            "mnemos_hot Rust accelerator enabled (MORPHEUS clustering will use mnemos_hot %s)",
+            getattr(_HOT_RS, "__version__", "?"),
+        )
+    except ImportError as _exc:
+        logger.warning(
+            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
+            "Falling back to pure-Python MORPHEUS cosine clustering.",
+            _exc,
+        )
+        _HOT_RS = None
+
 
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity between two 1-D float vectors. Returns 0.0 if
@@ -35,6 +57,35 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     if na == 0.0 or nb == 0.0:
         return 0.0
     return float(np.dot(a, b) / (na * nb))
+
+
+def _vector_to_float_list(vector: np.ndarray) -> list[float]:
+    return [float(value) for value in vector]
+
+
+def _cosine_similarities(query: np.ndarray, candidates: list[np.ndarray]) -> list[float]:
+    """Score one query vector against candidate vectors.
+
+    When opted in, dispatch the row-vs-clusters scoring work to the
+    Rust batch helper. Any import/runtime mismatch falls back to the
+    per-pair Python implementation, which remains the source of truth.
+    """
+    if _HOT_RS is not None:
+        try:
+            # The existing NumPy path raises on non-zero length
+            # mismatches. Keep that behavior by avoiding Rust's
+            # length-mismatch-to-0.0 semantics for this caller.
+            if any(len(candidate) != len(query) for candidate in candidates):
+                return [_cosine_similarity(query, candidate) for candidate in candidates]
+            scores = _HOT_RS.cosine_batch(
+                _vector_to_float_list(query),
+                [_vector_to_float_list(candidate) for candidate in candidates],
+            )
+            if len(scores) == len(candidates):
+                return [float(score) for score in scores]
+        except Exception:
+            pass
+    return [_cosine_similarity(query, candidate) for candidate in candidates]
 
 
 def _parse_pgvector(raw: object) -> Optional[np.ndarray]:
@@ -175,7 +226,8 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
         async with conn.transaction():
             # Per-row tagging means rollback never crosses runs.
             del_result = await conn.execute(
-                "DELETE FROM memories WHERE morpheus_run_id=$1::uuid",
+                "DELETE FROM memories WHERE morpheus_run_id=$1::uuid "
+                "AND deleted_at IS NULL",
                 run_id,
             )
             # asyncpg returns "DELETE <n>"; parse the count.
@@ -223,6 +275,7 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
             WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
               AND m.provenance IS DISTINCT FROM 'morpheus_local'
               AND m.morpheus_run_id IS NULL
+              AND m.deleted_at IS NULL
               AND (r.namespace IS NULL OR m.namespace = r.namespace)
             """,
             run_id,
@@ -268,6 +321,7 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
               AND provenance IS DISTINCT FROM 'morpheus_local'
               AND morpheus_run_id IS NULL
               AND embedding IS NOT NULL
+              AND deleted_at IS NULL
               AND ($3::text IS NULL OR namespace = $3)
             ORDER BY created
             """,
@@ -289,8 +343,8 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
             continue
         best_idx = -1
         best_sim = -1.0
-        for i, cl in enumerate(clusters):
-            sim = _cosine_similarity(vec, cl["centroid"])
+        scores = _cosine_similarities(vec, [cl["centroid"] for cl in clusters])
+        for i, sim in enumerate(scores):
             if sim > best_sim:
                 best_sim = sim
                 best_idx = i
@@ -384,6 +438,7 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
                 SELECT id, content, category, owner_id, namespace
                 FROM memories
                 WHERE id = ANY($1::text[])
+                  AND deleted_at IS NULL
                 """,
                 member_ids,
             )
