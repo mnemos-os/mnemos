@@ -155,7 +155,8 @@ class StateManager:
                 async with self.db_pool.acquire() as conn:
                     row = await conn.fetchrow(
                         'SELECT value FROM state '
-                        'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+                        'WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
+                        'AND deleted_at IS NULL',
                         owner_id, namespace, key,
                     )
                     if row:
@@ -217,7 +218,8 @@ class StateManager:
                        ON CONFLICT (owner_id, namespace, key) DO UPDATE
                        SET value = $4,
                            updated = NOW(),
-                           version = state.version + 1''',
+                           version = state.version + 1
+                       WHERE state.deleted_at IS NULL''',
                     owner_id, namespace, key, serialized,
                 )
             # 3. Cache update — only on confirmed durable write. Cache
@@ -241,7 +243,8 @@ class StateManager:
                 async with self.db_pool.acquire() as conn:
                     result = await conn.execute(
                         'DELETE FROM state '
-                        'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+                        'WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
+                        'AND deleted_at IS NULL',
                         owner_id, namespace, key,
                     )
                     return result != 'DELETE 0'
@@ -258,7 +261,8 @@ class StateManager:
             async with self.db_pool.acquire() as conn:
                 rows = await conn.fetch(
                     'SELECT key, updated FROM state '
-                    'WHERE owner_id = $1 AND namespace = $2 ORDER BY key',
+                    'WHERE owner_id = $1 AND namespace = $2 '
+                    'AND deleted_at IS NULL ORDER BY key',
                     owner_id, namespace,
                 )
                 return [dict(row) for row in rows]

@@ -80,7 +80,8 @@ async def create_session(
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
                 "SELECT id, created_at, model FROM sessions "
-                "WHERE id = $1 AND user_id = $2 AND namespace = $3",
+                "WHERE id = $1 AND user_id = $2 AND namespace = $3 "
+                "AND deleted_at IS NULL",
                 session_id, user.user_id, user.namespace,
             )
 
@@ -107,7 +108,8 @@ async def get_session(
 
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
+            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 "
+            "AND namespace = $3 AND deleted_at IS NULL",
             session_id,
             user.user_id,
             target_ns,
@@ -122,6 +124,7 @@ async def get_session(
             """
             SELECT memory_id FROM session_memory_injections
             WHERE session_id = $1
+              AND deleted_at IS NULL
             GROUP BY memory_id
             ORDER BY MAX(injection_timestamp) DESC
             LIMIT 10
@@ -164,7 +167,8 @@ async def add_session_message(
     # Verify session ownership
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
+            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 "
+            "AND namespace = $3 AND deleted_at IS NULL",
             session_id,
             user.user_id,
             target_ns,
@@ -222,6 +226,7 @@ async def add_session_message(
                 SELECT id, role, content, timestamp
                   FROM session_messages
                  WHERE session_id = $1 AND role = 'system'
+                   AND deleted_at IS NULL
                  ORDER BY timestamp ASC, id ASC
                  LIMIT 1
             ),
@@ -230,6 +235,7 @@ async def add_session_message(
                   FROM session_messages s
                  WHERE s.session_id = $1
                    AND s.role = 'system'
+                   AND s.deleted_at IS NULL
                    AND s.id <> (SELECT id FROM first_system)
                  ORDER BY s.timestamp DESC, s.id DESC
                  LIMIT 4
@@ -243,6 +249,7 @@ async def add_session_message(
                 SELECT id, role, content, timestamp, 1 AS k
                   FROM session_messages
                  WHERE session_id = $1 AND role <> 'system'
+                   AND deleted_at IS NULL
                  ORDER BY timestamp DESC, id DESC
                  LIMIT 10
             )
@@ -353,6 +360,7 @@ async def add_session_message(
                 total_tokens = total_tokens + $2,
                 last_activity = NOW()
             WHERE id = $1 AND user_id = $3 AND namespace = $4
+              AND deleted_at IS NULL
             """,
             session_id,
             tokens_used,
@@ -392,7 +400,8 @@ async def get_session_history(
     # Verify session ownership
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
+            "SELECT * FROM sessions WHERE id = $1 AND user_id = $2 "
+            "AND namespace = $3 AND deleted_at IS NULL",
             session_id,
             user.user_id,
             target_ns,
@@ -407,6 +416,7 @@ async def get_session_history(
             """
             SELECT role, content, timestamp, model FROM session_messages
             WHERE session_id = $1
+              AND deleted_at IS NULL
             ORDER BY timestamp ASC
             LIMIT $2 OFFSET $3
             """,
@@ -416,7 +426,8 @@ async def get_session_history(
         )
 
         total = await conn.fetchval(
-            "SELECT COUNT(*) FROM session_messages WHERE session_id = $1",
+            "SELECT COUNT(*) FROM session_messages "
+            "WHERE session_id = $1 AND deleted_at IS NULL",
             session_id,
         )
 
@@ -450,7 +461,8 @@ async def delete_session(
     # Verify session ownership
     async with pool.acquire() as conn:
         session = await conn.fetchrow(
-            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
+            "SELECT id FROM sessions WHERE id = $1 AND user_id = $2 "
+            "AND namespace = $3 AND deleted_at IS NULL",
             session_id,
             user.user_id,
             target_ns,
@@ -462,7 +474,8 @@ async def delete_session(
     # Delete session (cascade deletes messages and injections)
     async with pool.acquire() as conn:
         await conn.execute(
-            "DELETE FROM sessions WHERE id = $1 AND user_id = $2 AND namespace = $3",
+            "DELETE FROM sessions WHERE id = $1 AND user_id = $2 "
+            "AND namespace = $3 AND deleted_at IS NULL",
             session_id, user.user_id, target_ns,
         )
 

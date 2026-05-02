@@ -37,7 +37,8 @@ async def list_state_keys(
         async with _lc.get_pool_manager().acquire() as conn:
             rows = await conn.fetch(
                 'SELECT key, updated::text, version FROM state '
-                'WHERE owner_id = $1 AND namespace = $2 ORDER BY key',
+                'WHERE owner_id = $1 AND namespace = $2 '
+                'AND deleted_at IS NULL ORDER BY key',
                 target_owner, target_ns,
             )
         return {"keys": [dict(r) for r in rows]}
@@ -60,7 +61,8 @@ async def get_state(
         async with _lc.get_pool_manager().acquire() as conn:
             row = await conn.fetchrow(
                 'SELECT key, value, updated::text, version FROM state '
-                'WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+                'WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
+                'AND deleted_at IS NULL',
                 target_owner, target_ns, key,
             )
         if not row:
@@ -107,8 +109,14 @@ async def set_state(
                    VALUES ($1, $2, $3, $4, NOW())
                    ON CONFLICT (owner_id, namespace, key) DO UPDATE
                    SET value = $4, updated = NOW(), version = state.version + 1
+                   WHERE state.deleted_at IS NULL
                    RETURNING key, value, updated::text, version''',
                 target_owner, target_ns, key, json.dumps(req.value),
+            )
+        if row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="State key is reserved by a soft-deleted row; restore before updating it",
             )
         return dict(row)
     except HTTPException:
@@ -130,7 +138,8 @@ async def delete_state(
     target_ns = scope_namespace(user, namespace)
     async with _lc.get_pool_manager().transactional() as conn:
         result = await conn.execute(
-            'DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3',
+            'DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
+            'AND deleted_at IS NULL',
             target_owner, target_ns, key,
         )
     if result == 'DELETE 0':

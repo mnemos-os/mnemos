@@ -74,6 +74,12 @@ def _federation_sync_worker(pool: Any):
     return federation_worker_loop(pool)
 
 
+def _deletion_request_worker(pool: Any):
+    from mnemos.workers.deletion_request_worker import deletion_request_worker_loop
+
+    return deletion_request_worker_loop(pool)
+
+
 async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     """Launch one federation NATS consumer per configured peer.
 
@@ -138,6 +144,11 @@ def register_lifespan_hooks() -> None:
     lifecycle.register_lifespan_worker(
         "distillation_worker",
         _run_distillation_worker,
+        honor_worker_enabled=True,
+    )
+    lifecycle.register_lifespan_worker(
+        "deletion_request_worker",
+        _deletion_request_worker,
         honor_worker_enabled=True,
     )
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)

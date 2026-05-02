@@ -269,6 +269,11 @@ class MemoryRepository(ABC):
         Returns full memory rows (not the join-only shape used by the
         legacy SQLite helper), so the handler can hand them straight to
         ``row_to_memory`` without a second fetch.
+
+        Vector ranking is backend-owned: Postgres ranks with pgvector
+        ``ORDER BY embedding <=>`` and SQLite ranks in SQL via
+        ``mnemos_cosine_similarity``. There is currently no Python
+        post-fetch vector rerank call site for ``mnemos_hot.top_k``.
         """
         ...
 

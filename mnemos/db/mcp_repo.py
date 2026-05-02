@@ -25,7 +25,8 @@ async def assert_memory_readable(conn: Any, memory_id: str, user: UserContext) -
     """Same chokepoint as api/routes/versions._assert_memory_readable."""
     if _is_root(user):
         row = await conn.fetchrow(
-            "SELECT 1 FROM memory_versions WHERE memory_id = $1 LIMIT 1",
+            "SELECT 1 FROM memory_versions "
+            "WHERE memory_id = $1 AND deleted_at IS NULL LIMIT 1",
             memory_id,
         )
         if not row:
@@ -40,7 +41,8 @@ async def assert_memory_readable(conn: Any, memory_id: str, user: UserContext) -
     ns_ph = f"${len(vis_params) + 2}"
     row = await conn.fetchrow(
         f"SELECT 1 FROM memories WHERE id = $1 "
-        f"AND {vis_clause} AND namespace = {ns_ph} LIMIT 1",
+        f"AND deleted_at IS NULL AND {vis_clause} "
+        f"AND namespace = {ns_ph} LIMIT 1",
         memory_id,
         *vis_params,
         user.namespace,
@@ -72,6 +74,8 @@ async def fetch_memory_log(
                 mb.head_version_id = mv.id
             )
             WHERE mv.memory_id = $1
+              AND mv.deleted_at IS NULL
+              AND mb.deleted_at IS NULL
             UNION ALL
             -- Same-memory predicate (mv.memory_id = cw.memory_id)
             -- prevents corrupt parent_version_id from pulling another
@@ -88,6 +92,7 @@ async def fetch_memory_log(
                 ON mv.id = cw.parent_version_id
                AND mv.memory_id = cw.memory_id
             WHERE cw.depth < $3
+              AND mv.deleted_at IS NULL
         )
         SELECT
             commit_hash, version_num, branch, category, change_type,
@@ -124,12 +129,14 @@ async def create_memory_branch(
         # This closes the TOCTOU between auth check and branch insert.
         if _is_root(user):
             live = await conn.fetchrow(
-                "SELECT 1 FROM memories WHERE id = $1 FOR SHARE",
+                "SELECT 1 FROM memories "
+                "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
                 memory_id,
             )
         else:
             live = await conn.fetchrow(
                 "SELECT 1 FROM memories WHERE id = $1 "
+                "AND deleted_at IS NULL "
                 "AND owner_id = $2 AND namespace = $3 FOR SHARE",
                 memory_id,
                 user.user_id,
@@ -181,7 +188,8 @@ async def _fetch_branch_start_by_commit(
     if _is_root(user):
         return await conn.fetchrow(
             "SELECT id, commit_hash FROM memory_versions "
-            "WHERE memory_id = $1 AND commit_hash = $2",
+            "WHERE memory_id = $1 AND commit_hash = $2 "
+            "AND deleted_at IS NULL",
             memory_id,
             from_commit,
         )
@@ -194,7 +202,7 @@ async def _fetch_branch_start_by_commit(
     return await conn.fetchrow(
         "SELECT id, commit_hash FROM memory_versions "
         "WHERE memory_id = $1 AND commit_hash = $2 "
-        f"AND {vis_clause} AND namespace = {ns_ph}",
+        f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
         memory_id,
         from_commit,
         *vis_params,
@@ -210,6 +218,8 @@ async def _fetch_main_branch_start(conn: Any, memory_id: str, user: UserContext)
             FROM memory_versions mv
             INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
             WHERE mv.memory_id = $1 AND mb.name = 'main'
+              AND mv.deleted_at IS NULL
+              AND mb.deleted_at IS NULL
             """,
             memory_id,
         )
@@ -226,6 +236,8 @@ async def _fetch_main_branch_start(conn: Any, memory_id: str, user: UserContext)
         FROM memory_versions mv
         INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
         WHERE mv.memory_id = $1 AND mb.name = 'main'
+          AND mv.deleted_at IS NULL
+          AND mb.deleted_at IS NULL
           AND {vis_clause} AND mv.namespace = {ns_ph}
         """,
         memory_id,
@@ -286,7 +298,8 @@ async def _fetch_existing_branch(
             "INNER JOIN memory_versions mv "
             "    ON mv.id = mb.head_version_id "
             "   AND mv.memory_id = mb.memory_id "
-            "WHERE mb.memory_id = $1 AND mb.name = $2",
+            "WHERE mb.memory_id = $1 AND mb.name = $2 "
+            "AND mb.deleted_at IS NULL AND mv.deleted_at IS NULL",
             memory_id,
             name,
         )
@@ -305,7 +318,8 @@ async def _fetch_existing_branch(
         "   AND mv.memory_id = mb.memory_id "
         f"   AND {vis_clause} "
         f"   AND mv.namespace = {ns_ph} "
-        "WHERE mb.memory_id = $1 AND mb.name = $2",
+        "WHERE mb.memory_id = $1 AND mb.name = $2 "
+        "AND mb.deleted_at IS NULL AND mv.deleted_at IS NULL",
         memory_id,
         name,
         *vis_params,
@@ -323,7 +337,8 @@ async def fetch_diff_commit_pair(
     if _is_root(user):
         base_sql = (
             "SELECT content, version_num FROM memory_versions "
-            "WHERE memory_id = $1 AND commit_hash = $2"
+            "WHERE memory_id = $1 AND commit_hash = $2 "
+            "AND deleted_at IS NULL"
         )
         return (
             await conn.fetchrow(base_sql, memory_id, commit_a),
@@ -338,7 +353,7 @@ async def fetch_diff_commit_pair(
     gated_sql = (
         "SELECT content, version_num FROM memory_versions "
         "WHERE memory_id = $1 AND commit_hash = $2 "
-        f"AND {vis_clause} AND namespace = {ns_ph}"
+        f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}"
     )
     return (
         await conn.fetchrow(gated_sql, memory_id, commit_a, *vis_params, user.namespace),
@@ -360,6 +375,7 @@ async def fetch_checkout_commit(
                 content, change_type, snapshot_at, snapshot_by
             FROM memory_versions
             WHERE memory_id = $1 AND commit_hash = $2
+              AND deleted_at IS NULL
             """,
             memory_id,
             commit_hash,
@@ -377,6 +393,7 @@ async def fetch_checkout_commit(
             content, change_type, snapshot_at, snapshot_by
         FROM memory_versions
         WHERE memory_id = $1 AND commit_hash = $2
+          AND deleted_at IS NULL
           AND {vis_clause} AND namespace = {ns_ph}
         """,
         memory_id,

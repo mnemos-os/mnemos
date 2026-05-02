@@ -280,6 +280,7 @@ async def delete_federated_memory(pool: asyncpg.Pool, peer_name: str, memory_id:
             DELETE FROM memories
             WHERE id = $1
               AND federation_source = $2
+              AND deleted_at IS NULL
             """,
             local_id,
             peer_name,

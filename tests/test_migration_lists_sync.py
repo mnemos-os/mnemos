@@ -55,6 +55,8 @@ EXPECTED_MIGRATIONS = [
     "migrations_v4_2_document_import_chunk_idempotency.sql",
     "migrations_v4_2_deletion_requests.sql",
     "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql",
+    "migrations_v4_2_deletion_requests_soft_delete_columns.sql",
+    "migrations_v4_2_deletion_requests_sweep_verifying.sql",
 ]
 
 

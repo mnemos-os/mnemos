@@ -72,7 +72,8 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
             # check BOTH owner_id and namespace so a caller can't attach
             # triples across either tenancy boundary.
             mem_row = await conn.fetchrow(
-                "SELECT owner_id, namespace FROM memories WHERE id=$1",
+                "SELECT owner_id, namespace FROM memories "
+                "WHERE id=$1 AND deleted_at IS NULL",
                 req.memory_id,
             )
             if mem_row is None:
@@ -93,7 +94,12 @@ async def create_triple(req: KGTripleCreate, user: UserContext = Depends(get_cur
             valid_from, valid_until, req.memory_id, req.confidence,
             user.user_id, user.namespace,
         )
-        row = await conn.fetchrow("SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE id=$1", triple_id)
+        row = await conn.fetchrow(
+            "SELECT id, subject, predicate, object, subject_type, object_type, "
+            "valid_from, valid_until, memory_id, confidence, created "
+            "FROM kg_triples WHERE id=$1 AND deleted_at IS NULL",
+            triple_id,
+        )
 
     return _row_to_triple(row)
 
@@ -111,7 +117,7 @@ async def list_triples(
 ):
     require_postgres_pool_or_503(route_label="GET /v1/kg/triples")
 
-    conditions = []
+    conditions = ["deleted_at IS NULL"]
     filter_params = []
     idx = 1
 
@@ -158,12 +164,12 @@ async def get_timeline(subject: str, limit: int = Query(100, ge=1, le=1000), use
     async with _lc.get_pool_manager().acquire() as conn:
         if is_root(user):
             rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 ORDER BY valid_from ASC LIMIT $2",
+                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL ORDER BY valid_from ASC LIMIT $2",
                 subject, limit,
             )
         else:
             rows = await conn.fetch(
-                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND owner_id=$2 AND namespace=$3 ORDER BY valid_from ASC LIMIT $4",
+                "SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE subject=$1 AND deleted_at IS NULL AND owner_id=$2 AND namespace=$3 ORDER BY valid_from ASC LIMIT $4",
                 subject, user.user_id, user.namespace, limit,
             )
     return KGTripleListResponse(count=len(rows), triples=[_row_to_triple(r) for r in rows])
@@ -189,7 +195,8 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
     set_clauses = [f"{col}=${i+2}" for i, col in enumerate(updates.keys())]
     async with _lc.get_pool_manager().transactional() as conn:
         row = await conn.fetchrow(
-            "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
+            "SELECT owner_id, namespace FROM kg_triples "
+            "WHERE id=$1 AND deleted_at IS NULL",
             triple_id,
         )
         if row is None:
@@ -201,10 +208,16 @@ async def update_triple(triple_id: str, req: KGTripleUpdate, user: UserContext =
             # Non-owner: 404 (same response as missing — don't leak existence).
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
         await conn.execute(
-            f"UPDATE kg_triples SET {', '.join(set_clauses)} WHERE id=$1",
+            f"UPDATE kg_triples SET {', '.join(set_clauses)} "
+            "WHERE id=$1 AND deleted_at IS NULL",
             triple_id, *list(updates.values()),
         )
-        row = await conn.fetchrow("SELECT id, subject, predicate, object, subject_type, object_type, valid_from, valid_until, memory_id, confidence, created FROM kg_triples WHERE id=$1", triple_id)
+        row = await conn.fetchrow(
+            "SELECT id, subject, predicate, object, subject_type, object_type, "
+            "valid_from, valid_until, memory_id, confidence, created "
+            "FROM kg_triples WHERE id=$1 AND deleted_at IS NULL",
+            triple_id,
+        )
     return _row_to_triple(row)
 
 
@@ -213,7 +226,8 @@ async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_
     require_postgres_pool_or_503(route_label="DELETE /v1/kg/triples/{triple_id}")
     async with _lc.get_pool_manager().transactional() as conn:
         row = await conn.fetchrow(
-            "SELECT owner_id, namespace FROM kg_triples WHERE id=$1",
+            "SELECT owner_id, namespace FROM kg_triples "
+            "WHERE id=$1 AND deleted_at IS NULL",
             triple_id,
         )
         if row is None:
@@ -223,4 +237,7 @@ async def delete_triple(triple_id: str, user: UserContext = Depends(get_current_
             or row["namespace"] != user.namespace
         ):
             raise HTTPException(status_code=404, detail=f"Triple {triple_id} not found")
-        await conn.execute("DELETE FROM kg_triples WHERE id=$1", triple_id)
+        await conn.execute(
+            "DELETE FROM kg_triples WHERE id=$1 AND deleted_at IS NULL",
+            triple_id,
+        )

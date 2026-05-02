@@ -154,7 +154,7 @@ async def _assert_target_head_visible(
     row = await conn.fetchrow(
         f"SELECT 1 FROM memory_versions "
         f"WHERE id = $1 "
-        f"AND {vis_clause} AND namespace = {ns_ph}",
+        f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
         head_version_id, *vis_params, user.namespace,
     )
     if not row:

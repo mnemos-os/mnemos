@@ -18,7 +18,7 @@ async def fetch_memory_export(
     limit: int,
     offset: int,
 ):
-    conditions: list[str] = []
+    conditions: list[str] = ["deleted_at IS NULL"]
     params: list[Any] = []
     idx = 1
     if effective_owner:
@@ -69,6 +69,8 @@ async def _fetch_sidecar(
     conditions: list[str] = []
     params: list[Any] = []
     idx = 1
+    if table in {"kg_triples", "memory_versions"}:
+        conditions.append("deleted_at IS NULL")
     if bound_to_memories:
         if null_ok and memory_ids:
             conditions.append(
@@ -191,7 +193,10 @@ async def fetch_referenced_memory_allowlist(
     scope_owner: Optional[str] = None,
     scope_namespace: Optional[str] = None,
 ):
-    sql = "SELECT id, owner_id, namespace FROM memories WHERE id = ANY($1::text[])"
+    sql = (
+        "SELECT id, owner_id, namespace FROM memories "
+        "WHERE id = ANY($1::text[]) AND deleted_at IS NULL"
+    )
     params: list[Any] = [list(referenced_ids)]
     if scope_owner is not None:
         sql += " AND owner_id = $2"
@@ -268,7 +273,7 @@ async def fetch_memory_by_id(conn, memory_id: str):
         "source_model, source_provider, "
         "source_session, source_agent, "
         "created, updated "
-        "FROM memories WHERE id = $1",
+        "FROM memories WHERE id = $1 AND deleted_at IS NULL",
         memory_id,
     )
 
@@ -287,7 +292,7 @@ async def delete_memory_branches_for_memories(conn, memory_ids: Sequence[str]) -
 async def fetch_versioned_memory_ids(conn, memory_ids: Sequence[str]):
     return await conn.fetch(
         "SELECT DISTINCT memory_id FROM memory_versions "
-        "WHERE memory_id = ANY($1::text[])",
+        "WHERE memory_id = ANY($1::text[]) AND deleted_at IS NULL",
         list(memory_ids),
     )
 
@@ -300,9 +305,12 @@ async def fetch_memory_head_checks(conn, memory_ids: Sequence[str]):
         FROM memories m
         LEFT JOIN memory_branches b
           ON b.memory_id = m.id AND b.name = 'main'
+         AND b.deleted_at IS NULL
         LEFT JOIN memory_versions mv
           ON mv.id = b.head_version_id
+         AND mv.deleted_at IS NULL
         WHERE m.id = ANY($1::text[])
+          AND m.deleted_at IS NULL
         """,
         list(memory_ids),
     )
@@ -365,7 +373,7 @@ async def fetch_kg_triple_by_id(conn, triple_id: str):
         "SELECT subject, predicate, object, subject_type, "
         "object_type, memory_id, confidence, owner_id, "
         "namespace, valid_from, valid_until, created "
-        "FROM kg_triples WHERE id = $1",
+        "FROM kg_triples WHERE id = $1 AND deleted_at IS NULL",
         triple_id,
     )
 
@@ -384,6 +392,7 @@ async def fetch_memory_branch_heads(
             FROM memory_versions
             WHERE memory_id = ANY($1::text[])
               AND id = ANY($2::uuid[])
+              AND deleted_at IS NULL
             ORDER BY memory_id, branch, version_num DESC
             """,
             list(memory_ids),
@@ -395,6 +404,7 @@ async def fetch_memory_branch_heads(
             memory_id, branch, id::text AS head_version_id
         FROM memory_versions
         WHERE memory_id = ANY($1::text[])
+          AND deleted_at IS NULL
         ORDER BY memory_id, branch, version_num DESC
         """,
         list(memory_ids),
@@ -424,7 +434,8 @@ async def upsert_memory_branch_head(
 async def fetch_memory_versions_by_ids(conn, version_ids: Sequence[str]):
     return await conn.fetch(
         "SELECT id::text AS id, memory_id, owner_id, namespace "
-        "FROM memory_versions WHERE id = ANY($1::uuid[])",
+        "FROM memory_versions WHERE id = ANY($1::uuid[]) "
+        "AND deleted_at IS NULL",
         list(version_ids),
     )
 
@@ -510,7 +521,7 @@ async def fetch_memory_version_by_id(conn, version_id: str):
         "source_model, source_provider, source_session, "
         "source_agent, snapshot_at, snapshot_by, "
         "change_type "
-        "FROM memory_versions WHERE id = $1::uuid",
+        "FROM memory_versions WHERE id = $1::uuid AND deleted_at IS NULL",
         version_id,
     )
 

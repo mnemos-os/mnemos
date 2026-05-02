@@ -8,15 +8,16 @@ Endpoint surface tested:
   GET    /admin/deletion-requests/{id}         single
   POST   /admin/deletion-requests/{id}/confirm transition requested → confirmed
   POST   /admin/deletion-requests/{id}/cancel  transition requested|confirmed → cancelled
+  POST   /admin/deletion-requests/{id}/restore reverse soft-delete in grace window
 
-The actual wipe worker that consumes confirmed rows is gated
-to round-78+; this test file covers only the request-side
-lifecycle.
+The actual wipe worker that consumes confirmed rows is covered in
+test_deletion_request_worker.py; this file covers the admin
+lifecycle and restore route.
 """
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, MagicMock
 from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock
 
 import asyncpg
 import pytest
@@ -29,6 +30,7 @@ from mnemos.api.routes.admin import (
     create_deletion_request,
     get_deletion_request,
     list_deletion_requests,
+    restore_deletion_request,
 )
 from mnemos.domain.models import DeletionRequestCreate
 
@@ -79,6 +81,7 @@ def _wire_pool(monkeypatch, mock_conn):
 
     pool_manager = MagicMock()
     pool_manager.acquire = MagicMock(return_value=_AsyncContext(mock_conn))
+    pool_manager.transactional = MagicMock(return_value=_AsyncContext(mock_conn))
     monkeypatch.setattr(lc, "get_pool_manager", lambda: pool_manager)
     monkeypatch.setattr(lc, "_pool", MagicMock())
     # Default transaction stub (clean exit).
@@ -566,3 +569,81 @@ async def test_cancel_deletion_request_409_on_soft_deleted(monkeypatch):
         await cancel_deletion_request("r-1", _=_root_user())
     assert exc.value.status_code == 409
     assert "soft_deleted" in exc.value.detail
+
+
+# ── POST /admin/deletion-requests/{id}/restore ───────────────
+
+
+@pytest.mark.asyncio
+async def test_restore_deletion_request_restores_soft_deleted_rows(monkeypatch):
+    soft_deleted_at = datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc)
+    restore_by = datetime(2026, 5, 31, 23, 5, 0, tzinfo=timezone.utc)
+    restored_at = datetime(2026, 5, 2, 0, 0, 0, tzinfo=timezone.utc)
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(
+        side_effect=[
+            _row(
+                id="00000000-0000-0000-0000-000000000001",
+                target_user_id="alice",
+                target_namespace="tenant-a",
+                status="soft_deleted",
+                soft_deleted_at=soft_deleted_at,
+                restore_by=restore_by,
+            ),
+            _row(
+                id="00000000-0000-0000-0000-000000000001",
+                target_user_id="alice",
+                target_namespace="tenant-a",
+                status="restored",
+                soft_deleted_at=soft_deleted_at,
+                restore_by=restore_by,
+                restored_at=restored_at,
+            ),
+        ]
+    )
+    mock_conn.fetchval = AsyncMock(return_value=False)
+    mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+    _wire_pool(monkeypatch, mock_conn)
+
+    result = await restore_deletion_request(
+        "00000000-0000-0000-0000-000000000001",
+        _=_root_user(),
+    )
+
+    assert result.status == "restored"
+    assert result.restored_at == restored_at.isoformat()
+    restore_sqls = [call.args[0] for call in mock_conn.execute.await_args_list]
+    assert restore_sqls
+    assert all("SET deleted_at = NULL" in sql for sql in restore_sqls)
+    assert all(call.args[1] == "alice" for call in mock_conn.execute.await_args_list)
+    assert all(call.args[2] == "tenant-a" for call in mock_conn.execute.await_args_list)
+    assert all(call.args[3] == soft_deleted_at for call in mock_conn.execute.await_args_list)
+
+
+@pytest.mark.asyncio
+async def test_restore_deletion_request_409_after_grace_window(monkeypatch):
+    soft_deleted_at = datetime(2026, 5, 1, 23, 5, 0, tzinfo=timezone.utc)
+    restore_by = datetime(2026, 5, 2, 23, 5, 0, tzinfo=timezone.utc)
+    mock_conn = AsyncMock()
+    mock_conn.fetchrow = AsyncMock(
+        return_value=_row(
+            id="00000000-0000-0000-0000-000000000001",
+            target_user_id="alice",
+            status="soft_deleted",
+            soft_deleted_at=soft_deleted_at,
+            restore_by=restore_by,
+        )
+    )
+    mock_conn.fetchval = AsyncMock(return_value=True)
+    mock_conn.execute = AsyncMock(return_value="UPDATE 1")
+    _wire_pool(monkeypatch, mock_conn)
+
+    with pytest.raises(HTTPException) as exc:
+        await restore_deletion_request(
+            "00000000-0000-0000-0000-000000000001",
+            _=_root_user(),
+        )
+
+    assert exc.value.status_code == 409
+    assert "restore window expired" in exc.value.detail
+    mock_conn.execute.assert_not_awaited()

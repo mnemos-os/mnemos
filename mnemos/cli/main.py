@@ -421,6 +421,12 @@ def worker_distillation() -> None:
     _run_async_module_main("mnemos.workers.distillation")
 
 
+@worker_app.command("deletion-requests")
+def worker_deletion_requests() -> None:
+    """Run the GDPR deletion-request soft-delete worker."""
+    _run_async_module_main("mnemos.workers.deletion_request_worker")
+
+
 @app.command()
 def install(
     agent: bool = typer.Option(False, "--agent", help="LLM-guided installation."),

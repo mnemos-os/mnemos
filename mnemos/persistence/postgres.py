@@ -274,7 +274,7 @@ class PostgresMemoryRepository(MemoryRepository):
         offset: int = 0,
     ) -> tuple[list[Row], int]:
         conn = _postgres_tx(tx).conn
-        where_parts: list[str] = []
+        where_parts: list[str] = ["deleted_at IS NULL"]
         params: list[Any] = []
         if category is not None:
             params.append(category)
@@ -308,12 +308,16 @@ class PostgresMemoryRepository(MemoryRepository):
         conn = _postgres_tx(tx).conn
         if visibility.scope == VisibilityScope.ROOT_BYPASS and visibility.namespace is None:
             return await conn.fetchrow(
-                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1", memory_id,
+                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1 AND deleted_at IS NULL",
+                memory_id,
             )
         vis_clause, vis_params, _ = _render_postgres_visibility(
             visibility, start_idx=2,
         )
-        sql = f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1 AND {vis_clause}"
+        sql = (
+            f"SELECT {_MEMORY_COLS} FROM memories "
+            f"WHERE id=$1 AND deleted_at IS NULL AND {vis_clause}"
+        )
         return await conn.fetchrow(sql, memory_id, *vis_params)
 
     async def update_memory(
@@ -341,12 +345,12 @@ class PostgresMemoryRepository(MemoryRepository):
         if vis_clause:
             sql = (
                 f"UPDATE memories SET {set_sql} "
-                f"WHERE id=$1 AND {vis_clause} "
+                f"WHERE id=$1 AND deleted_at IS NULL AND {vis_clause} "
                 f"RETURNING {_MEMORY_COLS}"
             )
             return await conn.fetchrow(sql, memory_id, *values, *vis_params)
         sql = (
-            f"UPDATE memories SET {set_sql} WHERE id=$1 "
+            f"UPDATE memories SET {set_sql} WHERE id=$1 AND deleted_at IS NULL "
             f"RETURNING {_MEMORY_COLS}"
         )
         return await conn.fetchrow(sql, memory_id, *values)
@@ -365,12 +369,12 @@ class PostgresMemoryRepository(MemoryRepository):
         if vis_clause:
             sql = (
                 "DELETE FROM memories "
-                f"WHERE id=$1 AND {vis_clause} "
+                f"WHERE id=$1 AND deleted_at IS NULL AND {vis_clause} "
                 "RETURNING owner_id, namespace, id, content, category, subcategory"
             )
             return await conn.fetchrow(sql, memory_id, *vis_params)
         return await conn.fetchrow(
-            "DELETE FROM memories WHERE id=$1 "
+            "DELETE FROM memories WHERE id=$1 AND deleted_at IS NULL "
             "RETURNING owner_id, namespace, id, content, category, subcategory",
             memory_id,
         )
@@ -395,7 +399,7 @@ class PostgresMemoryRepository(MemoryRepository):
         # embedding response.
         vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
         params: list[Any] = [vec_str]
-        conditions: list[str] = ["embedding IS NOT NULL"]
+        conditions: list[str] = ["embedding IS NOT NULL", "deleted_at IS NULL"]
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -443,6 +447,7 @@ class PostgresMemoryRepository(MemoryRepository):
         params: list[Any] = [clean_query, limit]
         conditions: list[str] = [
             "to_tsvector('english', content) @@ plainto_tsquery('english', $1)",
+            "deleted_at IS NULL",
         ]
         for col, val in (
             ("category", category),
@@ -475,7 +480,7 @@ class PostgresMemoryRepository(MemoryRepository):
             # pattern, $2 still the limit.
             like_q = f"%{query}%"
             ilike_params: list[Any] = [like_q, limit]
-            ilike_conditions: list[str] = ["content ILIKE $1"]
+            ilike_conditions: list[str] = ["content ILIKE $1", "deleted_at IS NULL"]
             for col, val in (
                 ("category", category),
                 ("subcategory", subcategory),
@@ -501,27 +506,30 @@ class PostgresMemoryRepository(MemoryRepository):
 
     async def gather_stats(self, tx: Transaction) -> MemoryStatsRow:
         conn = _postgres_tx(tx).conn
-        total = await conn.fetchval("SELECT COUNT(*) FROM memories")
+        total = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE deleted_at IS NULL")
         native = await conn.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL",
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NULL AND deleted_at IS NULL",
         )
         federated = await conn.fetchval(
-            "SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL",
+            "SELECT COUNT(*) FROM memories WHERE federation_source IS NOT NULL AND deleted_at IS NULL",
         )
         peer_rows = await conn.fetch(
             "SELECT federation_source, COUNT(*) AS cnt FROM memories "
-            "WHERE federation_source IS NOT NULL "
+            "WHERE federation_source IS NOT NULL AND deleted_at IS NULL "
             "GROUP BY federation_source ORDER BY cnt DESC",
         )
         cat_rows = await conn.fetch(
-            "SELECT category, COUNT(*) AS cnt FROM memories GROUP BY category",
+            "SELECT category, COUNT(*) AS cnt FROM memories "
+            "WHERE deleted_at IS NULL GROUP BY category",
         )
         sub_rows = await conn.fetch(
             "SELECT category, subcategory, COUNT(*) AS cnt FROM memories "
-            "WHERE subcategory IS NOT NULL GROUP BY category, subcategory ORDER BY cnt DESC",
+            "WHERE subcategory IS NOT NULL AND deleted_at IS NULL "
+            "GROUP BY category, subcategory ORDER BY cnt DESC",
         )
         avg_quality = await conn.fetchval(
-            "SELECT AVG(quality_rating) FROM memories WHERE quality_rating IS NOT NULL",
+            "SELECT AVG(quality_rating) FROM memories "
+            "WHERE quality_rating IS NOT NULL AND deleted_at IS NULL",
         )
         memories_by_subcategory: dict[str, dict[str, int]] = {}
         for r in sub_rows:
@@ -947,7 +955,8 @@ class PostgresFederationRepository(FederationRepository):
                 """
                 SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated
                 FROM memories
-                WHERE updated > $1 OR (updated = $1 AND id > $2)
+                WHERE deleted_at IS NULL
+                  AND (updated > $1 OR (updated = $1 AND id > $2))
                 ORDER BY updated ASC, id ASC
                 LIMIT $3
                 """,
@@ -959,6 +968,7 @@ class PostgresFederationRepository(FederationRepository):
             """
             SELECT id, content, category, subcategory, metadata, owner_id, namespace, updated
             FROM memories
+            WHERE deleted_at IS NULL
             ORDER BY updated ASC, id ASC
             LIMIT $1
             """,
@@ -1009,7 +1019,8 @@ class PostgresStateRepository(StateRepository):
     ) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
             "SELECT key, value, owner_id, namespace FROM state "
-            "WHERE owner_id = $1 AND namespace = $2 AND key = $3",
+            "WHERE owner_id = $1 AND namespace = $2 AND key = $3 "
+            "AND deleted_at IS NULL",
             owner_id,
             namespace,
             key,
@@ -1030,6 +1041,7 @@ class PostgresStateRepository(StateRepository):
             VALUES ($1, $2, $3, $4)
             ON CONFLICT (owner_id, namespace, key) DO UPDATE
             SET value = EXCLUDED.value
+            WHERE state.deleted_at IS NULL
             """,
             owner_id,
             namespace,
@@ -1046,7 +1058,8 @@ class PostgresStateRepository(StateRepository):
         namespace: str = "default",
     ) -> None:
         await _postgres_tx(tx).conn.execute(
-            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3",
+            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 "
+            "AND deleted_at IS NULL",
             owner_id,
             namespace,
             key,

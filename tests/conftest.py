@@ -432,7 +432,10 @@ class FakeConnection:
                 ]
             if (
                 "ORDER BY global_sequence_num DESC" in compact
-                or "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT" in compact
+                or (
+                    "FROM graeae_audit_log" in compact
+                    and "ORDER BY sequence_num DESC" in compact
+                )
                 or "ORDER BY al.sequence_num DESC" in compact
             ):
                 rows = list(reversed(rows))

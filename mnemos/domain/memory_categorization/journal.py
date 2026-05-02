@@ -99,6 +99,7 @@ class JournalManager:
                         rows = await conn.fetch(
                             '''SELECT * FROM journal
                                WHERE owner_id = $1 AND namespace = $2 AND topic = $3
+                                 AND deleted_at IS NULL
                                ORDER BY created DESC LIMIT $4''',
                             owner_id, namespace, topic, count,
                         )
@@ -106,6 +107,7 @@ class JournalManager:
                         rows = await conn.fetch(
                             '''SELECT * FROM journal
                                WHERE owner_id = $1 AND namespace = $2
+                                 AND deleted_at IS NULL
                                ORDER BY created DESC LIMIT $3''',
                             owner_id, namespace, count,
                         )
@@ -125,6 +127,7 @@ class JournalManager:
                            WHERE owner_id = $1
                              AND namespace = $2
                              AND (content ILIKE $3 OR topic ILIKE $3)
+                             AND deleted_at IS NULL
                            ORDER BY created DESC LIMIT $4''',
                         owner_id, namespace, f'%{search}%', limit,
                     )
@@ -142,6 +145,7 @@ class JournalManager:
                     rows = await conn.fetch(
                         '''SELECT * FROM journal
                            WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
+                             AND deleted_at IS NULL
                            ORDER BY created DESC''',
                         owner_id, namespace, date_str,
                     )
@@ -167,6 +171,7 @@ class JournalManager:
                            WHERE owner_id = $1
                              AND namespace = $2
                              AND entry_date BETWEEN $3 AND $4
+                             AND deleted_at IS NULL
                            ORDER BY created DESC''',
                         owner_id, namespace, start_date, end_date,
                     )
@@ -188,12 +193,14 @@ class JournalManager:
                 async with self.db_pool.acquire() as conn:
                     stats['total_entries'] = await conn.fetchval(
                         '''SELECT COUNT(*) FROM journal
-                           WHERE owner_id = $1 AND namespace = $2''',
+                           WHERE owner_id = $1 AND namespace = $2
+                             AND deleted_at IS NULL''',
                         owner_id, namespace,
                     ) or 0
                     topic_rows = await conn.fetch(
                         '''SELECT topic, COUNT(*) as count FROM journal
                            WHERE owner_id = $1 AND namespace = $2
+                             AND deleted_at IS NULL
                            GROUP BY topic ORDER BY count DESC''',
                         owner_id, namespace,
                     )
@@ -201,13 +208,15 @@ class JournalManager:
                     today = datetime.now(timezone.utc).date()
                     stats['entries_today'] = await conn.fetchval(
                         '''SELECT COUNT(*) FROM journal
-                           WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3''',
+                           WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
+                             AND deleted_at IS NULL''',
                         owner_id, namespace, today,
                     ) or 0
                     week_ago = datetime.now(timezone.utc).date() - timedelta(days=7)
                     stats['entries_this_week'] = await conn.fetchval(
                         '''SELECT COUNT(*) FROM journal
-                           WHERE owner_id = $1 AND namespace = $2 AND entry_date >= $3''',
+                           WHERE owner_id = $1 AND namespace = $2 AND entry_date >= $3
+                             AND deleted_at IS NULL''',
                         owner_id, namespace, week_ago,
                     ) or 0
             except Exception as e:

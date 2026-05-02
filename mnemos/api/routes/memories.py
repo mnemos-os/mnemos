@@ -246,7 +246,7 @@ async def _bump_recall_counters(memory_ids: list) -> None:
                 "UPDATE memories "
                 "SET recall_count = recall_count + 1, "
                 "    last_recalled_at = now() "
-                "WHERE id = ANY($1::text[])",
+                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
                 list(memory_ids),
             )
     except Exception as e:
@@ -424,13 +424,14 @@ async def get_compression_manifests(
             # defense-in-depth for the RLS-disabled case too.
             if is_root(user):
                 exists = await conn.fetchval(
-                    "SELECT 1 FROM memories WHERE id = $1",
+                    "SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL",
                     memory_id,
                 )
             else:
                 exists = await conn.fetchval(
                     "SELECT 1 FROM memories "
-                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
+                    "AND deleted_at IS NULL",
                     memory_id, user.user_id, user.namespace,
                 )
             if not exists:
@@ -1072,7 +1073,8 @@ async def rehydrate_memories(
     # iff at least one row returned a variant-compressed form.
     clean_query = request.query.strip()
     sql_conditions = [
-        "to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)"
+        "to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)",
+        "m.deleted_at IS NULL",
     ]
     sql_params: list = [clean_query, request.limit]
     idx = 3

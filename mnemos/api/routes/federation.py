@@ -125,6 +125,7 @@ def _federation_visibility_filters() -> list[str]:
     return [
         "m.federation_source IS NULL",
         "(m.permission_mode % 10) >= 4",
+        "m.deleted_at IS NULL",
     ]
 
 

@@ -396,7 +396,8 @@ async def compression_enqueue(
             # and must reflect the underlying memory. Single-user installs
             # (memories.owner_id DEFAULT 'default') keep working unchanged.
             known = await conn.fetch(
-                "SELECT id, owner_id FROM memories WHERE id = ANY($1::text[])",
+                "SELECT id, owner_id FROM memories "
+                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
                 request.memory_ids,
             )
             owner_by_id = {r["id"]: r["owner_id"] for r in known}
@@ -480,7 +481,7 @@ async def compression_enqueue_all(
 
     # Build WHERE clause incrementally. Avoid f-string injection by binding
     # every user-controlled value via asyncpg parameters.
-    where_parts: list[str] = []
+    where_parts: list[str] = ["m.deleted_at IS NULL"]
     params: list = []
     if request.only_uncompressed:
         where_parts.append(
@@ -543,7 +544,7 @@ async def reload_graeae_providers(_: UserContext = Depends(require_root)):
 # ── GDPR right-to-be-forgotten ────────────────────────────────────────────────
 #
 # Scaffold for a 3-step lifecycle: requested → confirmed →
-# soft_deleted → (hard_deleted | restored). The admin endpoints
+# sweep_verifying → soft_deleted → (hard_deleted | restored). The admin endpoints
 # below cover the lifecycle's request-side: creating, listing,
 # inspecting, confirming, and cancelling a request. The actual
 # soft-delete sweep is performed by a worker (round-78+) that
@@ -725,7 +726,7 @@ async def create_deletion_request(
                     SELECT id, target_namespace, status
                       FROM deletion_requests
                      WHERE target_user_id = $1
-                       AND status IN ('requested', 'confirmed', 'soft_deleted')
+                       AND status IN ('requested', 'confirmed', 'sweep_verifying', 'soft_deleted')
                        AND (
                             mnemos_is_blank_namespace(target_namespace)
                          OR $2::text IS NULL
@@ -963,6 +964,99 @@ async def cancel_deletion_request(
         )
     logger.info(
         "[ADMIN] Cancelled deletion request %s (target_user_id=%s)",
+        row["id"], row["target_user_id"],
+    )
+    return _row_to_deletion_request(row)
+
+
+@router.post(
+    "/deletion-requests/{request_id}/restore",
+    response_model=DeletionRequestItem,
+)
+async def restore_deletion_request(
+    request_id: str,
+    _: UserContext = Depends(require_root),
+):
+    """Restore a soft-deleted deletion request during its grace window."""
+    require_postgres_pool_or_503(
+        route_label="POST /admin/deletion-requests/{request_id}/restore"
+    )
+    from mnemos.workers.deletion_request_worker import (
+        invalidate_deletion_scope_caches,
+        restore_soft_deleted_target,
+    )
+
+    restored_target: tuple[str, str | None] | None = None
+    async with _lc.get_pool_manager().transactional() as conn:
+        existing = await conn.fetchrow(
+            """
+            SELECT *
+              FROM deletion_requests
+             WHERE id = $1::uuid
+             FOR UPDATE
+            """,
+            request_id,
+        )
+        if existing is None:
+            raise HTTPException(
+                status_code=404,
+                detail=f"deletion request {request_id} not found",
+            )
+        if existing["status"] != "soft_deleted":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"deletion request {request_id} is in state "
+                    f"{existing['status']!r}; only 'soft_deleted' "
+                    f"rows can be restored"
+                ),
+            )
+        if existing["restore_by"] is None or existing["soft_deleted_at"] is None:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"deletion request {request_id} is missing "
+                    "restore metadata"
+                ),
+            )
+        restore_window_expired = await conn.fetchval(
+            "SELECT $1::timestamptz <= NOW()",
+            existing["restore_by"],
+        )
+        if restore_window_expired:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"deletion request {request_id} restore window "
+                    f"expired at {existing['restore_by'].isoformat()}"
+                ),
+            )
+
+        await restore_soft_deleted_target(
+            conn,
+            existing["target_user_id"],
+            existing["target_namespace"],
+            existing["soft_deleted_at"],
+            invalidate_cache=False,
+        )
+        restored_target = (existing["target_user_id"], existing["target_namespace"])
+        row = await conn.fetchrow(
+            """
+            UPDATE deletion_requests
+               SET status = 'restored',
+                   restored_at = NOW()
+             WHERE id = $1::uuid
+               AND status = 'soft_deleted'
+            RETURNING *
+            """,
+            request_id,
+        )
+
+    if restored_target is not None:
+        await invalidate_deletion_scope_caches(*restored_target)
+
+    logger.info(
+        "[ADMIN] Restored deletion request %s (target_user_id=%s)",
         row["id"], row["target_user_id"],
     )
     return _row_to_deletion_request(row)

@@ -101,6 +101,7 @@ async def list_journal_entries(
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
                        FROM journal WHERE owner_id = $1 AND namespace = $2 AND entry_date = $3
+                         AND deleted_at IS NULL
                        ORDER BY created DESC LIMIT $4''',
                     target_owner, target_ns, parsed_date, limit
                 )
@@ -108,6 +109,7 @@ async def list_journal_entries(
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
                        FROM journal WHERE owner_id = $1 AND namespace = $2 AND topic = $3
+                         AND deleted_at IS NULL
                        ORDER BY created DESC LIMIT $4''',
                     target_owner, target_ns, topic, limit
                 )
@@ -115,6 +117,7 @@ async def list_journal_entries(
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
                        FROM journal WHERE owner_id = $1 AND namespace = $2 AND (content ILIKE $3 OR topic ILIKE $3)
+                         AND deleted_at IS NULL
                        ORDER BY created DESC LIMIT $4''',
                     target_owner, target_ns, f'%{search}%', limit
                 )
@@ -122,6 +125,7 @@ async def list_journal_entries(
                 rows = await conn.fetch(
                     '''SELECT id, entry_date::text, topic, content, metadata, created::text
                        FROM journal WHERE owner_id = $1 AND namespace = $2
+                         AND deleted_at IS NULL
                        ORDER BY created DESC LIMIT $3''',
                     target_owner, target_ns, limit
                 )
@@ -145,7 +149,8 @@ async def delete_journal_entry(
     target_ns = scope_namespace(user, namespace)
     async with _lc.get_pool_manager().transactional() as conn:
         result = await conn.execute(
-            'DELETE FROM journal WHERE id = $1 AND owner_id = $2 AND namespace = $3',
+            'DELETE FROM journal WHERE id = $1 AND owner_id = $2 AND namespace = $3 '
+            'AND deleted_at IS NULL',
             entry_id, target_owner, target_ns,
         )
     if result == 'DELETE 0':

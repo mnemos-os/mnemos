@@ -124,7 +124,7 @@ BEGIN
       FROM (
         SELECT target_user_id
           FROM deletion_requests
-         WHERE status IN ('requested', 'confirmed', 'soft_deleted')
+         WHERE status IN ('requested', 'confirmed', 'sweep_verifying', 'soft_deleted')
            AND mnemos_is_blank_namespace(target_namespace)
          GROUP BY target_user_id
         HAVING COUNT(*) > 1
@@ -142,7 +142,7 @@ BEGIN
             'Run: SELECT id, target_user_id, target_namespace, '
             'status FROM deletion_requests WHERE '
             'target_user_id IN (...) AND status IN '
-            '(''requested'', ''confirmed'', ''soft_deleted'') '
+            '(''requested'', ''confirmed'', ''sweep_verifying'', ''soft_deleted'') '
             'AND mnemos_is_blank_namespace(target_namespace) '
             'ORDER BY target_user_id, requested_at;';
     END IF;
@@ -164,8 +164,8 @@ BEGIN
           FROM deletion_requests all_ns_row
           JOIN deletion_requests specific_row
             USING (target_user_id)
-         WHERE all_ns_row.status IN ('requested', 'confirmed', 'soft_deleted')
-           AND specific_row.status IN ('requested', 'confirmed', 'soft_deleted')
+         WHERE all_ns_row.status IN ('requested', 'confirmed', 'sweep_verifying', 'soft_deleted')
+           AND specific_row.status IN ('requested', 'confirmed', 'sweep_verifying', 'soft_deleted')
            AND mnemos_is_blank_namespace(all_ns_row.target_namespace)
            AND NOT mnemos_is_blank_namespace(specific_row.target_namespace)
            AND all_ns_row.id <> specific_row.id
@@ -186,7 +186,7 @@ BEGIN
             'Run: SELECT id, target_user_id, target_namespace, '
             'status FROM deletion_requests WHERE '
             'target_user_id IN (...) AND status IN '
-            '(''requested'', ''confirmed'', ''soft_deleted'') '
+            '(''requested'', ''confirmed'', ''sweep_verifying'', ''soft_deleted'') '
             'ORDER BY target_user_id, requested_at;';
     END IF;
 END;

@@ -687,7 +687,8 @@ async def _store_memories(
 
         # Check existing
         existing = await conn.fetchrow(
-            "SELECT federation_remote_updated FROM memories WHERE id = $1",
+            "SELECT federation_remote_updated FROM memories "
+            "WHERE id = $1 AND deleted_at IS NULL",
             local_id,
         )
 
@@ -741,7 +742,8 @@ async def _store_memories(
                 # losing path still applies a delta if its remote_updated
                 # is the freshest.
                 existing = await conn.fetchrow(
-                    "SELECT federation_remote_updated FROM memories WHERE id = $1",
+                    "SELECT federation_remote_updated FROM memories "
+                    "WHERE id = $1 AND deleted_at IS NULL",
                     local_id,
                 )
 
@@ -768,6 +770,7 @@ async def _store_memories(
                       federation_remote_updated = $9::timestamptz,
                       updated = ($9::timestamptz AT TIME ZONE 'UTC')
                     WHERE id = $1
+                      AND deleted_at IS NULL
                       AND (
                           federation_remote_updated IS NULL
                           OR federation_remote_updated < $9::timestamptz

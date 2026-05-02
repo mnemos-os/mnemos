@@ -67,7 +67,10 @@ class _HiddenStartConn:
         if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
             return {"owner_id": "alice", "namespace": "alice-ns"}
 
-        if compact.startswith("SELECT 1 FROM memories WHERE id = $1 AND owner_id = $2"):
+        if (
+            compact.startswith("SELECT 1 FROM memories WHERE id = $1")
+            and "owner_id = $2" in compact
+        ):
             return {"ok": 1}
 
         if "FROM memory_versions" in compact and "commit_hash = $2" in compact:
@@ -257,18 +260,33 @@ class _MergeHiddenTargetConn:
         if compact.startswith("SELECT owner_id, namespace FROM memories WHERE id = $1"):
             return {"owner_id": "alice", "namespace": "alice-ns"}
 
-        if "FROM memories WHERE id = $1 AND owner_id = $2 AND namespace = $3 FOR UPDATE" in compact:
+        if (
+            "FROM memories WHERE id = $1" in compact
+            and "owner_id = $2" in compact
+            and "namespace = $3" in compact
+            and "FOR UPDATE" in compact
+        ):
             if args[1] == "alice" and args[2] == "alice-ns":
                 return self.memory
             return None
 
-        if "FROM memory_versions mv" in compact and "mb.name = $2" in compact:
+        if (
+            "FROM memory_versions mv" in compact
+            and "mb.name = $2" in compact
+            and "mv.deleted_at IS NULL" in compact
+            and "mb.deleted_at IS NULL" in compact
+        ):
             if args[1] == "source":
                 return self.source_head
             if args[1] == "hidden_branch":
                 return self.hidden_target
 
-        if compact.startswith("SELECT head_version_id FROM memory_branches WHERE memory_id = $1 AND name = $2 FOR UPDATE"):
+        if (
+            compact.startswith("SELECT head_version_id FROM memory_branches")
+            and "memory_id = $1" in compact
+            and "name = $2" in compact
+            and "FOR UPDATE" in compact
+        ):
             if args[1] == "hidden_branch":
                 return {"head_version_id": self.hidden_target["id"]}
             return None

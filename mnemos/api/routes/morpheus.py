@@ -200,7 +200,8 @@ async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
         synth_rows = await conn.fetch(
             "SELECT id, source_memories FROM memories "
             "WHERE morpheus_run_id=$1::uuid "
-            "  AND provenance='morpheus_local'",
+            "  AND provenance='morpheus_local' "
+            "  AND deleted_at IS NULL",
             run_id,
         )
 

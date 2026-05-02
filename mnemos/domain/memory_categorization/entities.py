@@ -58,6 +58,7 @@ class EntityManager:
                        ON CONFLICT (owner_id, namespace, entity_type, name) DO UPDATE
                        SET description = COALESCE($6, entities.description),
                            updated = NOW()
+                       WHERE entities.deleted_at IS NULL
                        RETURNING id::text''',
                     entity_id, owner_id, namespace, entity_type, name,
                     description, json.dumps(metadata or {}),
@@ -77,7 +78,8 @@ class EntityManager:
             async with self.db_pool.acquire() as conn:
                 row = await conn.fetchrow(
                     '''SELECT * FROM entities
-                       WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+                       WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
+                         AND deleted_at IS NULL''',
                     entity_id, owner_id, namespace,
                 )
                 return dict(row) if row else None
@@ -103,7 +105,8 @@ class EntityManager:
                        WHERE owner_id = $1
                          AND namespace = $2
                          AND entity_type = $3
-                         AND name = $4''',
+                         AND name = $4
+                         AND deleted_at IS NULL''',
                     owner_id, namespace, entity_type, name,
                 )
                 return dict(row) if row else None
@@ -134,6 +137,7 @@ class EntityManager:
                        WHERE id = $1::uuid
                          AND owner_id = $3
                          AND namespace = $4
+                         AND deleted_at IS NULL
                          AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
                     entity_id, related_id, owner_id, namespace,
                 )
@@ -148,6 +152,7 @@ class EntityManager:
                        WHERE id = $1::uuid
                          AND owner_id = $3
                          AND namespace = $4
+                         AND deleted_at IS NULL
                          AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
                     related_id, entity_id, owner_id, namespace,
                 )
@@ -174,7 +179,8 @@ class EntityManager:
                            WHERE owner_id = $1
                              AND namespace = $2
                              AND entity_type = $3
-                             AND name ILIKE $4
+                         AND name ILIKE $4
+                         AND deleted_at IS NULL
                            ORDER BY name LIMIT $5''',
                         owner_id, namespace, entity_type, f'%{name_search}%', limit,
                     )
@@ -182,6 +188,7 @@ class EntityManager:
                     rows = await conn.fetch(
                         '''SELECT * FROM entities
                            WHERE owner_id = $1 AND namespace = $2 AND entity_type = $3
+                             AND deleted_at IS NULL
                            ORDER BY name LIMIT $4''',
                         owner_id, namespace, entity_type, limit,
                     )
@@ -191,6 +198,7 @@ class EntityManager:
                            WHERE owner_id = $1
                              AND namespace = $2
                              AND name ILIKE $3
+                             AND deleted_at IS NULL
                            ORDER BY name LIMIT $4''',
                         owner_id, namespace, f'%{name_search}%', limit,
                     )
@@ -198,6 +206,7 @@ class EntityManager:
                     rows = await conn.fetch(
                         '''SELECT * FROM entities
                            WHERE owner_id = $1 AND namespace = $2
+                             AND deleted_at IS NULL
                            ORDER BY entity_type, name LIMIT $3''',
                         owner_id, namespace, limit,
                     )
@@ -226,7 +235,8 @@ class EntityManager:
                     '''SELECT * FROM entities
                        WHERE owner_id = $1
                          AND namespace = $2
-                         AND id = ANY($3::uuid[])''',
+                         AND id = ANY($3::uuid[])
+                         AND deleted_at IS NULL''',
                     owner_id, namespace, related_ids,
                 )
                 return [dict(row) for row in rows]
@@ -249,21 +259,24 @@ class EntityManager:
                     await conn.execute(
                         '''UPDATE entities
                            SET description = $1, metadata = $2::jsonb, updated = NOW()
-                           WHERE id = $3::uuid AND owner_id = $4 AND namespace = $5''',
+                           WHERE id = $3::uuid AND owner_id = $4 AND namespace = $5
+                             AND deleted_at IS NULL''',
                         description, json.dumps(metadata), entity_id, owner_id, namespace,
                     )
                 elif description is not None:
                     await conn.execute(
                         '''UPDATE entities
                            SET description = $1, updated = NOW()
-                           WHERE id = $2::uuid AND owner_id = $3 AND namespace = $4''',
+                           WHERE id = $2::uuid AND owner_id = $3 AND namespace = $4
+                             AND deleted_at IS NULL''',
                         description, entity_id, owner_id, namespace,
                     )
                 elif metadata is not None:
                     await conn.execute(
                         '''UPDATE entities
                            SET metadata = $1::jsonb, updated = NOW()
-                           WHERE id = $2::uuid AND owner_id = $3 AND namespace = $4''',
+                           WHERE id = $2::uuid AND owner_id = $3 AND namespace = $4
+                             AND deleted_at IS NULL''',
                         json.dumps(metadata), entity_id, owner_id, namespace,
                     )
             return True
@@ -284,12 +297,14 @@ class EntityManager:
                        SET related_entities = array_remove(related_entities, $1::uuid)
                        WHERE owner_id = $2
                          AND namespace = $3
+                         AND deleted_at IS NULL
                          AND $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
                     entity_id, owner_id, namespace,
                 )
                 result = await conn.execute(
                     '''DELETE FROM entities
-                       WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+                       WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
+                         AND deleted_at IS NULL''',
                     entity_id, owner_id, namespace,
                 )
                 return result != 'DELETE 0'
@@ -306,12 +321,14 @@ class EntityManager:
             async with self.db_pool.acquire() as conn:
                 stats['total_entities'] = await conn.fetchval(
                     '''SELECT COUNT(*) FROM entities
-                       WHERE owner_id = $1 AND namespace = $2''',
+                       WHERE owner_id = $1 AND namespace = $2
+                         AND deleted_at IS NULL''',
                     owner_id, namespace,
                 ) or 0
                 type_rows = await conn.fetch(
                     '''SELECT entity_type, COUNT(*) as count FROM entities
                        WHERE owner_id = $1 AND namespace = $2
+                         AND deleted_at IS NULL
                        GROUP BY entity_type ORDER BY count DESC''',
                     owner_id, namespace,
                 )

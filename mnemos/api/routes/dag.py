@@ -51,7 +51,9 @@ async def _assert_memory_writable(conn, memory_id: str, user: UserContext) -> No
     owner_id AND namespace. We return 404 to avoid leaking existence.
     """
     row = await conn.fetchrow(
-        "SELECT owner_id, namespace FROM memories WHERE id = $1", memory_id,
+        "SELECT owner_id, namespace FROM memories "
+        "WHERE id = $1 AND deleted_at IS NULL",
+        memory_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Memory not found")
@@ -65,19 +67,26 @@ async def _assert_memory_writable(conn, memory_id: str, user: UserContext) -> No
 async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> None:
     """Ensure DAG read endpoints match memory read visibility semantics."""
     if user.role == "root":
-        row = await conn.fetchrow("SELECT 1 FROM memories WHERE id = $1", memory_id)
+        row = await conn.fetchrow(
+            "SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL",
+            memory_id,
+        )
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
         return
 
     visibility = VisibilityFilter.for_read(user, namespace=user.namespace)
     if visibility.scope == VisibilityScope.ROOT_BYPASS:
-        row = await conn.fetchrow("SELECT 1 FROM memories WHERE id = $1", memory_id)
+        row = await conn.fetchrow(
+            "SELECT 1 FROM memories WHERE id = $1 AND deleted_at IS NULL",
+            memory_id,
+        )
     else:
         row = await conn.fetchrow(
             """
             SELECT 1 FROM memories
             WHERE id = $1
+              AND deleted_at IS NULL
               AND namespace = $2
               AND (
                     owner_id = $3
@@ -188,12 +197,15 @@ async def get_memory_log(
                     LEFT JOIN memory_versions parent_mv
                         ON parent_mv.id = mv.parent_version_id
                        AND parent_mv.memory_id = mv.memory_id
+                       AND parent_mv.deleted_at IS NULL
                     INNER JOIN memory_branches mb ON (
                         mb.memory_id = mv.memory_id AND
                         mb.name = $2 AND
                         mb.head_version_id = mv.id
                     )
                     WHERE mv.memory_id = $1
+                      AND mv.deleted_at IS NULL
+                      AND mb.deleted_at IS NULL
                     UNION ALL
                     -- Recursive: WALK backward via parent_version_id.
                     -- Same-memory predicate (mv.memory_id =
@@ -213,10 +225,12 @@ async def get_memory_log(
                     LEFT JOIN memory_versions parent_mv
                         ON parent_mv.id = mv.parent_version_id
                        AND parent_mv.memory_id = mv.memory_id
+                       AND parent_mv.deleted_at IS NULL
                     INNER JOIN commit_walk cw
                         ON mv.id = cw.parent_version_id
                        AND mv.memory_id = cw.memory_id
                     WHERE cw.depth < $3
+                      AND mv.deleted_at IS NULL
                 )
                 SELECT
                     id, commit_hash, parent_version_id, parent_commit_hash,
@@ -316,7 +330,9 @@ async def get_memory_branches(
                     LEFT JOIN memory_versions mv
                         ON mv.id = mb.head_version_id
                        AND mv.memory_id = mb.memory_id
+                       AND mv.deleted_at IS NULL
                     WHERE mb.memory_id = $1
+                      AND mb.deleted_at IS NULL
                     ORDER BY mb.created_at DESC
                     """,
                     memory_id,
@@ -336,9 +352,11 @@ async def get_memory_branches(
                     LEFT JOIN memory_versions mv
                         ON mv.id = mb.head_version_id
                        AND mv.memory_id = mb.memory_id
+                       AND mv.deleted_at IS NULL
                        AND {vis_clause}
                        AND mv.namespace = {ns_ph}
                     WHERE mb.memory_id = $1
+                      AND mb.deleted_at IS NULL
                     ORDER BY mb.created_at DESC
                     """,
                     memory_id, *vis_params, user.namespace,
@@ -396,13 +414,15 @@ async def create_branch(
                 # memory owner or namespace can change between auth and write.
                 if user.role == "root":
                     live = await conn.fetchrow(
-                        "SELECT 1 FROM memories WHERE id = $1 FOR SHARE",
+                        "SELECT 1 FROM memories "
+                        "WHERE id = $1 AND deleted_at IS NULL FOR SHARE",
                         memory_id,
                     )
                 else:
                     live = await conn.fetchrow(
                         "SELECT 1 FROM memories WHERE id = $1 "
-                        "AND owner_id = $2 AND namespace = $3 FOR SHARE",
+                        "AND owner_id = $2 AND namespace = $3 "
+                        "AND deleted_at IS NULL FOR SHARE",
                         memory_id,
                         user.user_id,
                         user.namespace,
@@ -416,7 +436,8 @@ async def create_branch(
                     if user.role == "root":
                         start_version = await conn.fetchrow(
                             "SELECT id, commit_hash, created_at FROM memory_versions "
-                            "WHERE memory_id = $1 AND commit_hash = $2",
+                            "WHERE memory_id = $1 AND commit_hash = $2 "
+                            "AND deleted_at IS NULL",
                             memory_id,
                             request.from_commit,
                         )
@@ -430,7 +451,7 @@ async def create_branch(
                         start_version = await conn.fetchrow(
                             "SELECT id, commit_hash, created_at FROM memory_versions "
                             "WHERE memory_id = $1 AND commit_hash = $2 "
-                            f"AND {vis_clause} AND namespace = {ns_ph}",
+                            f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
                             memory_id, request.from_commit, *vis_params, user.namespace,
                         )
                     if not start_version:
@@ -444,6 +465,8 @@ async def create_branch(
                             FROM memory_versions mv
                             INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                             WHERE mv.memory_id = $1 AND mb.name = 'main'
+                              AND mv.deleted_at IS NULL
+                              AND mb.deleted_at IS NULL
                             """,
                             memory_id,
                         )
@@ -460,6 +483,8 @@ async def create_branch(
                             FROM memory_versions mv
                             INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                             WHERE mv.memory_id = $1 AND mb.name = 'main'
+                              AND mv.deleted_at IS NULL
+                              AND mb.deleted_at IS NULL
                               AND {vis_clause} AND mv.namespace = {ns_ph}
                             """,
                             memory_id, *vis_params, user.namespace,
@@ -528,9 +553,11 @@ async def get_commit(
                         mv.subcategory, mv.snapshot_at, mv.snapshot_by, mv.change_type,
                         (SELECT commit_hash FROM memory_versions mv2
                          WHERE mv2.id = mv.parent_version_id
-                           AND mv2.memory_id = mv.memory_id) AS parent_hash
+                           AND mv2.memory_id = mv.memory_id
+                           AND mv2.deleted_at IS NULL) AS parent_hash
                     FROM memory_versions mv
                     WHERE mv.memory_id = $1 AND mv.commit_hash = $2
+                      AND mv.deleted_at IS NULL
                     """,
                     memory_id, commit_hash,
                 )
@@ -564,9 +591,11 @@ async def get_commit(
                         (SELECT mv2.commit_hash FROM memory_versions mv2
                          WHERE mv2.id = mv.parent_version_id
                            AND mv2.memory_id = mv.memory_id
+                           AND mv2.deleted_at IS NULL
                            AND {vis_mv2} AND mv2.namespace = {ns_mv2_ph}) AS parent_hash
                     FROM memory_versions mv
                     WHERE mv.memory_id = $1 AND mv.commit_hash = $2
+                      AND mv.deleted_at IS NULL
                       AND {vis_mv} AND mv.namespace = {ns_mv_ph}
                     """,
                     memory_id, commit_hash,
@@ -632,14 +661,16 @@ async def merge_branch(
             if user.role == "root":
                 live = await conn.fetchrow(
                     "SELECT id, owner_id, namespace, permission_mode, content, category, "
-                    "subcategory, metadata, verbatim_content FROM memories WHERE id = $1 FOR UPDATE",
+                    "subcategory, metadata, verbatim_content FROM memories "
+                    "WHERE id = $1 AND deleted_at IS NULL FOR UPDATE",
                     memory_id,
                 )
             else:
                 live = await conn.fetchrow(
                     "SELECT id, owner_id, namespace, permission_mode, content, category, "
                     "subcategory, metadata, verbatim_content FROM memories "
-                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3 FOR UPDATE",
+                    "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
+                    "AND deleted_at IS NULL FOR UPDATE",
                     memory_id,
                     user.user_id,
                     user.namespace,
@@ -656,6 +687,8 @@ async def merge_branch(
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = $2
+                      AND mv.deleted_at IS NULL
+                      AND mb.deleted_at IS NULL
                     """,
                     memory_id,
                     request.source_branch,
@@ -677,6 +710,8 @@ async def merge_branch(
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = $2
+                      AND mv.deleted_at IS NULL
+                      AND mb.deleted_at IS NULL
                       AND {vis_clause} AND mv.namespace = {ns_ph}
                     """,
                     memory_id,
@@ -688,7 +723,8 @@ async def merge_branch(
                 raise HTTPException(status_code=404, detail=f"Source branch '{request.source_branch}' not found")
 
             target_branch_row = await conn.fetchrow(
-                "SELECT head_version_id FROM memory_branches WHERE memory_id = $1 AND name = $2 FOR UPDATE",
+                "SELECT head_version_id FROM memory_branches "
+                "WHERE memory_id = $1 AND name = $2 AND deleted_at IS NULL FOR UPDATE",
                 memory_id,
                 target_branch,
             )
@@ -710,6 +746,7 @@ async def merge_branch(
                        metadata, verbatim_content, owner_id, namespace, permission_mode
                 FROM memory_versions
                 WHERE id = $1 AND memory_id = $2
+                  AND deleted_at IS NULL
                 """,
                 target_head_id,
                 memory_id,
@@ -789,7 +826,8 @@ async def merge_branch(
                 user.user_id,
             )
             await conn.execute(
-                "UPDATE memory_branches SET head_version_id = $1 WHERE memory_id = $2 AND name = $3",
+                "UPDATE memory_branches SET head_version_id = $1 "
+                "WHERE memory_id = $2 AND name = $3 AND deleted_at IS NULL",
                 new_version_id,
                 memory_id,
                 target_branch,
@@ -818,7 +856,7 @@ async def merge_branch(
                         metadata = $4::jsonb, verbatim_content = $5,
                         source_model = $6, source_provider = $7,
                         source_session = $8, source_agent = $9, updated = NOW()
-                    WHERE id = $10
+                    WHERE id = $10 AND deleted_at IS NULL
                     """,
                     source_head["content"],
                     source_head["category"],

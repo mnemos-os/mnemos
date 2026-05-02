@@ -88,7 +88,8 @@ async def assert_owned_context(
     safe_id_column = _sql_identifier(id_column, "id_column")
     id_expr = f"$1::{_sql_cast(id_cast)}" if id_cast else "$1"
     row = await conn.fetchrow(
-        f"SELECT owner_id, namespace FROM {safe_table} WHERE {safe_id_column} = {id_expr}",
+        f"SELECT owner_id, namespace FROM {safe_table} "
+        f"WHERE {safe_id_column} = {id_expr} AND deleted_at IS NULL",
         resource_id,
     )
     if not row:

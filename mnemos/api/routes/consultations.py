@@ -254,6 +254,9 @@ async def _write_audit_entry_on_conn(
     # Advisory lock (magic key = 0x4772616561 = "Graea") ensures only
     # one writer holds the chain tip at a time.
     await conn.execute("SELECT pg_advisory_xact_lock(285734657)")
+    # Audit-chain continuity is internal tamper-evidence, not a
+    # user-content read path: the chain tip must include soft-deleted
+    # rows so later writes keep validating across GDPR restore windows.
     prev_row = await conn.fetchrow(
         "SELECT id, chain_hash FROM graeae_audit_log "
         "ORDER BY sequence_num DESC LIMIT 1"
@@ -544,7 +547,8 @@ async def list_audit_log(
             rows = await conn.fetch(
                 "SELECT id, sequence_num, consultation_id, prompt_hash, response_hash, "
                 "chain_hash, prev_id, task_type, provider, quality_score, created_at "
-                "FROM graeae_audit_log ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
+                "FROM graeae_audit_log WHERE deleted_at IS NULL "
+                "ORDER BY sequence_num DESC LIMIT $1 OFFSET $2",
                 limit, offset,
             )
         elif root:
@@ -554,6 +558,8 @@ async def list_audit_log(
                 "FROM graeae_audit_log al "
                 "JOIN graeae_consultations c ON c.id = al.consultation_id "
                 "WHERE c.namespace = $1 "
+                "AND c.deleted_at IS NULL "
+                "AND al.deleted_at IS NULL "
                 "ORDER BY al.sequence_num DESC LIMIT $2 OFFSET $3",
                 target_ns, limit, offset,
             )
@@ -569,6 +575,8 @@ async def list_audit_log(
                 "FROM graeae_audit_log al "
                 "JOIN graeae_consultations c ON c.id = al.consultation_id "
                 "WHERE c.owner_id = $1 AND c.namespace = $2 "
+                "AND c.deleted_at IS NULL "
+                "AND al.deleted_at IS NULL "
                 ") "
                 "SELECT id, scoped_sequence_num AS sequence_num, consultation_id, "
                 "prompt_hash, response_hash, NULL::text AS chain_hash, "
@@ -616,6 +624,9 @@ async def verify_audit_chain(
     verify_global_chain = is_root(user) and namespace is None
     async with _lc.get_pool_manager().acquire() as conn:
         if verify_global_chain:
+            # Root global verification is admin tooling and must include
+            # soft-deleted audit rows, otherwise the immutable hash chain
+            # would appear broken immediately after a GDPR soft-delete.
             rows = await conn.fetch(
                 "SELECT sequence_num, prompt_hash, response_hash, chain_hash, prev_id "
                 "FROM graeae_audit_log ORDER BY sequence_num ASC"
@@ -637,6 +648,8 @@ async def verify_audit_chain(
                 "LIMIT 1"
                 ") prev ON TRUE "
                 "WHERE c.namespace = $1 "
+                "AND c.deleted_at IS NULL "
+                "AND al.deleted_at IS NULL "
                 "ORDER BY al.sequence_num ASC",
                 target_ns,
             )
@@ -657,6 +670,8 @@ async def verify_audit_chain(
                 "LIMIT 1"
                 ") prev ON TRUE "
                 "WHERE c.owner_id = $1 AND c.namespace = $2 "
+                "AND c.deleted_at IS NULL "
+                "AND al.deleted_at IS NULL "
                 "ORDER BY al.sequence_num ASC",
                 user.user_id, target_ns,
             )
@@ -860,21 +875,23 @@ async def get_consultation(
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1",
+                "FROM graeae_consultations WHERE id = $1 AND deleted_at IS NULL",
                 consultation_id,
             )
         elif is_root(user):
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1 AND namespace = $2",
+                "FROM graeae_consultations WHERE id = $1 AND namespace = $2 "
+                "AND deleted_at IS NULL",
                 consultation_id, target_ns,
             )
         else:
             row = await conn.fetchrow(
                 "SELECT id, prompt, task_type, consensus_response, consensus_score, "
                 "winning_muse, cost, latency_ms, mode, created "
-                "FROM graeae_consultations WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                "FROM graeae_consultations WHERE id = $1 AND owner_id = $2 "
+                "AND namespace = $3 AND deleted_at IS NULL",
                 consultation_id, user.user_id, target_ns,
             )
 
@@ -909,19 +926,21 @@ async def get_consultation_artifacts(
         # Get consultation — scoped to caller unless root.
         if is_root(user) and namespace is None:
             consultation = await conn.fetchrow(
-                "SELECT id, created FROM graeae_consultations WHERE id = $1",
+                "SELECT id, created FROM graeae_consultations "
+                "WHERE id = $1 AND deleted_at IS NULL",
                 consultation_id,
             )
         elif is_root(user):
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations "
-                "WHERE id = $1 AND namespace = $2",
+                "WHERE id = $1 AND namespace = $2 AND deleted_at IS NULL",
                 consultation_id, target_ns,
             )
         else:
             consultation = await conn.fetchrow(
                 "SELECT id, created FROM graeae_consultations "
-                "WHERE id = $1 AND owner_id = $2 AND namespace = $3",
+                "WHERE id = $1 AND owner_id = $2 AND namespace = $3 "
+                "AND deleted_at IS NULL",
                 consultation_id, user.user_id, target_ns,
             )
         if not consultation:

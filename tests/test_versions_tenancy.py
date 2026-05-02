@@ -207,12 +207,22 @@ class _FeatureRevertConn:
                     return None
             return row
 
-        if "FROM memories WHERE id=$1 AND owner_id=$2 AND namespace=$3 FOR UPDATE" in compact:
+        if (
+            "FROM memories WHERE id=$1" in compact
+            and "owner_id=$2" in compact
+            and "namespace=$3" in compact
+            and "FOR UPDATE" in compact
+        ):
             if args[1] == self.memory["owner_id"] and args[2] == self.memory["namespace"]:
                 return self.memory
             return None
 
-        if compact.startswith("SELECT head_version_id FROM memory_branches WHERE memory_id = $1 AND name = $2 FOR UPDATE"):
+        if (
+            compact.startswith("SELECT head_version_id FROM memory_branches")
+            and "memory_id = $1" in compact
+            and "name = $2" in compact
+            and "FOR UPDATE" in compact
+        ):
             return {"head_version_id": self.target_head["id"]}
 
         if compact.startswith("SELECT 1 FROM memory_versions WHERE id = $1"):

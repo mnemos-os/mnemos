@@ -96,7 +96,9 @@ def _row_to_version(row) -> MemoryVersion:
 async def _assert_memory_exists(conn, memory_id: str) -> None:
     """Raise 404 if memory_id has no version history (i.e. never existed)."""
     row = await conn.fetchrow(
-        "SELECT 1 FROM memory_versions WHERE memory_id = $1 LIMIT 1", memory_id
+        "SELECT 1 FROM memory_versions "
+        "WHERE memory_id = $1 AND deleted_at IS NULL LIMIT 1",
+        memory_id,
     )
     if not row:
         raise HTTPException(status_code=404, detail=f"Memory {memory_id} not found")
@@ -129,7 +131,8 @@ async def _assert_memory_readable(conn, memory_id: str, user: UserContext) -> No
     ns_ph = f"${len(vis_params) + 2}"
     row = await conn.fetchrow(
         f"SELECT 1 FROM memories WHERE id = $1 "
-        f"AND {vis_clause} AND namespace = {ns_ph} LIMIT 1",
+        f"AND deleted_at IS NULL AND {vis_clause} "
+        f"AND namespace = {ns_ph} LIMIT 1",
         memory_id, *vis_params, user.namespace,
     )
     if not row:
@@ -160,7 +163,8 @@ async def list_versions(
         if is_root(user):
             rows = await conn.fetch(
                 "SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
-                "FROM memory_versions WHERE memory_id = $1 AND branch = $2 ORDER BY version_num ASC",
+                "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                "AND deleted_at IS NULL ORDER BY version_num ASC",
                 memory_id,
                 branch,
             )
@@ -173,7 +177,7 @@ async def list_versions(
             rows = await conn.fetch(
                 f"SELECT version_num, snapshot_at, snapshot_by, change_type, content, branch "
                 f"FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
-                f"AND {vis_clause} AND namespace = {ns_ph} "
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph} "
                 f"ORDER BY version_num ASC",
                 memory_id, branch, *vis_params, user.namespace,
             )
@@ -207,7 +211,8 @@ async def get_version(
                 "verbatim_content, owner_id, namespace, permission_mode, "
                 "source_model, source_provider, source_session, source_agent, "
                 "snapshot_at, snapshot_by, change_type "
-                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
+                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
+                "AND branch = $3 AND deleted_at IS NULL",
                 memory_id, version_num, branch,
             )
         else:
@@ -223,7 +228,7 @@ async def get_version(
                 "source_model, source_provider, source_session, source_agent, "
                 "snapshot_at, snapshot_by, change_type "
                 f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
-                f"AND {vis_clause} AND namespace = {ns_ph}",
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
                 memory_id, version_num, branch, *vis_params, user.namespace,
             )
     if not row:
@@ -252,7 +257,8 @@ async def diff_versions(
         if is_root(user):
             rows = await conn.fetch(
                 "SELECT version_num, content FROM memory_versions "
-                "WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3",
+                "WHERE memory_id = $1 AND version_num = ANY($2::int[]) "
+                "AND branch = $3 AND deleted_at IS NULL",
                 memory_id, [from_version, to_version], branch,
             )
         else:
@@ -264,7 +270,7 @@ async def diff_versions(
             rows = await conn.fetch(
                 f"SELECT version_num, content FROM memory_versions "
                 f"WHERE memory_id = $1 AND version_num = ANY($2::int[]) AND branch = $3 "
-                f"AND {vis_clause} AND namespace = {ns_ph}",
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
                 memory_id, [from_version, to_version], branch,
                 *vis_params, user.namespace,
             )
@@ -316,7 +322,8 @@ async def revert_memory(
                 "verbatim_content, owner_id, namespace, permission_mode, "
                 "source_model, source_provider, source_session, source_agent, "
                 "snapshot_at, snapshot_by, change_type "
-                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3",
+                "FROM memory_versions WHERE memory_id = $1 AND version_num = $2 "
+                "AND branch = $3 AND deleted_at IS NULL",
                 memory_id, version_num, branch,
             )
         else:
@@ -331,7 +338,7 @@ async def revert_memory(
                 "source_model, source_provider, source_session, source_agent, "
                 "snapshot_at, snapshot_by, change_type "
                 f"FROM memory_versions WHERE memory_id = $1 AND version_num = $2 AND branch = $3 "
-                f"AND {vis_clause} AND namespace = {ns_ph}",
+                f"AND deleted_at IS NULL AND {vis_clause} AND namespace = {ns_ph}",
                 memory_id, version_num, branch, *vis_params, user.namespace,
             )
         if not ver_row:
@@ -374,13 +381,14 @@ async def revert_memory(
             if is_root(user):
                 live = await conn.fetchrow(
                     f"SELECT {_lc._MEMORY_COLS} FROM memories "
-                    "WHERE id=$1 FOR UPDATE",
+                    "WHERE id=$1 AND deleted_at IS NULL FOR UPDATE",
                     memory_id,
                 )
             else:
                 live = await conn.fetchrow(
                     f"SELECT {_lc._MEMORY_COLS} FROM memories "
-                    "WHERE id=$1 AND owner_id=$2 AND namespace=$3 FOR UPDATE",
+                    "WHERE id=$1 AND owner_id=$2 AND namespace=$3 "
+                    "AND deleted_at IS NULL FOR UPDATE",
                     memory_id, user.user_id, user.namespace,
                 )
             if live is None:
@@ -410,6 +418,8 @@ async def revert_memory(
                     FROM memory_versions mv
                     INNER JOIN memory_branches mb ON mb.memory_id = mv.memory_id AND mb.head_version_id = mv.id
                     WHERE mv.memory_id = $1 AND mb.name = 'main'
+                      AND mv.deleted_at IS NULL
+                      AND mb.deleted_at IS NULL
                     """,
                     memory_id,
                 )
@@ -470,7 +480,7 @@ async def revert_memory(
                         "UPDATE memories SET "
                         "content=$1, category=$2, subcategory=$3, metadata=$4::jsonb, "
                         "verbatim_content=$5, updated=NOW() "
-                        f"WHERE id=$6 RETURNING {_lc._MEMORY_COLS}",
+                        f"WHERE id=$6 AND deleted_at IS NULL RETURNING {_lc._MEMORY_COLS}",
                         ver_row["content"],
                         ver_row["category"],
                         ver_row["subcategory"],
@@ -496,7 +506,8 @@ async def revert_memory(
                 # commit.
                 target_branch_row = await conn.fetchrow(
                     "SELECT head_version_id FROM memory_branches "
-                    "WHERE memory_id = $1 AND name = $2 FOR UPDATE",
+                    "WHERE memory_id = $1 AND name = $2 "
+                    "AND deleted_at IS NULL FOR UPDATE",
                     memory_id, branch,
                 )
                 if (
@@ -527,6 +538,7 @@ async def revert_memory(
                     SELECT id, owner_id, namespace, permission_mode
                     FROM memory_versions
                     WHERE id = $1 AND memory_id = $2
+                      AND deleted_at IS NULL
                     """,
                     target_head_id, memory_id,
                 )
@@ -548,7 +560,8 @@ async def revert_memory(
                     )
                 next_version_num = await conn.fetchval(
                     "SELECT COALESCE(MAX(version_num), 0) + 1 "
-                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2",
+                    "FROM memory_versions WHERE memory_id = $1 AND branch = $2 "
+                    "AND deleted_at IS NULL",
                     memory_id, branch,
                 )
                 revert_hash = _hashlib_local.sha256(
@@ -585,7 +598,7 @@ async def revert_memory(
                 )
                 await conn.execute(
                     "UPDATE memory_branches SET head_version_id = $1 "
-                    "WHERE memory_id = $2 AND name = $3",
+                    "WHERE memory_id = $2 AND name = $3 AND deleted_at IS NULL",
                     new_version_id, memory_id, branch,
                 )
                 row = live  # live row unchanged; return the existing live state

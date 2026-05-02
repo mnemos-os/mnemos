@@ -36,8 +36,11 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                     LEFT JOIN memory_compressed_variants v
                         ON v.memory_id = m.id
                     WHERE
-                        to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
-                        OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                        m.deleted_at IS NULL
+                        AND (
+                            to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
+                            OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
+                        )
                     ORDER BY m.updated DESC NULLS LAST
                     LIMIT $2
                     """,
@@ -63,7 +66,8 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                     FROM memories m
                     LEFT JOIN memory_compressed_variants v
                         ON v.memory_id = m.id
-                    WHERE {vis_clause}
+                    WHERE m.deleted_at IS NULL
+                      AND {vis_clause}
                       AND m.namespace = {ns_ph}
                       AND (
                           to_tsvector('english', m.content) @@ plainto_tsquery('english', {q_ph})

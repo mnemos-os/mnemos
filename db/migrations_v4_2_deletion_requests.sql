@@ -25,6 +25,8 @@
 --
 --   * status='requested': admin endpoint just wrote the row.
 --   * status='confirmed': second-step confirmation accepted.
+--   * status='sweep_verifying': worker is checking for rows
+--     committed during the initial soft-delete sweep.
 --   * status='soft_deleted': worker has soft-deleted target's
 --     rows across memories, kg_triples, sessions, journal,
 --     entities, state, graeae_consultations, etc. ``restore_by``
@@ -67,7 +69,7 @@ CREATE TABLE IF NOT EXISTS deletion_requests (
     notes             TEXT,
     CONSTRAINT deletion_requests_status_valid
         CHECK (status IN (
-            'requested', 'confirmed', 'soft_deleted',
+            'requested', 'confirmed', 'sweep_verifying', 'soft_deleted',
             'restored', 'hard_deleted', 'cancelled'
         )),
     -- A given target_user_id + target_namespace can only have
@@ -78,6 +80,7 @@ CREATE TABLE IF NOT EXISTS deletion_requests (
     CONSTRAINT deletion_requests_status_lifecycle CHECK (
         (status = 'requested' AND soft_deleted_at IS NULL AND hard_deleted_at IS NULL)
         OR (status = 'confirmed' AND confirmed_at IS NOT NULL AND soft_deleted_at IS NULL)
+        OR (status = 'sweep_verifying' AND confirmed_at IS NOT NULL AND soft_deleted_at IS NULL AND hard_deleted_at IS NULL)
         OR (status = 'soft_deleted' AND soft_deleted_at IS NOT NULL AND restore_by IS NOT NULL AND hard_deleted_at IS NULL)
         OR (status = 'restored' AND restored_at IS NOT NULL)
         OR (status = 'hard_deleted' AND hard_deleted_at IS NOT NULL)
@@ -109,6 +112,6 @@ CREATE UNIQUE INDEX IF NOT EXISTS deletion_requests_active_unique_idx
         target_user_id,
         COALESCE(target_namespace, '*')
     )
-    WHERE status IN ('requested', 'confirmed', 'soft_deleted');
+    WHERE status IN ('requested', 'confirmed', 'sweep_verifying', 'soft_deleted');
 
 COMMIT;

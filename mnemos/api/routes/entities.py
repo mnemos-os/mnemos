@@ -60,12 +60,20 @@ async def create_entity(
                    ON CONFLICT (owner_id, namespace, entity_type, name) DO UPDATE
                    SET description = COALESCE($6, entities.description),
                        updated = NOW()
+                   WHERE entities.deleted_at IS NULL
                    RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
                 entity_id, user.user_id, user.namespace,
                 req.entity_type, req.name,
                 req.description, json.dumps(req.metadata or {})
             )
+        if row is None:
+            raise HTTPException(
+                status_code=409,
+                detail="Entity name is reserved by a soft-deleted row; restore before updating it",
+            )
         return dict(row)
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error creating entity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -93,6 +101,7 @@ async def list_entities(
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
                        FROM entities WHERE owner_id=$1 AND namespace=$2 AND entity_type=$3 AND name ILIKE $4
+                         AND deleted_at IS NULL
                        ORDER BY name LIMIT $5''',
                     target_owner, target_ns, entity_type, f'%{search}%', limit
                 )
@@ -100,6 +109,7 @@ async def list_entities(
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
                        FROM entities WHERE owner_id=$1 AND namespace=$2 AND entity_type=$3
+                         AND deleted_at IS NULL
                        ORDER BY name LIMIT $4''',
                     target_owner, target_ns, entity_type, limit
                 )
@@ -107,6 +117,7 @@ async def list_entities(
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
                        FROM entities WHERE owner_id=$1 AND namespace=$2 AND (name ILIKE $3 OR description ILIKE $3)
+                         AND deleted_at IS NULL
                        ORDER BY name LIMIT $4''',
                     target_owner, target_ns, f'%{search}%', limit
                 )
@@ -114,6 +125,7 @@ async def list_entities(
                 rows = await conn.fetch(
                     '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
                        FROM entities WHERE owner_id=$1 AND namespace=$2
+                         AND deleted_at IS NULL
                        ORDER BY entity_type, name LIMIT $3''',
                     target_owner, target_ns, limit
                 )
@@ -131,7 +143,8 @@ async def get_entity(entity_id: str, user: UserContext = Depends(get_current_use
             '''SELECT id::text, entity_type, name, description, metadata,
                       related_entities, created::text, updated::text
                FROM entities
-               WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+               WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
+                 AND deleted_at IS NULL''',
             entity_id, owner, namespace,
         )
     if not row:
@@ -162,6 +175,7 @@ async def update_entity(
                 row = await conn.fetchrow(
                     '''UPDATE entities SET description=$1, metadata=$2::jsonb, updated=NOW()
                        WHERE id=$3::uuid AND owner_id=$4 AND namespace=$5
+                         AND deleted_at IS NULL
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
                     updates['description'], json.dumps(updates['metadata']), entity_id, owner, namespace,
                 )
@@ -169,6 +183,7 @@ async def update_entity(
                 row = await conn.fetchrow(
                     '''UPDATE entities SET description=$1, updated=NOW()
                        WHERE id=$2::uuid AND owner_id=$3 AND namespace=$4
+                         AND deleted_at IS NULL
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
                     updates['description'], entity_id, owner, namespace,
                 )
@@ -176,6 +191,7 @@ async def update_entity(
                 row = await conn.fetchrow(
                     '''UPDATE entities SET metadata=$1::jsonb, updated=NOW()
                        WHERE id=$2::uuid AND owner_id=$3 AND namespace=$4
+                         AND deleted_at IS NULL
                        RETURNING id::text, entity_type, name, description, metadata, created::text, updated::text''',
                     json.dumps(updates['metadata']), entity_id, owner, namespace,
                 )
@@ -212,6 +228,7 @@ async def link_entities(
                    WHERE id = $1::uuid
                    AND owner_id = $3
                    AND namespace = $4
+                   AND deleted_at IS NULL
                    AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
                 entity_id, req.related_id, owner, namespace,
             )
@@ -224,6 +241,7 @@ async def link_entities(
                    WHERE id = $1::uuid
                    AND owner_id = $3
                    AND namespace = $4
+                   AND deleted_at IS NULL
                    AND NOT ($2::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[])))''',
                 req.related_id, entity_id, related_owner, related_namespace,
             )
@@ -245,7 +263,8 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
                 await conn.execute(
                     '''UPDATE entities
                        SET related_entities = array_remove(related_entities, $1::uuid)
-                       WHERE $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
+                       WHERE deleted_at IS NULL
+                         AND $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
                     entity_id
                 )
             else:
@@ -254,11 +273,12 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
                        SET related_entities = array_remove(related_entities, $1::uuid)
                        WHERE owner_id = $2
                        AND namespace = $3
+                       AND deleted_at IS NULL
                        AND $1::uuid = ANY(COALESCE(related_entities, ARRAY[]::uuid[]))''',
                     entity_id, owner, namespace,
                 )
             result = await conn.execute(
-                'DELETE FROM entities WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3',
+                'DELETE FROM entities WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3 AND deleted_at IS NULL',
                 entity_id, owner, namespace,
             )
         if result == 'DELETE 0':
@@ -276,7 +296,8 @@ async def get_related_entities(entity_id: str, user: UserContext = Depends(get_c
         target_owner, target_ns = await assert_owned_context(conn, "entities", entity_id, user)
         entity = await conn.fetchrow(
             '''SELECT related_entities FROM entities
-               WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3''',
+               WHERE id = $1::uuid AND owner_id = $2 AND namespace = $3
+                 AND deleted_at IS NULL''',
             entity_id, target_owner, target_ns,
         )
     if entity is None:
@@ -289,13 +310,15 @@ async def get_related_entities(entity_id: str, user: UserContext = Depends(get_c
         if is_root(user):
             rows = await conn.fetch(
                 '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                   FROM entities WHERE id = ANY($1::uuid[])''',
+                   FROM entities WHERE id = ANY($1::uuid[])
+                     AND deleted_at IS NULL''',
                 related_ids
             )
         else:
             rows = await conn.fetch(
                 '''SELECT id::text, entity_type, name, description, metadata, created::text, updated::text
-                   FROM entities WHERE owner_id = $1 AND namespace = $2 AND id = ANY($3::uuid[])''',
+                   FROM entities WHERE owner_id = $1 AND namespace = $2 AND id = ANY($3::uuid[])
+                     AND deleted_at IS NULL''',
                 target_owner, target_ns, related_ids
             )
     return {"related": [dict(r) for r in rows]}

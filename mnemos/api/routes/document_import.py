@@ -493,6 +493,7 @@ async def import_memories_from_document(
                                     "  AND permission_mode = $5 "
                                     "  AND category IS NOT DISTINCT FROM $6 "
                                     "  AND subcategory IS NOT DISTINCT FROM $7 "
+                                    "  AND deleted_at IS NULL "
                                     "RETURNING id",
                                     chunk_key,
                                     chunk_key_legacy_v70,
@@ -575,6 +576,7 @@ async def import_memories_from_document(
                                 "VALUES ($1, $2, $3, $4, $5::jsonb, 75, $6, $7, $8, $9, $10) "
                                 "ON CONFLICT (import_chunk_key) DO UPDATE "
                                 "  SET import_chunk_key = EXCLUDED.import_chunk_key "
+                                "  WHERE memories.deleted_at IS NULL "
                                 "RETURNING id",
                                 memory_id,
                                 chunk["content"],
@@ -588,14 +590,13 @@ async def import_memories_from_document(
                                 chunk_key,
                             )
                             if canonical_id is None:
-                                # Defensive: fetchval should never
-                                # return NULL given RETURNING id
-                                # with a NOT NULL primary key.
-                                # Fall back to the surrogate id we
-                                # generated — at worst this
-                                # matches pre-round-68 behavior
-                                # for this single chunk.
-                                canonical_id = memory_id
+                                raise HTTPException(
+                                    status_code=409,
+                                    detail=(
+                                        "Document chunk matches a soft-deleted memory; "
+                                        "restore it before retrying this import"
+                                    ),
+                                )
                             # Promote in_flight_id to canonical so
                             # __aexit__ infra failure surfaces the
                             # right id in unconfirmed_memory_ids

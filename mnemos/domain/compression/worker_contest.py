@@ -115,6 +115,7 @@ _MEMORY_CONTENT_SQL = """
 SELECT id, content, category, task_type
 FROM memories
 WHERE id = $1
+  AND deleted_at IS NULL
 """
 
 _MARK_DONE_SQL = """
