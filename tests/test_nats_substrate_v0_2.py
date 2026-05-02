@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import uuid
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Any
@@ -154,7 +155,7 @@ async def test_pantheon_gateway_publish_enabled_writes_memory_and_nats(
     memories = _routing_memories(pool)
     assert len(memories) == 1
     memory_payload = json.loads(memories[0]["content"])
-    assert memory_payload["request_id"] == "req-nats-on"
+    uuid.UUID(memory_payload["request_id"])
     assert nats_publish_calls == [
         {
             "subject": PANTHEON_ROUTING_SUBJECT,
@@ -165,7 +166,7 @@ async def test_pantheon_gateway_publish_enabled_writes_memory_and_nats(
                     "schema_version": PANTHEON_ROUTING_SCHEMA_VERSION,
                 },
             },
-            "msg_id": "pantheon.routing.req-nats-on",
+            "msg_id": f"pantheon.routing.{memory_payload['request_id']}",
         }
     ]
 

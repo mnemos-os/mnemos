@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import logging
 import time
 from collections.abc import AsyncIterator
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import httpx
@@ -14,12 +17,60 @@ from mnemos.domain.graeae.engine import get_graeae_engine
 from mnemos.domain.openai_compat.content import _content_text, _flatten_messages_for_prompt
 from mnemos.domain.pantheon.router import RouteDecision
 
+logger = logging.getLogger(__name__)
+_IDENTITY_BODY_KEY = "_mnemos_upstream_identity"
+
 
 class PantheonGatewayError(Exception):
     def __init__(self, status_code: int, message: str):
         super().__init__(message)
         self.status_code = status_code
         self.message = message
+
+
+@dataclass(frozen=True)
+class UpstreamIdentity:
+    user_id: str
+    namespace: str
+    session_id: str
+    request_id: str
+
+    @property
+    def opaque_user(self) -> str:
+        digest = hashlib.sha256(self.user_id.encode("utf-8")).hexdigest()[:16]
+        return f"mnemos:{digest}"
+
+
+def attach_upstream_identity(body: dict[str, Any], identity: UpstreamIdentity) -> dict[str, Any]:
+    payload = dict(body)
+    payload[_IDENTITY_BODY_KEY] = asdict(identity)
+    return payload
+
+
+def _pop_upstream_identity(payload: dict[str, Any]) -> UpstreamIdentity | None:
+    raw = payload.pop(_IDENTITY_BODY_KEY, None)
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return UpstreamIdentity(
+            user_id=str(raw["user_id"]),
+            namespace=str(raw["namespace"]),
+            session_id=str(raw["session_id"]),
+            request_id=str(raw["request_id"]),
+        )
+    except KeyError:
+        return None
+
+
+def _identity_headers(identity: UpstreamIdentity | None) -> dict[str, str]:
+    if identity is None:
+        return {}
+    return {
+        "X-MNEMOS-User-Id": identity.user_id,
+        "X-MNEMOS-Namespace": identity.namespace,
+        "X-MNEMOS-Session": identity.session_id,
+        "X-MNEMOS-Request-Id": identity.request_id,
+    }
 
 
 def _provider_config(decision: RouteDecision) -> dict[str, Any]:
@@ -32,7 +83,7 @@ def _provider_config(decision: RouteDecision) -> dict[str, Any]:
     return cfg
 
 
-def _auth_headers(cfg: dict[str, Any]) -> dict[str, str]:
+def _auth_headers(cfg: dict[str, Any], identity: UpstreamIdentity | None = None) -> dict[str, str]:
     key_name = cfg.get("key_name")
     api_key = get_key(str(key_name or ""))
     if not api_key:
@@ -40,15 +91,26 @@ def _auth_headers(cfg: dict[str, Any]) -> dict[str, str]:
     return {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
+        **_identity_headers(identity),
     }
 
 
 def _chat_payload(decision: RouteDecision, body: dict[str, Any], *, stream: bool | None = None) -> dict[str, Any]:
     payload = dict(body)
+    identity = _pop_upstream_identity(payload)
     if decision.model_id:
         payload["model"] = decision.model_id
     if stream is not None:
         payload["stream"] = stream
+    if identity is not None:
+        supplied_user = payload.get("user")
+        if supplied_user is not None and supplied_user != identity.opaque_user:
+            logger.warning(
+                "[PANTHEON] client-supplied OpenAI user field overridden "
+                "for request_id=%s",
+                identity.request_id,
+            )
+        payload["user"] = identity.opaque_user
     return payload
 
 
@@ -70,10 +132,11 @@ async def forward_chat_completion(decision: RouteDecision, body: dict[str, Any])
         return await _graeae_chat_completion(decision, body)
 
     async with httpx.AsyncClient(timeout=cfg.get("timeout", 200)) as client:
+        payload = _chat_payload(decision, body, stream=False)
         response = await client.post(
             str(cfg["url"]),
-            json=_chat_payload(decision, body, stream=False),
-            headers=_auth_headers(cfg),
+            json=payload,
+            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
         )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500])
@@ -96,11 +159,12 @@ async def stream_chat_completion(decision: RouteDecision, body: dict[str, Any]) 
 
     client = httpx.AsyncClient(timeout=None)
     try:
+        payload = _chat_payload(decision, body, stream=True)
         async with client.stream(
             "POST",
             str(cfg["url"]),
-            json=_chat_payload(decision, body, stream=True),
-            headers=_auth_headers(cfg),
+            json=payload,
+            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
         ) as response:
             if response.status_code >= 400:
                 body_bytes = await response.aread()
@@ -116,10 +180,11 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
         raise PantheonGatewayError(400, "consensus aliases are not valid for embeddings")
     cfg = _provider_config(decision)
     async with httpx.AsyncClient(timeout=cfg.get("timeout", 200)) as client:
+        payload = _chat_payload(decision, body, stream=None)
         response = await client.post(
             _embeddings_url(cfg),
-            json=_chat_payload(decision, body, stream=None),
-            headers=_auth_headers(cfg),
+            json=payload,
+            headers=_auth_headers(cfg, _pop_upstream_identity(dict(body))),
         )
     if response.status_code >= 400:
         raise PantheonGatewayError(response.status_code, response.text[:500])
@@ -129,7 +194,8 @@ async def forward_embeddings(decision: RouteDecision, body: dict[str, Any]) -> d
 
 
 async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any]) -> dict[str, Any]:
-    messages = body.get("messages") or []
+    payload = _chat_payload(decision, body, stream=None)
+    messages = payload.get("messages") or []
     prompt = _flatten_messages_for_prompt(messages)
     engine = get_graeae_engine()
     result = await engine.route(
@@ -138,8 +204,8 @@ async def _graeae_chat_completion(decision: RouteDecision, body: dict[str, Any])
         prompt,
         task_type="reasoning",
         timeout=30,
-        generation_params=_generation_params(body),
-        request_params=_request_params(body),
+        generation_params=_generation_params(payload),
+        request_params=_request_params(payload),
         messages=messages,
     )
     if result.get("status") != "success":

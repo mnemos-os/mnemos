@@ -70,7 +70,9 @@ async def _mcp_consult_rate_limit(
     if kind == "write":
         limit = min(MCP_WRITE_RATE_LIMIT_PER_MINUTE, default_per_minute)
     elif kind == "read":
-        limit = max(MCP_READ_RATE_LIMIT_PER_MINUTE, default_per_minute)
+        # Compose with the global ceiling: MCP reads may be stricter
+        # than the default, but they should never bypass it.
+        limit = min(MCP_READ_RATE_LIMIT_PER_MINUTE, default_per_minute)
     else:
         raise ValueError("unknown MCP rate-limit bucket")
 

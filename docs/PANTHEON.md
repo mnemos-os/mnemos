@@ -1,7 +1,8 @@
 # PANTHEON — Unified LLM Provider Facade
 
-**Status:** Implemented in MNEMOS v5.0.0 for the `/pantheon/v1` slice; this
-document also preserves forward-looking worker-pool design notes.
+**v5.0 status:** shipped (v0.2) for the `/pantheon/v1` slice. Routing is direct
+HTTP forward from the gateway to the selected upstream; NATS is used for the
+best-effort routing audit substrate, not the main request path.
 **Position in stack:** Above Triton (CERBERUS) + GRAEAE (PYTHIA); below every OpenAI-compatible client.
 **Greek-name fit:** *Temple of all gods.* One facade, many providers behind it. Pairs with CHARON (the ferryman who carries memories across systems): same interop posture, different surface.
 
@@ -101,18 +102,16 @@ can verify whether the gateway searched and injected memory for that request.
                      │ - extended /v1/models catalog             │
                      │ - usage_tier policy enforcement           │
                      │ - per-tenant token + cost cap             │
-                     │ - streaming bypass                        │
+                     │ - direct upstream forwarding              │
                      └───────────────┬───────────────────────────┘
-                                     │ NATS JetStream subjects:
-                                     │ work.{vllm.cerberus, groq,
-                                     │       together, openai,
-                                     │       gemini, perplexity}
+                                     │ alias resolver
+                                     │ + adaptive policy
                                      ▼
                      ┌───────────────────────────────────────────┐
-                     │ Worker pool                               │
-                     │ - per-provider rate-limit token bucket    │
-                     │ - retry/failover via NACK + redeliver     │
-                     │ - local key vault unsealed at start       │
+                     │ Direct upstream forward                    │
+                     │ - provider key resolved server-side       │
+                     │ - caller identity attached as MNEMOS hdrs │
+                     │ - OpenAI `user` field set from auth       │
                      └───────────────┬───────────────────────────┘
                                      │
        ┌─────────────────────────────┼───────────────────────────┐
@@ -120,6 +119,10 @@ can verify whether the gateway searched and injected memory for that request.
    Triton/vLLM                 Cloud APIs                Cloud APIs
    (CERBERUS)                  (Together, Groq,          (OpenAI,
    local GPU                    Perplexity)               Gemini)
+
+Routing decisions are also written to MNEMOS as `pantheon_routing` memories.
+When enabled, the same payload is published to `mnemos.pantheon.routing` and
+mirrored by the optional audit consumer into `pantheon_routing_audit`.
 ```
 
 GRAEAE remains a peer service — but PANTHEON's catalog can advertise GRAEAE-backed virtual models like `consensus:reasoning` that route through GRAEAE under the hood. Clients don't need to know the difference.
@@ -293,9 +296,13 @@ The user runs Anthropic Max as a personal sub. They're not abusing it; consultat
 
 ## Streaming
 
-**Streaming requests bypass the queue** and proxy directly from frontend to backend. Reason: NATS-stream-token-by-token works but adds 5–20ms hop latency, and clients streaming chat completions are extremely sensitive to that delay.
+**Shipped v0.2 routing is direct HTTP forward.** Streaming and non-streaming
+chat completions, plus embeddings, are forwarded directly from the gateway to
+the selected provider after alias resolution and adaptive policy selection.
+NATS carries audit events only.
 
-**Non-streaming, batch, embeddings, and async-completion requests flow through the queue** and benefit from worker-pool load balancing, retry, and rate-limit smoothing.
+The worker-pool shape below remains a v0.3+ design option for batch/async
+requests that would benefit from queue smoothing and redelivery semantics.
 
 The frontend decides at request time:
 

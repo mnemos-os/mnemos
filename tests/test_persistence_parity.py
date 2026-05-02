@@ -149,6 +149,98 @@ async def _raw_fetchval(case: BackendCase, tx: Any, pg_sql: str, *pg_args: Any, 
     return await tx.conn.fetchval(pg_sql, *pg_args)
 
 
+async def _raw_fetch(case: BackendCase, tx: Any, pg_sql: str, *pg_args: Any, sqlite_sql: str | None = None) -> list[Any]:
+    if case.name == "sqlite":
+        return await sqlite_persistence._fetch_all(tx.conn, sqlite_sql or pg_sql, pg_args)
+    return await tx.conn.fetch(pg_sql, *pg_args)
+
+
+@pytest.mark.asyncio
+async def test_schema_capabilities_include_morpheus_and_pantheon_parity(backend_case: BackendCase):
+    async with backend_case.backend.transactional() as tx:
+        if backend_case.name == "sqlite":
+            memories_cols = {
+                row["name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "",
+                    sqlite_sql="PRAGMA table_info(memories)",
+                )
+            }
+            kg_cols = {
+                row["name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "",
+                    sqlite_sql="PRAGMA table_info(kg_triples)",
+                )
+            }
+            run_cols = {
+                row["name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "",
+                    sqlite_sql="PRAGMA table_info(morpheus_runs)",
+                )
+            }
+            tables = {
+                row["name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "",
+                    sqlite_sql="SELECT name FROM sqlite_master WHERE type='table'",
+                )
+            }
+        else:
+            memories_cols = {
+                row["column_name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='memories'",
+                )
+            }
+            kg_cols = {
+                row["column_name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='kg_triples'",
+                )
+            }
+            run_cols = {
+                row["column_name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "SELECT column_name FROM information_schema.columns WHERE table_name='morpheus_runs'",
+                )
+            }
+            tables = {
+                row["table_name"]
+                for row in await _raw_fetch(
+                    backend_case,
+                    tx,
+                    "SELECT table_name FROM information_schema.tables WHERE table_schema='public'",
+                )
+            }
+
+    assert {"consolidated_into", "consolidated_at", "triples_extracted_at"} <= memories_cols
+    assert "extracted_by_run_id" in kg_cols
+    assert {
+        "memories_consolidated",
+        "clusters_consolidated",
+        "triples_extracted",
+        "memories_processed_for_extraction",
+    } <= run_cols
+    assert "pantheon_routing_audit" in tables
+    assert "morpheus_extract_run_memories" in tables
+
+
 async def _ensure_user(case: BackendCase, tx: Any, user_id: str, namespace: str = "default") -> None:
     if case.name == "sqlite":
         await _raw_execute(

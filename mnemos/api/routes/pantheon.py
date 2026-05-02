@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import time
 import uuid
 from typing import Any
@@ -18,6 +19,7 @@ from mnemos.domain.pantheon.caps import ConsultationCapResult, consultation_cap_
 from mnemos.domain.pantheon.routing_log import routing_payload, schedule_routing_memory
 
 router = APIRouter(prefix="/pantheon/v1", tags=["pantheon"])
+logger = logging.getLogger(__name__)
 
 
 async def _pantheon_user(
@@ -61,8 +63,8 @@ def _to_http_exception(exc: PantheonRoutingError | gateway.PantheonGatewayError)
 
 def _pantheon_session_id(request: Request, user: UserContext) -> str:
     return str(
-        request.headers.get("x-pantheon-session")
-        or getattr(user, "session_id", None)
+        getattr(user, "session_id", None)
+        or request.headers.get("x-pantheon-session")
         or getattr(request.state, "mnemos_session_id", None)
         or request.headers.get("x-mnemos-session-id")
         or request.headers.get("x-session-id")
@@ -72,7 +74,37 @@ def _pantheon_session_id(request: Request, user: UserContext) -> str:
 
 
 def _request_id(request: Request) -> str:
-    return request.headers.get("x-request-id") or f"pantheon-{uuid.uuid4()}"
+    return str(uuid.uuid4())
+
+
+def _upstream_identity(
+    request: Request,
+    user: UserContext,
+    *,
+    session_id: str,
+    request_id: str,
+) -> gateway.UpstreamIdentity:
+    identity = gateway.UpstreamIdentity(
+        user_id=user.user_id,
+        namespace=user.namespace,
+        session_id=session_id,
+        request_id=request_id,
+    )
+    expected = {
+        "x-mnemos-user-id": identity.user_id,
+        "x-mnemos-namespace": identity.namespace,
+        "x-mnemos-session": identity.session_id,
+        "x-mnemos-request-id": identity.request_id,
+    }
+    for header, value in expected.items():
+        supplied = request.headers.get(header)
+        if supplied is not None and supplied != value:
+            logger.warning(
+                "[PANTHEON] stripped spoofed %s header for request_id=%s",
+                header,
+                request_id,
+            )
+    return identity
 
 
 def _consultation_cap_exceeded(result: ConsultationCapResult) -> JSONResponse:
@@ -122,6 +154,8 @@ def _log_route_outcome(
     started_at: float,
     response: dict[str, Any] | None = None,
     error_class: str | None = None,
+    namespace: str | None = None,
+    forwarded_user: str | None = None,
 ) -> None:
     payload, metadata = routing_payload(
         request_id=request_id,
@@ -132,6 +166,8 @@ def _log_route_outcome(
         latency_ms=round((time.perf_counter() - started_at) * 1000.0, 3),
         response=response,
         error_class=error_class,
+        namespace=namespace,
+        forwarded_user=forwarded_user,
     )
     schedule_routing_memory(payload, metadata)
 
@@ -162,6 +198,7 @@ async def chat_completions(
     decision: pantheon_router.RouteDecision | None = None
     session_id = _pantheon_session_id(request, user)
     request_id = _request_id(request)
+    identity = _upstream_identity(request, user, session_id=session_id, request_id=request_id)
     try:
         decision = await pantheon_router.route_model(model, body)
         cap_result = _check_consultation_cap(
@@ -173,6 +210,7 @@ async def chat_completions(
             return _consultation_cap_exceeded(cap_result)
         started_at = time.perf_counter()
         if body.get("stream") is True:
+            forward_body = gateway.attach_upstream_identity(body, identity)
             _log_route_outcome(
                 request_id=request_id,
                 tenant_user_id=user.user_id,
@@ -180,12 +218,15 @@ async def chat_completions(
                 decision=decision,
                 outcome="success",
                 started_at=started_at,
+                namespace=user.namespace,
+                forwarded_user=identity.opaque_user,
             )
             return StreamingResponse(
-                gateway.stream_chat_completion(decision, body),
+                gateway.stream_chat_completion(decision, forward_body),
                 media_type="text/event-stream",
             )
-        response_data = await gateway.forward_chat_completion(decision, body)
+        forward_body = gateway.attach_upstream_identity(body, identity)
+        response_data = await gateway.forward_chat_completion(decision, forward_body)
         _log_route_outcome(
             request_id=request_id,
             tenant_user_id=user.user_id,
@@ -194,6 +235,8 @@ async def chat_completions(
             outcome="success",
             started_at=started_at,
             response=response_data,
+            namespace=user.namespace,
+            forwarded_user=identity.opaque_user,
         )
         return JSONResponse(response_data)
     except PantheonRoutingError as exc:
@@ -208,6 +251,8 @@ async def chat_completions(
                 outcome="error",
                 started_at=started_at,
                 error_class=exc.__class__.__name__,
+                namespace=user.namespace,
+                forwarded_user=identity.opaque_user,
             )
         raise _to_http_exception(exc) from exc
 
@@ -227,10 +272,12 @@ async def embeddings(
     decision: pantheon_router.RouteDecision | None = None
     session_id = _pantheon_session_id(request, user)
     request_id = _request_id(request)
+    identity = _upstream_identity(request, user, session_id=session_id, request_id=request_id)
     try:
         decision = await pantheon_router.route_model(model, body)
         started_at = time.perf_counter()
-        response_data = await gateway.forward_embeddings(decision, body)
+        forward_body = gateway.attach_upstream_identity(body, identity)
+        response_data = await gateway.forward_embeddings(decision, forward_body)
         _log_route_outcome(
             request_id=request_id,
             tenant_user_id=user.user_id,
@@ -239,6 +286,8 @@ async def embeddings(
             outcome="success",
             started_at=started_at,
             response=response_data,
+            namespace=user.namespace,
+            forwarded_user=identity.opaque_user,
         )
         return JSONResponse(response_data)
     except PantheonRoutingError as exc:
@@ -253,6 +302,8 @@ async def embeddings(
                 outcome="error",
                 started_at=started_at,
                 error_class=exc.__class__.__name__,
+                namespace=user.namespace,
+                forwarded_user=identity.opaque_user,
             )
         raise _to_http_exception(exc) from exc
 

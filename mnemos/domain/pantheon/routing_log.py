@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
@@ -17,6 +19,16 @@ logger = logging.getLogger(__name__)
 
 PANTHEON_ROUTING_SUBJECT = "mnemos.pantheon.routing"
 PANTHEON_ROUTING_SCHEMA_VERSION = "1"
+
+
+@dataclass(frozen=True)
+class _RoutingLogItem:
+    payload: dict[str, Any]
+    metadata: dict[str, Any]
+
+
+_routing_log_queue: asyncio.Queue[_RoutingLogItem] | None = None
+_routing_log_drainers = 0
 
 
 def _usage_value(response: dict[str, Any] | None, key: str) -> int | None:
@@ -75,6 +87,8 @@ def routing_payload(
     latency_ms: float,
     response: dict[str, Any] | None = None,
     error_class: str | None = None,
+    namespace: str | None = None,
+    forwarded_user: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     payload = {
         "request_id": request_id,
@@ -92,6 +106,15 @@ def routing_payload(
         "schema_version": PANTHEON_ROUTING_SCHEMA_VERSION,
         "pantheon_version": "0.2",
         "session_id": session_id,
+        "namespace": namespace,
+        "forwarded_user": forwarded_user,
+        "forwarded_identity": {
+            "tenant_user_id": tenant_user_id,
+            "namespace": namespace,
+            "session_id": session_id,
+            "request_id": request_id,
+            "upstream_user": forwarded_user,
+        },
         "usage_tier": _usage_tier(decision),
         **payload,
     }
@@ -186,17 +209,74 @@ async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]
         logger.debug("[PANTHEON] routing-log write failed: %s", exc)
 
 
+def _routing_log_settings() -> tuple[int, int]:
+    settings = get_settings().pantheon
+    return (
+        max(1, int(settings.routing_log_queue_size)),
+        max(1, int(settings.routing_log_drain_workers)),
+    )
+
+
+def _get_routing_log_queue() -> asyncio.Queue[_RoutingLogItem]:
+    global _routing_log_queue
+    size, _workers = _routing_log_settings()
+    if _routing_log_queue is None or _routing_log_queue.maxsize != size:
+        _routing_log_queue = asyncio.Queue(maxsize=size)
+    return _routing_log_queue
+
+
+async def _drain_routing_log_queue() -> None:
+    global _routing_log_drainers
+    queue = _get_routing_log_queue()
+    try:
+        while True:
+            try:
+                item = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                await write_routing_memory(item.payload, item.metadata)
+                await publish_routing_event(item.payload, item.metadata)
+            finally:
+                queue.task_done()
+    finally:
+        _routing_log_drainers = max(0, _routing_log_drainers - 1)
+
+
+def _ensure_routing_log_drainers() -> None:
+    global _routing_log_drainers
+    queue = _get_routing_log_queue()
+    _size, workers = _routing_log_settings()
+    while _routing_log_drainers < workers and not queue.empty():
+        try:
+            _lc._schedule_background(_drain_routing_log_queue())
+        except RuntimeError as exc:
+            logger.debug("[PANTHEON] routing-log scheduling failed: %s", exc)
+            return
+        _routing_log_drainers += 1
+
+
 def schedule_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    queue = _get_routing_log_queue()
+    item = _RoutingLogItem(dict(payload), dict(metadata))
+    if queue.full():
+        try:
+            queue.get_nowait()
+            queue.task_done()
+            logger.warning("[PANTHEON] routing-log queue full; dropped oldest event")
+        except asyncio.QueueEmpty:
+            pass
     try:
-        _lc._schedule_background(write_routing_memory(payload, metadata))
-    except RuntimeError as exc:
-        logger.debug("[PANTHEON] routing-log scheduling failed: %s", exc)
-    if not get_settings().nats.publish_pantheon_routing:
+        queue.put_nowait(item)
+    except asyncio.QueueFull:
+        logger.warning("[PANTHEON] routing-log queue full; dropped newest event")
         return
-    try:
-        _lc._schedule_background(publish_routing_event(payload, metadata))
-    except RuntimeError as exc:
-        logger.debug("[PANTHEON] routing NATS publish scheduling failed: %s", exc)
+    _ensure_routing_log_drainers()
+
+
+async def drain_routing_log_queue_for_tests() -> None:
+    queue = _get_routing_log_queue()
+    await queue.join()
 
 
 __all__ = [
@@ -207,4 +287,5 @@ __all__ = [
     "routing_payload",
     "schedule_routing_memory",
     "write_routing_memory",
+    "drain_routing_log_queue_for_tests",
 ]

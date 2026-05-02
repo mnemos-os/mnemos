@@ -320,7 +320,8 @@ class TestFederationFeedCursor:
 
         sql = " ".join(pool.conn.queries[-1].split())
         assert "(m.updated > $1 OR (m.updated = $1 AND m.id > $2))" in sql
-        assert "ORDER BY m.updated ASC, m.id ASC" in sql
+        assert "(m.consolidated_at > $1 OR (m.consolidated_at = $1 AND m.id > $2))" in sql
+        assert "ORDER BY updated ASC, id ASC" in sql
 
 
 class TestFederationMemoryEndpoint:

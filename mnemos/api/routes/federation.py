@@ -19,6 +19,7 @@ from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.ids import parse_uuid_or_404
 from mnemos.domain import federation as _fed
 from mnemos.domain.models import (
+    FederationConsolidationEvent,
     FederationFeedResponse,
     FederationPeer,
     FederationPeerCreateRequest,
@@ -129,13 +130,41 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
     )
 
 
+def _feed_item_from_row(
+    row,
+    *,
+    include_compressed: bool = False,
+) -> MemoryItem | FederationConsolidationEvent:
+    try:
+        item_type = row["type"]
+    except (KeyError, IndexError):
+        item_type = None
+    if item_type == "consolidation":
+        consolidated_at = row["consolidated_at"]
+        return FederationConsolidationEvent(
+            id=row["id"],
+            consolidated_into=row["consolidated_into"],
+            consolidated_at=(
+                consolidated_at.isoformat()
+                if consolidated_at and hasattr(consolidated_at, "isoformat")
+                else str(consolidated_at)
+            ),
+        )
+    return _memory_item_from_row(row, include_compressed=include_compressed)
+
+
 def _federation_visibility_filters() -> list[str]:
     # Match `/feed`: only local, explicitly world-readable memories are visible
     # to federation peers.
+    return [_fed.eligible_for_federation("m")]
+
+
+def _federation_tombstone_filters() -> list[str]:
     return [
         "m.federation_source IS NULL",
-        "(m.permission_mode % 10) >= 4",
         "m.deleted_at IS NULL",
+        "m.consolidated_into IS NOT NULL",
+        "m.consolidated_at IS NOT NULL",
     ]
 
 
@@ -458,26 +487,34 @@ async def federation_feed(
     #
     # `federation_source IS NULL` prevents loops (don't re-export memories
     # we ourselves pulled from another peer).
-    query_parts = _federation_visibility_filters()
+    memory_query_parts = _federation_visibility_filters()
+    tombstone_query_parts = _federation_tombstone_filters()
     args: list = []
     if since_ts is not None:
         args.append(since_ts)
         since_updated_arg = len(args)
         args.append(since_id)
         since_id_arg = len(args)
-        query_parts.append(
+        memory_query_parts.append(
             f"(m.updated > ${since_updated_arg} "
             f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
         )
+        tombstone_query_parts.append(
+            f"(m.consolidated_at > ${since_updated_arg} "
+            f"OR (m.consolidated_at = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+        )
     if namespaces:
         args.append(namespaces)
-        query_parts.append(f"m.namespace = ANY(${len(args)})")
+        memory_query_parts.append(f"m.namespace = ANY(${len(args)})")
+        tombstone_query_parts.append(f"m.namespace = ANY(${len(args)})")
     if categories:
         args.append(categories)
-        query_parts.append(f"m.category = ANY(${len(args)})")
+        memory_query_parts.append(f"m.category = ANY(${len(args)})")
+        tombstone_query_parts.append(f"m.category = ANY(${len(args)})")
 
     args.append(limit + 1)   # request one extra to detect has_more
-    where_clause = " AND ".join(query_parts)
+    memory_where_clause = " AND ".join(memory_query_parts)
+    tombstone_where_clause = " AND ".join(tombstone_query_parts)
 
     # prefer_compressed contract:
     #   * Per-row byte gate: the variant is used only when its
@@ -553,18 +590,50 @@ async def federation_feed(
     async with _lc.get_pool_manager().acquire() as conn:
         rows = await conn.fetch(
             f"""
-            SELECT m.id, {content_select}
-                   m.category, m.subcategory, m.metadata,
-                   m.quality_rating, {verbatim_select}
-                   m.owner_id, m.namespace,
-                   m.permission_mode, m.source_model, m.source_provider,
-                   m.source_session, m.source_agent, m.created, m.updated,
-                   m.archived_at,
-                   {compressed_select.rstrip(',')}
-            FROM memories m
-            {join_compressed}
-            WHERE {where_clause}
-            ORDER BY m.updated ASC, m.id ASC
+            SELECT *
+            FROM (
+                SELECT NULL::text AS type,
+                       m.id, {content_select}
+                       m.category, m.subcategory, m.metadata,
+                       m.quality_rating, {verbatim_select}
+                       m.owner_id, m.namespace,
+                       m.permission_mode, m.source_model, m.source_provider,
+                       m.source_session, m.source_agent, m.created, m.updated,
+                       m.archived_at,
+                       NULL::text AS consolidated_into,
+                       NULL::timestamptz AS consolidated_at,
+                       {compressed_select.rstrip(',')}
+                FROM memories m
+                {join_compressed}
+                WHERE {memory_where_clause}
+
+                UNION ALL
+
+                SELECT 'consolidation'::text AS type,
+                       m.id,
+                       NULL::text AS content,
+                       NULL::text AS category,
+                       NULL::text AS subcategory,
+                       NULL::jsonb AS metadata,
+                       NULL::int AS quality_rating,
+                       NULL::text AS verbatim_content,
+                       NULL::text AS owner_id,
+                       m.namespace,
+                       NULL::smallint AS permission_mode,
+                       NULL::text AS source_model,
+                       NULL::text AS source_provider,
+                       NULL::text AS source_session,
+                       NULL::text AS source_agent,
+                       m.created,
+                       m.consolidated_at AS updated,
+                       NULL::timestamptz AS archived_at,
+                       m.consolidated_into,
+                       m.consolidated_at,
+                       NULL::text AS compressed_content
+                FROM memories m
+                WHERE {tombstone_where_clause}
+            ) feed
+            ORDER BY updated ASC, id ASC
             LIMIT ${len(args)}
             """,
             *args,
@@ -573,7 +642,7 @@ async def federation_feed(
     has_more = len(rows) > limit
     rows = rows[:limit]
 
-    memories = [_memory_item_from_row(r, include_compressed=prefer_compressed) for r in rows]
+    memories = [_feed_item_from_row(r, include_compressed=prefer_compressed) for r in rows]
     if rows and rows[-1]["updated"]:
         next_cursor = _fed._encode_feed_cursor(rows[-1]["updated"], rows[-1]["id"])
     else:

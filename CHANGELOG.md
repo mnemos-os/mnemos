@@ -44,8 +44,9 @@ Postgres 17 deployment: 98.5% write success, 99.7% read success,
   canonical with read-only pointers (``permission_mode=0o400``)
   on the originals. New ``consolidated_into`` column on
   ``memories``. Soft-only: never hard-deletes user data.
-  Federation-safe — peers see the merge via the existing version
-  trigger. Opt-in via ``MNEMOS_MORPHEUS_CONSOLIDATE``.
+  Federation-aware: peers receive a consolidation tombstone via
+  the federation feed (see consolidation event type). Opt-in via
+  ``MNEMOS_MORPHEUS_CONSOLIDATE``.
 - **EXTRACT phase.** LLM mining of latent KG triples from
   ``verbatim_content`` of prose memories not yet triplified.
   Two-model split: fast/quantized for raw extraction, optional
@@ -131,7 +132,7 @@ Postgres 17 deployment: 98.5% write success, 99.7% read success,
 
 ### Added — MCP §6.4 security gates
 
-- Cross-cutting audit + hardening across all 18 MCP tools:
+- Cross-cutting audit + hardening across all 22 MCP tools:
   parameter-shape audit log (no raw values), per-tool rate
   buckets honouring ``mnemos.core.rate_limit``, role + namespace
   validation in the dispatcher, root-bypass logged as a warning,
@@ -143,6 +144,9 @@ Postgres 17 deployment: 98.5% write success, 99.7% read success,
   errors that don't echo the offending value or the regex
   pattern.
 - ``_rest_delete`` now ``raise_for_status`` (was silent on 4xx).
+- Tool surface count includes the four v5 additions:
+  ``pantheon_list_models``, ``pantheon_route_explain``,
+  ``tool_kronos_anomalies``, and ``tool_kronos_forecast``.
 
 ### Added — Document import retry-safety
 
@@ -254,7 +258,9 @@ group by area rather than by intermediate version.
   Markdown guides (``docs/connectors/{claude-code,cursor,
   codex-cli,continue-dev,cline}.md``) with mechanically-
   verified config snippets. Canonical MCP tool surface table
-  in the README enumerates 18 tools with R/W classification
+  in the README enumerates 22 tools with R/W classification,
+  including ``pantheon_list_models``, ``pantheon_route_explain``,
+  ``tool_kronos_anomalies``, and ``tool_kronos_forecast``,
   and the ``kg_``-prefix asymmetry called out (``kg_create_triple``
   has the prefix; ``update_triple`` / ``delete_triple`` do
   not). The ``mnemos_`` UI prefix some agents add (Cursor's

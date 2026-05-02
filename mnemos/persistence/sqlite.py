@@ -92,7 +92,12 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v3_5_session_compression_legacy_drop.sql",
     "migrations_v3_5_sessions_consultations_namespace.sql",
     "migrations_v4_2_compression_candidates_reject_reason.sql",
+    "migrations_v4_2_morpheus_consolidate_sqlite.sql",
+    "migrations_v4_2_morpheus_extract_sqlite.sql",
     "migrations_v4_2_persephone.sql",
+    "migrations_v4_2_pantheon_routing_audit_sqlite.sql",
+    "migrations_v5_0_consolidated_at_sqlite.sql",
+    "migrations_v5_0_morpheus_extract_run_memories_sqlite.sql",
 ]
 
 

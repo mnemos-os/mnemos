@@ -49,6 +49,7 @@ class _Conn:
         self.run_row = {"config": run_config or {"extract": True}, "namespace": run_namespace}
         self.memories = {row["id"]: row for row in memories or []}
         self.kg_triples = list(kg_triples or [])
+        self.extract_run_memories: list[dict] = []
         self.executed: list[tuple[str, tuple]] = []
         self.counter_updates: list[tuple[str, tuple]] = []
 
@@ -70,6 +71,10 @@ class _Conn:
             content = row.get("verbatim_content")
             if row.get("deleted_at") is not None:
                 continue
+            if row.get("archived_at") is not None:
+                continue
+            if row.get("consolidated_into") is not None:
+                continue
             if row.get("triples_extracted_at") is not None:
                 continue
             if content is None or len(content) < min_chars:
@@ -85,6 +90,10 @@ class _Conn:
             memory_id, namespace = args
             row = self.memories.get(memory_id)
             if row is None or row.get("deleted_at") is not None:
+                return None
+            if row.get("archived_at") is not None:
+                return None
+            if row.get("consolidated_into") is not None:
                 return None
             if row.get("triples_extracted_at") is not None:
                 return None
@@ -110,6 +119,19 @@ class _Conn:
                 "namespace": args[8],
             })
             return "INSERT 0 1"
+        if compact.startswith("INSERT INTO morpheus_extract_run_memories"):
+            run_id, memory_id = args
+            self.extract_run_memories = [
+                row
+                for row in self.extract_run_memories
+                if not (row["run_id"] == run_id and row["memory_id"] == memory_id)
+            ]
+            self.extract_run_memories.append({
+                "run_id": run_id,
+                "memory_id": memory_id,
+                "processed_at": "now",
+            })
+            return "INSERT 0 1"
         if compact.startswith("WITH deleted_extract_triples AS"):
             return self._execute_extract_rollback(args[0])
         if compact.startswith("UPDATE memories SET consolidated_into = NULL"):
@@ -127,9 +149,18 @@ class _Conn:
             for row in self.kg_triples
             if row.get("extracted_by_run_id") == run_id and row.get("memory_id")
         }
+        affected_memory_ids.update(
+            row["memory_id"]
+            for row in self.extract_run_memories
+            if row["run_id"] == run_id
+        )
         self.kg_triples = [
             row for row in self.kg_triples
             if row.get("extracted_by_run_id") != run_id
+        ]
+        self.extract_run_memories = [
+            row for row in self.extract_run_memories
+            if row["run_id"] != run_id
         ]
         reset = 0
         for memory_id in affected_memory_ids:
@@ -174,6 +205,8 @@ def _memory(
     verbatim_content: object = _DEFAULT_CONTENT,
     triples_extracted_at: object | None = None,
     created_offset: int = 0,
+    archived_at: object | None = None,
+    consolidated_into: str | None = None,
 ) -> dict:
     content = _long_prose(memory_id) if verbatim_content is _DEFAULT_CONTENT else verbatim_content
     return {
@@ -182,6 +215,8 @@ def _memory(
         "owner_id": f"owner-{namespace}",
         "namespace": namespace,
         "deleted_at": None,
+        "archived_at": archived_at,
+        "consolidated_into": consolidated_into,
         "triples_extracted_at": triples_extracted_at,
         "created": datetime(2026, 5, 2, 12, 0, 0) + timedelta(minutes=created_offset),
     }
@@ -303,6 +338,24 @@ async def test_rollback_run_removes_only_triples_from_that_run():
     assert conn.memories["mem_a"]["triples_extracted_at"] is None
     assert conn.memories["mem_b"]["triples_extracted_at"] is None
     assert conn.memories["mem_c"]["triples_extracted_at"] == "done"
+
+
+@pytest.mark.asyncio
+async def test_rollback_run_resets_zero_triple_processed_memories():
+    conn = _Conn(memories=[_memory("mem_zero", triples_extracted_at="done")])
+    conn.extract_run_memories.append({
+        "run_id": RUN_ID,
+        "memory_id": "mem_zero",
+        "processed_at": "now",
+    })
+
+    deleted, run_rows = await rollback_run(_Pool(conn), RUN_ID)
+
+    assert deleted == 0
+    assert run_rows == 1
+    assert conn.kg_triples == []
+    assert conn.extract_run_memories == []
+    assert conn.memories["mem_zero"]["triples_extracted_at"] is None
 
 
 @pytest.mark.asyncio

@@ -22,6 +22,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 import asyncpg
 import httpx
 
+from mnemos.db import eligibility as _eligibility
+
 logger = logging.getLogger(__name__)
 
 FEDERATION_HTTP_TIMEOUT = 30.0
@@ -33,6 +35,10 @@ FEDERATION_CURSOR_LOWER_ID = ""
 FEDERATION_MAX_CONTENT = 1_000_000  # 1 MB per content body
 FEDERATION_MAX_METADATA = 64 * 1024  # 64 KB metadata json
 FEDERATION_MAX_NAME = 256            # category/subcategory/namespace length
+
+
+def eligible_for_federation(alias: str = "m") -> str:
+    return _eligibility.eligible_for_federation(alias)
 
 
 class FederationFeedCursor(NamedTuple):
@@ -664,6 +670,9 @@ async def _store_memories(
         remote_id = mem.get("id")
         if not remote_id or not isinstance(remote_id, str):
             continue
+        if mem.get("type") == "consolidation":
+            upd_n += await _apply_consolidation_tombstone(conn, peer_name, mem)
+            continue
         # Cap inbound strings. A hostile peer otherwise fills the disk.
         content = _cap(mem.get("content", ""), FEDERATION_MAX_CONTENT)
         verbatim = _cap(
@@ -796,6 +805,59 @@ async def _store_memories(
                     upd_n += 1
 
     return new_n, upd_n
+
+
+async def _apply_consolidation_tombstone(
+    conn: asyncpg.Connection,
+    peer_name: str,
+    event: Dict[str, Any],
+) -> int:
+    remote_id = event.get("id")
+    canonical_remote_id = event.get("consolidated_into")
+    if not isinstance(remote_id, str) or not isinstance(canonical_remote_id, str):
+        return 0
+    raw_consolidated_at = event.get("consolidated_at")
+    if isinstance(raw_consolidated_at, str):
+        try:
+            consolidated_at = datetime.fromisoformat(
+                raw_consolidated_at.replace("Z", "+00:00")
+            )
+        except ValueError:
+            consolidated_at = None
+    else:
+        consolidated_at = None
+    local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
+    local_canonical_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{canonical_remote_id}"
+    result = await conn.execute(
+        """
+        UPDATE memories
+        SET consolidated_into = $2,
+            consolidated_at = COALESCE($3::timestamptz, NOW()),
+            permission_mode = 400,
+            metadata = COALESCE(metadata, '{}'::jsonb)
+                || jsonb_build_object(
+                    'federation_consolidation', jsonb_build_object(
+                        'remote_id', $4,
+                        'remote_consolidated_into', $5,
+                        'peer', $6
+                    )
+                )
+        WHERE id = $1
+          AND deleted_at IS NULL
+          AND consolidated_into IS DISTINCT FROM $2
+          AND EXISTS (
+              SELECT 1 FROM memories
+              WHERE id = $2 AND deleted_at IS NULL
+          )
+        """,
+        local_id,
+        local_canonical_id,
+        consolidated_at,
+        remote_id,
+        canonical_remote_id,
+        peer_name,
+    )
+    return 0 if not result or result.split()[-1] == "0" else 1
 
 
 # ── Background worker ────────────────────────────────────────────────────────

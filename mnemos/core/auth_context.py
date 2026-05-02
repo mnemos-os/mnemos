@@ -12,3 +12,4 @@ class UserContext:
     role: str
     namespace: str
     authenticated: bool
+    session_id: str | None = None

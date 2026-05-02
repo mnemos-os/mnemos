@@ -26,6 +26,8 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
+from mnemos.db.eligibility import eligible_for_compression
+
 from .contest import ContestOutcome
 
 logger = logging.getLogger(__name__)
@@ -74,7 +76,7 @@ ON CONFLICT (memory_id) DO UPDATE SET
     selected_at         = NOW()
 """
 
-_FETCH_SOURCE_MAIN_HEAD_SQL = """
+_FETCH_SOURCE_MAIN_HEAD_SQL = f"""
 SELECT
     m.id AS memory_id,
     m.category,
@@ -98,6 +100,7 @@ INNER JOIN memories m
     ON m.id = mb.memory_id
 WHERE mb.memory_id = $1
   AND mb.name = 'main'
+  AND {eligible_for_compression('m', reject_private_parent=True)}
 FOR UPDATE OF mb
 """
 

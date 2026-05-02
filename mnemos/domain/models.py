@@ -83,6 +83,13 @@ class MemoryItem(BaseModel):
     archived: bool = False
 
 
+class FederationConsolidationEvent(BaseModel):
+    type: Literal["consolidation"] = "consolidation"
+    id: str
+    consolidated_into: str
+    consolidated_at: str
+
+
 def _isoformat_value(value: Any) -> str | None:
     if value is None:
         return None
@@ -717,7 +724,7 @@ class FederationStatusResponse(BaseModel):
 
 class FederationFeedResponse(BaseModel):
     """Returned by /v1/federation/feed to remote peers pulling from us."""
-    memories: List[MemoryItem]
+    memories: List[MemoryItem | FederationConsolidationEvent]
     next_cursor: Optional[str] = None
     has_more: bool = False
 

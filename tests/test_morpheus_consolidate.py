@@ -55,6 +55,27 @@ class _Conn:
     async def fetchval(self, sql: str, *_args):
         if "SELECT config FROM morpheus_runs" in sql and self.run_row:
             return self.run_row["config"]
+        compact = " ".join(sql.split())
+        if compact.startswith("SELECT COUNT(*) FROM memories WHERE id = ANY"):
+            member_ids, canonical_id, run_id, namespace = _args
+            count = 0
+            for memory_id in member_ids:
+                row = self.memories.get(memory_id)
+                metadata = dict(row.get("metadata") or {}) if row else {}
+                if row is None:
+                    continue
+                if row.get("deleted_at") is not None or row.get("archived_at") is not None:
+                    continue
+                if row.get("consolidated_into") != canonical_id:
+                    continue
+                if row.get("morpheus_run_id") != run_id:
+                    continue
+                if "pre_consolidate_permission_mode" not in metadata:
+                    continue
+                if namespace is not None and row.get("namespace") != namespace:
+                    continue
+                count += 1
+            return count
         return None
 
     async def fetch(self, sql: str, *args):
@@ -69,6 +90,8 @@ class _Conn:
         for memory_id in requested:
             row = self.memories.get(memory_id)
             if row is None or row.get("deleted_at") is not None:
+                continue
+            if row.get("archived_at") is not None:
                 continue
             if namespace is not None and row.get("namespace") != namespace:
                 continue
@@ -120,6 +143,8 @@ class _Conn:
         row = self.memories.get(memory_id)
         if row is None or row.get("deleted_at") is not None:
             return "UPDATE 0"
+        if row.get("archived_at") is not None:
+            return "UPDATE 0"
         if row.get("consolidated_into") is not None or row.get("morpheus_run_id") is not None:
             return "UPDATE 0"
         if namespace is not None and row.get("namespace") != namespace:
@@ -129,6 +154,7 @@ class _Conn:
         metadata.setdefault("pre_consolidate_permission_mode", row["permission_mode"])
         row["metadata"] = metadata
         row["consolidated_into"] = canonical_id
+        row["consolidated_at"] = "now"
         row["permission_mode"] = permission_mode
         row["morpheus_run_id"] = run_id
         self.memory_versions.append({
@@ -145,6 +171,7 @@ class _Conn:
             if row.get("morpheus_run_id") != run_id or metadata_key not in metadata:
                 continue
             row["consolidated_into"] = None
+            row["consolidated_at"] = None
             row["permission_mode"] = int(metadata[metadata_key])
             metadata.pop(metadata_key, None)
             row["metadata"] = metadata
@@ -199,6 +226,7 @@ def _memory(
     consolidated_into: str | None = None,
     morpheus_run_id: str | None = None,
     content: str | None = None,
+    archived_at: object | None = None,
 ) -> dict:
     return {
         "id": memory_id,
@@ -209,6 +237,7 @@ def _memory(
         "morpheus_run_id": morpheus_run_id,
         "metadata": {},
         "deleted_at": None,
+        "archived_at": archived_at,
         "namespace": namespace,
         "content": content or f"{memory_id} content.",
         "category": "facts",

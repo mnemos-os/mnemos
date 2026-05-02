@@ -24,6 +24,7 @@ import numpy as np
 
 from mnemos.core.config import get_settings, hot_rs_enabled
 from mnemos.core.ids import new_memory_id
+from mnemos.db.eligibility import eligible_for_morpheus
 
 logger = logging.getLogger(__name__)
 
@@ -311,12 +312,20 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
                     DELETE FROM kg_triples
                     WHERE extracted_by_run_id=$1::uuid
                     RETURNING memory_id
+                ), run_memories AS (
+                    DELETE FROM morpheus_extract_run_memories
+                    WHERE run_id=$1::uuid
+                    RETURNING memory_id
+                ), affected_memories AS (
+                    SELECT memory_id FROM deleted_extract_triples
+                    UNION
+                    SELECT memory_id FROM run_memories
                 )
                 UPDATE memories
                 SET triples_extracted_at = NULL
                 WHERE id IN (
                     SELECT DISTINCT memory_id
-                    FROM deleted_extract_triples
+                    FROM affected_memories
                     WHERE memory_id IS NOT NULL
                 )
                 """,
@@ -327,6 +336,7 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
                 """
                 UPDATE memories
                 SET consolidated_into = NULL,
+                    consolidated_at = NULL,
                     permission_mode = COALESCE(
                         (metadata->>$2)::int,
                         permission_mode
@@ -379,14 +389,14 @@ async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
     """
     async with pool.acquire() as conn:
         n = await conn.fetchval(
-            """
+            f"""
             SELECT COUNT(*)
             FROM memories m
             JOIN morpheus_runs r ON r.id = $1::uuid
             WHERE m.created BETWEEN r.window_started_at AND r.window_ended_at
               AND m.provenance IS DISTINCT FROM 'morpheus_local'
               AND m.morpheus_run_id IS NULL
-              AND m.deleted_at IS NULL
+              AND {eligible_for_morpheus('m')}
               AND (r.namespace IS NULL OR m.namespace = r.namespace)
             """,
             run_id,
@@ -425,14 +435,14 @@ async def phase_cluster(pool: asyncpg.Pool, run_id: str) -> int:
         min_size = int(run_row["cluster_min_size"])
 
         rows = await conn.fetch(
-            """
+            f"""
             SELECT id, embedding::text AS embedding
             FROM memories
             WHERE created BETWEEN $1 AND $2
               AND provenance IS DISTINCT FROM 'morpheus_local'
               AND morpheus_run_id IS NULL
               AND embedding IS NOT NULL
-              AND deleted_at IS NULL
+              AND {eligible_for_morpheus('')}
               AND ($3::text IS NULL OR namespace = $3)
             ORDER BY created
             """,
@@ -548,25 +558,43 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
 
         async with pool.acquire() as conn:
             rows = await conn.fetch(
-                """
+                f"""
                 SELECT id, recall_count, created, permission_mode,
                        consolidated_into, morpheus_run_id, metadata
                 FROM memories
                 WHERE id = ANY($1::text[])
-                  AND deleted_at IS NULL
+                  AND {eligible_for_morpheus('')}
                   AND ($2::text IS NULL OR namespace = $2)
                 """,
                 member_ids, namespace,
             )
         if len(rows) < min_size:
-            continue
-
-        candidates = [row for row in rows if row["consolidated_into"] is None]
-        if not candidates:
-            continue
+            already_count = 0
+            if len(rows) == 1:
+                async with pool.acquire() as conn:
+                    already_count = int(await conn.fetchval(
+                        """
+                        SELECT COUNT(*)
+                        FROM memories
+                        WHERE id = ANY($1::text[])
+                          AND deleted_at IS NULL
+                          AND archived_at IS NULL
+                          AND consolidated_into=$2
+                          AND morpheus_run_id=$3::uuid
+                          AND COALESCE(metadata, '{}'::jsonb)
+                              ? 'pre_consolidate_permission_mode'
+                          AND ($4::text IS NULL OR namespace=$4)
+                        """,
+                        member_ids,
+                        str(rows[0]["id"]),
+                        run_id,
+                        namespace,
+                    ) or 0)
+            if len(rows) + already_count < min_size:
+                continue
 
         canonical = sorted(
-            candidates,
+            rows,
             key=lambda row: (
                 -int(row["recall_count"] or 0),
                 row["created"],
@@ -574,20 +602,29 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
             ),
         )[0]
         canonical_id = str(canonical["id"])
-        cluster_count = 0
+        async with pool.acquire() as conn:
+            cluster_count = int(await conn.fetchval(
+                """
+                SELECT COUNT(*)
+                FROM memories
+                WHERE id = ANY($1::text[])
+                  AND deleted_at IS NULL
+                  AND archived_at IS NULL
+                  AND consolidated_into=$2
+                  AND morpheus_run_id=$3::uuid
+                  AND COALESCE(metadata, '{}'::jsonb)
+                      ? 'pre_consolidate_permission_mode'
+                  AND ($4::text IS NULL OR namespace=$4)
+                """,
+                member_ids,
+                canonical_id,
+                run_id,
+                namespace,
+            ) or 0)
 
         for row in rows:
             member_id = str(row["id"])
             if member_id == canonical_id:
-                continue
-            consolidated_into = row["consolidated_into"]
-            if consolidated_into is not None:
-                if (
-                    str(consolidated_into) == canonical_id
-                    and str(row["morpheus_run_id"]) == run_id
-                    and _metadata_has_key(row["metadata"], _PRE_CONSOLIDATE_PERMISSION_KEY)
-                ):
-                    cluster_count += 1
                 continue
 
             async with pool.acquire() as conn:
@@ -595,6 +632,7 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                     """
                     UPDATE memories
                     SET consolidated_into=$2,
+                        consolidated_at=NOW(),
                         permission_mode=$5,
                         morpheus_run_id=$3::uuid,
                         metadata = CASE
@@ -610,6 +648,7 @@ async def phase_consolidate(pool: asyncpg.Pool, run_id: str) -> int:
                         END
                     WHERE id=$1
                       AND deleted_at IS NULL
+                      AND archived_at IS NULL
                       AND consolidated_into IS NULL
                       AND morpheus_run_id IS NULL
                       AND ($4::text IS NULL OR namespace=$4)
@@ -685,12 +724,11 @@ async def phase_synthesise(pool: asyncpg.Pool, run_id: str) -> int:
 
         async with pool.acquire() as conn:
             members = await conn.fetch(
-                """
+                f"""
                 SELECT id, content, category, owner_id, namespace
                 FROM memories
                 WHERE id = ANY($1::text[])
-                  AND deleted_at IS NULL
-                  AND consolidated_into IS NULL
+                  AND {eligible_for_morpheus('')}
                 """,
                 member_ids,
             )
@@ -783,10 +821,10 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
     verify = _extract_verify_enabled(config)
     async with pool.acquire() as conn:
         candidates = await conn.fetch(
-            """
+            f"""
             SELECT id, verbatim_content, owner_id, namespace
             FROM memories
-            WHERE deleted_at IS NULL
+            WHERE {eligible_for_morpheus('')}
               AND triples_extracted_at IS NULL
               AND verbatim_content IS NOT NULL
               AND length(verbatim_content) >= $1
@@ -809,12 +847,12 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
         async with pool.acquire() as conn:
             async with conn.transaction():
                 marked_id = await conn.fetchval(
-                    """
+                    f"""
                     UPDATE memories
                     SET triples_extracted_at = NOW()
                     WHERE id=$1
                       AND triples_extracted_at IS NULL
-                      AND deleted_at IS NULL
+                      AND {eligible_for_morpheus('')}
                       AND ($2::text IS NULL OR namespace = $2)
                     RETURNING id
                     """,
@@ -822,6 +860,18 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
                 )
                 if marked_id is None:
                     continue
+
+                await conn.execute(
+                    """
+                    INSERT INTO morpheus_extract_run_memories
+                        (run_id, memory_id)
+                    VALUES ($1::uuid, $2)
+                    ON CONFLICT (run_id, memory_id) DO UPDATE
+                    SET processed_at = EXCLUDED.processed_at
+                    """,
+                    run_id,
+                    memory_id,
+                )
 
                 for triple in triples:
                     await conn.execute(

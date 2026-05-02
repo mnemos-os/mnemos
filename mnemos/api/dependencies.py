@@ -136,7 +136,9 @@ async def get_current_user(
             resolved = await resolve_session(conn, cookie_value)
         if resolved is not None:
             user_id, _identity_id = resolved
-            return await _user_context_from_id(pool, user_id, authenticated=True)
+            context = await _user_context_from_id(pool, user_id, authenticated=True)
+            context.session_id = cookie_value
+            return context
 
     # 3. No credentials.
     raise HTTPException(status_code=401, detail="Authentication required")

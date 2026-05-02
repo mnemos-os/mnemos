@@ -76,6 +76,8 @@ import logging
 from collections import Counter
 from typing import Any, Dict, Optional, Sequence
 
+from mnemos.db.eligibility import eligible_for_compression
+
 from .base import CompressionEngine, CompressionRequest, IdentifierPolicy
 from .contest import run_contest
 from .contest_store import persist_contest
@@ -111,11 +113,11 @@ RETURNING q.id, q.memory_id, q.owner_id, q.reason,
           q.scoring_profile, q.attempts
 """
 
-_MEMORY_CONTENT_SQL = """
+_MEMORY_CONTENT_SQL = f"""
 SELECT id, content, category, task_type
 FROM memories
 WHERE id = $1
-  AND deleted_at IS NULL
+  AND {eligible_for_compression('', reject_private_parent=True)}
 """
 
 _MARK_DONE_SQL = """

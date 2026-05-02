@@ -132,6 +132,35 @@ def _schedule_outbox_deliveries(delivery_ids: list[str]) -> None:
         _lc._schedule_delivery_attempt(_attempt_delivery(str(did)))
 
 
+async def _publish_nats_with_timeout(
+    subject: str,
+    payload: dict,
+    *,
+    msg_id: str,
+) -> None:
+    from mnemos.core.config import get_settings
+    from mnemos.nats import publish_event as _nats_publish_event
+
+    timeout = float(get_settings().nats.publish_timeout_seconds)
+    try:
+        await asyncio.wait_for(
+            _nats_publish_event(subject, payload, msg_id=msg_id),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "NATS publish timed out after %.3fs for %s; scheduling retry",
+            timeout,
+            subject,
+        )
+        try:
+            _lc._schedule_background(
+                _nats_publish_event(subject, payload, msg_id=msg_id)
+            )
+        except RuntimeError as exc:
+            logger.warning("NATS publish retry scheduling failed for %s: %s", subject, exc)
+
+
 async def _invalidate_caches_after_mutation() -> None:
     """Drop /stats + per-user search cache entries on any memory write."""
     if not _lc._cache:
@@ -872,10 +901,9 @@ async def create_memory(
 
     # v4.2 NATS additive emit. Best-effort — silent skip when broker
     # unreachable. Webhooks outbox above is the durable path.
-    from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
     safe_ns = (namespace or "default").replace(".", "_")
-    await _nats_publish_event(
+    await _publish_nats_with_timeout(
         f"mnemos.memory.created.{safe_ns}",
         {
             "memory_id": mem_id,
@@ -973,12 +1001,11 @@ async def bulk_create_memories(
         )
         delivery_ids.extend(item_delivery_ids)
     _schedule_outbox_deliveries(delivery_ids)
-    from mnemos.nats import publish_event as _nats_publish_event
     from mnemos.nats.client import get_node_name as _nats_get_node_name
     source_node = _nats_get_node_name()
     for event in nats_created_events:
         safe_ns = (event["namespace"] or "default").replace(".", "_")
-        await _nats_publish_event(
+        await _publish_nats_with_timeout(
             f"mnemos.memory.created.{safe_ns}",
             {**event, "source_node": source_node},
             msg_id=f"{event['memory_id']}.created",

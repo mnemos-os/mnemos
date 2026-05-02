@@ -62,6 +62,56 @@ EXPECTED_MIGRATIONS = [
     "migrations_v4_2_morpheus_extract.sql",
     "migrations_v4_2_persephone.sql",
     "migrations_v4_2_pantheon_routing_audit.sql",
+    "migrations_v5_0_consolidated_at.sql",
+    "migrations_v5_0_morpheus_extract_run_memories.sql",
+]
+
+EXPECTED_SQLITE_MIGRATIONS = [
+    "migrations.sql",
+    "migrations_v1_multiuser.sql",
+    "migrations_v2_versioning.sql",
+    "migrations_v2_sessions.sql",
+    "migrations_model_registry.sql",
+    "migrations_v3_dag.sql",
+    "migrations_v3_graeae_unified.sql",
+    "migrations_v3_webhooks.sql",
+    "migrations_v3_oauth.sql",
+    "migrations_v3_federation.sql",
+    "migrations_v3_ownership.sql",
+    "migrations_v3_1_compression.sql",
+    "migrations_v3_1_versioning_fix.sql",
+    "migrations_v3_1_2_kg_tenancy.sql",
+    "migrations_v3_1_2_audit_log_columns.sql",
+    "migrations_v3_2_user_namespace.sql",
+    "migrations_v3_2_entities_namespace.sql",
+    "migrations_v3_2_2_version_snapshot_new_values.sql",
+    "migrations_v3_3_morpheus.sql",
+    "migrations_v3_3_morpheus_namespace.sql",
+    "migrations_v3_3_recall_tracking.sql",
+    "migrations_charon_trigger_guard.sql",
+    "migrations_v3_4_federation_compat.sql",
+    "migrations_v3_5_trigger_same_memory_parent.sql",
+    "migrations_v3_5_rls_group_select_unix_bits.sql",
+    "migrations_v3_5_webhook_retry_terminal_state.sql",
+    "migrations_v3_5_webhook_attempt_lease.sql",
+    "migrations_v3_5_webhook_writer_revision.sql",
+    "migrations_v3_5_webhook_status_updated_at.sql",
+    "migrations_v3_5_webhook_superseded_marker.sql",
+    "migrations_v3_5_webhook_attempt_unique.sql",
+    "migrations_v3_5_webhook_succeeded_unique.sql",
+    "migrations_v3_5_webhook_succeeded_terminal_trigger.sql",
+    "migrations_v3_5_entities_namespace_unique.sql",
+    "migrations_v3_5_state_journal_namespace.sql",
+    "migrations_v3_5_session_compression_ratio_drop.sql",
+    "migrations_v3_5_session_compression_legacy_drop.sql",
+    "migrations_v3_5_sessions_consultations_namespace.sql",
+    "migrations_v4_2_compression_candidates_reject_reason.sql",
+    "migrations_v4_2_morpheus_consolidate_sqlite.sql",
+    "migrations_v4_2_morpheus_extract_sqlite.sql",
+    "migrations_v4_2_persephone.sql",
+    "migrations_v4_2_pantheon_routing_audit_sqlite.sql",
+    "migrations_v5_0_consolidated_at_sqlite.sql",
+    "migrations_v5_0_morpheus_extract_run_memories_sqlite.sql",
 ]
 
 
@@ -110,6 +160,27 @@ def test_installer_db_migration_list_matches_expected_order():
     assert installer_db_list == EXPECTED_MIGRATIONS
 
 
+def test_sqlite_migration_list_matches_expected_order():
+    repo_root = Path(__file__).resolve().parents[1]
+    tree = ast.parse((repo_root / "mnemos" / "persistence" / "sqlite.py").read_text())
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Assign)
+            and len(node.targets) == 1
+            and isinstance(node.targets[0], ast.Name)
+            and node.targets[0].id == "SQLITE_MIGRATION_FILES"
+            and isinstance(node.value, ast.List)
+        ):
+            names = [
+                elt.value
+                for elt in node.value.elts
+                if isinstance(elt, ast.Constant) and isinstance(elt.value, str)
+            ]
+            assert names == EXPECTED_SQLITE_MIGRATIONS
+            return
+    raise AssertionError("SQLITE_MIGRATION_FILES not found")
+
+
 def test_every_migration_list_entry_exists_on_disk():
     """Catches the other common mistake: adding a migration to one
     of the lists without the corresponding SQL file actually existing
@@ -125,6 +196,18 @@ def test_every_migration_list_entry_exists_on_disk():
     assert not missing, (
         f"Migration entries reference files that don't exist in db/: {missing}. "
         "Either remove the entry or add the SQL file."
+    )
+
+
+def test_every_sqlite_migration_list_entry_exists_on_disk():
+    repo_root = Path(__file__).resolve().parents[1]
+    missing = [
+        name
+        for name in EXPECTED_SQLITE_MIGRATIONS
+        if not (repo_root / "db" / "migrations_sqlite" / name).exists()
+    ]
+    assert not missing, (
+        f"SQLite migration entries reference files that don't exist: {missing}."
     )
 
 

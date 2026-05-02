@@ -318,6 +318,8 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v4_2_morpheus_extract.sql",
         repo_path / "db" / "migrations_v4_2_persephone.sql",
         repo_path / "db" / "migrations_v4_2_pantheon_routing_audit.sql",
+        repo_path / "db" / "migrations_v5_0_consolidated_at.sql",
+        repo_path / "db" / "migrations_v5_0_morpheus_extract_run_memories.sql",
     ]
 
     print("[db] Running migrations...")

@@ -421,8 +421,22 @@ class PantheonSettings(BaseSettings):
             "MNEMOS_PANTHEON_DEFAULT_MAX_COST_USD_PER_MTOK",
         ),
     )
+    routing_log_queue_size: int = Field(
+        2000,
+        validation_alias="MNEMOS_PANTHEON_ROUTING_LOG_QUEUE_SIZE",
+    )
+    routing_log_drain_workers: int = Field(
+        1,
+        validation_alias="MNEMOS_PANTHEON_ROUTING_LOG_DRAIN_WORKERS",
+    )
 
-    @field_validator("consultation_cap", "routing_window_minutes", mode="before")
+    @field_validator(
+        "consultation_cap",
+        "routing_window_minutes",
+        "routing_log_queue_size",
+        "routing_log_drain_workers",
+        mode="before",
+    )
     @classmethod
     def _positive_int(cls, raw: Any) -> int:
         try:
@@ -530,6 +544,10 @@ class _NatsSettings(BaseSettings):
         False,
         validation_alias="MNEMOS_NATS_AUDIT_CONSUMER_ENABLED",
     )
+    publish_timeout_seconds: float = Field(
+        1.0,
+        validation_alias="MNEMOS_NATS_PUBLISH_TIMEOUT",
+    )
     # When set, the webhook NATS trigger uses a SHARED durable consumer
     # joined via this queue group instead of per-node durables. JetStream
     # load-balances delivery so only one replica receives each nudge
@@ -541,6 +559,15 @@ class _NatsSettings(BaseSettings):
     webhook_queue_group: str = Field(
         "", validation_alias="MNEMOS_WEBHOOK_NATS_QUEUE_GROUP"
     )
+
+    @field_validator("publish_timeout_seconds", mode="before")
+    @classmethod
+    def _positive_timeout(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 1.0
+        return value if value > 0 else 1.0
 
 
 class Settings(BaseSettings):
