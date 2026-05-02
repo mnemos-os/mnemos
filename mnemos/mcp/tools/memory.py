@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.config import connector_default_namespace
 
 from ._runtime import (
     MCP_BULK_CREATE_MAX_ITEMS,
@@ -52,10 +52,10 @@ def _connector_namespace() -> str | None:
     Empty / unset → no namespace override; server falls through
     to the API key's resolved namespace.
     """
-    val = os.environ.get("MNEMOS_DEFAULT_NAMESPACE", "").strip()
+    val = connector_default_namespace()
     if val:
         _safe_path_value(val, label="namespace", max_length=128)
-    return val or None
+    return val
 
 
 def _validate_optional_filter(value: str | None, *, label: str) -> str | None:

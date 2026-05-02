@@ -15,7 +15,6 @@ from dataclasses import dataclass, replace
 import json
 import logging
 import math
-import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Tuple
 from uuid import UUID, uuid4
@@ -23,7 +22,7 @@ from uuid import UUID, uuid4
 import asyncpg
 import numpy as np
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, hot_rs_enabled
 from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
@@ -36,7 +35,7 @@ _CONSOLIDATED_PERMISSION_MODE = 400
 # Python implementation below stays the source of truth.
 # Opt-in via env var MNEMOS_HOT_RS_ENABLED=1; default off until soak.
 _HOT_RS = None
-_HOT_RS_ENABLED = os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+_HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
     try:
         import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]

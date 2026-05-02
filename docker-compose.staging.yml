@@ -95,6 +95,7 @@ services:
       - ./db/migrations_v4_2_morpheus_consolidate.sql:/docker-entrypoint-initdb.d/48-morpheus-consolidate.sql
       - ./db/migrations_v4_2_morpheus_extract.sql:/docker-entrypoint-initdb.d/49-morpheus-extract.sql
       - ./db/migrations_v4_2_persephone.sql:/docker-entrypoint-initdb.d/50-persephone.sql
+      - ./db/migrations_v4_2_pantheon_routing_audit.sql:/docker-entrypoint-initdb.d/51-pantheon-routing-audit.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -139,6 +140,7 @@ services:
       - ./db/migrations_v4_2_morpheus_consolidate.sql:/migrations/48-morpheus-consolidate.sql:ro
       - ./db/migrations_v4_2_morpheus_extract.sql:/migrations/49-morpheus-extract.sql:ro
       - ./db/migrations_v4_2_persephone.sql:/migrations/50-persephone.sql:ro
+      - ./db/migrations_v4_2_pantheon_routing_audit.sql:/migrations/51-pantheon-routing-audit.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -168,7 +170,8 @@ services:
       -f /migrations/47-compression-dag.sql
       -f /migrations/48-morpheus-consolidate.sql
       -f /migrations/49-morpheus-extract.sql
-      -f /migrations/50-persephone.sql"
+      -f /migrations/50-persephone.sql
+      -f /migrations/51-pantheon-routing-audit.sql"
     restart: "no"
 
   mnemos:

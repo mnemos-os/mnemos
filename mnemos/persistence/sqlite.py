@@ -11,7 +11,6 @@ import inspect
 import json
 import logging
 import math
-import os
 import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
@@ -26,6 +25,7 @@ except ImportError:  # pragma: no cover - local CI can run without optional extr
     aiosqlite = None
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.config import hot_rs_enabled
 from mnemos.core.lifecycle import _MEMORY_COLS
 from mnemos.persistence.base import (
     BranchRepository,
@@ -293,7 +293,7 @@ def _parse_embedding(raw: Any) -> list[float]:
 # Python implementation below stays the source of truth.
 # Opt-in via env var MNEMOS_HOT_RS_ENABLED=1; default off until soak.
 _HOT_RS = None
-_HOT_RS_ENABLED = os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+_HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
     try:
         import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]

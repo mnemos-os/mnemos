@@ -4,9 +4,10 @@ Generates quality manifests tracking what was preserved/removed
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
+
+from mnemos.core.config import hot_rs_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,7 @@ logger = logging.getLogger(__name__)
 # Python implementation below stays the source of truth.
 # Opt-in via env var MNEMOS_HOT_RS_ENABLED=1; default off until soak.
 _HOT_RS = None
-_HOT_RS_ENABLED = os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in ("1", "true", "yes")
+_HOT_RS_ENABLED = hot_rs_enabled()
 if _HOT_RS_ENABLED:
     try:
         import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]

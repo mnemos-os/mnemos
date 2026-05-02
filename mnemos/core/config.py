@@ -522,6 +522,14 @@ class _NatsSettings(BaseSettings):
     url: str | None = Field(None, validation_alias="MNEMOS_NATS_URL")
     token: str | None = Field(None, validation_alias="MNEMOS_NATS_TOKEN")
     node_name: str = Field("", validation_alias="MNEMOS_NODE_NAME")
+    publish_pantheon_routing: bool = Field(
+        False,
+        validation_alias="MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING",
+    )
+    audit_consumer_enabled: bool = Field(
+        False,
+        validation_alias="MNEMOS_NATS_AUDIT_CONSUMER_ENABLED",
+    )
     # When set, the webhook NATS trigger uses a SHARED durable consumer
     # joined via this queue group instead of per-node durables. JetStream
     # load-balances delivery so only one replica receives each nudge
@@ -757,6 +765,17 @@ def set_profile_override(profile_value: str) -> Settings:
     os.environ["MNEMOS_PROFILE_OVERRIDE"] = profile_value
     os.environ["MNEMOS_PROFILE"] = profile_value
     return reload_settings()
+
+
+def connector_default_namespace() -> str | None:
+    """Return the MCP connector namespace override, if explicitly set."""
+    value = os.environ.get("MNEMOS_DEFAULT_NAMESPACE", "").strip()
+    return value or None
+
+
+def hot_rs_enabled() -> bool:
+    """Return whether optional Rust hot-path acceleration is enabled."""
+    return os.environ.get("MNEMOS_HOT_RS_ENABLED", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def mcp_nats_raw_enabled() -> bool:

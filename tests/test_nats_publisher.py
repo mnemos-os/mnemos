@@ -133,6 +133,7 @@ _CANONICAL_SUBJECTS = {
     "MNEMOS_MEMORY": ["mnemos.memory.>"],
     "MNEMOS_CONSULTATION": ["mnemos.consultation.>"],
     "MNEMOS_WEBHOOK": ["mnemos.webhook.>"],
+    "MNEMOS_PANTHEON": ["mnemos.pantheon.>"],
 }
 
 

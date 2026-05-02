@@ -121,6 +121,7 @@ async def ensure_streams(js) -> bool:
       mnemos.memory.created.<namespace>
       mnemos.memory.updated.<namespace>
       mnemos.memory.deleted.<namespace>
+      mnemos.pantheon.routing
 
     Retention: file-backed, 30 days, max 10 GB. Per-message TTL not
     set; consumers can replay within the retention window.
@@ -148,6 +149,7 @@ async def ensure_streams(js) -> bool:
         _stream_config("MNEMOS_MEMORY", ["mnemos.memory.>"]),
         _stream_config("MNEMOS_CONSULTATION", ["mnemos.consultation.>"]),
         _stream_config("MNEMOS_WEBHOOK", ["mnemos.webhook.>"]),
+        _stream_config("MNEMOS_PANTHEON", ["mnemos.pantheon.>"]),
     ]
     for cfg in streams:
         try:

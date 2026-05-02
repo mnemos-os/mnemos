@@ -19,6 +19,8 @@ _ENV_KEYS = (
     "PG_POOL_MAX",
     "MNEMOS_CONFIG_PATH",
     "MNEMOS_GRAEAE_NATS_FANOUT",
+    "MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING",
+    "MNEMOS_NATS_AUDIT_CONSUMER_ENABLED",
 )
 
 
@@ -54,6 +56,8 @@ def test_default_values_when_env_unset(monkeypatch: pytest.MonkeyPatch, tmp_path
         assert settings.database.password == ""
         assert settings.server.port == 5002
         assert settings.graeae.nats_fanout is False
+        assert settings.nats.publish_pantheon_routing is False
+        assert settings.nats.audit_consumer_enabled is False
 
 
 def test_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
@@ -73,6 +77,23 @@ def test_graeae_nats_fanout_feature_flag_defaults_off_and_can_enable(
         settings = config.get_settings()
         assert settings.graeae.nats_fanout is True
         assert config.GRAEAE_CONFIG["nats_fanout"] is True
+
+
+def test_nats_substrate_flags_default_off_and_can_enable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+) -> None:
+    with _isolated_settings(
+        monkeypatch,
+        str(tmp_path / "missing.toml"),
+        {
+            "MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING": "1",
+            "MNEMOS_NATS_AUDIT_CONSUMER_ENABLED": "true",
+        },
+    ):
+        settings = config.get_settings()
+        assert settings.nats.publish_pantheon_routing is True
+        assert settings.nats.audit_consumer_enabled is True
 
 
 def test_config_toml_override(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:

@@ -7,11 +7,16 @@ import logging
 from typing import Any
 
 import mnemos.core.lifecycle as _lc
+from mnemos.core.config import get_settings
 from mnemos.core.ids import new_memory_id
 from mnemos.core.numeric import safe_float
 from mnemos.domain.pantheon.router import RouteDecision
+from mnemos.nats import publisher as nats_publisher
 
 logger = logging.getLogger(__name__)
+
+PANTHEON_ROUTING_SUBJECT = "mnemos.pantheon.routing"
+PANTHEON_ROUTING_SCHEMA_VERSION = "1"
 
 
 def _usage_value(response: dict[str, Any] | None, key: str) -> int | None:
@@ -84,12 +89,41 @@ def routing_payload(
         "error_class": error_class,
     }
     metadata = {
+        "schema_version": PANTHEON_ROUTING_SCHEMA_VERSION,
         "pantheon_version": "0.2",
         "session_id": session_id,
         "usage_tier": _usage_tier(decision),
         **payload,
     }
     return payload, metadata
+
+
+def routing_event_payload(payload: dict[str, Any], metadata: dict[str, Any]) -> dict[str, Any]:
+    event = dict(payload)
+    event["metadata"] = dict(metadata)
+    return event
+
+
+def _routing_msg_id(payload: dict[str, Any]) -> str | None:
+    request_id = str(payload.get("request_id") or "").strip()
+    if not request_id:
+        return None
+    return f"pantheon.routing.{request_id}"
+
+
+async def publish_routing_event(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
+    """Publish one routing decision to NATS, swallowing all failures."""
+    if not get_settings().nats.publish_pantheon_routing:
+        return
+    try:
+        event = routing_event_payload(payload, metadata)
+        await nats_publisher.publish_event(
+            PANTHEON_ROUTING_SUBJECT,
+            event,
+            msg_id=_routing_msg_id(payload),
+        )
+    except Exception as exc:
+        logger.warning("[PANTHEON] routing NATS publish failed: %s", exc)
 
 
 async def write_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -> None:
@@ -157,6 +191,20 @@ def schedule_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -
         _lc._schedule_background(write_routing_memory(payload, metadata))
     except RuntimeError as exc:
         logger.debug("[PANTHEON] routing-log scheduling failed: %s", exc)
+    if not get_settings().nats.publish_pantheon_routing:
+        return
+    try:
+        _lc._schedule_background(publish_routing_event(payload, metadata))
+    except RuntimeError as exc:
+        logger.debug("[PANTHEON] routing NATS publish scheduling failed: %s", exc)
 
 
-__all__ = ["routing_payload", "schedule_routing_memory", "write_routing_memory"]
+__all__ = [
+    "PANTHEON_ROUTING_SCHEMA_VERSION",
+    "PANTHEON_ROUTING_SUBJECT",
+    "publish_routing_event",
+    "routing_event_payload",
+    "routing_payload",
+    "schedule_routing_memory",
+    "write_routing_memory",
+]

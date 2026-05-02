@@ -140,6 +140,17 @@ async def _webhook_nats_post_db_hook(pool: Any, settings: Any) -> None:
     lifecycle.schedule_worker(webhook_nats_trigger_loop(pool, settings=settings))
 
 
+async def _pantheon_routing_audit_post_db_hook(pool: Any, settings: Any) -> None:
+    """Launch the optional PANTHEON routing audit NATS consumer."""
+    if not settings.nats.audit_consumer_enabled:
+        return
+
+    from mnemos.workers.pantheon_routing_audit_consumer import consumer_loop
+
+    logger.info("Launching PANTHEON routing audit NATS consumer")
+    lifecycle.schedule_worker(consumer_loop(pool, settings=settings))
+
+
 def register_lifespan_hooks() -> None:
     """Register high-level integrations once per process."""
     global _registered
@@ -166,5 +177,8 @@ def register_lifespan_hooks() -> None:
     )
     lifecycle.register_post_db_startup_hook(
         "webhook nats trigger", _webhook_nats_post_db_hook
+    )
+    lifecycle.register_post_db_startup_hook(
+        "PANTHEON routing audit NATS consumer", _pantheon_routing_audit_post_db_hook
     )
     _registered = True
