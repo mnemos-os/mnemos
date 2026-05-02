@@ -6,7 +6,31 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ---
 
-## Current status — v4.0.0 shipped on 2026-04-29
+## Current status — v5.0.0 shipped on 2026-05-02
+
+v5.0 closes the v3.6 + v4.x charters and rolls up the v4.2.0a14
+alpha line. Major new surfaces in this release:
+
+- ✅ GDPR right-to-be-forgotten: deletion-request lifecycle +
+  soft-delete worker + hard-delete worker.
+- ✅ MORPHEUS slices 3 + 4: CONSOLIDATE + EXTRACT phases close
+  the divergent dream-state pipeline.
+- ✅ PERSEPHONE archival subsystem with cold-set rotation +
+  zstd-compressed archive.
+- ✅ PANTHEON v0.1 + v0.2: unified LLM facade with adaptive
+  routing + agentic-tier caps + MNEMOS routing-log feedback.
+- ✅ KRONOS v0.1: recall-pattern anomaly detection + forecasting.
+- ✅ DAG wiring for compression derivations.
+- ✅ NATS substrate v0.2: PANTHEON routing pub/sub bounded slice.
+- ✅ MCP §6.4 cross-tenant security gates across 18 tools.
+- ✅ Document-import retry-safety with content-derived idempotency.
+- ✅ Connector smoke tests across 8 surfaces.
+- ✅ RFC-002 re-engagement memo + design paper draft.
+
+PROTEUS barrage (2026-05-02) validated at 2500 concurrent writes,
+2000 reads, 200 searches: 98.5% / 99.7% / 100% success.
+
+## Historical: v4.0.0 shipped on 2026-04-29
 
 v4.0.0 is shipped. The v4.0 work that used to be forward-looking is now current
 state:

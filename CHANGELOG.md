@@ -2,6 +2,185 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [5.0.0] — 2026-05-02
+
+Major release closing the v3.6 / v4.x charters and absorbing the
+v4.2.0a14 alpha line. v5.0 is the first release that ships the
+full divergent dream-state pipeline (REPLAY → CLUSTER →
+CONSOLIDATE → SYNTHESISE → EXTRACT), the right-to-be-forgotten
+worker, the archival subsystem, the unified LLM facade, and the
+recall-pattern observability surface.
+
+A PROTEUS barrage validated the release at 2500 concurrent
+writes / 2000 reads / 200 search round-trips against a fresh
+Postgres 17 deployment: 98.5% write success, 99.7% read success,
+100% search success.
+
+### Added — GDPR right-to-be-forgotten
+
+- **Deletion-request lifecycle.** New ``deletion_requests`` table
+  with status state machine (requested → confirmed → soft_deleted
+  → restored | hard_deleted | cancelled). Admin endpoints under
+  ``/admin/deletion_requests`` for create / cancel / confirm /
+  restore / force-purge. Per-target advisory lock + active-row
+  partial unique index prevent overlapping requests.
+- **Soft-delete worker (Phase B).** ``deletion_request_worker``
+  picks ``status='confirmed'`` rows, two-phase sweep
+  (``confirmed`` → ``sweep_verifying`` → ``soft_deleted``) with
+  ``SELECT FOR UPDATE SKIP LOCKED`` and 30-day restore window via
+  ``restore_by``.
+- **Hard-delete worker (Phase C).** Purges rows whose
+  ``soft_deleted`` window has elapsed. Trigger-suppressed
+  hard-delete via ``SET LOCAL mnemos.suppress_version_snapshot``
+  so the audit chain isn't polluted with surrogate version rows.
+- **Operational caveats** documented in ``KNOWN_LIMITATIONS.md``
+  with recovery SQL for the rare race windows (final-verify
+  race, sweep-verifying exhaustion under pathological concurrent
+  writes).
+
+### Added — MORPHEUS divergent dream-state, slices 3 + 4
+
+- **CONSOLIDATE phase.** Merges near-duplicate clusters into a
+  canonical with read-only pointers (``permission_mode=0o400``)
+  on the originals. New ``consolidated_into`` column on
+  ``memories``. Soft-only: never hard-deletes user data.
+  Federation-safe — peers see the merge via the existing version
+  trigger. Opt-in via ``MNEMOS_MORPHEUS_CONSOLIDATE``.
+- **EXTRACT phase.** LLM mining of latent KG triples from
+  ``verbatim_content`` of prose memories not yet triplified.
+  Two-model split: fast/quantized for raw extraction, optional
+  strong reasoner for verification (gated on ``extract_verify``).
+  Results land in ``kg_triples`` with ``extracted_by_run_id``
+  provenance. New ``triples_extracted_at`` idempotency column on
+  memories. Opt-in via ``MNEMOS_MORPHEUS_EXTRACT``.
+
+### Added — PERSEPHONE archival subsystem
+
+- **Cold-set rotation.** ``memory_archive`` table holds
+  zstd-compressed full payloads; live ``memories`` row keeps a
+  stub-pointer (content cleared, ``archived_at`` set) so the
+  primary table stays small while preserving identity.
+- **Sweep + restore.** ``persephone_archival_worker`` and
+  ``/admin/persephone/{sweep,archive/{id},restore/{id},status}``
+  endpoints. Eligibility: not consolidated, not deleted, last
+  recall ≥ M days ago. Archived rows hidden from search and list
+  by default; ``?include_archived=true`` opts in (root-only).
+- **Federation-aware.** Peers see the archival event via the
+  existing version trigger.
+- Operator-gated by ``MNEMOS_PERSEPHONE_ENABLED``.
+
+### Added — PANTHEON + IRIS
+
+- **PANTHEON v0.1 scaffold.** Unified LLM facade in front of the
+  GRAEAE muses registry. ``/pantheon/v1/{models,
+  chat/completions, embeddings, route/explain}`` OpenAI-compat
+  routes. Auto-populated catalog from existing muses; alias
+  prefix resolver (``auto:reasoning``, ``auto:cheap``,
+  ``auto:fast``, ``consensus:<task_type>``); per-model
+  ``usage_tier`` metadata.
+- **PANTHEON v0.2.** Per-(user, session) hard caps on
+  ``consultation_only`` tier (configurable via
+  ``MNEMOS_PANTHEON_CONSULTATION_CAP``); MNEMOS routing-log writes
+  for every routing decision (``category=pantheon_routing``,
+  ``namespace=pantheon``); rolling-window adaptive routing policy
+  that scores backends by latency / error / cost from the recent
+  routing-log. ``/pantheon/v1/route/explain`` returns the full
+  resolution chain with per-candidate scores.
+- **IRIS MCP tools.** ``pantheon_list_models`` and
+  ``pantheon_route_explain`` tools registered on the canonical
+  MCP surface, gated by the same V4 §6.4 security checks.
+- Disabled by default (``MNEMOS_PANTHEON_ENABLED=false``); 503
+  with profile-aware message when off.
+
+### Added — KRONOS v0.1
+
+- **Recall-pattern anomaly detection.** Z-score over
+  ``memories.recall_count`` history per memory. Flags spikes
+  (``trending``) and drops (``eligible_for_persephone``).
+- **Namespace drift.** Compares last 7-day recall volume against
+  prior-30-day baseline.
+- **Recall-load forecasting.** EWMA over hourly recall buckets
+  predicts next-window load with 95% CI.
+- **PERSEPHONE eligibility forecast.** Predicts how many
+  memories become archive-eligible in the next N days.
+- New ``/admin/kronos/{anomalies,drift,forecast}`` routes;
+  ``tool_kronos_anomalies`` and ``tool_kronos_forecast`` MCP
+  tools. Operator-gated by ``MNEMOS_KRONOS_ENABLED``.
+- v0.1 is CPU-only via numpy. GPU integration via Tesseract
+  deferred to v5.1.
+
+### Added — DAG wiring for compression derivations
+
+- Each successful compression contest now persists a child row
+  in ``memory_versions`` parented to the source memory's
+  ``branch='main'`` HEAD, on ``branch='distilled'`` (raw
+  compression artifact) or ``branch='narrated'`` (prose).
+  ``change_type='compress'`` extends the existing CHECK
+  constraint; commit hash is content-derived (sha256 over
+  parent + variant + branch). Compressed artifacts are now
+  walkable from the original memory's version history.
+
+### Added — NATS substrate v0.2
+
+- Bounded second slice. PANTHEON routing-log → NATS publish to
+  ``mnemos.pantheon.routing`` (opt-in via
+  ``MNEMOS_NATS_PUBLISH_PANTHEON_ROUTING``). New
+  ``pantheon_routing_audit`` table fed by an optional consumer
+  worker. Webhook outbox migration and federation rewire remain
+  deferred to substrate v0.3.
+
+### Added — MCP §6.4 security gates
+
+- Cross-cutting audit + hardening across all 18 MCP tools:
+  parameter-shape audit log (no raw values), per-tool rate
+  buckets honouring ``mnemos.core.rate_limit``, role + namespace
+  validation in the dispatcher, root-bypass logged as a warning,
+  and uniform error normalization (``Resource not found`` /
+  ``Invalid tool input`` / ``Rate limit exceeded`` /
+  ``Tool execution failed``) so error shapes don't leak ownership
+  data.
+- ``_safe_path_segment`` and ``_safe_path_value`` raise generic
+  errors that don't echo the offending value or the regex
+  pattern.
+- ``_rest_delete`` now ``raise_for_status`` (was silent on 4xx).
+
+### Added — Document import retry-safety
+
+- ``import_chunk_key`` content-derived idempotency key prevents
+  duplicate chunk insertion on retry; ON CONFLICT (key) DO
+  UPDATE returns the canonical row id. Per-chunk transaction
+  isolation ensures partial failures don't poison the import.
+
+### Added — Connector documentation + smoke
+
+- End-to-end smoke per surface (``tests/test_connector_smoke.py``):
+  spawns the configured stdio MCP transport, sends ``tools/list``,
+  validates the canonical tool registry returns, exercises
+  ``search_memories``. ChatGPT HTTP/SSE smoke uses a mock REST
+  backend.
+- Documentation gallery covers all 8 connector surfaces with
+  mechanically-validated JSON snippets.
+
+### Added — Documentation
+
+- ``docs/RFC-002-REENGAGEMENT.md`` — re-engagement memo for the
+  MemPalace working group framing MNEMOS as a contributor to
+  MIF rather than a competing format.
+- ``docs/papers/mnemos-dag-distillation.md`` — design paper
+  draft. Git-like DAG + LLM-synthesized distillation/narration
+  + judge-verified fidelity.
+
+### Operational
+
+- The PROTEUS barrage exposed long-tail latency under sustained
+  50-concurrent writes (p99 ~33s) — a v5.1 optimization target.
+  Search and read paths held up well (search p99 ~300ms; reads
+  p50 ~120ms with the same long tail under contention).
+- All migrations apply cleanly on a fresh Postgres 17 + pgvector
+  install. ``mnemos_proteus_test`` was provisioned with all v4.2
+  migrations through ``migrations_v4_2_pantheon_routing_audit.sql``
+  in a single ``run_migrations`` call.
+
 ## [4.2.0a14] — 2026-05-01
 
 Pre-release alpha consolidating five overnight waves of work
