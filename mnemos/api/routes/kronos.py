@@ -9,16 +9,17 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.config import get_settings
-from mnemos.domain.kronos import (
-    detect_namespace_drift,
-    detect_recall_anomalies,
-    forecast_recall_load,
-)
+from mnemos.core.extras import is_extra_installed, missing_extra_detail
 
 router = APIRouter(prefix="/admin/kronos", tags=["admin", "kronos"])
 
 
 def _require_enabled() -> None:
+    if not is_extra_installed("kronos"):
+        raise HTTPException(
+            status_code=503,
+            detail=missing_extra_detail("kronos", label="KRONOS"),
+        )
     if not get_settings().kronos.enabled:
         raise HTTPException(status_code=503, detail="KRONOS disabled in this profile")
 
@@ -29,6 +30,8 @@ async def recall_anomalies(
     _: UserContext = Depends(require_root),
 ) -> dict:
     _require_enabled()
+    from mnemos.domain.kronos import detect_recall_anomalies
+
     settings = get_settings().kronos
     pool = require_postgres_pool_or_503(route_label="GET /admin/kronos/anomalies")
     anomalies = await detect_recall_anomalies(
@@ -50,6 +53,8 @@ async def namespace_drift(
     _: UserContext = Depends(require_root),
 ) -> dict:
     _require_enabled()
+    from mnemos.domain.kronos import detect_namespace_drift
+
     settings = get_settings().kronos
     pool = require_postgres_pool_or_503(route_label="GET /admin/kronos/drift")
     drift = await detect_namespace_drift(
@@ -67,6 +72,8 @@ async def recall_forecast(
     _: UserContext = Depends(require_root),
 ) -> dict:
     _require_enabled()
+    from mnemos.domain.kronos import forecast_recall_load
+
     pool = require_postgres_pool_or_503(route_label="GET /admin/kronos/forecast")
     result = await forecast_recall_load(pool, namespace, hours_ahead=hours_ahead)
     return asdict(result)

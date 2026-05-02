@@ -19,13 +19,13 @@ from mnemos.api.persistence_helpers import (
     require_postgres_pool_or_503,
 )
 from mnemos.core.ids import new_memory_id
+from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.lifecycle import (
     _get_cache_key,
     _get_embedding,
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
-from mnemos.domain.persephone.runner import restore_memory as _restore_archived_memory
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
@@ -440,6 +440,13 @@ async def get_memory(
             )
 
     if restore:
+        if not is_extra_installed("persephone"):
+            raise HTTPException(
+                status_code=503,
+                detail=missing_extra_detail("persephone", label="PERSEPHONE"),
+            )
+        from mnemos.domain.persephone.runner import restore_memory as _restore_archived_memory
+
         require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}?restore=true")
         try:
             async with _lc.get_pool_manager().acquire() as conn:

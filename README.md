@@ -76,9 +76,21 @@ coordination.
 ## Quick Install
 
 ```bash
-pip install mnemos-os==5.0.0
+pip install 'mnemos-os[edge]==5.0.0'
 mnemos serve --profile dev
 ```
+
+| Shape | Command |
+|---|---|
+| Core | `pip install mnemos-os==5.0.0` |
+| Edge | `pip install 'mnemos-os[edge]==5.0.0'` |
+| Server | `pip install 'mnemos-os[server]==5.0.0'` |
+| ML | `pip install 'mnemos-os[ml]==5.0.0'` |
+| Full | `pip install 'mnemos-os[full]==5.0.0'` |
+
+Mix bundles as needed, for example `pip install 'mnemos-os[server,ml]==5.0.0'`.
+See [`docs/INSTALL.md`](./docs/INSTALL.md) for the full matrix and migration
+notes.
 
 ```bash
 docker pull ghcr.io/mnemos-os/mnemos:5.0.0
@@ -737,7 +749,7 @@ chmod +x mnemos
 ### Package install
 
 ```bash
-pip install mnemos-os==5.0.0
+pip install 'mnemos-os[edge]==5.0.0'
 mnemos install --profile dev
 mnemos serve --profile dev
 ```
@@ -747,7 +759,7 @@ mnemos serve --profile dev
 ```bash
 git clone https://github.com/mnemos-os/mnemos.git
 cd mnemos
-python -m pip install -e ".[dev,sqlite]"
+python -m pip install -e ".[dev,edge]"
 mnemos install --profile dev
 mnemos serve --profile dev
 ```

@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.extras import is_extra_installed
 
 from ._runtime import (
     _backend_headers,
@@ -47,11 +48,6 @@ from .kg import (
     tool_kg_timeline,
     tool_update_triple,
 )
-from .kronos import (
-    TOOLS as KRONOS_TOOLS,
-    tool_kronos_anomalies,
-    tool_kronos_forecast,
-)
 from .memory import (
     TOOLS as MEMORY_TOOLS,
     tool_bulk_create_memories,
@@ -71,6 +67,20 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+
+KRONOS_TOOLS: dict[str, dict[str, Any]] = {}
+if is_extra_installed("kronos"):
+    from .kronos import (
+        TOOLS as KRONOS_TOOLS,
+        tool_kronos_anomalies,
+        tool_kronos_forecast,
+    )
+else:
+    async def tool_kronos_anomalies(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"success": False, "error": "KRONOS not installed"}
+
+    async def tool_kronos_forecast(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        return {"success": False, "error": "KRONOS not installed"}
 
 _DOMAIN_TOOLS: dict[str, dict[str, Any]] = {}
 for _domain_tools in (MEMORY_TOOLS, KG_TOOLS, DAG_TOOLS, MODEL_TOOLS, KRONOS_TOOLS):
@@ -101,6 +111,24 @@ _TOOL_ORDER = [
     "kronos_forecast",
 ]
 
+
+def _filter_unavailable_tools(order: list[str]) -> list[str]:
+    extras_for_tool = {
+        "pantheon_list_models": "pantheon",
+        "pantheon_route_explain": "pantheon",
+        "kronos_anomalies": "kronos",
+        "kronos_forecast": "kronos",
+    }
+    filtered: list[str] = []
+    for name in order:
+        extra = extras_for_tool.get(name)
+        if extra is None or is_extra_installed(extra):
+            filtered.append(name)
+    return filtered
+
+
+_TOOL_ORDER = _filter_unavailable_tools(_TOOL_ORDER)
+
 _WRITE_TOOLS = {
     "update_memory",
     "create_memory",
@@ -112,10 +140,7 @@ _WRITE_TOOLS = {
     "branch_memory",
 }
 
-TOOL_REGISTRY: dict[str, dict[str, Any]] = {
-    name: _DOMAIN_TOOLS[name]
-    for name in _TOOL_ORDER
-}
+TOOL_REGISTRY: dict[str, dict[str, Any]] = {name: _DOMAIN_TOOLS[name] for name in _TOOL_ORDER}
 
 TOOLS = TOOL_REGISTRY
 

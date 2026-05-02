@@ -11,12 +11,8 @@ import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user, require_root
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.config import get_settings
+from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.security import is_root
-from mnemos.domain.persephone.runner import (
-    archive_memory as _archive_memory,
-    restore_memory as _restore_memory,
-    sweep_for_archival as _sweep_for_archival,
-)
 from mnemos.domain.models import (
     ApiKeyCreateRequest,
     ApiKeyResponse,
@@ -421,7 +417,16 @@ class PersephoneStatusResponse(BaseModel):
     namespace: Optional[str] = None
 
 
+def _require_persephone_installed() -> None:
+    if not is_extra_installed("persephone"):
+        raise HTTPException(
+            status_code=503,
+            detail=missing_extra_detail("persephone", label="PERSEPHONE"),
+        )
+
+
 def _require_persephone_enabled() -> None:
+    _require_persephone_installed()
     if not get_settings().persephone.enabled:
         raise HTTPException(
             status_code=409,
@@ -599,12 +604,13 @@ async def persephone_sweep(
     _: UserContext = Depends(require_root),
 ):
     """Run one namespace-scoped PERSEPHONE archival sweep."""
-    require_postgres_pool_or_503(route_label="POST /admin/persephone/sweep")
     _require_persephone_enabled()
+    require_postgres_pool_or_503(route_label="POST /admin/persephone/sweep")
     settings = get_settings().persephone
     namespace = request.namespace or settings.namespace
     archive_after_days = request.archive_after_days or settings.archive_after_days
     batch_size = request.batch_size or settings.batch_size
+    from mnemos.domain.persephone.runner import sweep_for_archival as _sweep_for_archival
 
     archived = await _sweep_for_archival(
         _lc._pool,
@@ -628,8 +634,10 @@ async def persephone_archive_memory(
     user: UserContext = Depends(require_root),
 ):
     """Archive a specific memory. Root-only operator override."""
-    require_postgres_pool_or_503(route_label="POST /admin/persephone/archive/{memory_id}")
     _require_persephone_enabled()
+    require_postgres_pool_or_503(route_label="POST /admin/persephone/archive/{memory_id}")
+    from mnemos.domain.persephone.runner import archive_memory as _archive_memory
+
     try:
         async with _lc.get_pool_manager().acquire() as conn:
             await _archive_memory(conn, memory_id, user.user_id)
@@ -645,7 +653,10 @@ async def persephone_restore_memory(
     user: UserContext = Depends(get_current_user),
 ):
     """Restore an archived memory. Allowed for root or the memory owner."""
+    _require_persephone_enabled()
     require_postgres_pool_or_503(route_label="POST /admin/persephone/restore/{memory_id}")
+    from mnemos.domain.persephone.runner import restore_memory as _restore_memory
+
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
             """
@@ -683,6 +694,7 @@ async def persephone_status(
     namespace: Optional[str] = None,
 ):
     """Return PERSEPHONE archive totals and cold-set age signal."""
+    _require_persephone_installed()
     require_postgres_pool_or_503(route_label="GET /admin/persephone/status")
     clauses: list[str] = []
     args: list = []

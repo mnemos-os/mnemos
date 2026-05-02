@@ -16,6 +16,22 @@ writes / 2000 reads / 200 search round-trips against a fresh
 Postgres 17 deployment: 98.5% write success, 99.7% read success,
 100% search success.
 
+### Added — Subsystem modularization
+
+- Optional subsystem extras: `morpheus`, `persephone`, `pantheon`,
+  `kronos`, `knossos`, `apollo`, `artemis`, `nats`, and `hot`.
+- Named bundles: `edge`, `server`, `ml`, `interop`, and `full`, so
+  operators install deployment shapes instead of selecting every
+  individual subsystem.
+- Missing optional subsystems now fail closed with HTTP 503 install
+  hints, MCP tools for missing subsystems are filtered from
+  `tools/list`, and optional workers no-op cleanly when their extra
+  is unavailable.
+- Migration note: `pip install mnemos-os==5.0.0` is now core-only.
+  Use `pip install 'mnemos-os[full]==5.0.0'` for the prior
+  all-bundled behavior or `pip install 'mnemos-os[server]==5.0.0'`
+  for production server deployments.
+
 ### Added — GDPR right-to-be-forgotten
 
 - **Deletion-request lifecycle.** New ``deletion_requests`` table

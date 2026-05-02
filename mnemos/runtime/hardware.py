@@ -275,14 +275,46 @@ def cli_doctor() -> int:
     profile = detect_host_profile(force_refresh=True)
     print(f"Host: {profile.os_family} / {profile.arch}")
     print(f"GPU kinds: {[k.value for k in profile.gpu_kinds]}")
-    print(f"Suggested mnemos extra: [{profile.suggested_extra}]")
+    display_extra = "semantic" if profile.suggested_extra == "ml" else profile.suggested_extra
+    print(f"Suggested semantic runtime extra: [{display_extra}]")
     if profile.suggested_extra == "ml":
-        print("  → pip install 'mnemos-os[ml]'  (fastembed, CPU, ~20 MB)")
+        print("  → pip install 'mnemos-os[semantic]'  (fastembed, CPU, ~20 MB)")
     elif profile.suggested_extra == "gpu":
         print("  → pip install 'mnemos-os[gpu]'  (fastembed-gpu, NVIDIA CUDA EP)")
     elif profile.suggested_extra == "phi":
         print("  → pip install 'mnemos-os[phi]'  (OpenVINO + fastembed, Intel iGPU)")
+    _print_optional_extras()
     return 0
+
+
+def _print_optional_extras() -> None:
+    from mnemos.core.extras import (
+        FEATURE_BUNDLES,
+        bundle_status,
+        install_hint,
+        is_extra_installed,
+    )
+
+    print("")
+    print("Extras:")
+    for name in ("morpheus", "persephone", "pantheon", "kronos", "knossos", "apollo", "artemis", "nats", "hot"):
+        installed = is_extra_installed(name)
+        state = "✓ installed" if installed else f"✗ not installed (run: {install_hint(name)})"
+        suffix = " (Rust accelerator)" if name == "hot" and not installed else ""
+        print(f"  [{name:<10}] {state}{suffix}")
+
+    print("")
+    print("Bundles:")
+    for name in ("edge", "server", "ml", "interop", "full"):
+        members = FEATURE_BUNDLES[name]
+        have, missing = bundle_status(members)
+        if not missing:
+            state = "installed"
+        elif have:
+            state = f"partial (have: {', '.join(have)} | missing: {', '.join(missing)})"
+        else:
+            state = f"missing ({', '.join(missing)})"
+        print(f"  [{name:<10}] {state}")
 
 
 if __name__ == "__main__":

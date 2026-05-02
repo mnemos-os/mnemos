@@ -52,3 +52,7 @@ DELETE FROM memories WHERE morpheus_run_id = X for run-created rows.
 Mutation paths additionally restore in-place audit state, including
 consolidated_into pointers and pre-consolidation permission modes.
 """
+
+from mnemos.core.extras import require_extra
+
+require_extra("morpheus")

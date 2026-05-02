@@ -554,7 +554,7 @@ timestamp)`. Chain-verify endpoint: `GET /v1/consultations/audit/verify`
   (OpenAI, Together, Groq, etc.); optional GPU inference endpoint for
   APOLLO LLM fallback (`GPU_PROVIDER_HOST`).
 
-### 8.2 Python dependencies (required, 18 packages)
+### 8.2 Python dependencies (required core runtime)
 
 ```
 fastapi>=0.115.0           # HTTP surface
@@ -563,18 +563,16 @@ starlette>=0.40.0          # Middleware + session cookie
 pydantic>=2.8.0            # Models / validation
 python-multipart>=0.0.9    # File upload handling
 asyncpg>=0.29.0            # Postgres async driver (primary)
-psycopg[binary]>=3.1.0     # Postgres sync driver (installer)
 httpx>=0.27.0              # Outbound HTTP (providers, federation, webhooks)
 slowapi>=0.1.9             # Rate limiting
 limits>=3.6.0              # SlowAPI backend
 redis>=5.0.0               # Optional SlowAPI/cache backend
 python-dotenv>=1.0.0       # .env loading
 mcp>=1.0.0                 # MCP stdio server
-numpy>=1.26.0              # Vector math
-psutil>=5.9.0              # Process metrics
 authlib>=1.3.0             # OAuth/OIDC
 itsdangerous>=2.2.0        # Starlette session signing
 prometheus_client>=0.20.0  # /metrics exposition
+typer>=0.9.0               # Unified CLI
 ```
 
 ### 8.3 Python dependencies (optional extras)
@@ -584,15 +582,28 @@ prometheus_client>=0.20.0  # /metrics exposition
 tracing   = [opentelemetry-api, opentelemetry-sdk, opentelemetry-exporter-otlp-proto-http >=1.27.0]
 structlog = [structlog >=25.0.0]
 docling   = [docling >=2.5.0, docling-core >=2.0.0, pillow >=10.0.0]
-ml        = [fastembed >=0.3.0]                                    # CPU embeddings, ONNX, no torch
+morpheus  = [numpy >=1.24]
+persephone = [zstandard >=0.25]
+pantheon  = []
+kronos    = [numpy >=1.24]
+knossos   = []
+apollo    = []
+artemis   = [networkx >=3.3]                                      # ARTEMIS TextRank fallback
+nats      = [nats-py >=2.14.0]
+hot       = [mnemos-hot >=0.1.0]
+edge      = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
+server    = [mnemos-os[nats,persephone,pantheon]]
+ml        = [mnemos-os[morpheus,kronos,apollo,artemis,hot]]
+interop   = [mnemos-os[knossos]]
+full      = [mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge]]
+semantic  = [fastembed >=0.3.0]                                    # CPU embeddings, ONNX, no torch
 gpu       = [fastembed-gpu >=0.3.0]                                # NVIDIA CUDA EP via fastembed-gpu
 phi       = [openvino-genai >=2024.4.0, fastembed >=0.3.0]         # Intel iGPU via OpenVINO
-full      = [networkx >=3.3]                                       # ARTEMIS TextRank fallback (graph centrality)
 sqlite    = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
 dev       = [pytest >=8.0.0, pytest-asyncio >=0.23.0, pytest-cov >=5.0.0, ruff >=0.5.0]
 ```
 
-The ML extras are deliberately **torch-free**. ``fastembed`` uses
+The semantic/gpu/phi runtime extras are deliberately **torch-free**. ``fastembed`` uses
 ONNX runtime for the same MiniLM/Nomic embedding model family that
 ``sentence-transformers`` exposes via torch, but ships ~10–20 MB
 instead of ~700 MB–1 GB of torch + nvidia binary weight. This

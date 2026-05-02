@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Awaitable, Callable, Mapping
 
 from mnemos.core.config import Settings, get_settings
+from mnemos.core.extras import is_extra_installed
 from mnemos.domain.pantheon.routing_log import PANTHEON_ROUTING_SUBJECT
 from mnemos.nats.backoff import ReconnectBackoff
 
@@ -38,6 +39,9 @@ async def consumer_loop(
 ) -> None:
     """Consume PANTHEON routing events until cancelled."""
     settings = settings or get_settings()
+    if not is_extra_installed("nats"):
+        logger.info("PANTHEON routing audit consumer disabled (nats extra not installed)")
+        return
     if not settings.nats.audit_consumer_enabled:
         logger.info("PANTHEON routing audit consumer disabled")
         return

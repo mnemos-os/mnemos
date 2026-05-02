@@ -44,15 +44,12 @@ dependencies = [
   "redis>=5.0.0",
   "python-dotenv>=1.0.0",
   "mcp>=1.0.0",
-  "numpy>=1.26.0",
-  "zstandard==0.25.0",
   # psutil dropped 2026-05-01: zero import sites in mnemos/ source
   # (was a leftover from an earlier health-check experiment).
   "authlib>=1.3.0",
   "itsdangerous>=2.2.0",
   "prometheus_client>=0.20.0",
   "typer>=0.9.0",
-  "nats-py>=2.14.0",
 ]
 
 [project.urls]
@@ -82,31 +79,40 @@ sqlite = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",
 ]
-# [ml] — recommended ML stack for default installs that want
-# semantic-similarity quality scoring. fastembed uses ONNX runtime
-# (~10-20 MB), supports the same MiniLM/Nomic embedding model
-# family as sentence-transformers, and pulls NO torch / nvidia /
-# transformers / safetensors weight. This is the prod mnemos
-# blueprint at PYTHIA :5002.
-ml = ["fastembed>=0.3.0"]
+# v5 feature extras. Core installs stay small; operators select a
+# deployment bundle (edge/server/ml/interop/full) or mix bundles.
+morpheus = ["numpy>=1.24"]
+persephone = ["zstandard>=0.25"]
+pantheon = []
+kronos = ["numpy>=1.24"]
+knossos = []
+apollo = []
+artemis = ["networkx>=3.3"]
+nats = ["nats-py>=2.14.0"]
+hot = ["mnemos-hot>=0.1.0"]
+edge = [
+  "aiosqlite>=0.20.0",
+  "sqlite-vec>=0.1.6",
+]
+server = ["mnemos-os[nats,persephone,pantheon]"]
+ml = ["mnemos-os[morpheus,kronos,apollo,artemis,hot]"]
+interop = ["mnemos-os[knossos]"]
+full = ["mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge]"]
+# [semantic] — optional semantic-similarity quality scoring.
+# fastembed uses ONNX runtime (~10-20 MB), supports the same
+# MiniLM/Nomic embedding family as sentence-transformers, and pulls
+# NO torch / nvidia / transformers / safetensors weight.
+semantic = ["fastembed>=0.3.0"]
 # [gpu] — GPU acceleration for the ML embedding path. Default
 # is fastembed-gpu (ONNX CUDA execution provider) which works
 # with a system CUDA install but does NOT require the torch
 # CUDA wheel chain. Operators on systems WITHOUT NVIDIA CUDA
 # (Apple Silicon, Intel iGPU, Tegra, ARM) should NOT install
-# this extra — install [ml] (CPU) or [phi] (Intel iGPU) instead.
+# this extra — install [semantic] (CPU) or [phi] (Intel iGPU) instead.
 gpu = ["fastembed-gpu>=0.3.0"]
 # [phi] — Intel-iGPU-accelerated path: OpenVINO + FastEmbed, used
 # in production at PYTHIA. Apache-2.0 across the board, no torch.
 phi = ["openvino-genai>=2024.4.0", "fastembed>=0.3.0"]
-# [full] — networkx for the ARTEMIS TextRank graph centrality
-# fallback (imported in mnemos/domain/compression/artemis.py).
-# spacy was historically declared here but has ZERO import sites in
-# mnemos/ source — dropped 2026-05-01.
-# sentence-transformers + its torch transitive was removed in
-# v4.2.0a11; semantic-similarity is now in [ml] (fastembed).
-# Operators wanting both: pip install 'mnemos-os[full,ml]'.
-full = ["networkx>=3.3"]
 dev = [
   "import-linter>=2.0.0",
   "pytest>=8.0.0",

@@ -26,7 +26,7 @@ from pydantic import BaseModel, Field
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, require_root
 from mnemos.api.routes._postgres_only import _require_postgres_backend
-from mnemos.domain.morpheus.runner import rollback_run, run_dream
+from mnemos.core.extras import is_extra_installed, missing_extra_detail
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["morpheus"])
@@ -107,6 +107,14 @@ class MorpheusClusterList(BaseModel):
     clusters: List[MorpheusCluster]
 
 
+def _require_morpheus_installed() -> None:
+    if not is_extra_installed("morpheus"):
+        raise HTTPException(
+            status_code=503,
+            detail=missing_extra_detail("morpheus", label="MORPHEUS"),
+        )
+
+
 def _row_to_run(r) -> MorpheusRun:
     keys = r.keys()
     return MorpheusRun(
@@ -156,6 +164,7 @@ async def list_runs(
     Operator-only telemetry endpoint. Returned rows can include tenant
     namespaces, configs, errors, and synthesized memory IDs.
     """
+    _require_morpheus_installed()
     _require_postgres_backend()
     where = ""
     args: list = []
@@ -181,6 +190,7 @@ async def list_runs(
 @router.get("/v1/morpheus/runs/{run_id}", response_model=MorpheusRun)
 async def get_run(run_id: str, _: UserContext = Depends(require_root)):
     """Return one MORPHEUS run. Operator-only telemetry."""
+    _require_morpheus_installed()
     _require_postgres_backend()
     async with _lc.get_pool_manager().acquire() as conn:
         row = await conn.fetchrow(
@@ -217,6 +227,7 @@ async def list_clusters(run_id: str, _: UserContext = Depends(require_root)):
     the run never reached the cluster phase or produced zero clusters
     above cluster_min_size.
     """
+    _require_morpheus_installed()
     _require_postgres_backend()
     async with _lc.get_pool_manager().acquire() as conn:
         config_raw = await conn.fetchval(
@@ -281,7 +292,10 @@ async def trigger_run(
     task with the caller polling /v1/morpheus/runs/{id}. Slice 1's
     runner is a no-op so this returns near-instantly.
     """
+    _require_morpheus_installed()
     _require_postgres_backend()
+    from mnemos.domain.morpheus.runner import run_dream
+
     run_config = dict(request.config)
     if request.consolidate:
         run_config["consolidate"] = True
@@ -330,6 +344,7 @@ async def rollback(
     and leaves the run status at 'rolled_back'. Returns 404 if the
     run_id doesn't exist.
     """
+    _require_morpheus_installed()
     _require_postgres_backend()
     async with _lc.get_pool_manager().acquire() as conn:
         existing = await conn.fetchval(
@@ -338,6 +353,8 @@ async def rollback(
     if existing is None:
         raise HTTPException(status_code=404, detail=f"morpheus run {run_id} not found")
     try:
+        from mnemos.domain.morpheus.runner import rollback_run
+
         n_deleted, _n_run = await rollback_run(_lc._pool, run_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))

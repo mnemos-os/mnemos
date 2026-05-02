@@ -50,6 +50,8 @@ import time
 from collections import Counter
 from typing import Dict, List, Optional, Tuple
 
+from mnemos.core.extras import require_extra
+
 from .base import (
     CompressionEngine,
     CompressionRequest,
@@ -57,6 +59,8 @@ from .base import (
     GPUIntent,
     IdentifierPolicy,
 )
+
+require_extra("artemis")
 
 # ── protected-span regexes ────────────────────────────────────────────────
 

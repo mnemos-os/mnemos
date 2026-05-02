@@ -37,16 +37,19 @@ mcp>=1.0.0
 anyio>=4.4.0
 
 # Utilities
-numpy>=1.26.0
-zstandard==0.25.0
 # psutil dropped 2026-05-01 (zero imports in mnemos/ source)
 typer>=0.9.0
 
+# Optional subsystem dependencies now live in pyproject extras:
+#   morpheus/kronos -> numpy
+#   persephone      -> zstandard
+#   nats            -> nats-py
+#
 # v4.2 NATS JetStream substrate (event bus, federation push, MCP push).
 # v4.2.0a8+ queue-group support depends on nats-py 2.14+ subscribe
 # semantics (queue==durable enforcement). Older versions silently
 # accepted mismatched queue/durable values — keep the floor here.
-nats-py>=2.14.0
+# Install with: pip install 'mnemos-os[nats]'
 
 # Optional: Intel OpenVINO / phi_server.py (local GPU inference)
 # Install on GPU systems only: pip install mnemos-os[phi]

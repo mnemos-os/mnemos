@@ -22,8 +22,8 @@ from pydantic import BaseModel, Field
 import mnemos.core.lifecycle as _lc  # noqa: F401  (kept for symmetry; helpers consume _lc)
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.api.persistence_helpers import backend_or_503, maybe_set_pg_rls
+from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.security import is_root
-from mnemos.domain.compression.apollo import narrate_encoded
 from mnemos.persistence.visibility import VisibilityFilter
 
 router = APIRouter(prefix="/v1/memories", tags=["narrate"])
@@ -51,6 +51,17 @@ class NarrateResponse(BaseModel):
     engine_version: Optional[str] = None
 
 
+def _narrate_apollo(encoded: str) -> str:
+    if not is_extra_installed("apollo"):
+        raise HTTPException(
+            status_code=503,
+            detail=missing_extra_detail("apollo", label="APOLLO"),
+        )
+    from mnemos.domain.compression.apollo import narrate_encoded
+
+    return narrate_encoded(encoded)
+
+
 def _render_narration(memory_row: dict, variant_row: dict | None, format: str) -> str:
     """Pure dispatch — no I/O. Picks raw / passthrough / narrated
     based on (variant present, engine, format).
@@ -68,7 +79,7 @@ def _render_narration(memory_row: dict, variant_row: dict | None, format: str) -
         return raw_content
     if variant_row["engine_id"] != "apollo":
         return variant_row["compressed_content"] or ""
-    return narrate_encoded(variant_row["compressed_content"])
+    return _narrate_apollo(variant_row["compressed_content"])
 
 
 async def build_narration_body(
@@ -156,7 +167,7 @@ def _build_narrate_response(
     return NarrateResponse(
         memory_id=memory_id,
         format="prose",
-        content=narrate_encoded(variant_row["compressed_content"]),
+        content=_narrate_apollo(variant_row["compressed_content"]),
         source="narrated",
         engine_id=engine_id,
         engine_version=variant_row["engine_version"],

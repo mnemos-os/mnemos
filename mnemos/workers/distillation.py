@@ -27,12 +27,11 @@ logging.basicConfig(
 # Config — loaded from config.py (single source of truth)
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from mnemos.core.config import PG_CONFIG as _PG_CONFIG, get_settings  # noqa: E402
+from mnemos.core.extras import is_extra_installed  # noqa: E402
 
 # Contest path: drains memory_compression_queue via the plugin
 # CompressionEngine ABC + run_contest + persist_contest.
 try:
-    from mnemos.domain.compression.apollo import APOLLOEngine
-    from mnemos.domain.compression.artemis import ARTEMISEngine
     from mnemos.domain.compression.judge import CrossEncoderJudge, EnsembleJudge, LLMJudge, NullJudge
     from mnemos.domain.compression.worker_contest import process_contest_queue
     _CONTEST_AVAILABLE = True
@@ -159,13 +158,25 @@ class MemoryDistillationWorker:
             #   Apollo:  Schema-aware dense encoding (portfolio / decision
             #            / person / event) with LLM fallback on misses.
             # Built-in stack: ARTEMIS + optional APOLLO.
-            self._contest_engines = [ARTEMISEngine()]
-            if _APOLLO_ENABLED:
+            if is_extra_installed("artemis"):
+                from mnemos.domain.compression.artemis import ARTEMISEngine
+
+                self._contest_engines.append(ARTEMISEngine())
+            else:
+                logger.info("ARTEMIS contest engine disabled (extra not installed)")
+            if _APOLLO_ENABLED and is_extra_installed("apollo"):
+                from mnemos.domain.compression.apollo import APOLLOEngine
+
                 self._contest_engines.append(
                     APOLLOEngine(
                         enable_llm_fallback=_APOLLO_LLM_FALLBACK_ENABLED,
                     )
                 )
+            elif _APOLLO_ENABLED:
+                logger.info("APOLLO contest engine disabled (extra not installed)")
+            if not self._contest_engines:
+                logger.info("compression contest path disabled (no installed engines)")
+                return
             # Judge fidelity scoring (v3.3 S-II). Selected by
             # MNEMOS_JUDGE_MODE (default 'llm') when enabled.
             # NullJudge when disabled — keeps the contest using

@@ -44,6 +44,7 @@ from typing import List, Optional
 import httpx
 
 from mnemos.core.config import get_settings
+from mnemos.core.extras import require_extra
 
 from .apollo_schemas import (
     CodeSchema,
@@ -64,6 +65,7 @@ from .base import (
 from .gpu_guard import get_guard
 
 logger = logging.getLogger(__name__)
+require_extra("apollo")
 
 # GPU provider endpoint for APOLLO's LLM fallback.
 _PROVIDER_SETTINGS = get_settings().providers

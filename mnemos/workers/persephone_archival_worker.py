@@ -7,13 +7,19 @@ import logging
 from typing import Any
 
 from mnemos.core.config import get_settings
-from mnemos.domain.persephone.runner import sweep_for_archival
+from mnemos.core.extras import is_extra_installed
 
 logger = logging.getLogger(__name__)
 
 
 async def persephone_archival_worker_loop(pool: Any) -> None:
     """Run periodic PERSEPHONE archival sweeps when explicitly enabled."""
+    if not is_extra_installed("persephone"):
+        logger.info("PERSEPHONE worker disabled (extra not installed)")
+        return
+
+    from mnemos.domain.persephone.runner import sweep_for_archival
+
     settings = get_settings().persephone
     if not settings.enabled:
         logger.info("PERSEPHONE archival worker disabled")

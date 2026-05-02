@@ -1,5 +1,9 @@
 """KRONOS recall-pattern anomaly detection and forecasting."""
 
+from mnemos.core.extras import require_extra
+
+require_extra("kronos")
+
 from mnemos.domain.kronos.anomaly import NamespaceDrift, RecallAnomaly, detect_namespace_drift, detect_recall_anomalies
 from mnemos.domain.kronos.forecast import ForecastResult, forecast_persephone_eligibility, forecast_recall_load
 

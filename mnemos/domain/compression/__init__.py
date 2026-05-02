@@ -1,9 +1,8 @@
 """
 Compression Module
 
-Provides the APOLLO + ARTEMIS stack plus a plugin CompressionEngine
-ABC for operator-registered engines, dispatched via the contest
-framework.
+Provides the core plugin CompressionEngine ABC and contest framework.
+APOLLO + ARTEMIS engines are optional extras and are imported lazily.
 
 - APOLLO: schema-aware dense encoding for LLM-to-LLM consumption
   (v3.3 S-IC: PortfolioSchema as the first concrete schema with
@@ -14,10 +13,6 @@ framework.
 - QualityAnalyzer: Quality manifest generation.
 """
 
-from .apollo import APOLLOEngine
-from .apollo_schemas import PortfolioSchema
-from .apollo_schemas import Schema as APOLLOSchema
-from .artemis import ARTEMISEngine
 from .base import (
     BASE_CHUNK_RATIO,
     MIN_CHUNK_RATIO,
@@ -39,6 +34,25 @@ from .contest import (
 )
 from .contest_store import persist_contest
 from .quality_analyzer import QualityAnalyzer, QualityManifest
+
+_OPTIONAL_EXPORTS = {
+    "APOLLOEngine": (".apollo", "APOLLOEngine"),
+    "APOLLOSchema": (".apollo_schemas", "Schema"),
+    "PortfolioSchema": (".apollo_schemas", "PortfolioSchema"),
+    "ARTEMISEngine": (".artemis", "ARTEMISEngine"),
+}
+
+
+def __getattr__(name: str):
+    if name not in _OPTIONAL_EXPORTS:
+        raise AttributeError(name)
+    module_name, attr_name = _OPTIONAL_EXPORTS[name]
+    from importlib import import_module
+
+    module = import_module(module_name, __name__)
+    value = getattr(module, attr_name)
+    globals()[name] = value
+    return value
 
 __all__ = [
     # v3.1 competitive-selection plugin ABC

@@ -618,9 +618,9 @@ def doctor() -> None:
     """Probe host accelerators and print the recommended pip extra.
 
     Pure-stdlib detection of NVIDIA CUDA / Tegra, Intel iGPU, and
-    Apple Silicon. Output names the right ``mnemos-os[ml|gpu|phi]``
-    extra for the host. Use this BEFORE pip install to pick the
-    correct ML extra — see docs/SPECIFICATION.md §8.3.
+    Apple Silicon, plus optional subsystem extra and bundle status.
+    Use this before pip install to pick runtime extras and after
+    install to verify feature bundles.
     """
     from mnemos.runtime.hardware import cli_doctor
 

@@ -1,5 +1,9 @@
 """PERSEPHONE archival subsystem."""
 
+from mnemos.core.extras import require_extra
+
+require_extra("persephone")
+
 from mnemos.domain.persephone.runner import (
     archive_memory,
     is_archived,

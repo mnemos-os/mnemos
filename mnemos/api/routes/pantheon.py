@@ -12,11 +12,8 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from mnemos.api.dependencies import UserContext, get_current_user
 from mnemos.core.config import get_settings
+from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.rate_limit import limiter
-from mnemos.domain.pantheon import catalog, gateway, router as pantheon_router
-from mnemos.domain.pantheon.aliases import PantheonRoutingError
-from mnemos.domain.pantheon.caps import ConsultationCapResult, consultation_cap_bucket
-from mnemos.domain.pantheon.routing_log import routing_payload, schedule_routing_memory
 
 router = APIRouter(prefix="/pantheon/v1", tags=["pantheon"])
 logger = logging.getLogger(__name__)
@@ -46,8 +43,31 @@ def _pantheon_rate_key(request: Request) -> str:
 
 
 def _require_enabled() -> None:
+    if not is_extra_installed("pantheon"):
+        raise HTTPException(
+            status_code=503,
+            detail=missing_extra_detail("pantheon", label="PANTHEON"),
+        )
     if not get_settings().pantheon.enabled:
         raise HTTPException(status_code=503, detail="PANTHEON disabled in this profile")
+
+
+def _pantheon_imports() -> tuple[Any, Any, Any, Any, Any, Any, Any]:
+    _require_enabled()
+    from mnemos.domain.pantheon import catalog, gateway, router as pantheon_router
+    from mnemos.domain.pantheon.aliases import PantheonRoutingError
+    from mnemos.domain.pantheon.caps import consultation_cap_bucket
+    from mnemos.domain.pantheon.routing_log import routing_payload, schedule_routing_memory
+
+    return (
+        catalog,
+        gateway,
+        pantheon_router,
+        PantheonRoutingError,
+        consultation_cap_bucket,
+        routing_payload,
+        schedule_routing_memory,
+    )
 
 
 def _body_model(body: dict[str, Any]) -> str:
@@ -57,8 +77,11 @@ def _body_model(body: dict[str, Any]) -> str:
     return model.strip()
 
 
-def _to_http_exception(exc: PantheonRoutingError | gateway.PantheonGatewayError) -> HTTPException:
-    return HTTPException(status_code=exc.status_code, detail=exc.message)
+def _to_http_exception(exc: Exception) -> HTTPException:
+    return HTTPException(
+        status_code=getattr(exc, "status_code", 500),
+        detail=getattr(exc, "message", str(exc)),
+    )
 
 
 def _pantheon_session_id(request: Request, user: UserContext) -> str:
@@ -78,13 +101,14 @@ def _request_id(request: Request) -> str:
 
 
 def _upstream_identity(
+    gateway_module: Any,
     request: Request,
     user: UserContext,
     *,
     session_id: str,
     request_id: str,
-) -> gateway.UpstreamIdentity:
-    identity = gateway.UpstreamIdentity(
+) -> Any:
+    identity = gateway_module.UpstreamIdentity(
         user_id=user.user_id,
         namespace=user.namespace,
         session_id=session_id,
@@ -107,7 +131,7 @@ def _upstream_identity(
     return identity
 
 
-def _consultation_cap_exceeded(result: ConsultationCapResult) -> JSONResponse:
+def _consultation_cap_exceeded(result: Any) -> JSONResponse:
     return JSONResponse(
         status_code=429,
         headers={"Retry-After": "0"},
@@ -128,11 +152,12 @@ def _consultation_cap_exceeded(result: ConsultationCapResult) -> JSONResponse:
 
 
 def _check_consultation_cap(
-    decision: pantheon_router.RouteDecision,
+    consultation_cap_bucket: Any,
+    decision: Any,
     *,
     user_id: str,
     session_id: str,
-) -> ConsultationCapResult | None:
+) -> Any | None:
     model = decision.model or {}
     if model.get("usage_tier") != "consultation_only":
         return None
@@ -146,10 +171,12 @@ def _check_consultation_cap(
 
 def _log_route_outcome(
     *,
+    routing_payload: Any,
+    schedule_routing_memory: Any,
     request_id: str,
     tenant_user_id: str,
     session_id: str,
-    decision: pantheon_router.RouteDecision,
+    decision: Any,
     outcome: str,
     started_at: float,
     response: dict[str, Any] | None = None,
@@ -179,7 +206,7 @@ async def list_models(
     authorization: str | None = Header(None),
     user: UserContext = Depends(_pantheon_user),
 ) -> dict[str, Any]:
-    _require_enabled()
+    catalog, *_ = _pantheon_imports()
     return await catalog.models_response()
 
 
@@ -191,17 +218,26 @@ async def chat_completions(
     authorization: str | None = Header(None),
     user: UserContext = Depends(_pantheon_user),
 ):
-    _require_enabled()
+    (
+        _catalog,
+        gateway,
+        pantheon_router,
+        PantheonRoutingError,
+        consultation_cap_bucket,
+        routing_payload,
+        schedule_routing_memory,
+    ) = _pantheon_imports()
     if not isinstance(body.get("messages"), list) or not body["messages"]:
         raise HTTPException(status_code=400, detail="messages required")
     model = _body_model(body)
-    decision: pantheon_router.RouteDecision | None = None
+    decision: Any | None = None
     session_id = _pantheon_session_id(request, user)
     request_id = _request_id(request)
-    identity = _upstream_identity(request, user, session_id=session_id, request_id=request_id)
+    identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
     try:
         decision = await pantheon_router.route_model(model, body)
         cap_result = _check_consultation_cap(
+            consultation_cap_bucket,
             decision,
             user_id=user.user_id,
             session_id=session_id,
@@ -212,6 +248,8 @@ async def chat_completions(
         if body.get("stream") is True:
             forward_body = gateway.attach_upstream_identity(body, identity)
             _log_route_outcome(
+                routing_payload=routing_payload,
+                schedule_routing_memory=schedule_routing_memory,
                 request_id=request_id,
                 tenant_user_id=user.user_id,
                 session_id=session_id,
@@ -228,6 +266,8 @@ async def chat_completions(
         forward_body = gateway.attach_upstream_identity(body, identity)
         response_data = await gateway.forward_chat_completion(decision, forward_body)
         _log_route_outcome(
+            routing_payload=routing_payload,
+            schedule_routing_memory=schedule_routing_memory,
             request_id=request_id,
             tenant_user_id=user.user_id,
             session_id=session_id,
@@ -244,6 +284,8 @@ async def chat_completions(
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
             _log_route_outcome(
+                routing_payload=routing_payload,
+                schedule_routing_memory=schedule_routing_memory,
                 request_id=request_id,
                 tenant_user_id=user.user_id,
                 session_id=session_id,
@@ -265,20 +307,30 @@ async def embeddings(
     authorization: str | None = Header(None),
     user: UserContext = Depends(_pantheon_user),
 ) -> JSONResponse:
-    _require_enabled()
+    (
+        _catalog,
+        gateway,
+        pantheon_router,
+        PantheonRoutingError,
+        _consultation_cap_bucket,
+        routing_payload,
+        schedule_routing_memory,
+    ) = _pantheon_imports()
     if "input" not in body:
         raise HTTPException(status_code=400, detail="input is required")
     model = _body_model(body)
-    decision: pantheon_router.RouteDecision | None = None
+    decision: Any | None = None
     session_id = _pantheon_session_id(request, user)
     request_id = _request_id(request)
-    identity = _upstream_identity(request, user, session_id=session_id, request_id=request_id)
+    identity = _upstream_identity(gateway, request, user, session_id=session_id, request_id=request_id)
     try:
         decision = await pantheon_router.route_model(model, body)
         started_at = time.perf_counter()
         forward_body = gateway.attach_upstream_identity(body, identity)
         response_data = await gateway.forward_embeddings(decision, forward_body)
         _log_route_outcome(
+            routing_payload=routing_payload,
+            schedule_routing_memory=schedule_routing_memory,
             request_id=request_id,
             tenant_user_id=user.user_id,
             session_id=session_id,
@@ -295,6 +347,8 @@ async def embeddings(
     except gateway.PantheonGatewayError as exc:
         if decision is not None:
             _log_route_outcome(
+                routing_payload=routing_payload,
+                schedule_routing_memory=schedule_routing_memory,
                 request_id=request_id,
                 tenant_user_id=user.user_id,
                 session_id=session_id,
@@ -318,7 +372,15 @@ async def route_explain(
     authorization: str | None = Header(None),
     user: UserContext = Depends(_pantheon_user),
 ) -> dict[str, Any]:
-    _require_enabled()
+    (
+        _catalog,
+        _gateway,
+        pantheon_router,
+        PantheonRoutingError,
+        _consultation_cap_bucket,
+        _routing_payload,
+        _schedule_routing_memory,
+    ) = _pantheon_imports()
     request_body: dict[str, Any] = dict(body or {})
     if model_or_alias is not None:
         request_body["model_or_alias"] = model_or_alias

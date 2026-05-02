@@ -25,6 +25,11 @@ alpha line. Major new surfaces in this release:
 - ✅ MCP §6.4 cross-tenant security gates across 22 tools,
   including `pantheon_list_models`, `pantheon_route_explain`,
   `tool_kronos_anomalies`, and `tool_kronos_forecast`.
+- ✅ Subsystem modularization: optional pip extras + named feature
+  bundles (`[edge]`, `[server]`, `[ml]`, `[interop]`, `[full]`) so
+  operators install only what they deploy. Routes for missing extras
+  return 503 with install hint; MCP tools are filtered from
+  `tools/list`; workers gracefully no-op.
 - ✅ Document-import retry-safety with content-derived idempotency.
 - ✅ Connector smoke tests across 8 surfaces.
 - ✅ RFC-002 re-engagement memo + design paper draft.
