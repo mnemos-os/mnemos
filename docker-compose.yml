@@ -58,6 +58,7 @@ services:
       - ./db/migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql:/docker-entrypoint-initdb.d/44-deletion-requests-blank-namespace-cleanup.sql
       - ./db/migrations_v4_2_deletion_requests_soft_delete_columns.sql:/docker-entrypoint-initdb.d/45-deletion-requests-soft-delete-columns.sql
       - ./db/migrations_v4_2_deletion_requests_sweep_verifying.sql:/docker-entrypoint-initdb.d/46-deletion-requests-sweep-verifying.sql
+      - ./db/migrations_v4_2_compression_dag.sql:/docker-entrypoint-initdb.d/47-compression-dag.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
@@ -97,6 +98,7 @@ services:
       - ./db/migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql:/migrations/44-deletion-requests-blank-namespace-cleanup.sql:ro
       - ./db/migrations_v4_2_deletion_requests_soft_delete_columns.sql:/migrations/45-deletion-requests-soft-delete-columns.sql:ro
       - ./db/migrations_v4_2_deletion_requests_sweep_verifying.sql:/migrations/46-deletion-requests-sweep-verifying.sql:ro
+      - ./db/migrations_v4_2_compression_dag.sql:/migrations/47-compression-dag.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -122,7 +124,8 @@ services:
       -f /migrations/43-deletion-requests.sql
       -f /migrations/44-deletion-requests-blank-namespace-cleanup.sql
       -f /migrations/45-deletion-requests-soft-delete-columns.sql
-      -f /migrations/46-deletion-requests-sweep-verifying.sql"
+      -f /migrations/46-deletion-requests-sweep-verifying.sql
+      -f /migrations/47-compression-dag.sql"
     restart: "no"
 
   ollama:

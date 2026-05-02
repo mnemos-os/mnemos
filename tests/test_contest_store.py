@@ -52,12 +52,62 @@ def _make_conn():
     tx.__aexit__ = AsyncMock(return_value=None)
     conn.transaction = MagicMock(return_value=tx)
 
-    # fetchrow returns {"id": <uuid>} for every INSERT
-    def _gen_row(*args, **kwargs):
-        return {"id": uuid.uuid4()}
-    conn.fetchrow = AsyncMock(side_effect=_gen_row)
+    conn.parent_version_id = uuid.uuid4()
+    conn.parent_commit_hash = "a" * 64
+    conn.inserted_versions = []
+
+    def _fetchrow(*args, **kwargs):  # noqa: ARG001
+        sql = args[0]
+        if "INSERT INTO memory_compression_candidates" in sql:
+            return {"id": uuid.uuid4()}
+        if "FROM memory_branches mb" in sql and "mb.name = 'main'" in sql:
+            return {
+                "memory_id": "mem-1",
+                "category": "general",
+                "subcategory": "notes",
+                "metadata": {},
+                "verbatim_content": "raw body",
+                "owner_id": "alice",
+                "namespace": "default",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "parent_version_id": conn.parent_version_id,
+                "parent_commit_hash": conn.parent_commit_hash,
+            }
+        if "INSERT INTO memory_versions" in sql:
+            row = {
+                "id": uuid.uuid4(),
+                "version_num": 1,
+                "commit_hash": args[14],
+                "branch": args[15],
+                "parent_version_id": args[16],
+            }
+            conn.inserted_versions.append(row)
+            return row
+        if "FROM memory_versions" in sql and "commit_hash" in sql:
+            return None
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
+
+    conn.fetchrow = AsyncMock(side_effect=_fetchrow)
     conn.execute = AsyncMock(return_value="INSERT 0 1")
     return conn
+
+
+def _candidate_fetch_calls(conn):
+    return [
+        call_args for call_args in conn.fetchrow.call_args_list
+        if "INSERT INTO memory_compression_candidates" in call_args.args[0]
+    ]
+
+
+def _variant_execute_args(conn):
+    for call_args in conn.execute.call_args_list:
+        if "INSERT INTO memory_compressed_variants" in call_args.args[0]:
+            return call_args.args
+    raise AssertionError("variant upsert was not executed")
 
 
 def _make_outcome(winner_engine_id: str | None = "fast_good") -> ContestOutcome:
@@ -116,10 +166,11 @@ def test_happy_path_writes_every_candidate_and_upserts_variant():
     # caller-owns-transaction contract.
     assert conn.transaction.call_count == 0
 
-    # One fetchrow per candidate (5 total)
-    assert conn.fetchrow.await_count == 5
-    # One execute for the variant upsert
-    assert conn.execute.await_count == 1
+    # One fetchrow per candidate; the winner also writes one derived DAG row.
+    assert len(_candidate_fetch_calls(conn)) == 5
+    assert len(conn.inserted_versions) == 1
+    # Variant upsert + trigger-suppression GUC + derived branch head upsert.
+    assert conn.execute.await_count == 3
 
     assert result["candidates_written"] == 5
     assert result["variant_written"] is True
@@ -137,7 +188,7 @@ def test_no_winner_skips_variant_upsert():
 
     result = asyncio.run(persist_contest(conn, outcome))
 
-    assert conn.fetchrow.await_count == 5
+    assert len(_candidate_fetch_calls(conn)) == 5
     assert conn.execute.await_count == 0  # no variant upsert
     assert result["variant_written"] is False
     assert result["winner_engine"] is None
@@ -153,7 +204,7 @@ def test_candidate_insert_positional_args_include_all_fields():
     asyncio.run(persist_contest(conn, outcome))
 
     # Every INSERT has 19 positional args (see _INSERT_CANDIDATE_SQL).
-    for call_args in conn.fetchrow.call_args_list:
+    for call_args in _candidate_fetch_calls(conn):
         args = call_args.args
         # arg[0] is the SQL, then 19 bind parameters
         assert len(args) == 1 + 19, f"expected 20 positional args, got {len(args)}"
@@ -164,18 +215,47 @@ def test_variant_upsert_uses_winning_candidate_id():
     winner_id = uuid.uuid4()
 
     # Override fetchrow to return a deterministic id for the winner
-    def _side(*args, **kwargs):
-        # args[0] is SQL; args[1] memory_id; args[4] engine_id ... cand.is_winner is args[17]
-        is_winner = args[17]
-        return {"id": winner_id if is_winner else uuid.uuid4()}
+    def _side(*args, **kwargs):  # noqa: ARG001
+        sql = args[0]
+        if "INSERT INTO memory_compression_candidates" in sql:
+            # args[0] is SQL; args[1] memory_id; args[4] engine_id ... cand.is_winner is args[17]
+            is_winner = args[17]
+            return {"id": winner_id if is_winner else uuid.uuid4()}
+        if "FROM memory_branches mb" in sql and "mb.name = 'main'" in sql:
+            return {
+                "memory_id": "mem-1",
+                "category": "general",
+                "subcategory": "notes",
+                "metadata": {},
+                "verbatim_content": "raw body",
+                "owner_id": "alice",
+                "namespace": "default",
+                "permission_mode": 600,
+                "source_model": None,
+                "source_provider": None,
+                "source_session": None,
+                "source_agent": None,
+                "parent_version_id": conn.parent_version_id,
+                "parent_commit_hash": conn.parent_commit_hash,
+            }
+        if "INSERT INTO memory_versions" in sql:
+            return {
+                "id": uuid.uuid4(),
+                "version_num": 1,
+                "commit_hash": args[14],
+                "branch": args[15],
+                "parent_version_id": args[16],
+            }
+        if "FROM memory_versions" in sql and "commit_hash" in sql:
+            return None
+        raise AssertionError(f"unexpected fetchrow SQL: {sql}")
     conn.fetchrow = AsyncMock(side_effect=_side)
 
     outcome = _make_outcome(winner_engine_id="fast_good")
     asyncio.run(persist_contest(conn, outcome))
 
     # Variant upsert's $3 is winner_candidate_id
-    assert conn.execute.await_count == 1
-    variant_args = conn.execute.call_args.args
+    variant_args = _variant_execute_args(conn)
     assert variant_args[3] == winner_id, (
         f"variant_candidate_id should match winner's id; got {variant_args[3]!r}"
     )
@@ -188,7 +268,7 @@ def test_manifest_serialized_as_json_string():
     asyncio.run(persist_contest(conn, outcome))
 
     # manifest is arg position 19 (1 SQL + 18 params before it = index 19)
-    for call_args in conn.fetchrow.call_args_list:
+    for call_args in _candidate_fetch_calls(conn):
         manifest_arg = call_args.args[19]
         assert isinstance(manifest_arg, str)
         # Must round-trip as JSON
@@ -205,7 +285,7 @@ def _manifest_for_engine(conn, engine_id: str) -> dict:
     """Pull the serialized manifest JSON for a given engine_id and
     decode it back to a dict.
     """
-    for call_args in conn.fetchrow.call_args_list:
+    for call_args in _candidate_fetch_calls(conn):
         if call_args.args[4] == engine_id:
             return json.loads(call_args.args[19])
     raise AssertionError(f"no insert for engine_id={engine_id!r}")
@@ -374,12 +454,12 @@ def test_judge_model_fallback_applied_when_result_is_silent():
 
     # judge_model is positional arg index 15 on the candidate insert
     # (1 SQL + 14 fields before it)
-    for call_args in conn.fetchrow.call_args_list:
+    for call_args in _candidate_fetch_calls(conn):
         assert call_args.args[15] == "gemma4:e2b"
 
     # Variant upsert judge_model is at positional index 12
     # (1 SQL + 11 fields before it)
-    variant_args = conn.execute.call_args.args
+    variant_args = _variant_execute_args(conn)
     assert variant_args[12] == "gemma4:e2b"
 
 
@@ -393,7 +473,7 @@ def test_result_judge_model_wins_over_fallback():
 
     asyncio.run(persist_contest(conn, outcome, judge_model="gemma4:e2b"))
 
-    judge_models = [call_args.args[15] for call_args in conn.fetchrow.call_args_list]
+    judge_models = [call_args.args[15] for call_args in _candidate_fetch_calls(conn)]
     assert "gemma4:e4b" in judge_models  # the candidate's own value
     assert "gemma4:e2b" in judge_models  # fallback on others
 
@@ -410,7 +490,7 @@ def test_zero_speed_factor_and_composite_coerced_to_null():
 
     # speed_factor at positional index 11, composite_score at 12
     # (1 SQL + 10 fields before speed_factor)
-    for call_args in conn.fetchrow.call_args_list:
+    for call_args in _candidate_fetch_calls(conn):
         sf = call_args.args[11]
         comp = call_args.args[12]
         engine_id = call_args.args[4]

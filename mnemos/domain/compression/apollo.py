@@ -297,6 +297,7 @@ class APOLLOEngine(CompressionEngine):
                     identifier_policy=IdentifierPolicy.STRICT,
                     manifest={
                         "path": "schema_no_op",
+                        "representation_kind": "dense",
                         "schema_id": match.schema_id,
                         "schema_version": match.schema_version,
                         "schema_confidence": match.confidence,
@@ -318,6 +319,7 @@ class APOLLOEngine(CompressionEngine):
                 identifier_policy=IdentifierPolicy.STRICT,
                 manifest={
                     "path": "schema",
+                    "representation_kind": "dense",
                     "schema_id": match.schema_id,
                     "schema_version": match.schema_version,
                     "schema_confidence": match.confidence,
@@ -481,6 +483,7 @@ class APOLLOEngine(CompressionEngine):
             identifier_policy=IdentifierPolicy.OFF,
             manifest={
                 "path": "fallback",
+                "representation_kind": "dense",
                 "gpu_url": self.gpu_url,
                 "output_shape": "summary;facts;entities;concepts",
             },

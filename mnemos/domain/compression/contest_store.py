@@ -21,6 +21,7 @@ surface.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from typing import Any, Dict, Optional
@@ -72,6 +73,97 @@ ON CONFLICT (memory_id) DO UPDATE SET
     judge_model         = EXCLUDED.judge_model,
     selected_at         = NOW()
 """
+
+_FETCH_SOURCE_MAIN_HEAD_SQL = """
+SELECT
+    m.id AS memory_id,
+    m.category,
+    m.subcategory,
+    m.metadata,
+    m.verbatim_content,
+    m.owner_id,
+    m.namespace,
+    m.permission_mode,
+    m.source_model,
+    m.source_provider,
+    m.source_session,
+    m.source_agent,
+    mv.id AS parent_version_id,
+    mv.commit_hash AS parent_commit_hash
+FROM memory_branches mb
+INNER JOIN memory_versions mv
+    ON mv.id = mb.head_version_id
+   AND mv.memory_id = mb.memory_id
+INNER JOIN memories m
+    ON m.id = mb.memory_id
+WHERE mb.memory_id = $1
+  AND mb.name = 'main'
+FOR UPDATE OF mb
+"""
+
+_INSERT_COMPRESSION_VERSION_SQL = """
+INSERT INTO memory_versions (
+    memory_id, version_num, content, category, subcategory, metadata,
+    verbatim_content, owner_id, namespace, permission_mode,
+    source_model, source_provider, source_session, source_agent,
+    snapshot_by, change_type, commit_hash, branch, parent_version_id
+) VALUES (
+    $1,
+    (
+        SELECT COALESCE(MAX(version_num), 0) + 1
+        FROM memory_versions
+        WHERE memory_id = $1 AND branch = $15
+    ),
+    $2, $3, $4, $5::jsonb,
+    $6, $7, $8, $9,
+    $10, $11, $12, $13,
+    'system:compression', 'compress', $14, $15, $16
+)
+ON CONFLICT (commit_hash) DO NOTHING
+RETURNING id, version_num, commit_hash, parent_version_id, branch
+"""
+
+_FETCH_COMPRESSION_VERSION_BY_HASH_SQL = """
+SELECT id, version_num, commit_hash, parent_version_id, branch
+FROM memory_versions
+WHERE memory_id = $1 AND branch = $2 AND commit_hash = $3
+"""
+
+_UPSERT_COMPRESSION_BRANCH_SQL = """
+INSERT INTO memory_branches (memory_id, name, head_version_id, created_by)
+VALUES ($1, $2, $3, 'system:compression')
+ON CONFLICT (memory_id, name) DO UPDATE
+SET head_version_id = EXCLUDED.head_version_id
+"""
+
+
+_DISTILLED_REPRESENTATION_KINDS = {
+    "apollo_dense",
+    "compressed",
+    "compression",
+    "dense",
+    "distilled",
+    "llm_dense",
+    "raw",
+    "raw_compression",
+    "schema_dense",
+    "structured_dense",
+}
+_NARRATED_REPRESENTATION_KINDS = {
+    "abstractive_prose",
+    "extractive_prose",
+    "narrated",
+    "narration",
+    "natural_language",
+    "prose",
+    "prose_narration",
+}
+_REPRESENTATION_KIND_KEYS = (
+    "representation_kind",
+    "representation",
+    "output_kind",
+    "format",
+)
 
 
 def _nullable_positive(value: Optional[float]) -> Optional[float]:
@@ -163,6 +255,128 @@ def _enriched_manifest(cand) -> Dict[str, Any]:
     return base
 
 
+def _normalize_representation_kind(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    normalized = value.strip().lower().replace("-", "_").replace(" ", "_")
+    return normalized or None
+
+
+def _variant_branch(result: Any) -> str:
+    manifest = result.manifest or {}
+    for key in _REPRESENTATION_KIND_KEYS:
+        kind = _normalize_representation_kind(manifest.get(key))
+        if kind in _NARRATED_REPRESENTATION_KINDS:
+            return "narrated"
+        if kind in _DISTILLED_REPRESENTATION_KINDS:
+            return "distilled"
+
+    # Current built-ins: APOLLO emits dense LLM-to-LLM forms; ARTEMIS
+    # and third-party extractive engines generally emit prose-shaped
+    # variants unless they explicitly mark a denser representation.
+    if result.engine_id == "apollo":
+        return "distilled"
+    return "narrated"
+
+
+def _compression_commit_hash(
+    parent_commit_hash: str,
+    variant_content: str,
+    branch: str,
+) -> str:
+    return hashlib.sha256(
+        (parent_commit_hash + variant_content + branch).encode("utf-8")
+    ).hexdigest()
+
+
+def _jsonb_arg(value: Any) -> str:
+    if value is None:
+        return "{}"
+    if isinstance(value, str):
+        return value
+    return json.dumps(value)
+
+
+async def _persist_compression_version(
+    conn: Any,
+    *,
+    memory_id: str,
+    result: Any,
+) -> Dict[str, Any]:
+    variant_content = result.compressed_content
+    if variant_content is None:
+        raise RuntimeError(
+            f"winner for memory {memory_id} has no compressed_content; "
+            "cannot create compression DAG version"
+        )
+
+    branch = _variant_branch(result)
+
+    # This direct memory_versions insert does not mutate memories, but
+    # keep the transaction-local guard set so any future trigger path in
+    # the same unit of work cannot double-snapshot this derivation.
+    await conn.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
+
+    source = await conn.fetchrow(_FETCH_SOURCE_MAIN_HEAD_SQL, memory_id)
+    if source is None:
+        raise RuntimeError(
+            f"main branch HEAD missing for memory {memory_id}; "
+            "cannot create compression DAG version"
+        )
+
+    parent_commit_hash = source["parent_commit_hash"]
+    commit_hash = _compression_commit_hash(
+        parent_commit_hash,
+        variant_content,
+        branch,
+    )
+    version_row = await conn.fetchrow(
+        _INSERT_COMPRESSION_VERSION_SQL,
+        memory_id,
+        variant_content,
+        source["category"],
+        source["subcategory"],
+        _jsonb_arg(source["metadata"]),
+        source["verbatim_content"],
+        source["owner_id"],
+        source["namespace"],
+        source["permission_mode"],
+        source["source_model"],
+        source["source_provider"],
+        source["source_session"],
+        source["source_agent"],
+        commit_hash,
+        branch,
+        source["parent_version_id"],
+    )
+    if version_row is None:
+        version_row = await conn.fetchrow(
+            _FETCH_COMPRESSION_VERSION_BY_HASH_SQL,
+            memory_id,
+            branch,
+            commit_hash,
+        )
+    if version_row is None:
+        raise RuntimeError(
+            f"compression DAG version insert produced no row for memory "
+            f"{memory_id} branch {branch}"
+        )
+
+    await conn.execute(
+        _UPSERT_COMPRESSION_BRANCH_SQL,
+        memory_id,
+        branch,
+        version_row["id"],
+    )
+
+    return {
+        "compression_version_id": str(version_row["id"]),
+        "compression_version_branch": branch,
+        "compression_version_commit_hash": version_row["commit_hash"],
+        "compression_parent_version_id": str(version_row["parent_version_id"]),
+    }
+
+
 async def persist_contest(
     conn: Any,
     outcome: ContestOutcome,
@@ -227,6 +441,7 @@ async def persist_contest(
             winner_candidate_db_id = row["id"]
 
     variant_written = False
+    version_result: Dict[str, Any] = {}
     if outcome.winner is not None and winner_candidate_db_id is not None:
         w = outcome.winner
         r = w.result
@@ -246,14 +461,21 @@ async def persist_contest(
             r.judge_model or judge_model,
         )
         variant_written = True
+        version_result = await _persist_compression_version(
+            conn,
+            memory_id=outcome.memory_id,
+            result=r,
+        )
 
-    return {
+    result = {
         "contest_id": str(outcome.contest_id),
         "memory_id": outcome.memory_id,
         "candidates_written": candidates_written,
         "variant_written": variant_written,
         "winner_engine": outcome.winner.result.engine_id if outcome.winner else None,
     }
+    result.update(version_result)
+    return result
 
 
 __all__ = ["persist_contest"]

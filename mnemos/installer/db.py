@@ -313,6 +313,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v4_2_deletion_requests_blank_namespace_cleanup.sql",
         repo_path / "db" / "migrations_v4_2_deletion_requests_soft_delete_columns.sql",
         repo_path / "db" / "migrations_v4_2_deletion_requests_sweep_verifying.sql",
+        repo_path / "db" / "migrations_v4_2_compression_dag.sql",
     ]
 
     print("[db] Running migrations...")

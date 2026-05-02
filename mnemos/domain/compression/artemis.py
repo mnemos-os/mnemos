@@ -705,6 +705,7 @@ class ARTEMISEngine(CompressionEngine):
             identifier_policy=IdentifierPolicy.STRICT,
             manifest={
                 "path": "extractive",
+                "representation_kind": "prose",
                 "protected_spans": len(protected),
                 "anchored_sentences": len(anchored_indices),
                 "selected": len(selected),

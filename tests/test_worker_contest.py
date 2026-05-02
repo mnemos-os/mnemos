@@ -107,7 +107,17 @@ def _mock_pool(
     sweep_calls = [list(sweep_rows) if sweep_rows else []]
     execute_log: list[tuple[str, tuple]] = []
     fetchrow_calls: list[tuple[str, tuple]] = []
+    compression_versions: list[dict] = []
+    source_heads: dict[str, dict] = {}
     persist_fetchrow_calls = 0
+
+    def _source_head(memory_id: str) -> dict:
+        if memory_id not in source_heads:
+            source_heads[memory_id] = {
+                "parent_version_id": uuid.uuid4(),
+                "parent_commit_hash": "d" * 64,
+            }
+        return source_heads[memory_id]
 
     async def fetch(sql, *args):
         # sweep_stale_running: SELECT ... WHERE status = 'running'
@@ -138,6 +148,44 @@ def _mock_pool(
         if "INSERT INTO memory_compression_candidates" in sql:
             persist_fetchrow_calls += 1
             return {"id": uuid.uuid4()}
+        # persist_contest's compression-DAG parent lookup.
+        if "FROM memory_branches mb" in sql and "mb.name = 'main'" in sql:
+            memory_id = args[0]
+            memory = memory_content_by_id.get(memory_id)
+            if memory is None:
+                return None
+            head = _source_head(memory_id)
+            return {
+                "memory_id": memory_id,
+                "category": memory.get("category", "general"),
+                "subcategory": memory.get("subcategory"),
+                "metadata": memory.get("metadata", {}),
+                "verbatim_content": memory.get("verbatim_content"),
+                "owner_id": memory.get("owner_id", "alice"),
+                "namespace": memory.get("namespace", "default"),
+                "permission_mode": memory.get("permission_mode", 600),
+                "source_model": memory.get("source_model"),
+                "source_provider": memory.get("source_provider"),
+                "source_session": memory.get("source_session"),
+                "source_agent": memory.get("source_agent"),
+                "parent_version_id": head["parent_version_id"],
+                "parent_commit_hash": head["parent_commit_hash"],
+            }
+        if "INSERT INTO memory_versions" in sql:
+            row = {
+                "id": uuid.uuid4(),
+                "version_num": 1,
+                "commit_hash": args[13],
+                "branch": args[14],
+                "parent_version_id": args[15],
+            }
+            compression_versions.append(row)
+            return row
+        if "FROM memory_versions" in sql and "commit_hash" in sql:
+            for row in compression_versions:
+                if row["branch"] == args[1] and row["commit_hash"] == args[2]:
+                    return row
+            return None
         raise AssertionError(f"unexpected fetchrow: {sql[:80]!r}")
 
     async def execute(sql, *args):
@@ -161,6 +209,7 @@ def _mock_pool(
 
     pool._execute_log = execute_log
     pool._fetchrow_calls = fetchrow_calls
+    pool._compression_versions = compression_versions
     pool._conn = conn
     return pool
 
