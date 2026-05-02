@@ -5,9 +5,10 @@ commits status + counters as it goes. Each phase is a separate async
 function; the runner tags every memory mutation with morpheus_run_id so
 rollback is a single DELETE.
 
-v1 slice 1: phases are stubbed with TODO markers; the run row is
-real, the audit trail is real, the API can list/inspect runs and roll
-them back. Slice 2 fills in the actual REPLAY/CLUSTER/SYNTHESISE work.
+The pipeline is REPLAY → CLUSTER → SYNTHESISE → COMMIT. Mutation phases
+(CONSOLIDATE / EXTRACT / ARCHIVE) are intentionally not part of v1 —
+GRAEAE consensus 2026-04-25 deferred them to v3.6+ in favour of the
+append-only synthesis path here.
 """
 from __future__ import annotations
 
@@ -252,13 +253,13 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
     return n_deleted, n_run
 
 
-# ── Phase stubs (slice 2 fills these in) ──────────────────────────────────────
+# ── Phases ────────────────────────────────────────────────────────────────────
 #
-# The phase functions below produce no side effects yet. Slice 2 wires up
-# the actual REPLAY → CLUSTER → SYNTHESISE → COMMIT pipeline. They are
-# defined here so the runner shape and the rollback contract are real
-# from day one — the API can already trigger a "no-op dream" and undo
-# it, which is the foundation we want before touching synthesis logic.
+# Each phase function below carries out one stage of the REPLAY →
+# CLUSTER → SYNTHESISE → COMMIT pipeline. Every memory the run
+# creates is tagged with its ``morpheus_run_id`` so rollback is a
+# single DELETE and the audit trail in ``morpheus_runs`` stays
+# authoritative for what the run did.
 
 async def phase_replay(pool: asyncpg.Pool, run_id: str) -> int:
     """Scan memories from the run's window. Returns count scanned.
