@@ -116,9 +116,142 @@ group by area rather than by intermediate version.
   create/search/list/bulk tools stamp the configured
   namespace on writes. Documented as a write-stamp / search-
   filter ergonomic, NOT enforced isolation; root keys cross.
+- **Profile-aware ``require_postgres_pool_or_503`` helper +
+  67-site migration sweep (`a14`, rounds 53-60)**: every
+  Postgres-only route now emits a profile-aware 503 detail
+  that names the route AND tells operators to set
+  ``MNEMOS_PROFILE=server`` (or ``MNEMOS_PERSISTENCE_BACKEND
+  =postgres + a working PG_*``) to enable the route. The old
+  bare ``Database pool not available`` detail conflated
+  "this route is Postgres-only-by-design" with "the pool is
+  transiently down" — operators on edge profiles chased
+  phantom outages. 67 call sites across 14 modules
+  (journal, ingest, sessions, portability, providers, oauth,
+  dag, document_import, kg, webhooks, versions,
+  consultations, memories, admin, federation) migrated onto
+  the canonical helper. ``oauth_me`` keeps a non-raising
+  ``if cookie_session and _lc._pool:`` fallback because it
+  short-circuits to a personal/api-key response rather than
+  raising; documented in
+  ``tests/test_postgres_only_503_invariant.py``.
+- **AST invariant pins the bare-503-shape (`a14`,
+  round-61)**: ``tests/test_postgres_only_503_invariant.py``
+  bans the bare ``if not _lc._pool: raise HTTPException(503,
+  "Database pool not available")`` shape across
+  ``mnemos/api/routes/`` and asserts ``require_postgres_pool
+  _or_503`` is called from ≥20 sites — a future regression
+  to the bare shape trips a unit test before code review.
+- **Document-import transactional outbox + HTTP status
+  surfacing (`a14`, rounds 47-50)**: per-chunk ``async with
+  conn.transaction():`` wraps the memory INSERT and
+  ``_dispatch_webhook(conn=conn)`` so the delivery row joins
+  the same transaction (corpus-review-2026-04-29 #2 closure).
+  Single-file ``POST /v1/import/document`` returns 207 Multi-
+  Status when ``errors`` is non-empty + 502 Bad Gateway when
+  every chunk failed on a retryable infra fault; multi-file
+  ``POST /v1/batch-import`` aggregates per-file
+  ``status_code`` into a top-level 207 (mixed) or 502
+  (every per-file ``status_code == 502``) so HTTP-status-
+  only clients see partial / full failure even when the
+  body is JSON.
+- **AST invariant: every dispatch call passes ``conn=``
+  (`a14`, round-52)**:
+  ``tests/test_dispatch_outbox_invariants.py`` AST-walks
+  every call to ``mnemos.webhooks.dispatcher.dispatch``
+  (and aliased imports) and fails if any call is missing
+  the ``conn=`` keyword — the transactional-outbox guarantee
+  that the delivery row joins the caller's transaction.
+- **``mnemos dump-openapi --server-url`` (`a14`,
+  round-51)**: Custom GPT / OpenAI Actions consumers can
+  now bake the deployment hostname into the spec at export
+  time (``servers: [{url: ...}]``) rather than patching by
+  hand post-export. ``--target gpt-actions`` deep-copies the
+  cached FastAPI ``app.openapi()`` dict before mutation so
+  the per-CLI-invocation server override doesn't bleed into
+  pytest fixtures.
+- **OpenAI Custom GPT connector doc (`a14`, round-42)**:
+  ``docs/connectors/openai-custom-gpt.md`` covers Custom GPT
+  Actions setup against ``mnemos dump-openapi --target
+  gpt-actions``: spec generation, Bearer-auth wiring,
+  endpoint description / parameter description limits.
+- **Claude Desktop connector doc (`a14`, round-44)**:
+  ``docs/connectors/claude-desktop.md`` fills the previously
+  broken README link with stdio + HTTP/SSE recipes.
+- **Connector-doc config validation tests (`a14`,
+  round-46)**: ``tests/test_connector_doc_configs.py``
+  mechanically parses every fenced JSON block in
+  ``docs/connectors/*.md`` and fails the suite on a config
+  that won't parse. Surfaced two pre-existing broken-JSON
+  bugs in ``continue-dev.md`` and ``claude-desktop.md``
+  (placeholder ``...existing...`` / ``... ...`` syntax that
+  never parsed); both fixed in the same commit.
+- **MNEMOS_NODE_NAME hostname-fallback warning (`a14`,
+  round-39)**: when ``MNEMOS_NODE_NAME`` is unset and the
+  NATS connect helper falls back to ``socket.gethostname()``,
+  one WARNING line is logged the first time so operators
+  see the fallback explicitly. Subsequent connects stay
+  silent (one-shot ``_NODE_NAME_FALLBACK_LOGGED`` flag).
+  NATS-corpus-review-V4.2 finding #9 closure.
+- **NATS payload sensitivity + ACL guidance
+  (``docs/NATS_OPERATIONS.md``, `a14`, rounds 40-41,
+  corrected round-45)**: per-subject sensitivity table
+  documents that JetStream nudges carry only memory IDs
+  (not bodies); bodies are fetched via authorized HTTP feed.
+  Sample ACL configs for ``mnemos-server`` (pub/sub) vs
+  ``mnemos-observer`` (subscribe-only) vs federation peer
+  scope-tight pattern. NATS-corpus-review-V4.2 findings
+  #10, #11.
 
 ### Fixed
 
+- **document_import retry-safety arc (`a14`, rounds 62..68)**:
+  the round-54..60 503-helper sweep dropped a stub route_label
+  on ``import_memories_from_document``; codex caught it in
+  round-61 review, then surfaced six progressively-deeper
+  problems over rounds 62..67 before round-68 closed the loop
+  with a real schema-level idempotency primitive. The full arc:
+  - **round-62**: per-caller ``route_label`` (single-file vs
+    batch); batch endpoint pre-loop pool check so SQLite/edge-
+    profile 503s escape uncaught with the correct top-level
+    status. Pool check precedes Docling-availability check.
+  - **round-63**: aggregator surfaces top-level 503 if ANY
+    per-file is 503 (so a mid-batch pool drop doesn't hide
+    behind a 207 body). Helper wraps acquire to convert
+    asyncpg/asyncio.TimeoutError to HTTPException(503,
+    route_label).
+  - **round-64**: helper returns ``(payload, 503)`` preserving
+    committed-chunks ``memory_ids`` on infra failure instead of
+    raising bare HTTPException(503).
+  - **round-65**: ``unconfirmed_memory_ids`` field surfaces
+    in-flight chunk IDs whose INSERT was accepted but commit-
+    ack was lost. Retry-aware clients query
+    ``GET /v1/memories/{id}`` to reconcile.
+  - **round-66**: documentation revised — a single 404 on the
+    reconciliation read is NOT a safe rollback oracle under
+    Postgres MVCC; three operator-honest retry options
+    documented in DOCUMENT_IMPORT_GUIDE.md.
+  - **round-67**: deferred-primitive section corrected —
+    ``ON CONFLICT (...) DO NOTHING RETURNING id`` returns 0
+    rows on conflict, NOT the existing row's id. Two viable
+    shapes (DO UPDATE no-op SET vs two-step INSERT-then-SELECT)
+    documented with their trade-offs.
+  - **round-68**: ships the full primitive — migration
+    ``migrations_v4_2_document_import_chunk_idempotency.sql``
+    adds ``import_chunk_key`` (sha256 of owner_id+namespace+
+    source_file+chunk_num with NUL separators) and a partial
+    UNIQUE index. Helper switches to ``ON CONFLICT
+    (import_chunk_key) DO UPDATE SET import_chunk_key =
+    EXCLUDED.import_chunk_key RETURNING id`` and trusts the
+    RETURNING value as the canonical id. Postgres serializes
+    the conflict path against the prior in-flight transaction,
+    so commit-ambiguous retries are now safe — ``new_memory_id
+    ()`` remains the surrogate but the canonical id is whatever
+    came back from RETURNING. The no-op SET fires the AFTER
+    UPDATE trigger, but ``mnemos_version_snapshot()`` only
+    writes a new ``memory_versions`` row when audited fields
+    are IS DISTINCT — ``import_chunk_key`` is not in that
+    audited set, so retry-conflicts produce zero version-row
+    churn.
 - **LATENT BUG: ``SET LOCAL <name> = $1`` SQL on RLS-enabled
   Postgres (`a14`)**: PostgreSQL ``SET`` syntax does NOT
   accept bind parameters (per the official docs). The

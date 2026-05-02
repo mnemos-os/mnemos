@@ -1,0 +1,87 @@
+-- migrations_v4_2_document_import_chunk_idempotency.sql
+--
+-- Closes the safe-retry gap surfaced in codex review-4..7 of the
+-- round-62 sweep on document_import: under mid-flight infra
+-- failure (asyncpg connection drop, asyncio.TimeoutError on
+-- commit-ack), document_import chunks could end up
+-- commit-ambiguous and a retry could create duplicate rows
+-- because ``new_memory_id()`` is non-deterministic.
+--
+-- Adds ``import_chunk_key`` to ``memories`` — opaque sha256
+-- derived in the document_import helper from
+-- ``(owner_id, namespace, source_file, chunk_num,
+--   sha256(content), permission_mode, category, subcategory)``.
+-- The chunk INSERT uses
+-- ``ON CONFLICT (import_chunk_key) DO UPDATE SET
+--   import_chunk_key = EXCLUDED.import_chunk_key
+-- RETURNING id`` so retries deduplicate without losing the
+-- canonical row id. The ``mnemos_version_snapshot()`` AFTER
+-- UPDATE trigger only writes a new ``memory_versions`` row
+-- when audited fields IS DISTINCT — ``import_chunk_key`` is
+-- not in the audited set, so the no-op SET produces zero
+-- version-row churn.
+--
+-- ── No BEGIN/COMMIT ────────────────────────────────────────
+--
+-- This file deliberately does NOT wrap its statements in an
+-- explicit transaction block. The migration loader runs each
+-- file via ``psql -f`` which uses autocommit-per-statement
+-- when no explicit BEGIN is present; that lets us use
+-- ``CREATE UNIQUE INDEX CONCURRENTLY`` for the unique-index
+-- creation, which Postgres prohibits inside a transaction
+-- block. CONCURRENTLY runs the index build without holding a
+-- write-blocking lock on ``memories``, so the migration is
+-- safe to apply against deployments with arbitrarily-large
+-- ``memories`` tables. Codex review-11 of round-72 flagged
+-- the previous transactional shape as a write-outage hazard
+-- on large tables (lock_timeout caps the WAIT but not the
+-- BUILD).
+--
+-- Idempotency: ``ADD COLUMN IF NOT EXISTS`` and ``CREATE
+-- UNIQUE INDEX CONCURRENTLY IF NOT EXISTS`` make this safe
+-- to re-run. If a previous CONCURRENTLY build failed and
+-- left an INVALID index, operators must drop it manually
+-- (``DROP INDEX CONCURRENTLY memories_import_chunk_key_uniq``)
+-- and re-apply this migration.
+--
+-- ── Round-68 partial-index legacy state ────────────────────
+--
+-- Deployments that ran the round-68 alpha of this migration
+-- created a PARTIAL unique index
+-- (``CREATE UNIQUE INDEX ... WHERE import_chunk_key IS NOT
+-- NULL``). The bare ``ON CONFLICT (import_chunk_key)``
+-- shipped in round-68's helper cannot infer a partial index
+-- as the arbiter, so document_import would fail every chunk
+-- on those deployments. The repair step from round-70..72
+-- (a DO block detecting and dropping the partial index) is
+-- INCOMPATIBLE with the no-BEGIN / CONCURRENTLY shape we
+-- need here — DROP INDEX (without CONCURRENTLY) inside an
+-- implicit transaction would still hold a brief lock; and
+-- DROP INDEX CONCURRENTLY cannot run inside a DO block.
+--
+-- Round-73 EXTRACTS the partial-index repair to a separate
+-- operator runbook at ``db/scripts/repair_round_68_partial
+-- _chunk_key_index.sql`` — a manual, online, two-step
+-- procedure operators apply BEFORE running this migration on
+-- a round-68-alpha deployment. Fresh installs and round-70+
+-- deployments are unaffected. The operator runbook is also
+-- documented in DOCUMENT_IMPORT_GUIDE.md.
+--
+-- Rollback: drop the index (CONCURRENTLY for online), then
+-- the column. Both are cheap on tables of any size since
+-- the column is NULL for non-document_import rows.
+--
+-- See also: DOCUMENT_IMPORT_GUIDE.md "Idempotency primitive"
+-- section for the operator-facing description.
+
+ALTER TABLE memories
+    ADD COLUMN IF NOT EXISTS import_chunk_key TEXT;
+
+-- Online unique-index creation. Cannot run inside a
+-- transaction block, so the migration file MUST NOT have
+-- explicit BEGIN/COMMIT — psql autocommit-per-statement gives
+-- us that. NULLS DISTINCT is the default, so multiple NULL
+-- values are allowed (non-document_import rows keep NULL
+-- chunk_keys without colliding).
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS memories_import_chunk_key_uniq
+    ON memories (import_chunk_key);

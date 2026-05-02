@@ -1,0 +1,102 @@
+-- repair_round_68_partial_chunk_key_index.sql
+--
+-- Operator-only repair script for deployments that ran the
+-- round-68 alpha of migrations_v4_2_document_import_chunk_
+-- idempotency.sql. That alpha created a PARTIAL unique index
+-- (``WHERE import_chunk_key IS NOT NULL``) which the helper's
+-- bare ``ON CONFLICT (import_chunk_key) DO UPDATE`` cannot
+-- infer as its arbiter — every document_import chunk INSERT
+-- errors with "no unique or exclusion constraint matching the
+-- ON CONFLICT specification".
+--
+-- This script repairs the partial index ONLINE: it builds a
+-- replacement non-partial index CONCURRENTLY (no write lock),
+-- then drops the partial index CONCURRENTLY, then renames the
+-- replacement to the canonical name. No write-blocking step.
+--
+-- ── Who needs to run this ──────────────────────────────────
+--
+-- ONLY deployments that:
+--   1. Ran the v4.2.0a14 round-68 alpha (any commit between
+--      round-68 and round-72).
+--   2. Have ``memories_import_chunk_key_uniq`` as a partial
+--      index (verify with ``\d memories_import_chunk_key_uniq``
+--      in psql; partial indexes show ``WHERE
+--      (import_chunk_key IS NOT NULL)`` in the index def).
+--
+-- Fresh installs of v4.2.0a14 round-73+ get the non-partial
+-- index from ``migrations_v4_2_document_import_chunk_
+-- idempotency.sql`` directly and do NOT need this repair.
+-- Deployments that ran round-69 → round-72 (which had the
+-- DO-block transactional repair) before applying round-73
+-- will already have the non-partial index and this script
+-- will be a no-op.
+--
+-- ── How to run ─────────────────────────────────────────────
+--
+-- Run as the postgres superuser (or any role with index-DDL
+-- on the ``memories`` table). Each statement runs in its own
+-- transaction (CONCURRENTLY requires this). Run sequentially
+-- in the same psql session. Idempotent — safe to re-run.
+--
+--   sudo -u postgres psql -d mnemos -f \
+--       db/scripts/repair_round_68_partial_chunk_key_index.sql
+--
+-- Verify the partial index exists before repairing:
+--
+--   sudo -u postgres psql -d mnemos -c \
+--     "SELECT indpred IS NOT NULL AS is_partial \
+--      FROM pg_index \
+--      WHERE indexrelid = 'memories_import_chunk_key_uniq'::regclass"
+--
+--   is_partial
+--   ----------
+--    t              ← needs repair
+--    f              ← already correct
+--   (0 rows)        ← index doesn't exist; run the migration first
+--
+-- ── Why not in the migration ───────────────────────────────
+--
+-- ``CREATE INDEX CONCURRENTLY`` and ``DROP INDEX CONCURRENTLY``
+-- cannot run inside a transaction block. The migration loader's
+-- per-file shape (``psql -f`` with autocommit-per-statement)
+-- supports plain CONCURRENTLY but a DO block detecting "is
+-- partial?" then conditionally dropping CANNOT — DO blocks are
+-- their own transaction context. Codex review-11 of round-72
+-- flagged that even with ``SET LOCAL lock_timeout``, a non-
+-- concurrent rebuild blocks writes for the full build duration.
+--
+-- The cleanest split: the migration handles fresh installs
+-- (CONCURRENTLY-create the non-partial index, idempotent) and
+-- this operator script handles round-68-alpha legacy state
+-- (manual CONCURRENTLY rebuild + rename). Round-68 alpha
+-- deployments are tiny (alpha-cycle dev environments), and
+-- requiring a manual operator action to repair them is
+-- acceptable for a pre-release upgrade path.
+
+-- Step 1: Build the replacement index under a temp name.
+-- CONCURRENTLY means no write-blocking lock. Idempotent via
+-- IF NOT EXISTS.
+CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS
+    memories_import_chunk_key_uniq_v2
+    ON memories (import_chunk_key);
+
+-- Step 2: Drop the old partial index (if it exists).
+-- CONCURRENTLY means no write-blocking lock. The IF EXISTS
+-- guard makes this no-op when the index has already been
+-- dropped (e.g., by an earlier run of this script).
+DROP INDEX CONCURRENTLY IF EXISTS memories_import_chunk_key_uniq;
+
+-- Step 3: Rename the replacement to the canonical name.
+-- This is metadata-only, sub-millisecond.
+ALTER INDEX IF EXISTS memories_import_chunk_key_uniq_v2
+    RENAME TO memories_import_chunk_key_uniq;
+
+-- Verify: the canonical index now exists and is non-partial.
+-- (Operators should run this query manually post-repair.)
+--
+--   SELECT indpred IS NULL AS is_non_partial
+--     FROM pg_index
+--    WHERE indexrelid = 'memories_import_chunk_key_uniq'::regclass;
+--
+-- Expected: ``is_non_partial = t``.

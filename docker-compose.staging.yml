@@ -86,6 +86,7 @@ services:
       - ./db/migrations_v4_2_users_username.sql:/docker-entrypoint-initdb.d/39-users-username.sql
       - ./db/migrations_v4_2_compression_candidates_nullable_tokens.sql:/docker-entrypoint-initdb.d/40-compression-candidates-nullable-tokens.sql
       - ./db/migrations_v4_2_state_value_text.sql:/docker-entrypoint-initdb.d/41-state-value-text.sql
+      - ./db/migrations_v4_2_document_import_chunk_idempotency.sql:/docker-entrypoint-initdb.d/42-document-import-chunk-idempotency.sql
     ports:
       - '127.0.0.1:5433:5432'  # NOTE: 5433 (not 5432) to avoid host-Postgres collision on PROTEUS / any host with system Postgres
     healthcheck:
@@ -121,6 +122,7 @@ services:
       - ./db/migrations_v4_2_users_username.sql:/migrations/39-users-username.sql:ro
       - ./db/migrations_v4_2_compression_candidates_nullable_tokens.sql:/migrations/40-compression-candidates-nullable-tokens.sql:ro
       - ./db/migrations_v4_2_state_value_text.sql:/migrations/41-state-value-text.sql:ro
+      - ./db/migrations_v4_2_document_import_chunk_idempotency.sql:/migrations/42-document-import-chunk-idempotency.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -141,7 +143,8 @@ services:
       -f /migrations/38-sessions-consultations-namespace.sql
       -f /migrations/39-users-username.sql
       -f /migrations/40-compression-candidates-nullable-tokens.sql
-      -f /migrations/41-state-value-text.sql"
+      -f /migrations/41-state-value-text.sql
+      -f /migrations/42-document-import-chunk-idempotency.sql"
     restart: "no"
 
   mnemos:

@@ -308,6 +308,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v4_2_users_username.sql",
         repo_path / "db" / "migrations_v4_2_compression_candidates_nullable_tokens.sql",
         repo_path / "db" / "migrations_v4_2_state_value_text.sql",
+        repo_path / "db" / "migrations_v4_2_document_import_chunk_idempotency.sql",
     ]
 
     print("[db] Running migrations...")

@@ -73,6 +73,27 @@ async def test_import_document_persists_explicit_permission_mode(
 
     mock_conn.transaction = MagicMock(return_value=_TxCtx())
 
+    # Round-68 switched the chunk INSERT from ``execute`` to
+    # ``fetchval`` (so ON CONFLICT (import_chunk_key) DO UPDATE
+    # ... RETURNING id can return the canonical row id). Default
+    # the fetchval mock to echo back the surrogate id (first
+    # positional arg after the SQL string), simulating a
+    # successful new-row insert.
+    # Round-72 added a legacy v70 chunk_key resolution UPDATE
+    # that runs BEFORE the INSERT-with-ON-CONFLICT. The mock
+    # has to return None for the UPDATE (no legacy row exists in
+    # this fresh-fixture scenario) so the helper falls through to
+    # the new INSERT — otherwise the INSERT never fires and the
+    # permission_mode positional-arg assertion below has nothing
+    # to check.
+    async def _fetchval_legacy_aware(*args, **kwargs):
+        sql = args[0] if args else ""
+        if isinstance(sql, str) and sql.lstrip().upper().startswith("UPDATE"):
+            return None
+        return args[1] if len(args) >= 2 else None
+
+    mock_conn.fetchval.side_effect = _fetchval_legacy_aware
+
     # Stub the in-transaction webhook dispatch so it returns an
     # empty delivery_ids list without touching webhook_subscriptions.
     monkeypatch.setattr(
@@ -94,10 +115,19 @@ async def test_import_document_persists_explicit_permission_mode(
     )
     assert resp.status_code == 200, resp.text
 
-    # Last positional arg of INSERT is the permission_mode value
-    assert mock_conn.execute.await_count >= 1
-    last_call = mock_conn.execute.await_args_list[-1]
-    assert last_call.args[-1] == 644
+    # Permission_mode is the 9th positional arg of the chunk
+    # INSERT (id, content, category, subcategory, metadata,
+    # verbatim_content, owner_id, namespace, permission_mode,
+    # import_chunk_key). The 10th — ``import_chunk_key`` —
+    # appended in round-68. Inspect fetchval (was execute pre-
+    # round-68).
+    assert mock_conn.fetchval.await_count >= 1
+    last_call = mock_conn.fetchval.await_args_list[-1]
+    # args = (sql, id, content, category, subcategory, metadata,
+    #         verbatim_content, owner_id, namespace,
+    #         permission_mode, import_chunk_key)
+    # permission_mode is at index 9 (0=sql, 1=id, ..., 9=perm_mode).
+    assert last_call.args[9] == 644
 
 
 @patch("mnemos.api.routes.document_import.DOCLING_AVAILABLE", True)
@@ -141,6 +171,23 @@ async def test_import_document_defaults_to_600(
 
     mock_conn.transaction = MagicMock(return_value=_TxCtx())
 
+    # Round-68 fetchval default — see explicit-permission_mode
+    # test above for the why.
+    # Round-72 added a legacy v70 chunk_key resolution UPDATE
+    # that runs BEFORE the INSERT-with-ON-CONFLICT. The mock
+    # has to return None for the UPDATE (no legacy row exists in
+    # this fresh-fixture scenario) so the helper falls through to
+    # the new INSERT — otherwise the INSERT never fires and the
+    # permission_mode positional-arg assertion below has nothing
+    # to check.
+    async def _fetchval_legacy_aware(*args, **kwargs):
+        sql = args[0] if args else ""
+        if isinstance(sql, str) and sql.lstrip().upper().startswith("UPDATE"):
+            return None
+        return args[1] if len(args) >= 2 else None
+
+    mock_conn.fetchval.side_effect = _fetchval_legacy_aware
+
     # Stub the in-transaction webhook dispatch so it returns an
     # empty delivery_ids list without touching webhook_subscriptions.
     monkeypatch.setattr(
@@ -161,5 +208,6 @@ async def test_import_document_defaults_to_600(
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
-    last_call = mock_conn.execute.await_args_list[-1]
-    assert last_call.args[-1] == 600
+    last_call = mock_conn.fetchval.await_args_list[-1]
+    # See round-68 commit on the permission_mode positional layout.
+    assert last_call.args[9] == 600
