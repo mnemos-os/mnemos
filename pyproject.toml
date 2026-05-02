@@ -45,6 +45,7 @@ dependencies = [
   "python-dotenv>=1.0.0",
   "mcp>=1.0.0",
   "numpy>=1.26.0",
+  "zstandard==0.25.0",
   # psutil dropped 2026-05-01: zero import sites in mnemos/ source
   # (was a leftover from an earlier health-check experiment).
   "authlib>=1.3.0",

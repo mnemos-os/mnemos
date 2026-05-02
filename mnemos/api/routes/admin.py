@@ -8,8 +8,15 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as _lc
-from mnemos.api.dependencies import UserContext, require_root
+from mnemos.api.dependencies import UserContext, get_current_user, require_root
 from mnemos.api.persistence_helpers import require_postgres_pool_or_503
+from mnemos.core.config import get_settings
+from mnemos.core.security import is_root
+from mnemos.domain.persephone.runner import (
+    archive_memory as _archive_memory,
+    restore_memory as _restore_memory,
+    sweep_for_archival as _sweep_for_archival,
+)
 from mnemos.domain.models import (
     ApiKeyCreateRequest,
     ApiKeyResponse,
@@ -334,6 +341,20 @@ _VALID_REASONS = {"on_write", "manual", "scheduled", "reprocess"}
 _VALID_PROFILES = {"balanced", "quality_first", "speed_first", "custom"}
 
 
+async def _invalidate_memory_read_caches() -> None:
+    if not _lc._cache:
+        return
+    try:
+        await _lc._cache.delete("stats:global:v2")
+        try:
+            async for key in _lc._cache.scan_iter(match="mnemos:search:*", count=500):
+                await _lc._cache.delete(key)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
 class CompressionEnqueueRequest(BaseModel):
     memory_ids: List[str] = Field(
         ...,
@@ -359,6 +380,53 @@ class CompressionEnqueueResponse(BaseModel):
     enqueued: int
     skipped_unknown: int
     memory_ids: List[str]
+
+
+class PersephoneSweepRequest(BaseModel):
+    namespace: Optional[str] = Field(
+        default=None,
+        description="Namespace to sweep. Defaults to MNEMOS_PERSEPHONE_NAMESPACE.",
+    )
+    archive_after_days: Optional[int] = Field(
+        default=None,
+        ge=1,
+        description="Cold threshold in days. Defaults to MNEMOS_PERSEPHONE_ARCHIVE_AFTER_DAYS.",
+    )
+    batch_size: Optional[int] = Field(
+        default=None,
+        ge=1,
+        le=10000,
+        description="Maximum memories to archive in this sweep.",
+    )
+
+
+class PersephoneSweepResponse(BaseModel):
+    archived: int
+    namespace: str
+    archive_after_days: int
+    batch_size: int
+
+
+class PersephoneMemoryResponse(BaseModel):
+    memory_id: str
+    archived: bool
+    restored: bool = False
+
+
+class PersephoneStatusResponse(BaseModel):
+    enabled: bool
+    archived_count: int
+    last_run_at: Optional[str] = None
+    oldest_unrecalled: Optional[str] = None
+    namespace: Optional[str] = None
+
+
+def _require_persephone_enabled() -> None:
+    if not get_settings().persephone.enabled:
+        raise HTTPException(
+            status_code=409,
+            detail="PERSEPHONE archival is disabled; set MNEMOS_PERSEPHONE_ENABLED=true",
+        )
 
 
 @router.post("/compression/enqueue", response_model=CompressionEnqueueResponse, status_code=201)
@@ -521,6 +589,146 @@ async def compression_enqueue_all(
             n = 0
 
     return CompressionEnqueueAllResponse(enqueued=n, reason=request.reason)
+
+
+# ── PERSEPHONE archival admin ────────────────────────────────────────────────
+
+@router.post("/persephone/sweep", response_model=PersephoneSweepResponse)
+async def persephone_sweep(
+    request: PersephoneSweepRequest,
+    _: UserContext = Depends(require_root),
+):
+    """Run one namespace-scoped PERSEPHONE archival sweep."""
+    require_postgres_pool_or_503(route_label="POST /admin/persephone/sweep")
+    _require_persephone_enabled()
+    settings = get_settings().persephone
+    namespace = request.namespace or settings.namespace
+    archive_after_days = request.archive_after_days or settings.archive_after_days
+    batch_size = request.batch_size or settings.batch_size
+
+    archived = await _sweep_for_archival(
+        _lc._pool,
+        namespace=namespace,
+        archive_after_days=archive_after_days,
+        batch_size=batch_size,
+    )
+    if archived:
+        await _invalidate_memory_read_caches()
+    return PersephoneSweepResponse(
+        archived=archived,
+        namespace=namespace,
+        archive_after_days=archive_after_days,
+        batch_size=batch_size,
+    )
+
+
+@router.post("/persephone/archive/{memory_id}", response_model=PersephoneMemoryResponse)
+async def persephone_archive_memory(
+    memory_id: str,
+    user: UserContext = Depends(require_root),
+):
+    """Archive a specific memory. Root-only operator override."""
+    require_postgres_pool_or_503(route_label="POST /admin/persephone/archive/{memory_id}")
+    _require_persephone_enabled()
+    try:
+        async with _lc.get_pool_manager().acquire() as conn:
+            await _archive_memory(conn, memory_id, user.user_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    await _invalidate_memory_read_caches()
+    return PersephoneMemoryResponse(memory_id=memory_id, archived=True)
+
+
+@router.post("/persephone/restore/{memory_id}", response_model=PersephoneMemoryResponse)
+async def persephone_restore_memory(
+    memory_id: str,
+    user: UserContext = Depends(get_current_user),
+):
+    """Restore an archived memory. Allowed for root or the memory owner."""
+    require_postgres_pool_or_503(route_label="POST /admin/persephone/restore/{memory_id}")
+    async with _lc.get_pool_manager().acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT id, owner_id, namespace, archived_at
+              FROM memories
+             WHERE id = $1
+               AND deleted_at IS NULL
+            """,
+            memory_id,
+        )
+        if row is None:
+            raise HTTPException(status_code=404, detail="Memory not found")
+        if row["archived_at"] is None:
+            raise HTTPException(status_code=409, detail="Memory is not archived")
+        if not (is_root(user) or row["owner_id"] == user.user_id):
+            raise HTTPException(
+                status_code=403,
+                detail="restore requires root or memory owner",
+            )
+        try:
+            await _restore_memory(conn, memory_id, user.user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+    await _invalidate_memory_read_caches()
+    return PersephoneMemoryResponse(
+        memory_id=memory_id,
+        archived=False,
+        restored=True,
+    )
+
+
+@router.get("/persephone/status", response_model=PersephoneStatusResponse)
+async def persephone_status(
+    _: UserContext = Depends(require_root),
+    namespace: Optional[str] = None,
+):
+    """Return PERSEPHONE archive totals and cold-set age signal."""
+    require_postgres_pool_or_503(route_label="GET /admin/persephone/status")
+    clauses: list[str] = []
+    args: list = []
+    if namespace is not None:
+        args.append(namespace)
+        clauses.append(f"m.namespace = ${len(args)}")
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+
+    oldest_clauses = [
+        "deleted_at IS NULL",
+        "archived_at IS NULL",
+        "consolidated_into IS NULL",
+    ]
+    oldest_args: list = []
+    if namespace is not None:
+        oldest_args.append(namespace)
+        oldest_clauses.append(f"namespace = ${len(oldest_args)}")
+
+    async with _lc.get_pool_manager().acquire() as conn:
+        archive_row = await conn.fetchrow(
+            f"""
+            SELECT COUNT(*) AS archived_count,
+                   MAX(a.archived_at) AS last_run_at
+              FROM memory_archive a
+              JOIN memories m ON m.id = a.id
+              {where}
+            """,
+            *args,
+        )
+        oldest_unrecalled = await conn.fetchval(
+            f"""
+            SELECT MIN(COALESCE(last_recalled_at, created))
+              FROM memories
+             WHERE {' AND '.join(oldest_clauses)}
+            """,
+            *oldest_args,
+        )
+
+    last_run_at = archive_row["last_run_at"] if archive_row else None
+    return PersephoneStatusResponse(
+        enabled=get_settings().persephone.enabled,
+        archived_count=int(archive_row["archived_count"] or 0) if archive_row else 0,
+        last_run_at=last_run_at.isoformat() if last_run_at else None,
+        oldest_unrecalled=oldest_unrecalled.isoformat() if oldest_unrecalled else None,
+        namespace=namespace,
+    )
 
 
 # ── GRAEAE provider manifest ──────────────────────────────────────────────────

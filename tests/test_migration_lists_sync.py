@@ -60,6 +60,7 @@ EXPECTED_MIGRATIONS = [
     "migrations_v4_2_compression_dag.sql",
     "migrations_v4_2_morpheus_consolidate.sql",
     "migrations_v4_2_morpheus_extract.sql",
+    "migrations_v4_2_persephone.sql",
 ]
 
 

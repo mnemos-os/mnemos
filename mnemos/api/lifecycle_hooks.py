@@ -80,6 +80,12 @@ def _deletion_request_worker(pool: Any):
     return deletion_request_worker_loop(pool)
 
 
+def _persephone_archival_worker(pool: Any):
+    from mnemos.workers.persephone_archival_worker import persephone_archival_worker_loop
+
+    return persephone_archival_worker_loop(pool)
+
+
 async def _federation_nats_post_db_hook(pool: Any, settings: Any) -> None:
     """Launch one federation NATS consumer per configured peer.
 
@@ -151,6 +157,7 @@ def register_lifespan_hooks() -> None:
         _deletion_request_worker,
         honor_worker_enabled=True,
     )
+    lifecycle.register_lifespan_worker("persephone archival worker", _persephone_archival_worker)
     lifecycle.register_lifespan_worker("webhook retry repair worker", _webhook_repair_worker)
     lifecycle.register_lifespan_worker("webhook delivery recovery worker", _webhook_delivery_worker)
     lifecycle.register_lifespan_worker("federation sync worker", _federation_sync_worker)

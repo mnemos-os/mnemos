@@ -45,6 +45,7 @@ def test_top_level_help_lists_all_subcommands() -> None:
         ["worker", "--help"],
         ["worker", "distillation", "--help"],
         ["worker", "deletion-requests", "--help"],
+        ["worker", "persephone", "--help"],
         ["install", "--help"],
         ["export", "--help"],
         ["import", "--help"],

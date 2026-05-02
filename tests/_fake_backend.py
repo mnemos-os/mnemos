@@ -44,7 +44,7 @@ class _FakeMemoryRepo:
 
     async def list_memories(
         self, tx, *, visibility, category=None, subcategory=None,
-        limit=20, offset=0,
+        limit=20, offset=0, include_archived=False,
     ):
         self.calls.append((
             "list_memories",
@@ -54,14 +54,19 @@ class _FakeMemoryRepo:
                 "subcategory": subcategory,
                 "limit": limit,
                 "offset": offset,
+                "include_archived": include_archived,
             },
         ))
         return self._resolve("list_memories", ([], 0))
 
-    async def get_memory(self, tx, memory_id, *, visibility):
+    async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
         self.calls.append((
             "get_memory",
-            {"memory_id": memory_id, "visibility": visibility},
+            {
+                "memory_id": memory_id,
+                "visibility": visibility,
+                "include_archived": include_archived,
+            },
         ))
         return self._resolve("get_memory", None)
 
@@ -97,6 +102,7 @@ class _FakeMemoryRepo:
         self, tx, *, embedding, limit, visibility,
         category=None, subcategory=None,
         source_provider=None, source_model=None, source_agent=None,
+        include_archived=False,
     ):
         self.calls.append((
             "semantic_search",
@@ -109,6 +115,7 @@ class _FakeMemoryRepo:
                 "source_provider": source_provider,
                 "source_model": source_model,
                 "source_agent": source_agent,
+                "include_archived": include_archived,
             },
         ))
         return self._resolve("semantic_search", [])
@@ -117,6 +124,7 @@ class _FakeMemoryRepo:
         self, tx, *, query, limit, visibility,
         category=None, subcategory=None,
         source_provider=None, source_model=None, source_agent=None,
+        include_archived=False,
     ):
         self.calls.append((
             "fts_search",
@@ -129,6 +137,7 @@ class _FakeMemoryRepo:
                 "source_provider": source_provider,
                 "source_model": source_model,
                 "source_agent": source_agent,
+                "include_archived": include_archived,
             },
         ))
         return self._resolve("fts_search", [])
@@ -311,11 +320,20 @@ class _PoolBackedMemoryRepo:
         group_readable = (mode // 10) % 10 >= 4 and row.get("group_id") in set(visibility.group_ids)
         return world_readable or group_readable
 
-    def _rows(self, visibility, *, category=None, subcategory=None) -> list[dict[str, Any]]:
+    def _rows(
+        self,
+        visibility,
+        *,
+        category=None,
+        subcategory=None,
+        include_archived=False,
+    ) -> list[dict[str, Any]]:
         rows = [
             row for row in self._pool.state["memories"].values()
             if self._visible(row, visibility)
         ]
+        if not include_archived:
+            rows = [row for row in rows if row.get("archived_at") is None]
         if category is not None:
             rows = [row for row in rows if row.get("category") == category]
         if subcategory is not None:
@@ -324,24 +342,37 @@ class _PoolBackedMemoryRepo:
 
     async def list_memories(
         self, tx, *, visibility, category=None, subcategory=None, limit=20, offset=0,
+        include_archived=False,
     ):
-        rows = self._rows(visibility, category=category, subcategory=subcategory)
+        rows = self._rows(
+            visibility,
+            category=category,
+            subcategory=subcategory,
+            include_archived=include_archived,
+        )
         return rows[offset:offset + limit], len(rows)
 
-    async def get_memory(self, tx, memory_id, *, visibility):
+    async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
         row = self._pool.state["memories"].get(memory_id)
         if row is None or not self._visible(row, visibility):
+            return None
+        if row.get("archived_at") is not None and not include_archived:
             return None
         return row
 
     async def fts_search(
         self, tx, *, query, limit, visibility,
         category=None, subcategory=None, source_provider=None,
-        source_model=None, source_agent=None,
+        source_model=None, source_agent=None, include_archived=False,
     ):
         needle = query.lower()
         rows = [
-            row for row in self._rows(visibility, category=category, subcategory=subcategory)
+            row for row in self._rows(
+                visibility,
+                category=category,
+                subcategory=subcategory,
+                include_archived=include_archived,
+            )
             if needle in row.get("content", "").lower()
         ]
         return rows[:limit]
@@ -349,9 +380,14 @@ class _PoolBackedMemoryRepo:
     async def semantic_search(
         self, tx, *, embedding, limit, visibility,
         category=None, subcategory=None, source_provider=None,
-        source_model=None, source_agent=None,
+        source_model=None, source_agent=None, include_archived=False,
     ):
-        rows = self._rows(visibility, category=category, subcategory=subcategory)
+        rows = self._rows(
+            visibility,
+            category=category,
+            subcategory=subcategory,
+            include_archived=include_archived,
+        )
         return [{**row, "similarity": 0.99} for row in rows[:limit]]
 
     async def insert_memory(self, tx, **kwargs):

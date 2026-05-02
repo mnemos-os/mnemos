@@ -38,6 +38,7 @@ anyio>=4.4.0
 
 # Utilities
 numpy>=1.26.0
+zstandard==0.25.0
 # psutil dropped 2026-05-01 (zero imports in mnemos/ source)
 typer>=0.9.0
 

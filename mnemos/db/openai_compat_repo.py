@@ -37,6 +37,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                         ON v.memory_id = m.id
                     WHERE
                         m.deleted_at IS NULL
+                        AND m.archived_at IS NULL
                         AND (
                             to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)
                             OR m.category IN ('solutions', 'patterns', 'decisions', 'infrastructure')
@@ -67,6 +68,7 @@ async def fetch_memory_context(query: str, user: Any, limit: int = 5) -> List[Di
                     LEFT JOIN memory_compressed_variants v
                         ON v.memory_id = m.id
                     WHERE m.deleted_at IS NULL
+                      AND m.archived_at IS NULL
                       AND {vis_clause}
                       AND m.namespace = {ns_ph}
                       AND (

@@ -94,6 +94,10 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
             compressed = row["compressed_content"]
         except (KeyError, IndexError):
             compressed = None
+    try:
+        archived_at = row["archived_at"]
+    except (KeyError, IndexError):
+        archived_at = None
     return MemoryItem(
         id=row["id"],
         content=row["content"],
@@ -116,6 +120,12 @@ def _memory_item_from_row(row, include_compressed: bool = False) -> MemoryItem:
         source_provider=row["source_provider"],
         source_session=row["source_session"],
         source_agent=row["source_agent"],
+        archived_at=(
+            archived_at.isoformat()
+            if archived_at and hasattr(archived_at, "isoformat")
+            else archived_at
+        ),
+        archived=archived_at is not None,
     )
 
 
@@ -515,7 +525,8 @@ async def federation_feed(
         #         < octet_length(to_json(m.content)::text)
         #           + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0)
         use_variant = (
-            "v.compressed_content IS NOT NULL "
+            "m.archived_at IS NULL "
+            "AND v.compressed_content IS NOT NULL "
             "AND (2 * octet_length(to_json(v.compressed_content)::text)) "
             "  < (octet_length(to_json(m.content)::text) "
             "     + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0))"
@@ -548,6 +559,7 @@ async def federation_feed(
                    m.owner_id, m.namespace,
                    m.permission_mode, m.source_model, m.source_provider,
                    m.source_session, m.source_agent, m.created, m.updated,
+                   m.archived_at,
                    {compressed_select.rstrip(',')}
             FROM memories m
             {join_compressed}
@@ -604,7 +616,7 @@ async def federation_memory(
             SELECT id, content, category, subcategory, metadata, quality_rating,
                    verbatim_content, owner_id, namespace, permission_mode,
                    source_model, source_provider, source_session, source_agent,
-                   created, updated
+                   created, updated, archived_at
             FROM memories m
             WHERE {where_clause}
             """,

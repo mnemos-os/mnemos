@@ -328,6 +328,37 @@ class _MorpheusSettings(BaseSettings):
     extract_verifier: str = Field("openai", validation_alias="MNEMOS_MORPHEUS_EXTRACT_VERIFIER")
 
 
+class _PersephoneSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    enabled: bool = Field(False, validation_alias="MNEMOS_PERSEPHONE_ENABLED")
+    archive_after_days: int = Field(180, validation_alias="MNEMOS_PERSEPHONE_ARCHIVE_AFTER_DAYS")
+    batch_size: int = Field(100, validation_alias="MNEMOS_PERSEPHONE_BATCH_SIZE")
+    check_interval_seconds: float = Field(
+        3600.0,
+        validation_alias="MNEMOS_PERSEPHONE_CHECK_INTERVAL_SECONDS",
+    )
+    namespace: str = Field("default", validation_alias="MNEMOS_PERSEPHONE_NAMESPACE")
+
+    @field_validator("archive_after_days", "batch_size", mode="before")
+    @classmethod
+    def _positive_int(cls, raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return value if value >= 1 else 1
+
+    @field_validator("check_interval_seconds", mode="before")
+    @classmethod
+    def _positive_interval(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 3600.0
+        return value if value > 0 else 3600.0
+
+
 class _FederationNatsPeerSettings(BaseModel):
     name: str
     nats_url: str
@@ -438,6 +469,7 @@ class Settings(BaseSettings):
     observability: _ObservabilitySettings
     compression: _CompressionSettings
     morpheus: _MorpheusSettings
+    persephone: _PersephoneSettings
     federation: _FederationSettings
     oauth: _OAuthSettings
     auth: _AuthSettings
@@ -506,6 +538,7 @@ def _build_settings() -> Settings:
         "observability": _ObservabilitySettings(**_toml_section(toml_config, "observability")),
         "compression": _CompressionSettings(**_toml_section(toml_config, "compression")),
         "morpheus": _MorpheusSettings(**_toml_section(toml_config, "morpheus")),
+        "persephone": _PersephoneSettings(**_toml_section(toml_config, "persephone")),
         "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
         "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
         "auth": _AuthSettings(**_toml_section(toml_config, "auth")),
@@ -526,6 +559,7 @@ def _build_settings() -> Settings:
         observability=groups["observability"],
         compression=groups["compression"],
         morpheus=groups["morpheus"],
+        persephone=groups["persephone"],
         federation=groups["federation"],
         oauth=groups["oauth"],
         auth=groups["auth"],

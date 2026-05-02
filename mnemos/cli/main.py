@@ -441,6 +441,12 @@ def worker_deletion_requests(
     _raise_for_int_result(asyncio.run(deletion_request_worker.main(phase=phase.value)))
 
 
+@worker_app.command("persephone")
+def worker_persephone() -> None:
+    """Run the PERSEPHONE archival worker."""
+    _run_async_module_main("mnemos.workers.persephone_archival_worker")
+
+
 @app.command()
 def install(
     agent: bool = typer.Option(False, "--agent", help="LLM-guided installation."),

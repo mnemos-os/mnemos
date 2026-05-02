@@ -8,7 +8,7 @@ from typing import Optional
 
 import asyncpg
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import PlainTextResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.content_negotiation import negotiate_narrate_format
@@ -25,6 +25,7 @@ from mnemos.core.lifecycle import (
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.domain.persephone.runner import restore_memory as _restore_archived_memory
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
@@ -146,6 +147,27 @@ async def _invalidate_caches_after_mutation() -> None:
         pass
 
 
+def _row_archived_at(row) -> object | None:
+    try:
+        return row.get("archived_at")
+    except AttributeError:
+        try:
+            return row["archived_at"]
+        except (KeyError, IndexError, TypeError):
+            return None
+
+
+def _is_memory_owner(row, user: UserContext) -> bool:
+    try:
+        owner_id = row.get("owner_id")
+    except AttributeError:
+        try:
+            owner_id = row["owner_id"]
+        except (KeyError, IndexError, TypeError):
+            owner_id = None
+    return owner_id == user.user_id
+
+
 def _read_visibility_predicate(
     user: UserContext, start_param_idx: int
 ) -> tuple[str, list]:
@@ -246,7 +268,9 @@ async def _bump_recall_counters(memory_ids: list) -> None:
                 "UPDATE memories "
                 "SET recall_count = recall_count + 1, "
                 "    last_recalled_at = now() "
-                "WHERE id = ANY($1::text[]) AND deleted_at IS NULL",
+                "WHERE id = ANY($1::text[]) "
+                "AND deleted_at IS NULL "
+                "AND archived_at IS NULL",
                 list(memory_ids),
             )
     except Exception as e:
@@ -258,6 +282,7 @@ async def list_memories(
     category: Optional[str] = None,
     subcategory: Optional[str] = None,
     namespace: Optional[str] = None,
+    include_archived: bool = False,
     limit: int = Query(20, ge=1, le=500),
     offset: int = Query(0, ge=0),
     user: UserContext = Depends(get_current_user),
@@ -272,6 +297,11 @@ async def list_memories(
             status_code=403,
             detail="cross-namespace list requires root",
         )
+    if include_archived and not root:
+        raise HTTPException(
+            status_code=403,
+            detail="include_archived requires root",
+        )
     effective_namespace = namespace if root else user.namespace
     visibility = VisibilityFilter.for_read(user, namespace=effective_namespace)
 
@@ -284,6 +314,7 @@ async def list_memories(
             subcategory=subcategory,
             limit=limit,
             offset=offset,
+            include_archived=include_archived,
         )
     return MemoryListResponse(
         count=total, memories=[_row_to_memory(r) for r in rows],
@@ -294,6 +325,8 @@ async def list_memories(
 async def get_memory(
     memory_id: str,
     request: Request,
+    include_archived: bool = False,
+    restore: bool = False,
     user: UserContext = Depends(get_current_user),
 ):
     """Fetch a memory by id.
@@ -331,10 +364,40 @@ async def get_memory(
     async with backend.transactional() as tx:
         await _maybe_set_pg_rls(tx, user)
         row = await backend.memories.get_memory(
-            tx, memory_id, visibility=visibility,
+            tx, memory_id, visibility=visibility, include_archived=True,
         )
         if not row:
             raise HTTPException(status_code=404, detail="Memory not found")
+        archived_at = _row_archived_at(row)
+        if archived_at is not None:
+            if restore:
+                if not (is_root(user) or _is_memory_owner(row, user)):
+                    raise HTTPException(
+                        status_code=403,
+                        detail="restore requires root or memory owner",
+                    )
+            elif include_archived:
+                from fastapi.encoders import jsonable_encoder
+
+                return JSONResponse(
+                    content=jsonable_encoder(_row_to_memory(row, include_compressed=True)),
+                    headers={"Vary": "Accept"},
+                )
+            else:
+                archived_at_text = (
+                    archived_at.isoformat()
+                    if hasattr(archived_at, "isoformat")
+                    else str(archived_at)
+                )
+                return JSONResponse(
+                    status_code=410,
+                    content={
+                        "archived": True,
+                        "archived_at": archived_at_text,
+                        "restore_endpoint": f"/admin/persephone/restore/{memory_id}",
+                    },
+                    headers={"Vary": "Accept"},
+                )
         # Variant lookup must run inside the same transaction as the
         # memory fetch so a SQLite backend (single shared connection)
         # sees a consistent view, and so the visibility-gated row and
@@ -346,6 +409,31 @@ async def get_memory(
             body = await build_narration_body(
                 backend, tx, row, narrate_format,
             )
+
+    if restore:
+        require_postgres_pool_or_503(route_label="GET /v1/memories/{memory_id}?restore=true")
+        try:
+            async with _lc.get_pool_manager().acquire() as conn:
+                await _restore_archived_memory(conn, memory_id, user.user_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        await _invalidate_caches_after_mutation()
+        async with backend.transactional() as tx:
+            await _maybe_set_pg_rls(tx, user)
+            row = await backend.memories.get_memory(
+                tx,
+                memory_id,
+                visibility=visibility,
+                include_archived=False,
+            )
+            if not row:
+                raise HTTPException(status_code=404, detail="Memory not found after restore")
+            if narrate_format is not None:
+                from mnemos.api.routes.narrate import build_narration_body
+
+                body = await build_narration_body(
+                    backend, tx, row, narrate_format,
+                )
 
     # Vary: Accept on every successful representation. Unifies cache
     # behaviour even when the negotiated branch was not taken (a
@@ -367,8 +455,6 @@ async def get_memory(
         )
 
     from fastapi.encoders import jsonable_encoder
-    from fastapi.responses import JSONResponse
-
     memory_item = _row_to_memory(row, include_compressed=True)
     return JSONResponse(
         content=jsonable_encoder(memory_item),
@@ -562,6 +648,11 @@ async def search_memories(
         search_owner_id = None  # no owner filter for root
         search_namespace = request.namespace  # honor caller's request
     else:
+        if request.include_archived:
+            raise HTTPException(
+                status_code=403,
+                detail="include_archived requires root",
+            )
         search_owner_id = user.user_id
         # If the caller asked for a different namespace than theirs,
         # reject explicitly — don't silently scope and hide rows.
@@ -597,6 +688,7 @@ async def search_memories(
         request.source_agent,
         search_namespace, search_owner_id,
         sorted(user.group_ids),  # list, not pre-serialized string
+        request.include_archived,
     )
 
     if _lc._cache and not request.include_compressed:
@@ -631,6 +723,7 @@ async def search_memories(
                     source_provider=request.source_provider,
                     source_model=request.source_model,
                     source_agent=request.source_agent,
+                    include_archived=bool(request.include_archived),
                 )
             else:
                 logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
@@ -644,6 +737,7 @@ async def search_memories(
                     source_provider=request.source_provider,
                     source_model=request.source_model,
                     source_agent=request.source_agent,
+                    include_archived=bool(request.include_archived),
                 )
         else:
             rows = await backend.memories.fts_search(
@@ -656,6 +750,7 @@ async def search_memories(
                 source_provider=request.source_provider,
                 source_model=request.source_model,
                 source_agent=request.source_agent,
+                include_archived=bool(request.include_archived),
             )
 
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
@@ -1075,6 +1170,7 @@ async def rehydrate_memories(
     sql_conditions = [
         "to_tsvector('english', m.content) @@ plainto_tsquery('english', $1)",
         "m.deleted_at IS NULL",
+        "m.archived_at IS NULL",
     ]
     sql_params: list = [clean_query, request.limit]
     idx = 3

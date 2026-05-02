@@ -187,6 +187,7 @@ class MemoryRepository(ABC):
         subcategory: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> tuple[list[Row], int]:
         """List memories under the given visibility filter, ordered
         ``created DESC``.
@@ -205,6 +206,7 @@ class MemoryRepository(ABC):
         memory_id: str,
         *,
         visibility: VisibilityFilter,
+        include_archived: bool = False,
     ) -> Row | None:
         """Fetch a memory by id, applying the visibility filter.
 
@@ -263,6 +265,7 @@ class MemoryRepository(ABC):
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
+        include_archived: bool = False,
     ) -> list[Row]:
         """Vector search over memory embeddings, applying visibility.
 
@@ -290,6 +293,7 @@ class MemoryRepository(ABC):
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
+        include_archived: bool = False,
     ) -> list[Row]:
         """Full-text search over memory content, applying visibility."""
         ...

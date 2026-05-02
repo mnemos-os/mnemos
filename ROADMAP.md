@@ -160,7 +160,8 @@ Remaining after v3.5.0:
 
 ### v3.6 — PERSEPHONE + MORPHEUS mutation paths
 
-- 🔵 **PERSEPHONE — archival subsystem.** Cold-set rotation: memories not recalled in M days move to compressed archival storage with a stub pointer in the live table. Recall-tracking columns from v3.3 feed the eligibility decision. Restore on demand. Federation-aware (peers see archive marker, can request restore).
+- ✅ **PERSEPHONE — archival subsystem.** Cold-set rotation now moves unrecalled memories into zstd-backed `memory_archive` storage with live stub pointers, explicit restore, root-gated sweeps, and federation-visible archive markers.
+  - Constraint: archived memories are not auto-restored on read in this slice; callers must use `POST /admin/persephone/restore/{memory_id}` or `GET /v1/memories/{id}?restore=true` with root/owner authority.
 - ✅ MORPHEUS slice 3 — CONSOLIDATE phase. Merge near-duplicate clusters into a canonical with `permission_mode=400` read-only pointers on originals (`consolidated_into:<canonical_id>`). Soft-only; never hard-delete user data. Shipped via `db/migrations_v4_2_morpheus_consolidate.sql`.
 - ✅ MORPHEUS slice 4 — EXTRACT phase. LLM mining of latent KG triples from `verbatim_content` of prose memories not already triplified. Two-model split: fast/quantized for extraction, strong reasoner for synthesis (already the v3.3 slice 2 pattern).
 

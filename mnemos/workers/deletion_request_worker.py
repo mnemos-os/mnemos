@@ -318,6 +318,22 @@ _HARD_DELETE_SQL: tuple[tuple[str, str, str], ...] = (
         """,
     ),
     (
+        "memory_archive",
+        "memory_archive",
+        """
+        WITH target_memories AS (
+            SELECT id
+              FROM memories
+             WHERE owner_id = $1
+               AND ($2::text IS NULL OR namespace = $2::text)
+               AND deleted_at IS NOT NULL
+        )
+        DELETE FROM memory_archive ma
+         USING target_memories tm
+         WHERE ma.id = tm.id
+        """,
+    ),
+    (
         "memories",
         "memories",
         """

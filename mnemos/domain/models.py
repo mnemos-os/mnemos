@@ -79,6 +79,8 @@ class MemoryItem(BaseModel):
     source_provider: Optional[str] = None
     source_session: Optional[str] = None
     source_agent: Optional[str] = None
+    archived_at: Optional[str] = None
+    archived: bool = False
 
 
 def _isoformat_value(value: Any) -> str | None:
@@ -117,6 +119,8 @@ def row_to_memory(row, include_compressed: bool = False) -> MemoryItem:
         source_provider=row.get("source_provider"),
         source_session=row.get("source_session"),
         source_agent=row.get("source_agent"),
+        archived_at=_isoformat_value(row.get("archived_at")),
+        archived=row.get("archived_at") is not None,
     )
 
 
@@ -139,6 +143,7 @@ class MemorySearchRequest(BaseModel):
     source_model: Optional[str] = None
     source_agent: Optional[str] = None
     namespace: Optional[str] = None
+    include_archived: Optional[bool] = False
 
 
 class MemoryCreateRequest(BaseModel):

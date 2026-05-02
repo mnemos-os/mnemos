@@ -737,7 +737,8 @@ _MEMORY_COLS = (
     "id, content, category, subcategory, created, updated, "
     "metadata, quality_rating, compressed_content, verbatim_content, "
     "owner_id, group_id, namespace, permission_mode, "
-    "source_model, source_provider, source_session, source_agent"
+    "source_model, source_provider, source_session, source_agent, "
+    "archived_at"
 )
 
 
@@ -811,7 +812,7 @@ async def _vector_search(conn, embedding: list, limit: int,
 
     # Dynamic WHERE builder: $1=vec_str, filter params at $2+, limit always last
     params: list = [vec_str]
-    conditions: list = ["embedding IS NOT NULL", "deleted_at IS NULL"]
+    conditions: list = ["embedding IS NOT NULL", "deleted_at IS NULL", "archived_at IS NULL"]
     for col, val in [("category", category), ("subcategory", subcategory),
                      ("source_provider", source_provider), ("source_model", source_model),
                      ("source_agent", source_agent), ("namespace", namespace)]:
@@ -889,6 +890,7 @@ async def _fts_fetch(conn, query: str, limit: int,
     fts_conditions = [
         "to_tsvector('english', content) @@ plainto_tsquery('english', $1)",
         "deleted_at IS NULL",
+        "archived_at IS NULL",
     ] + fts_conditions
     where = " AND ".join(fts_conditions)
     sql = (f"SELECT {select_cols}, {rank_col} FROM memories "
@@ -900,7 +902,7 @@ async def _fts_fetch(conn, query: str, limit: int,
         like_q = f"%{query}%"
         # ILIKE path: $1=like_q, $2=limit; filter params at $3+
         ilike_conditions, ilike_params = _build_filters([like_q, limit])
-        ilike_conditions = ["content ILIKE $1", "deleted_at IS NULL"] + ilike_conditions
+        ilike_conditions = ["content ILIKE $1", "deleted_at IS NULL", "archived_at IS NULL"] + ilike_conditions
         ilike_where = " AND ".join(ilike_conditions)
         ilike_sql = (f"SELECT {select_cols} FROM memories "
                      f"WHERE {ilike_where} ORDER BY created DESC LIMIT $2")

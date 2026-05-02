@@ -422,13 +422,14 @@ def test_hard_delete_sql_order_keeps_fk_children_before_parents():
         "session_memory_injections",
         "graeae_audit_log",
     ]
-    assert labels[5:8] == [
+    assert labels[5:9] == [
+        "memory_archive",
         "memories",
         "sessions",
         "graeae_consultations",
     ]
-    assert labels[8:] == ["kg_triples", "journal", "entities", "state"]
-    assert len(labels) == 12
+    assert labels[9:] == ["kg_triples", "journal", "entities", "state"]
+    assert len(labels) == 13
 
 
 @pytest.mark.asyncio

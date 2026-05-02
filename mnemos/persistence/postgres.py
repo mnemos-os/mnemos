@@ -272,9 +272,12 @@ class PostgresMemoryRepository(MemoryRepository):
         subcategory: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> tuple[list[Row], int]:
         conn = _postgres_tx(tx).conn
         where_parts: list[str] = ["deleted_at IS NULL"]
+        if not include_archived:
+            where_parts.append("archived_at IS NULL")
         params: list[Any] = []
         if category is not None:
             params.append(category)
@@ -304,11 +307,13 @@ class PostgresMemoryRepository(MemoryRepository):
         memory_id: str,
         *,
         visibility: VisibilityFilter,
+        include_archived: bool = False,
     ) -> Row | None:
         conn = _postgres_tx(tx).conn
+        archived_clause = "" if include_archived else " AND archived_at IS NULL"
         if visibility.scope == VisibilityScope.ROOT_BYPASS and visibility.namespace is None:
             return await conn.fetchrow(
-                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1 AND deleted_at IS NULL",
+                f"SELECT {_MEMORY_COLS} FROM memories WHERE id=$1 AND deleted_at IS NULL{archived_clause}",
                 memory_id,
             )
         vis_clause, vis_params, _ = _render_postgres_visibility(
@@ -316,7 +321,7 @@ class PostgresMemoryRepository(MemoryRepository):
         )
         sql = (
             f"SELECT {_MEMORY_COLS} FROM memories "
-            f"WHERE id=$1 AND deleted_at IS NULL AND {vis_clause}"
+            f"WHERE id=$1 AND deleted_at IS NULL{archived_clause} AND {vis_clause}"
         )
         return await conn.fetchrow(sql, memory_id, *vis_params)
 
@@ -391,6 +396,7 @@ class PostgresMemoryRepository(MemoryRepository):
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
+        include_archived: bool = False,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
         # $1 is the embedding vector, used in both SELECT (for the
@@ -400,6 +406,8 @@ class PostgresMemoryRepository(MemoryRepository):
         vec_str = "[" + ",".join(str(float(x)) for x in embedding) + "]"
         params: list[Any] = [vec_str]
         conditions: list[str] = ["embedding IS NOT NULL", "deleted_at IS NULL"]
+        if not include_archived:
+            conditions.append("archived_at IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -437,6 +445,7 @@ class PostgresMemoryRepository(MemoryRepository):
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
+        include_archived: bool = False,
     ) -> list[Row]:
         # plainto_tsquery treats user input as plain text — tsquery
         # operators like |, !, & are not interpreted. Prevents tsquery
@@ -449,6 +458,8 @@ class PostgresMemoryRepository(MemoryRepository):
             "to_tsvector('english', content) @@ plainto_tsquery('english', $1)",
             "deleted_at IS NULL",
         ]
+        if not include_archived:
+            conditions.append("archived_at IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -481,6 +492,8 @@ class PostgresMemoryRepository(MemoryRepository):
             like_q = f"%{query}%"
             ilike_params: list[Any] = [like_q, limit]
             ilike_conditions: list[str] = ["content ILIKE $1", "deleted_at IS NULL"]
+            if not include_archived:
+                ilike_conditions.append("archived_at IS NULL")
             for col, val in (
                 ("category", category),
                 ("subcategory", subcategory),

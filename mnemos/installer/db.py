@@ -316,6 +316,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v4_2_compression_dag.sql",
         repo_path / "db" / "migrations_v4_2_morpheus_consolidate.sql",
         repo_path / "db" / "migrations_v4_2_morpheus_extract.sql",
+        repo_path / "db" / "migrations_v4_2_persephone.sql",
     ]
 
     print("[db] Running migrations...")

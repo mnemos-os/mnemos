@@ -92,6 +92,7 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v3_5_session_compression_legacy_drop.sql",
     "migrations_v3_5_sessions_consultations_namespace.sql",
     "migrations_v4_2_compression_candidates_reject_reason.sql",
+    "migrations_v4_2_persephone.sql",
 ]
 
 
@@ -788,9 +789,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
+        include_archived: bool = False,
     ) -> list[Row]:
         embedding_json = json.dumps([float(value) for value in embedding])
         conditions: list[str] = ["me.embedding IS NOT NULL"]
+        if not include_archived:
+            conditions.append("m.archived_at IS NULL")
         params: list[Any] = [embedding_json]
         for col, val in (
             ("category", category),
@@ -833,6 +837,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_provider: str | None = None,
         source_model: str | None = None,
         source_agent: str | None = None,
+        include_archived: bool = False,
     ) -> list[Row]:
         conn = self._conn(tx)
         # FTS path: $1=query (MATCH), filter+visibility params in the
@@ -841,6 +846,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         # straight to row_to_memory.
         params: list[Any] = [query]
         conditions: list[str] = []
+        if not include_archived:
+            conditions.append("m.archived_at IS NULL")
         for col, val in (
             ("category", category),
             ("subcategory", subcategory),
@@ -873,6 +880,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             # predicate shape, content LIKE instead of MATCH.
             like_params: list[Any] = [f"%{query}%"]
             like_conditions: list[str] = ["lower(m.content) LIKE lower(?)"]
+            if not include_archived:
+                like_conditions.append("m.archived_at IS NULL")
             for col, val in (
                 ("category", category),
                 ("subcategory", subcategory),
@@ -908,9 +917,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         subcategory: str | None = None,
         limit: int = 20,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> tuple[list[Row], int]:
         conn = self._conn(tx)
         where_parts: list[str] = []
+        if not include_archived:
+            where_parts.append("archived_at IS NULL")
         params: list[Any] = []
         if category is not None:
             where_parts.append("category = ?")
@@ -939,17 +951,19 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         memory_id: str,
         *,
         visibility: VisibilityFilter,
+        include_archived: bool = False,
     ) -> Row | None:
         conn = self._conn(tx)
+        archived_clause = "" if include_archived else " AND archived_at IS NULL"
         if visibility.scope == VisibilityScope.ROOT_BYPASS and visibility.namespace is None:
             return await _fetch_one(
                 conn,
-                f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ?",
+                f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ?{archived_clause}",
                 (memory_id,),
             )
         params: list[Any] = [memory_id]
         vis_clause = _render_sqlite_visibility(visibility, params)
-        sql = f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ? AND {vis_clause}"
+        sql = f"SELECT {_sqlite_memory_cols()} FROM memories WHERE id = ?{archived_clause} AND {vis_clause}"
         return await _fetch_one(conn, sql, params)
 
     async def update_memory(
