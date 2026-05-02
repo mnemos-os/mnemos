@@ -26,6 +26,9 @@ state:
 - ✅ Seven import-linter contracts and Pydantic Settings singleton discipline.
 - ✅ GRAEAE modes: `auto`, `local`, `external`, `all`, `single`, `debate`,
   `majority`; unknown values now 422.
+- ✅ KRONOS v0.1 scaffold: CPU-only recall-pattern anomaly detection and
+  recall-load forecasting in `mnemos/domain/kronos`; Tesseract/CUDA integration
+  is deferred to KRONOS v0.2.
 
 Next planning focus:
 
@@ -203,6 +206,14 @@ Same code, same API, same KNOSSOS interop. Single-binary, embeddable, MemPalace-
 - ✅ SQLite migration chain mirrors the Postgres conceptual schema.
 - ✅ Single-binary build via PyInstaller ships MNEMOS + sqlite-vec + migrations in one executable.
 - ✅ Pitch: **"Run it as a single SQLite binary on your laptop, scale it to a Postgres+pgvector+GPU stack on a fleet, anywhere in between."**
+
+### Track 5c — KRONOS / Tesseract GPU stack
+
+- ✅ KRONOS v0.1 scaffold ships the CPU-only forward path for recall-pattern
+  anomalies, namespace drift, recall-load forecasts, and PERSEPHONE eligibility
+  forecasting. Breadcrumb: `mnemos/domain/kronos`.
+- 🔵 KRONOS v0.2 moves large-history EWMA computation onto the Tesseract/CUDA
+  path while preserving the v0.1 NumPy implementation as fallback.
 
 ### Track 6 — surface integrations (multi-vendor MCP + REST connectors) — v4.1
 

@@ -359,6 +359,33 @@ class _PersephoneSettings(BaseSettings):
         return value if value > 0 else 3600.0
 
 
+class KronosSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    enabled: bool = Field(False, validation_alias="MNEMOS_KRONOS_ENABLED")
+    default_sensitivity: float = Field(2.5, validation_alias="MNEMOS_KRONOS_SENSITIVITY")
+    default_lookback_hours: int = Field(168, validation_alias="MNEMOS_KRONOS_LOOKBACK_HOURS")
+    default_baseline_days: int = Field(30, validation_alias="MNEMOS_KRONOS_BASELINE_DAYS")
+
+    @field_validator("default_sensitivity", mode="before")
+    @classmethod
+    def _positive_sensitivity(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 2.5
+        return value if value > 0 else 2.5
+
+    @field_validator("default_lookback_hours", "default_baseline_days", mode="before")
+    @classmethod
+    def _positive_int(cls, raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return value if value >= 1 else 1
+
+
 class PantheonSettings(BaseSettings):
     model_config = _config_model_config()
 
@@ -525,6 +552,7 @@ class Settings(BaseSettings):
     compression: _CompressionSettings
     morpheus: _MorpheusSettings
     persephone: _PersephoneSettings
+    kronos: KronosSettings
     pantheon: PantheonSettings
     federation: _FederationSettings
     oauth: _OAuthSettings
@@ -595,6 +623,7 @@ def _build_settings() -> Settings:
         "compression": _CompressionSettings(**_toml_section(toml_config, "compression")),
         "morpheus": _MorpheusSettings(**_toml_section(toml_config, "morpheus")),
         "persephone": _PersephoneSettings(**_toml_section(toml_config, "persephone")),
+        "kronos": KronosSettings(**_toml_section(toml_config, "kronos")),
         "pantheon": PantheonSettings(**_toml_section(toml_config, "pantheon")),
         "federation": _FederationSettings(**_toml_section(toml_config, "federation")),
         "oauth": _OAuthSettings(**_toml_section(toml_config, "oauth")),
@@ -617,6 +646,7 @@ def _build_settings() -> Settings:
         compression=groups["compression"],
         morpheus=groups["morpheus"],
         persephone=groups["persephone"],
+        kronos=groups["kronos"],
         pantheon=groups["pantheon"],
         federation=groups["federation"],
         oauth=groups["oauth"],

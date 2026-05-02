@@ -46,6 +46,11 @@ from .kg import (
     tool_kg_timeline,
     tool_update_triple,
 )
+from .kronos import (
+    TOOLS as KRONOS_TOOLS,
+    tool_kronos_anomalies,
+    tool_kronos_forecast,
+)
 from .memory import (
     TOOLS as MEMORY_TOOLS,
     tool_bulk_create_memories,
@@ -67,7 +72,7 @@ from .models import (
 logger = logging.getLogger(__name__)
 
 _DOMAIN_TOOLS: dict[str, dict[str, Any]] = {}
-for _domain_tools in (MEMORY_TOOLS, KG_TOOLS, DAG_TOOLS, MODEL_TOOLS):
+for _domain_tools in (MEMORY_TOOLS, KG_TOOLS, DAG_TOOLS, MODEL_TOOLS, KRONOS_TOOLS):
     _DOMAIN_TOOLS.update(_domain_tools)
 
 _TOOL_ORDER = [
@@ -91,6 +96,8 @@ _TOOL_ORDER = [
     "recommend_model",
     "pantheon_list_models",
     "pantheon_route_explain",
+    "kronos_anomalies",
+    "kronos_forecast",
 ]
 
 _WRITE_TOOLS = {
@@ -347,6 +354,8 @@ __all__ = [
     "tool_kg_create_triple",
     "tool_kg_search",
     "tool_kg_timeline",
+    "tool_kronos_anomalies",
+    "tool_kronos_forecast",
     "tool_list_memories",
     "tool_log_memory",
     "tool_pantheon_list_models",

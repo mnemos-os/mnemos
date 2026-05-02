@@ -754,7 +754,7 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 | Track 5b: Persistence abstraction + SQLite | 8–10 | ✅ shipped in v4.0.0 |
 | Track 6: MCP consolidation (unified MNEMOS + IRIS server) | 3 | 🔵 non-IRIS MCP surface shipped; IRIS consolidation deferred |
 | Track 6b: Connectors gallery | 7–10 | 🔵 v4.1 |
-| KRONOS / Tesseract GPU stack (with IRIS integration) | 5–6 | 🔵 deferred |
+| KRONOS / Tesseract GPU stack (with IRIS integration) | 5–6 | ✅ v0.1 CPU scaffold shipped; Tesseract/CUDA deferred to v0.2 |
 | Security + compliance (token rotation, GDPR, audits) | 6–7 | Consolidation items first (so we know where security logic lives) |
 | Horizontal scaling (Redis) | 3–4 | ✅ shipped in v4.0.0 |
 | Docs + governance | 9 | All other items mostly done |
@@ -802,7 +802,7 @@ All items from the Audit Remediation Log in ROADMAP.md that remain open post-v3.
 | GRAEAE | gray sisters | multi-LLM consensus | ✅ core |
 | PANTHEON | temple of all gods | unified LLM gateway | 🔵 prerequisite / planned |
 | IRIS | messenger of the gods | MCP discovery + capability-based selection (models + all ETLANTIS ops) | 🔵 deferred to v4.1/v5.0 |
-| KRONOS | titan of time | time-series anomaly + forecasting | 🔵 deferred |
+| KRONOS | titan of time | time-series anomaly + forecasting | ✅ v0.1 CPU scaffold; GPU deferred |
 | PERSEPHONE | queen of the underworld | archival subsystem | 🔵 deferred |
 
 ---

@@ -16,6 +16,7 @@ from mnemos.api.routes.federation import router as federation_router
 from mnemos.api.routes.health import router as health_router
 from mnemos.api.routes.ingest import router as ingest_router
 from mnemos.api.routes.journal import router as journal_router
+from mnemos.api.routes.kronos import router as kronos_router
 from mnemos.api.routes.kg import router as kg_router
 from mnemos.api.routes.memories import router as memories_router
 from mnemos.api.routes.morpheus import router as morpheus_router
@@ -248,6 +249,7 @@ app.include_router(ingest_router)
 app.include_router(kg_router)
 app.include_router(portability_router)  # v3.2: /v1/export + /v1/import (MPF v0.1)
 app.include_router(admin_router)
+app.include_router(kronos_router)
 app.include_router(versions_router)
 app.include_router(journal_router)
 app.include_router(state_router)
