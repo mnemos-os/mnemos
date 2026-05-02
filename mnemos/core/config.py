@@ -363,6 +363,26 @@ class PantheonSettings(BaseSettings):
     model_config = _config_model_config()
 
     enabled: bool = Field(False, validation_alias="MNEMOS_PANTHEON_ENABLED")
+    consultation_cap: int = Field(
+        50,
+        validation_alias="MNEMOS_PANTHEON_CONSULTATION_CAP",
+    )
+    routing_window_minutes: int = Field(
+        15,
+        validation_alias="MNEMOS_PANTHEON_ROUTING_WINDOW_MINUTES",
+    )
+    policy_latency_weight: float = Field(
+        0.40,
+        validation_alias="MNEMOS_PANTHEON_POLICY_LATENCY_WEIGHT",
+    )
+    policy_error_weight: float = Field(
+        0.40,
+        validation_alias="MNEMOS_PANTHEON_POLICY_ERROR_WEIGHT",
+    )
+    policy_cost_weight: float = Field(
+        0.20,
+        validation_alias="MNEMOS_PANTHEON_POLICY_COST_WEIGHT",
+    )
     default_quality_floor: float = Field(
         0.80,
         validation_alias="MNEMOS_PANTHEON_DEFAULT_QUALITY_FLOOR",
@@ -374,6 +394,24 @@ class PantheonSettings(BaseSettings):
             "MNEMOS_PANTHEON_DEFAULT_MAX_COST_USD_PER_MTOK",
         ),
     )
+
+    @field_validator("consultation_cap", "routing_window_minutes", mode="before")
+    @classmethod
+    def _positive_int(cls, raw: Any) -> int:
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 1
+        return value if value >= 1 else 1
+
+    @field_validator("policy_latency_weight", "policy_error_weight", "policy_cost_weight", mode="before")
+    @classmethod
+    def _non_negative_weight(cls, raw: Any) -> float:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+        return value if value >= 0.0 else 0.0
 
 
 class _FederationNatsPeerSettings(BaseModel):

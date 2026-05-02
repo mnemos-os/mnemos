@@ -4,17 +4,24 @@
 **Position in stack:** Above Triton (CERBERUS) + GRAEAE (PYTHIA); below every OpenAI-compatible client.
 **Greek-name fit:** *Temple of all gods.* One facade, many providers behind it. Pairs with CHARON (the ferryman who carries memories across systems): same interop posture, different surface.
 
-## v0.1 Implementation Note
+## v0.2 Implementation Note
 
-This commit ships the bounded PANTHEON v0.1 scaffold: an opt-in `/pantheon/v1`
-OpenAI-shaped facade, a GRAEAE-derived extended model catalog, simple
-`auto:*` alias routing, provider forwarding via existing GRAEAE key storage,
-and IRIS MCP discovery tools for listing models and explaining routes.
+PANTHEON v0.2 closes the v0.1 deferred items while keeping the surface opt-in
+under `/pantheon/v1`. The shipped slice now includes per-(user, session)
+hard caps for `usage_tier=consultation_only` models, best-effort MNEMOS
+`pantheon_routing` memory writes for successful and failed gateway calls,
+rolling-window adaptive selection for `auto:*` aliases, and expanded
+`/pantheon/v1/route/explain` output with candidates, scores, selected backend,
+and the selection reason.
 
-The full design below remains the target architecture. The following items are
-explicitly deferred to v0.2: agentic-tier per-session caps/enforcement, the
-MNEMOS routing-log feedback loop, rolling-window routing-policy adaptation, and
-full streaming/tool-use passthrough semantics across every provider adapter.
+The consultation cap bucket is intentionally process-local in v0.2. It is
+correct for a single MNEMOS process and test/dev deployments; horizontally
+scaled deployments need a Redis-backed bucket so every replica shares the same
+per-session count.
+
+Deferred to v0.3: Redis-backed cap buckets, full tool-use streaming passthrough
+across provider adapters, real-time provider health via NATS, and KRONOS
+forecasting integration for proactive routing.
 
 ---
 
@@ -417,32 +424,46 @@ MCP-aware agents (Claude Code with custom MCP, Cursor, Continue) discover capabi
 Every routing decision + outcome lands in MNEMOS as a structured memory:
 
 ```python
-mnemos.create({
+create_memory({
     "category": "pantheon_routing",
     "content": json.dumps({
         "request_id": "...",
-        "tenant": "alice",
+        "tenant_user_id": "alice",
         "alias_or_model": "auto:reasoning",
-        "resolved_to": "together:llama-4-405b",
+        "resolved_to": "llama-4-405b",
         "outcome": "success",
         "latency_ms": 2400,
         "tokens_in": 1200,
         "tokens_out": 380,
         "cost_usd": 0.012,
-        "graeae_quality": null,
+        "error_class": null,
     }),
     "namespace": "pantheon",
     "owner_id": "system:pantheon",
+    "metadata": {
+        "pantheon_version": "0.2",
+        "session_id": "session-123",
+        "usage_tier": "agentic_ok",
+        "resolved_to": "llama-4-405b",
+        "outcome": "success",
+        "latency_ms": 2400,
+        "cost_usd": 0.012,
+    },
 })
 ```
 
 The routing policy queries this rolling window at decision time:
 
 ```sql
-SELECT backend, AVG(latency_ms), AVG(error_rate), AVG(cost_usd)
-FROM pantheon_routing_log
-WHERE created > NOW() - INTERVAL '15 min'
-  AND tenant = $1
+SELECT metadata->>'resolved_to' AS backend,
+       AVG((metadata->>'latency_ms')::FLOAT) AS avg_latency_ms,
+       SUM(CASE WHEN metadata->>'outcome' = 'error' THEN 1 ELSE 0 END)::FLOAT
+         / COUNT(*)::FLOAT AS error_rate,
+       AVG((metadata->>'cost_usd')::FLOAT) AS avg_cost
+FROM memories
+WHERE category = 'pantheon_routing'
+  AND created > NOW() - INTERVAL '15 min'
+  AND metadata->>'resolved_to' = ANY($candidate_list)
 GROUP BY backend
 ```
 

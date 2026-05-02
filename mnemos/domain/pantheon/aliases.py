@@ -62,6 +62,25 @@ def _select_cheapest(
     return sorted(candidates, key=_cost_sort_value)[0]
 
 
+def _candidate_pool(
+    models: list[dict[str, Any]],
+    *,
+    required_capability: str | None = None,
+    quality_floor: float = 0.0,
+    max_cost: float | None = None,
+) -> list[dict[str, Any]]:
+    candidates = _available(models)
+    if required_capability:
+        candidates = [
+            model for model in candidates
+            if required_capability in set(model.get("capabilities") or [])
+        ]
+    return [
+        model for model in candidates
+        if _quality_ok(model, quality_floor) and _cost_ok(model, max_cost)
+    ]
+
+
 def resolve_alias(
     model_or_alias: str,
     models: list[dict[str, Any]],
@@ -87,18 +106,20 @@ def resolve_alias(
         }
 
     if requested == "auto:reasoning":
-        model = _select_cheapest(
+        candidates = _candidate_pool(
             models,
             required_capability="reasoning",
             quality_floor=quality_floor,
             max_cost=max_cost,
         )
+        model = sorted(candidates, key=_cost_sort_value)[0] if candidates else None
         if model is None:
             raise PantheonRoutingError(404, "no reasoning-capable model meets the routing floor")
         return {
             "alias": requested,
             "type": "auto",
             "required_capability": "reasoning",
+            "candidates": candidates,
             "provider": model["provider"],
             "resolved_model": model["id"],
             "model": model,
@@ -109,12 +130,14 @@ def resolve_alias(
         }
 
     if requested == "auto:cheap":
-        model = _select_cheapest(models, quality_floor=0.0, max_cost=max_cost)
+        candidates = _candidate_pool(models, quality_floor=0.0, max_cost=max_cost)
+        model = sorted(candidates, key=_cost_sort_value)[0] if candidates else None
         if model is None:
             raise PantheonRoutingError(404, "no available model meets the cost ceiling")
         return {
             "alias": requested,
             "type": "auto",
+            "candidates": candidates,
             "provider": model["provider"],
             "resolved_model": model["id"],
             "model": model,
@@ -122,16 +145,14 @@ def resolve_alias(
         }
 
     if requested == "auto:fast":
-        candidates = [
-            model for model in _available(models)
-            if _quality_ok(model, 0.0) and _cost_ok(model, max_cost)
-        ]
+        candidates = _candidate_pool(models, quality_floor=0.0, max_cost=max_cost)
         if not candidates:
             raise PantheonRoutingError(404, "no available model meets the cost ceiling")
         model = sorted(candidates, key=_latency_sort_value)[0]
         return {
             "alias": requested,
             "type": "auto",
+            "candidates": candidates,
             "provider": model["provider"],
             "resolved_model": model["id"],
             "model": model,
@@ -147,6 +168,7 @@ def resolve_alias(
     return {
         "alias": requested,
         "type": "literal",
+        "candidates": [model],
         "provider": model["provider"],
         "resolved_model": model["id"],
         "model": model,
