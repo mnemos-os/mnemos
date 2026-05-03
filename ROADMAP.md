@@ -25,6 +25,10 @@ alpha line. Major new surfaces in this release:
 - ✅ MCP §6.4 cross-tenant security gates across 22 tools,
   including `pantheon_list_models`, `pantheon_route_explain`,
   `tool_kronos_anomalies`, and `tool_kronos_forecast`.
+- ✅ Rust hot-path accelerator (mnemos_hot v0.2): cosine/top-k,
+  batch cosine, embedding parse, embedding L2-normalize, composite
+  search rerank, deterministic judge scoring, and SHA-256 batch
+  hashing behind `MNEMOS_HOT_RS_ENABLED=1`.
 - ✅ Subsystem modularization: optional pip extras + named feature
   bundles (`[edge]`, `[server]`, `[ml]`, `[interop]`, `[full]`) so
   operators install only what they deploy. Routes for missing extras
@@ -64,10 +68,10 @@ state:
 Next planning focus:
 
 - **v4.1**: web UX in the separate `mnemos-web` frontend repo (Tier-1 MVP),
-  mobile hardening for Android Termux first, iOS native client later, connector
-  gallery expansion, and any targeted Rust rewrites deferred on 2026-04-29.
+  mobile hardening for Android Termux first, iOS native client later, and
+  connector gallery expansion.
 - **v5.0+**: hosted MNEMOS Cloud, foundation-tier OSS standardization
-  (MCP-MD via LF AI & Data), and larger Rust/mobile investments once the v4
+  (MCP-MD via LF AI & Data), and larger mobile investments once the v4
   Python architecture has settled under production use.
 
 ## v3.1 — compression platform + v3.0 unblocks
@@ -214,7 +218,7 @@ Remaining after v3.5.0:
 
 The 4.0 charter was structural, not feature-driven. Tracks 5, 5b, and horizontal
 scaling shipped in v4.0.0. Connector gallery expansion moves to v4.1; hosted
-cloud, MCP-MD foundation standardization, and larger Rust/mobile work move to
+cloud, MCP-MD foundation standardization, and larger mobile work move to
 v5.0+ framing.
 
 ### Track 5 — modularization + persistence abstraction

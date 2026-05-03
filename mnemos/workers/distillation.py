@@ -32,7 +32,13 @@ from mnemos.core.extras import is_extra_installed  # noqa: E402
 # Contest path: drains memory_compression_queue via the plugin
 # CompressionEngine ABC + run_contest + persist_contest.
 try:
-    from mnemos.domain.compression.judge import CrossEncoderJudge, EnsembleJudge, LLMJudge, NullJudge
+    from mnemos.domain.compression.judge import (
+        CrossEncoderJudge,
+        DeterministicJudge,
+        EnsembleJudge,
+        LLMJudge,
+        NullJudge,
+    )
     from mnemos.domain.compression.worker_contest import process_contest_queue
     _CONTEST_AVAILABLE = True
 except Exception as _ce:
@@ -76,6 +82,7 @@ _JUDGE_MODEL = _COMPRESSION_SETTINGS.judge_model
 # Judge mode selects the scoring implementation:
 #   llm        — LLMJudge only (v3.3 S-II default; reasoning + fidelity)
 #   cross      — CrossEncoderJudge only (fast CPU-only, no reasoning)
+#   deterministic — CPU-only deterministic text scorer
 #   ensemble   — LLMJudge primary + CrossEncoderJudge secondary; primary
 #                authoritative, secondary captured on the manifest for
 #                correlation telemetry over a corpus
@@ -183,6 +190,8 @@ class MemoryDistillationWorker:
             # engine-self-reported scores (pre-S-II behavior).
             if not _JUDGE_ENABLED:
                 self._judge = NullJudge()
+            elif _JUDGE_MODE == "deterministic":
+                self._judge = DeterministicJudge()
             elif _JUDGE_MODE == "cross":
                 try:
                     self._judge = CrossEncoderJudge(_CROSS_ENCODER_MODEL)

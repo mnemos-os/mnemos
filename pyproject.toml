@@ -89,7 +89,7 @@ knossos = []
 apollo = []
 artemis = ["networkx>=3.3"]
 nats = ["nats-py>=2.14.0"]
-hot = ["mnemos-hot>=0.1.0"]
+hot = ["mnemos-hot>=0.2.0"]
 edge = [
   "aiosqlite>=0.20.0",
   "sqlite-vec>=0.1.6",

@@ -45,11 +45,31 @@ from typing import Dict, List, Optional
 
 import httpx
 
-from mnemos.core.config import get_settings
+from mnemos.core.config import get_settings, hot_rs_enabled
 
 from .gpu_guard import get_guard
 
 logger = logging.getLogger(__name__)
+
+
+# Optional Rust hot-path accelerator. Loaded only when explicitly
+# enabled so operators do not need the Rust wheel for default installs.
+_HOT_RS = None
+_HOT_RS_ENABLED = hot_rs_enabled()
+if _HOT_RS_ENABLED:
+    try:
+        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+        logger.info(
+            "mnemos_hot Rust accelerator enabled (judge deterministic scoring will use mnemos_hot %s)",
+            getattr(_HOT_RS, "__version__", "?"),
+        )
+    except ImportError as _exc:
+        logger.warning(
+            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
+            "Falling back to pure-Python judge deterministic scoring.",
+            _exc,
+        )
+        _HOT_RS = None
 
 
 # GPU provider endpoint for APOLLO fallback and judge calls.
@@ -113,6 +133,125 @@ class NullJudge(Judge):
 
     async def score(self, **kwargs) -> Optional[JudgeScore]:  # noqa: ARG002
         return None
+
+
+def _char_bigrams(text: str) -> set[tuple[str, str]]:
+    chars = list(text)
+    return set(zip(chars, chars[1:]))
+
+
+def _levenshtein(left: str, right: str) -> int:
+    if not left:
+        return len(right)
+    if not right:
+        return len(left)
+    previous = list(range(len(right) + 1))
+    current = [0] * (len(right) + 1)
+    for i, left_char in enumerate(left, start=1):
+        current[0] = i
+        for j, right_char in enumerate(right, start=1):
+            substitution = 0 if left_char == right_char else 1
+            current[j] = min(
+                previous[j] + 1,
+                current[j - 1] + 1,
+                previous[j - 1] + substitution,
+            )
+        previous, current = current, previous
+    return previous[len(right)]
+
+
+def _judge_deterministic_score_python(
+    reference: str,
+    candidate: str,
+    weights: tuple[float, float, float] | None = None,
+) -> dict[str, float]:
+    ref_bigrams = _char_bigrams(reference)
+    cand_bigrams = _char_bigrams(candidate)
+    union = ref_bigrams | cand_bigrams
+    if not union:
+        bigram_overlap = 1.0 if reference == candidate else 0.0
+    else:
+        bigram_overlap = len(ref_bigrams & cand_bigrams) / len(union)
+
+    max_len = max(len(reference), len(candidate))
+    edit_distance_ratio = (
+        1.0 if max_len == 0
+        else 1.0 - (_levenshtein(reference, candidate) / max_len)
+    )
+
+    ref_len = len(reference)
+    cand_len = len(candidate)
+    if ref_len == 0 and cand_len == 0:
+        length_ratio = 1.0
+    elif ref_len == 0 or cand_len == 0:
+        length_ratio = 0.0
+    else:
+        length_ratio = min(cand_len / ref_len, ref_len / cand_len)
+
+    w_bigram, w_edit, w_length = weights or (0.4, 0.4, 0.2)
+    composite = (
+        w_bigram * bigram_overlap
+        + w_edit * edit_distance_ratio
+        + w_length * length_ratio
+    )
+    return {
+        "bigram_overlap": float(bigram_overlap),
+        "edit_distance_ratio": float(edit_distance_ratio),
+        "length_ratio": float(length_ratio),
+        "composite": float(composite),
+    }
+
+
+def _judge_deterministic_score(
+    reference: str,
+    candidate: str,
+    weights: tuple[float, float, float] | None = None,
+) -> dict[str, float]:
+    if _HOT_RS is not None:
+        try:
+            result = _HOT_RS.judge_deterministic_score(reference, candidate, weights)
+            return {
+                "bigram_overlap": float(result["bigram_overlap"]),
+                "edit_distance_ratio": float(result["edit_distance_ratio"]),
+                "length_ratio": float(result["length_ratio"]),
+                "composite": float(result["composite"]),
+            }
+        except Exception:
+            pass
+    return _judge_deterministic_score_python(reference, candidate, weights)
+
+
+class DeterministicJudge(Judge):
+    """CPU-only fidelity judge based on deterministic text metrics.
+
+    The Python implementation is the source of truth. When
+    ``MNEMOS_HOT_RS_ENABLED=1`` and ``mnemos_hot`` is importable, the
+    same arithmetic is dispatched to Rust.
+    """
+
+    model_id = "deterministic-fast"
+
+    async def score(
+        self,
+        *,
+        original: str,
+        candidate_encoded: str,  # noqa: ARG002 — part of the Judge ABC
+        candidate_narrated: str,
+        candidate_engine_id: str,  # noqa: ARG002 — part of the Judge ABC
+    ) -> Optional[JudgeScore]:
+        if not original or not candidate_narrated:
+            return None
+        score = _judge_deterministic_score(original, candidate_narrated)
+        return JudgeScore(
+            fidelity=max(0.0, min(1.0, score["composite"])),
+            model_id=self.model_id,
+            reasoning=(
+                "deterministic "
+                f"bigram={score['bigram_overlap']:.3f} "
+                f"edit={score['edit_distance_ratio']:.3f} "
+                f"length={score['length_ratio']:.3f}"
+            ),
+        )
 
 
 # Strict shape for the judge's one-line JSON output.

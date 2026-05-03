@@ -665,6 +665,7 @@ v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/r
 - ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 18 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
 - ✅ **Document-import retry-safety** — content-derived `import_chunk_key` prevents duplicate chunk insertion on retry; ON CONFLICT (key) DO UPDATE returns canonical row id.
 - ✅ **Connector smoke gallery** — end-to-end smoke per surface (Claude Code, Cursor, Codex CLI, Continue, Cline, Claude Desktop, ChatGPT) with mechanically-validated JSON snippets.
+- ✅ **Rust hot-path accelerator (mnemos_hot v0.2)** — Rust implementations of cosine, top_k, batch cosine, embedding parse, embedding L2-normalize, composite search re-rank, deterministic judge scoring, and SHA-256 batch hashing. All wired with MNEMOS_HOT_RS_ENABLED=1 opt-in plus identical Python fallback.
 
 ### Shipped in v4.1.1
 
@@ -688,8 +689,8 @@ v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/r
 - MORPHEUS run and cluster endpoints are operator-only telemetry. They require
   root credentials because responses can include namespaces, configs, errors,
   and memory IDs across tenants.
-- v5.0 still does not ship the separate web frontend, mobile clients, hosted
-  MNEMOS Cloud, or full Rust hot-path rewrites; those remain roadmap items.
+- v5.0 still does not ship the separate web frontend, mobile clients, or hosted
+  MNEMOS Cloud; those remain roadmap items.
 - The PROTEUS barrage exposed long-tail latency under sustained 50-concurrent
   writes (p99 ~33s). Search and read paths held up well (search p99 ~300ms;
   reads p50 ~120ms). Tuning the worker / pool budget is a v5.1 target.
@@ -704,7 +705,6 @@ Near-term not-yet-scoped candidates:
 
 - Web UX in the separate `mnemos-web` frontend repo
 - Mobile clients: Android Termux hardening first, iOS native later
-- Rust rewrites for selected hot paths beyond the existing `mnemos_hot` accelerator
 - Hosted MNEMOS Cloud and foundation-tier OSS standardization work (MCP-MD via LF AI & Data) in the v5.x+ frame
 - Hatchet workflow-engine integration alongside the NATS substrate (deferred from v5.0)
 - KRONOS Tesseract GPU integration (deferred from v5.0)

@@ -82,9 +82,21 @@ def _cosine_similarities(query: np.ndarray, candidates: list[np.ndarray]) -> lis
             # length-mismatch-to-0.0 semantics for this caller.
             if any(len(candidate) != len(query) for candidate in candidates):
                 return [_cosine_similarity(query, candidate) for candidate in candidates]
+            query_values = _vector_to_float_list(query)
+            candidate_values = [_vector_to_float_list(candidate) for candidate in candidates]
+            try:
+                normalized = _HOT_RS.normalize_embeddings([query_values, *candidate_values])
+                if len(normalized) == len(candidate_values) + 1:
+                    query_values = [float(value) for value in normalized[0]]
+                    candidate_values = [
+                        [float(value) for value in vector]
+                        for vector in normalized[1:]
+                    ]
+            except Exception:
+                pass
             scores = _HOT_RS.cosine_batch(
-                _vector_to_float_list(query),
-                [_vector_to_float_list(candidate) for candidate in candidates],
+                query_values,
+                candidate_values,
             )
             if len(scores) == len(candidates):
                 return [float(score) for score in scores]

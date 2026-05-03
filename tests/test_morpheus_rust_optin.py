@@ -73,6 +73,38 @@ def test_optin_uses_rust_cosine_batch(monkeypatch):
     assert calls == [([1.0, 0.0], [[1.0, 0.0], [0.0, 1.0]])]
 
 
+def test_optin_normalizes_batch_before_rust_cosine(monkeypatch):
+    normalize_calls = []
+    cosine_calls = []
+
+    def normalize_embeddings(vectors):
+        normalize_calls.append(vectors)
+        return [[1.0, 0.0], [1.0, 0.0], [0.0, 1.0]]
+
+    def cosine_batch(query, candidates):
+        cosine_calls.append((query, candidates))
+        return [1.0, 0.0]
+
+    fake = types.SimpleNamespace(
+        __version__="fake-0",
+        normalize_embeddings=normalize_embeddings,
+        cosine_batch=cosine_batch,
+    )
+    runner_mod = _reload_runner_module(monkeypatch, hot_enabled=True, hot_module=fake)
+
+    query = np.array([3.0, 4.0], dtype=np.float32)
+    candidates = [
+        np.array([6.0, 8.0], dtype=np.float32),
+        np.array([0.0, 5.0], dtype=np.float32),
+    ]
+
+    scores = runner_mod._cosine_similarities(query, candidates)
+
+    assert scores == [1.0, 0.0]
+    assert normalize_calls == [[[3.0, 4.0], [6.0, 8.0], [0.0, 5.0]]]
+    assert cosine_calls == [([1.0, 0.0], [[1.0, 0.0], [0.0, 1.0]])]
+
+
 def test_optin_falls_back_when_rust_batch_raises(monkeypatch):
     def cosine_batch(_query, _candidates):
         raise RuntimeError("synthetic rust failure")

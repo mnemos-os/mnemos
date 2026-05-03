@@ -7,9 +7,10 @@ to the backend-neutral persistence interfaces.
 
 from __future__ import annotations
 
-import inspect
 import hashlib
+import inspect
 import json
+import logging
 import uuid
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
@@ -19,6 +20,7 @@ from typing import Any
 import asyncpg
 
 from mnemos.core.auth_context import UserContext
+from mnemos.core.config import hot_rs_enabled
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
 )
@@ -41,6 +43,109 @@ from mnemos.persistence.base import (
 from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
+
+logger = logging.getLogger(__name__)
+_RECENCY_E_FOLD_SECONDS = 7 * 24 * 60 * 60
+
+
+# Optional Rust hot-path accelerator. Loaded lazily so operators do not
+# need the Rust wheel unless they opt in.
+_HOT_RS = None
+_HOT_RS_ENABLED = hot_rs_enabled()
+if _HOT_RS_ENABLED:
+    try:
+        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
+        logger.info(
+            "mnemos_hot Rust accelerator enabled (Postgres semantic rerank will use mnemos_hot %s)",
+            getattr(_HOT_RS, "__version__", "?"),
+        )
+    except ImportError as _exc:
+        logger.warning(
+            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
+            "Falling back to Python Postgres semantic rerank.",
+            _exc,
+        )
+        _HOT_RS = None
+
+
+def _vector_to_float_list(vector: Sequence[float]) -> list[float]:
+    return [float(value) for value in vector]
+
+
+def _parse_pgvector_text(raw: Any) -> list[float]:
+    if raw is None:
+        return []
+    if isinstance(raw, (list, tuple)):
+        return [float(value) for value in raw]
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = [part for part in raw.strip("[]").split(",") if part]
+        if isinstance(parsed, list):
+            try:
+                return [float(value) for value in parsed]
+            except (TypeError, ValueError):
+                return []
+    return []
+
+
+def _cosine_similarity(left: Sequence[float], right: Sequence[float]) -> float:
+    if not left or not right or len(left) != len(right):
+        return 0.0
+    dot = sum(a * b for a, b in zip(left, right))
+    norm_left = sum(a * a for a in left) ** 0.5
+    norm_right = sum(b * b for b in right) ** 0.5
+    if norm_left == 0.0 or norm_right == 0.0:
+        return 0.0
+    return dot / (norm_left * norm_right)
+
+
+def _rerank_composite_python(
+    query: Sequence[float],
+    candidates: Sequence[Sequence[float]],
+    recency_boost: Sequence[float],
+    weight_cos: float,
+    weight_recency: float,
+    k: int,
+) -> list[tuple[int, float]]:
+    query_values = _vector_to_float_list(query)
+    scores = [
+        (
+            idx,
+            weight_cos * _cosine_similarity(query_values, _vector_to_float_list(candidate))
+            + weight_recency * float(recency_boost[idx] if idx < len(recency_boost) else 0.0),
+        )
+        for idx, candidate in enumerate(candidates)
+    ]
+    scores.sort(key=lambda item: (-item[1], item[0]))
+    return scores if k == 0 or k >= len(scores) else scores[:k]
+
+
+def _rerank_composite(
+    query: Sequence[float],
+    candidates: Sequence[Sequence[float]],
+    recency_boost: Sequence[float],
+    weight_cos: float,
+    weight_recency: float,
+    k: int,
+) -> list[tuple[int, float]]:
+    if _HOT_RS is not None:
+        try:
+            result = _HOT_RS.rerank_composite(
+                _vector_to_float_list(query),
+                [_vector_to_float_list(candidate) for candidate in candidates],
+                [float(value) for value in recency_boost],
+                float(weight_cos),
+                float(weight_recency),
+                int(k),
+            )
+            return [(int(idx), float(score)) for idx, score in result]
+        except Exception:
+            pass
+    return _rerank_composite_python(
+        query, candidates, recency_boost, weight_cos, weight_recency, k,
+    )
 
 
 def _render_postgres_visibility(
@@ -396,6 +501,8 @@ class PostgresMemoryRepository(MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        boost_recency: bool = False,
+        recency_weight: float = 0.15,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
         # $1 is the embedding vector, used in both SELECT (for the
@@ -423,14 +530,49 @@ class PostgresMemoryRepository(MemoryRepository):
         if vis_clause:
             conditions.append(vis_clause)
             params.extend(vis_params)
-        params.append(limit)
+        candidate_limit = limit
+        if boost_recency:
+            candidate_limit = max(limit, min(limit * 4, 200))
+        params.append(candidate_limit)
+        recency_select = ""
+        if boost_recency:
+            recency_select = (
+                ", embedding::text AS _embedding_text, "
+                "EXP(-GREATEST(EXTRACT(EPOCH FROM (timezone('UTC', now()) - "
+                "COALESCE(last_recalled_at, updated, created))), 0) / "
+                f"{_RECENCY_E_FOLD_SECONDS}.0) AS _recency_boost"
+            )
         sql = (
-            f"SELECT {_MEMORY_COLS}, 1 - (embedding <=> $1::vector) AS similarity "
+            f"SELECT {_MEMORY_COLS}, 1 - (embedding <=> $1::vector) AS similarity"
+            f"{recency_select} "
             "FROM memories "
             f"WHERE {' AND '.join(conditions)} "
             f"ORDER BY embedding <=> $1::vector LIMIT ${len(params)}"
         )
-        return list(await conn.fetch(sql, *params))
+        rows = list(await conn.fetch(sql, *params))
+        if not boost_recency or len(rows) <= 1:
+            return rows[:limit]
+
+        candidates = [_parse_pgvector_text(row.get("_embedding_text")) for row in rows]
+        recency_boost = [float(row.get("_recency_boost") or 0.0) for row in rows]
+        weight_recency = max(0.0, min(1.0, float(recency_weight)))
+        weight_cos = 1.0 - weight_recency
+        ranking = _rerank_composite(
+            embedding,
+            candidates,
+            recency_boost,
+            weight_cos,
+            weight_recency,
+            limit,
+        )
+        reranked: list[Row] = []
+        for idx, composite_score in ranking:
+            row = rows[idx]
+            enriched = dict(row.items()) if hasattr(row, "items") else dict(row)
+            enriched["similarity"] = composite_score
+            enriched["_composite_score"] = composite_score
+            reranked.append(enriched)
+        return reranked
 
     async def fts_search(
         self,

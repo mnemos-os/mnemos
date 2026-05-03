@@ -266,6 +266,8 @@ class MemoryRepository(ABC):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        boost_recency: bool = False,
+        recency_weight: float = 0.15,
     ) -> list[Row]:
         """Vector search over memory embeddings, applying visibility.
 
@@ -275,8 +277,8 @@ class MemoryRepository(ABC):
 
         Vector ranking is backend-owned: Postgres ranks with pgvector
         ``ORDER BY embedding <=>`` and SQLite ranks in SQL via
-        ``mnemos_cosine_similarity``. There is currently no Python
-        post-fetch vector rerank call site for ``mnemos_hot.top_k``.
+        ``mnemos_cosine_similarity``. Postgres can optionally rerank a
+        wider vector candidate set with a decayed recency boost.
         """
         ...
 

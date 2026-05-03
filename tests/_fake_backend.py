@@ -102,7 +102,7 @@ class _FakeMemoryRepo:
         self, tx, *, embedding, limit, visibility,
         category=None, subcategory=None,
         source_provider=None, source_model=None, source_agent=None,
-        include_archived=False,
+        include_archived=False, boost_recency=False, recency_weight=0.15,
     ):
         self.calls.append((
             "semantic_search",
@@ -116,6 +116,8 @@ class _FakeMemoryRepo:
                 "source_model": source_model,
                 "source_agent": source_agent,
                 "include_archived": include_archived,
+                "boost_recency": boost_recency,
+                "recency_weight": recency_weight,
             },
         ))
         return self._resolve("semantic_search", [])
@@ -381,6 +383,7 @@ class _PoolBackedMemoryRepo:
         self, tx, *, embedding, limit, visibility,
         category=None, subcategory=None, source_provider=None,
         source_model=None, source_agent=None, include_archived=False,
+        boost_recency=False, recency_weight=0.15,
     ):
         rows = self._rows(
             visibility,

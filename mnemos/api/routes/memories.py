@@ -725,6 +725,8 @@ async def search_memories(
         search_namespace, search_owner_id,
         sorted(user.group_ids),  # list, not pre-serialized string
         request.include_archived,
+        request.boost_recency,
+        request.recency_weight,
     )
 
     if _lc._cache and not request.include_compressed:
@@ -760,6 +762,8 @@ async def search_memories(
                     source_model=request.source_model,
                     source_agent=request.source_agent,
                     include_archived=bool(request.include_archived),
+                    boost_recency=bool(request.boost_recency),
+                    recency_weight=float(request.recency_weight),
                 )
             else:
                 logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")

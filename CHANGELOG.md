@@ -137,6 +137,22 @@ Postgres 17 deployment: 98.5% write success, 99.7% read success,
   parent + variant + branch). Compressed artifacts are now
   walkable from the original memory's version history.
 
+### Added — Rust hot-path completion (mnemos_hot v0.2)
+
+- **Deterministic judge scoring.** Compression fidelity can use the
+  Rust bigram-overlap / Levenshtein / length-ratio scorer, with the
+  Python scorer preserved as the fallback and source of truth.
+- **Embedding L2-normalize batch.** MORPHEUS and compression
+  embedding helpers dispatch batch normalization to Rust when
+  ``MNEMOS_HOT_RS_ENABLED=1``.
+- **Composite search re-rank.** Postgres semantic search can opt into
+  vector + decayed-recency reranking via ``boost_recency`` while the
+  default pgvector ordering remains unchanged.
+- **SHA-256 batch hashing.** Compression DAG commit-hash payloads use
+  the Rust batch helper when enabled, falling back to ``hashlib``.
+- Parity invariant: every Rust accelerator is opt-in and covered by
+  Python-fallback parity tests with float tolerance at ``1e-9``.
+
 ### Added — NATS substrate v0.2
 
 - Bounded second slice. PANTHEON routing-log → NATS publish to

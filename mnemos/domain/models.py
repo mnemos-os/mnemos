@@ -151,6 +151,8 @@ class MemorySearchRequest(BaseModel):
     source_agent: Optional[str] = None
     namespace: Optional[str] = None
     include_archived: Optional[bool] = False
+    boost_recency: Optional[bool] = False
+    recency_weight: float = Field(0.15, ge=0.0, le=1.0)
 
 
 class MemoryCreateRequest(BaseModel):

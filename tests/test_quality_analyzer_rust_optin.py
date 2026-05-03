@@ -81,7 +81,40 @@ def test_optin_uses_rust_cosine(monkeypatch):
     score = analyzer._compute_semantic_similarity("a", "b")
 
     assert score == pytest.approx(75.0)
-    assert calls == [([1.0, 0.0], [0.5, 0.5])]
+    assert calls == [([1.0, 0.0], pytest.approx([0.7071067811865475, 0.7071067811865475]))]
+
+
+def test_optin_uses_rust_normalize_embeddings(monkeypatch):
+    normalize_calls = []
+    cosine_calls = []
+
+    def normalize_embeddings(vectors):
+        normalize_calls.append(vectors)
+        return [[1.0, 0.0], [0.0, 1.0]]
+
+    def cosine(left, right):
+        cosine_calls.append((left, right))
+        return 0.0
+
+    fake = types.SimpleNamespace(
+        __version__="fake-0",
+        normalize_embeddings=normalize_embeddings,
+        cosine=cosine,
+    )
+    quality_mod = _reload_quality_module(monkeypatch, hot_enabled=True, hot_module=fake)
+    analyzer = _make_analyzer(
+        quality_mod,
+        {
+            "a": np.array([3.0, 4.0], dtype=np.float32),
+            "b": np.array([5.0, 12.0], dtype=np.float32),
+        },
+    )
+
+    score = analyzer._compute_semantic_similarity("a", "b")
+
+    assert score == pytest.approx(50.0)
+    assert normalize_calls == [[[3.0, 4.0], [5.0, 12.0]]]
+    assert cosine_calls == [([1.0, 0.0], [0.0, 1.0])]
 
 
 def test_optin_falls_back_to_numpy_when_rust_cosine_raises(monkeypatch):

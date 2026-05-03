@@ -41,6 +41,29 @@ def _has_zero_norm(values: list[float]) -> bool:
     return sum(value * value for value in values) <= 0.0
 
 
+def _normalize_embeddings_python(vectors: list[list[float]]) -> list[list[float]]:
+    normalized: list[list[float]] = []
+    for vector in vectors:
+        norm = sum(value * value for value in vector) ** 0.5
+        if norm == 0.0:
+            normalized.append(list(vector))
+        else:
+            normalized.append([value / norm for value in vector])
+    return normalized
+
+
+def _normalize_embedding_batch(vectors: list[Any]) -> list[list[float]]:
+    values = [_embedding_to_float_list(vector) for vector in vectors]
+    if _HOT_RS is not None:
+        try:
+            result = _HOT_RS.normalize_embeddings(values)
+            if len(result) == len(values):
+                return [[float(item) for item in vector] for vector in result]
+        except Exception:
+            pass
+    return _normalize_embeddings_python(values)
+
+
 def _semantic_cosine(emb1: Any, emb2: Any, np_module: Any) -> float | None:
     if _HOT_RS is not None:
         try:
@@ -373,6 +396,9 @@ class QualityAnalyzer:
                 return -1.0
             emb1 = np.asarray(embeddings[0])
             emb2 = np.asarray(embeddings[1])
+            emb1_values, emb2_values = _normalize_embedding_batch([emb1, emb2])
+            emb1 = np.asarray(emb1_values)
+            emb2 = np.asarray(emb2_values)
             # cosine similarity via optional Rust hot path or NumPy
             # fallback (avoids sklearn dependency).
             similarity = _semantic_cosine(emb1, emb2, np)

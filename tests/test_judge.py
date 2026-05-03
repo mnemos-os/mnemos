@@ -11,9 +11,11 @@ import uuid
 from typing import Any, Dict
 
 from mnemos.domain.compression.judge import (
+    DeterministicJudge,
     JudgeScore,
     LLMJudge,
     NullJudge,
+    _judge_deterministic_score_python,
     _parse_judge_output,
 )
 
@@ -92,6 +94,28 @@ def test_null_judge_returns_none():
         candidate_engine_id="artemis",
     ))
     assert out is None
+
+
+def test_deterministic_score_python_known_values():
+    out = _judge_deterministic_score_python("abcd", "abxd")
+    assert out["bigram_overlap"] == 0.2
+    assert out["edit_distance_ratio"] == 0.75
+    assert out["length_ratio"] == 1.0
+    assert abs(out["composite"] - 0.58) < 1e-12
+
+
+def test_deterministic_judge_returns_composite_score():
+    j = DeterministicJudge()
+    out = asyncio.run(j.score(
+        original="abcd",
+        candidate_encoded="ignored",
+        candidate_narrated="abxd",
+        candidate_engine_id="artemis",
+    ))
+    assert out is not None
+    assert abs(out.fidelity - 0.58) < 1e-12
+    assert out.model_id == "deterministic-fast"
+    assert "bigram=" in out.reasoning
 
 
 # ── LLMJudge HTTP paths (substituted client) ──────────────────────────────

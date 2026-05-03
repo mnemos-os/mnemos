@@ -794,6 +794,8 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         source_model: str | None = None,
         source_agent: str | None = None,
         include_archived: bool = False,
+        boost_recency: bool = False,  # noqa: ARG002 - Postgres-only option.
+        recency_weight: float = 0.15,  # noqa: ARG002 - Postgres-only option.
     ) -> list[Row]:
         embedding_json = json.dumps([float(value) for value in embedding])
         conditions: list[str] = ["me.embedding IS NOT NULL"]
