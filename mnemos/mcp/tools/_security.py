@@ -13,8 +13,67 @@ from mnemos.core.auth_context import UserContext
 
 MCP_WRITE_RATE_LIMIT_PER_MINUTE = 60
 MCP_READ_RATE_LIMIT_PER_MINUTE = 600
+
+# Per-(principal, tool) sliding-window rate-limit buckets.
+# Each deque carries the timestamps of recent calls; old timestamps
+# are pruned on every touch (`_mcp_touch_bucket`).
+#
+# #204: until this slice the dict grew monotonically — empty/idle
+# buckets were never dropped, so a high-churn principal flow (CI
+# matrix, rotating tokens) leaked memory. The new
+# `_gc_stale_buckets` helper runs every `_GC_SWEEP_INTERVAL` touches
+# and removes any bucket whose newest timestamp is past the window
+# cutoff (i.e. the principal stopped calling). A hard cap at
+# `_MAX_BUCKETS` triggers an extra eviction pass that drops the
+# oldest-by-last-timestamp half if the sweep alone can't shrink
+# below cap.
 _TOOL_RATE_BUCKETS: dict[tuple[str, str], deque[float]] = defaultdict(deque)
+_GC_SWEEP_INTERVAL = 256  # touches between sweeps
+_MAX_BUCKETS = 4096        # hard cap; eviction kicks in past this
+_gc_touch_counter: int = 0
+
 _MCP_AUDIT_LOGGER = logging.getLogger("mnemos.mcp.audit")
+
+
+def _gc_stale_buckets(*, cutoff: float) -> None:
+    """Drop buckets whose newest timestamp is past the cutoff (i.e.
+    the principal hasn't called within the rate-limit window). Empty
+    buckets are also dropped — they exist when a `defaultdict` lookup
+    created them but the touch didn't append (rate-limit raised
+    before the append).
+
+    O(N) over the bucket dict; runs every `_GC_SWEEP_INTERVAL`
+    touches and on cap-overflow.
+    """
+    stale_keys: list[tuple[str, str]] = []
+    for key, bucket in _TOOL_RATE_BUCKETS.items():
+        # Empty bucket → stale by construction.
+        if not bucket:
+            stale_keys.append(key)
+            continue
+        # Newest timestamp is bucket[-1] (deque is FIFO with append).
+        if bucket[-1] < cutoff:
+            stale_keys.append(key)
+    for key in stale_keys:
+        _TOOL_RATE_BUCKETS.pop(key, None)
+
+
+def _evict_oldest_buckets(target_size: int) -> None:
+    """Hard cap fallback: when `_gc_stale_buckets` can't shrink
+    below `_MAX_BUCKETS`, evict the oldest-by-last-timestamp entries
+    until size <= `target_size`. Defensive — under expected load
+    the periodic sweep keeps the dict well below cap."""
+    if len(_TOOL_RATE_BUCKETS) <= target_size:
+        return
+    # Sort by newest timestamp, ascending. Empty buckets (no last
+    # timestamp) are oldest by construction — sort them first.
+    items = sorted(
+        _TOOL_RATE_BUCKETS.items(),
+        key=lambda kv: kv[1][-1] if kv[1] else float("-inf"),
+    )
+    drop_count = len(_TOOL_RATE_BUCKETS) - target_size
+    for key, _ in items[:drop_count]:
+        _TOOL_RATE_BUCKETS.pop(key, None)
 
 # Round-3 residual #2 of #146 (#149): track in-flight audit tasks so
 # transports can drain them on shutdown. Without this, a stdio
@@ -57,6 +116,7 @@ def _mcp_touch_bucket(
     limit: int,
     window_seconds: float,
 ) -> None:
+    global _gc_touch_counter
     now = time.monotonic()
     cutoff = now - window_seconds
     bucket = _TOOL_RATE_BUCKETS[key]
@@ -65,6 +125,18 @@ def _mcp_touch_bucket(
     if len(bucket) >= limit:
         raise PermissionError("rate limit exceeded")
     bucket.append(now)
+
+    # #204: periodic GC of stale (principal, tool) keys. The
+    # per-touch popleft above only prunes timestamps inside the
+    # current bucket; idle principals' buckets stay forever
+    # without this sweep. Run amortized — every Nth touch — so
+    # the hot path stays O(1).
+    _gc_touch_counter += 1
+    if _gc_touch_counter >= _GC_SWEEP_INTERVAL:
+        _gc_touch_counter = 0
+        _gc_stale_buckets(cutoff=cutoff)
+        if len(_TOOL_RATE_BUCKETS) > _MAX_BUCKETS:
+            _evict_oldest_buckets(target_size=_MAX_BUCKETS // 2)
 
 
 async def _mcp_consult_rate_limit(

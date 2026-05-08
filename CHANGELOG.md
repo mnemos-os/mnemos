@@ -4,6 +4,30 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — GC stale `(principal, tool)` keys in MCP rate-limit buckets (#204)
+
+Audit LOW finding (`mem_1778221719390_8cb1ba`) at
+`mnemos/mcp/tools/_security.py:16`: ``_TOOL_RATE_BUCKETS`` was a
+``defaultdict(deque)`` that pruned timestamps inside each deque on
+every touch but never dropped the (principal, tool) keys themselves.
+A high-churn principal flow (CI matrix, rotating tokens) leaked
+memory — small per-entry, monotonically growing for the lifetime
+of the process.
+
+Fix: amortized periodic sweep (`_gc_stale_buckets`) every 256
+touches. Drops buckets whose newest timestamp is past the cutoff
+(principal stopped calling) plus any empty buckets (a
+``defaultdict`` lookup that created the entry but the touch raised
+before the append). A hard cap at 4096 triggers a fallback
+`_evict_oldest_buckets` pass that drops the oldest-by-last-
+timestamp entries until the dict is at half-cap.
+
+Pinned by `tests/test_mcp_rate_bucket_gc.py` (6 tests):
+constants in sane range, sweep drops past-cutoff buckets, sweep
+drops empty buckets, beyond-cap eviction drops the oldest by
+last-timestamp, periodic sweep actually fires every Nth touch,
+hot-path rate-limit semantics unchanged.
+
 ### Fixed — MCP principal context cache TTL + size bound (#203)
 
 Audit MED finding (`mem_1778221719390_8cb1ba`) at
