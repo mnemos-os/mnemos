@@ -92,15 +92,17 @@ def test_get_past_ttl_evicts_and_returns_none(http, monkeypatch):
 
 
 def test_set_beyond_cap_evicts_oldest(http, monkeypatch):
-    """When the cap fills, set() must evict half the entries
-    (oldest expiry first) — a single insert at-cap shouldn't
-    drop EVERY entry, but should keep the dict from growing."""
+    """When the cap fills, set() must evict the OLDEST half by
+    expiry time — not random, not newest-first. Codex round-1 of
+    #203 noted the prior version of this test only asserted size
+    and that `p_overflow` remained, which would let a random
+    eviction policy pass too."""
     cap = http._PRINCIPAL_CACHE_MAX
     fake_now = [1000.0]
     monkeypatch.setattr(http, "_monotonic", lambda: fake_now[0])
-    # Fill to exactly cap
+    # Fill to exactly cap with monotonically-increasing expiry
     for i in range(cap):
-        fake_now[0] = 1000.0 + i  # different expiry per entry
+        fake_now[0] = 1000.0 + i
         http._principal_cache_set(
             f"p{i}",
             http.MCPUserContext(user_id=f"u{i}", role="user",
@@ -115,11 +117,30 @@ def test_set_beyond_cap_evicts_oldest(http, monkeypatch):
         http.MCPUserContext(user_id="overflow", role="user",
                             namespace="overflow"),
     )
+    # Cap holds.
     assert len(http._principal_context_cache) <= cap, (
         f"cache size grew past cap={cap} — eviction logic broken"
     )
     # The newest insertion must still be present.
     assert "p_overflow" in http._principal_context_cache
+
+    # Specifically verify "oldest half evicted, newest half kept":
+    # the bottom (cap//2) entries by insertion order should be
+    # gone; the top (cap//2) plus p_overflow should remain.
+    half = cap // 2
+    evicted_keys = {f"p{i}" for i in range(half)}
+    surviving_keys = {f"p{i}" for i in range(half, cap)}
+    leaked = evicted_keys & set(http._principal_context_cache)
+    missing = surviving_keys - set(http._principal_context_cache)
+    assert not leaked, (
+        f"oldest-half eviction should have removed {sorted(leaked)} "
+        f"but they're still cached — eviction policy may be random "
+        f"or newest-first instead of oldest-first by expiry"
+    )
+    assert not missing, (
+        f"newest-half should have survived eviction but "
+        f"{sorted(missing)} were dropped — eviction took too much"
+    )
 
 
 def test_bare_context_backward_compat(http):
