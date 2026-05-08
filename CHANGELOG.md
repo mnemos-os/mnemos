@@ -2,6 +2,29 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [Unreleased]
+
+### Fixed — `BulkCreateRequest.memories` capped at 1000 (#201)
+
+Audit MED finding (`mem_1778221719390_8cb1ba`):
+`BulkCreateRequest.memories` had no `max_length` cap, unlike
+newer hardened request fields. The `/v1/memories/bulk` handler
+iterates the list with one transaction per memory (N+1 writes +
+publishes), so an unbounded request can open thousands of round-
+trips through dedup + insert + version trigger + webhook outbox.
+
+Cap matched to the compression-enqueue admin pattern (1000 ids
+max). Validation rejects over-cap requests at the Pydantic
+boundary as 422 before any auth/RLS work happens. The deeper
+fix — bulkifying into a single SQL statement — is tracked
+separately because it changes partial-failure semantics across
+the batch.
+
+Pinned by `tests/test_bulk_create_max_length.py` (4 tests):
+1001 items rejected, exactly 1000 accepted, 1/100 under cap
+accepted, source-level guard that the literal `max_length=1000`
+remains in the model definition.
+
 ## [5.0.1] — 2026-05-08
 
 

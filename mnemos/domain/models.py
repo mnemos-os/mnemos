@@ -192,7 +192,17 @@ class MemoryUpdateRequest(BaseModel):
 
 
 class BulkCreateRequest(BaseModel):
-    memories: List[MemoryCreateRequest]
+    # Cap matched to the compression-enqueue admin shape (1000 ids
+    # max). The handler iterates with one transaction per memory; an
+    # unbounded list lets a single request open thousands of round-
+    # trips through the dedup + insert + version-trigger + webhook-
+    # outbox path. 1000 is the operational ceiling; bulkifying into
+    # a single SQL statement (which would also change the partial-
+    # failure semantics) is tracked separately. Validation rejects
+    # over-cap requests at the Pydantic boundary as 422 before any
+    # auth/RLS work happens — same surface as other recent hardened
+    # request fields.
+    memories: List[MemoryCreateRequest] = Field(..., max_length=1000)
 
 
 class BulkCreateResponse(BaseModel):
