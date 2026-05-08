@@ -236,10 +236,14 @@ Compression has two distinct decisions:
    * Heuristic-only — token-overlap, entity-preservation, and
      length-ratio scoring without ML. Default fallback.
 
-Operators pick the engine via `MNEMOS_COMPRESSION_ENGINE` and the
-judge via `MNEMOS_JUDGE_MODE` (`llm` | `cross` | `ensemble` |
-`heuristic`). Ensemble mode uses LLM as the primary and CrossEncoder
-as a secondary; the result is the higher-confidence score.
+The compression-engine choice runs through the contest mechanism
+(every registered engine produces a candidate; the best wins per
+the quality-judge score), not via a single-engine env var. The
+judge mode is configurable via `MNEMOS_JUDGE_MODE` (`llm` |
+`cross` | `ensemble` | `heuristic` — see `mnemos/core/config.py`
+`_CompressionSettings.judge_mode`). Ensemble mode uses LLM as the
+primary and CrossEncoder as a secondary; the result is the
+higher-confidence score.
 
 ### 5.3 Why fastembed (no torch)
 
@@ -268,7 +272,7 @@ fleet without bloating the install.
 ### 5.4 Hot-path expansion
 
 The compression read paths preferring compressed variants over raw
-content is incremental. As of v4.2.0a11:
+content is incremental. As of v5.0.1:
 
 * `/v1/memories/search` honors `include_compressed` to swap
   variants into the response.
@@ -319,7 +323,7 @@ We picked pull over push because:
 
 ### 6.2 NATS push as the additive fast path
 
-`v4.2.0a8+` adds a NATS JetStream push consumer that delivers
+The current v5.0.1 build adds a NATS JetStream push consumer that delivers
 memories with sub-second latency to subscribed peers. Critically,
 the HTTP pull path stays the **durable** fallback — NATS is purely
 a fast-path optimization. If NATS is down or a message is missed,
@@ -468,8 +472,12 @@ register: tracing → auth → metrics → routes
 runtime:  tracing wraps auth wraps metrics wraps routes
 ```
 
-This is documented in `mnemos/api/lifecycle.py` because the
-ordering is invisible from a flat `add_middleware(...)` list.
+This is documented in `mnemos/core/lifecycle.py` (process-level
+boot/shutdown + cache/pool globals) and
+`mnemos/api/lifecycle_hooks.py` (FastAPI startup/shutdown hooks);
+the actual `add_middleware(...)` calls live in
+`mnemos/api/main.py`. The ordering is invisible from a flat
+middleware list, so the spec lives next to the registration code.
 
 ---
 
@@ -554,4 +562,4 @@ round-trip on the native subset.
 
 ---
 
-*v1.0 — 2026-05-01. Tracks MNEMOS server v4.2.0a11.*
+*v1.0 — 2026-05-08. Tracks MNEMOS server v5.0.1.*

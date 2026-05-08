@@ -334,7 +334,7 @@ async def trigger_run(
 @router.delete("/admin/morpheus/runs/{run_id}", response_model=MorpheusRollbackResponse)
 async def rollback(
     run_id: str,
-    _: UserContext = Depends(require_root),
+    user: UserContext = Depends(require_root),
 ):
     """Roll back a MORPHEUS run.
 
@@ -355,7 +355,11 @@ async def rollback(
     try:
         from mnemos.domain.morpheus.runner import rollback_run
 
-        n_deleted, _n_run = await rollback_run(_lc._pool, run_id)
+        n_deleted, _n_run = await rollback_run(
+            _lc._pool,
+            run_id,
+            requested_by=user.user_id,
+        )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     return MorpheusRollbackResponse(run_id=run_id, memories_deleted=n_deleted)

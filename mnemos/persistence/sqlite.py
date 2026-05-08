@@ -11,13 +11,14 @@ import inspect
 import json
 import logging
 import math
+import re
 import sqlite3
 import uuid
 from collections.abc import AsyncIterator, Iterable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 try:  # pragma: no cover - exercised when the sqlite extra is installed.
     import aiosqlite
@@ -97,6 +98,11 @@ SQLITE_MIGRATION_FILES = [
     "migrations_v4_2_pantheon_routing_audit_sqlite.sql",
     "migrations_v5_0_consolidated_at_sqlite.sql",
     "migrations_v5_0_morpheus_extract_run_memories_sqlite.sql",
+    "migrations_v5_0_2_artemis_dedup_sqlite.sql",
+    "migrations_v5_0_3_timestamp_tz_upgrade_sqlite.sql",
+    "migrations_v5_1_0_deletion_log_sqlite.sql",
+    "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
+    "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
 ]
 
 
@@ -124,6 +130,12 @@ def _json_text(value: Any, *, default: Any = None) -> str:
     if isinstance(value, str):
         return value
     return json.dumps(value if value is not None else default)
+
+
+def _json_array_text(value: Sequence[Any] | None) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(list(value))
 
 
 def _json_list(value: Any) -> list[Any]:
@@ -345,6 +357,11 @@ def _cosine_similarity(left: Any, right: Any) -> float:
     return dot / (norm_a * norm_b)
 
 
+def _content_hash_for_sqlite(content: Any) -> str:
+    normalized = str(content or "").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
 async def _maybe_await(value: Any) -> Any:
     if inspect.isawaitable(value):
         return await value
@@ -360,9 +377,19 @@ async def _execute(conn: Any, sql: str, params: Sequence[Any] = ()) -> Any:
     return await _maybe_await(conn.execute(sql, normalized))
 
 
-async def _executemany(conn: Any, sql: str, rows: Sequence[Sequence[Any]]) -> Any:
-    normalized = [tuple(_sqlite_value(value) for value in row) for row in rows]
-    return await _maybe_await(conn.executemany(sql, normalized))
+async def _execute_count(conn: Any, sql: str, params: Sequence[Any] = ()) -> int:
+    cursor = await _execute(conn, sql, params)
+    count = int(getattr(cursor, "rowcount", 0) or 0)
+    close = getattr(cursor, "close", None)
+    if close is not None:
+        await _maybe_await(close())
+    return count
+
+
+# #184: removed `_executemany` — dead. No call sites; SQLite
+# multi-row writes go through individual `await conn.execute(...)`
+# calls in the migration runner and test helpers. The sibling
+# `_executescript` IS still used (migration script application).
 
 
 async def _executescript(conn: Any, sql: str) -> Any:
@@ -449,6 +476,34 @@ class _SqliteRepository:
 
 
 class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
+    # Set by SqliteBackend on construction so search/upsert paths can
+    # enforce the configured embedding dim end-to-end. None disables the
+    # check (e.g. tests that bypass the backend).
+    _expected_embedding_dim: int | None = None
+
+    def _require_dim(self, embedding: Sequence[float], op: str) -> None:
+        """Fail loudly if the embedding length doesn't match the configured dim.
+
+        Without this guard, mnemos_cosine_similarity would return 0.0 on every
+        length mismatch, silently degrading search to "rank by recency" and
+        letting wrong-dim writes poison the table until the next restart-time
+        guard fires. We want loud failure on every call.
+        """
+        expected = self._expected_embedding_dim
+        if expected is None:
+            return
+        actual = len(embedding)
+        if actual != expected:
+            raise ValueError(
+                f"SQLite embedding dim mismatch on {op}: got {actual}-D vector "
+                f"but the configured MNEMOS_EMBEDDING_DIM is {expected}. The "
+                f"embedding endpoint may have been switched to a different "
+                f"model. Verify `INFERENCE_EMBED_HOST` / model selection and "
+                f"either restart with the matching MNEMOS_EMBEDDING_DIM or "
+                f"swap the embedding endpoint back to the model the DB was "
+                f"sized for."
+            )
+
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
         conn = self._conn(tx)
         if _is_root(user):
@@ -600,10 +655,20 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         params.extend([limit, offset])
         return await _fetch_all(
             self._conn(tx),
+            # Provenance columns for MPF v0.2 emission. SQLite uses
+            # `source_memory_ids` and `provenance` (JSON-text) where
+            # postgres uses `source_memories` (text[]) and `provenance`
+            # (text). The serializer reads either key with fallback —
+            # we still alias `provenance` to `prov_kind` so it doesn't
+            # collide with the v0.2 record-level `provenance` field
+            # name in serializer logic.
             "SELECT id, content, category, subcategory, created, updated, "
             "owner_id, namespace, permission_mode, quality_rating, "
             "source_model, source_provider, source_session, source_agent, "
-            f"metadata FROM memories {where} ORDER BY created ASC LIMIT ? OFFSET ?",
+            "metadata, "
+            "provenance AS prov_kind, morpheus_run_id, "
+            "source_memory_ids, federation_source "
+            f"FROM memories {where} ORDER BY created ASC LIMIT ? OFFSET ?",
             params,
         )
 
@@ -657,13 +722,13 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             """
             INSERT INTO memories (
                 id, content, category, subcategory, metadata,
-                quality_rating, verbatim_content, owner_id, namespace, permission_mode,
+                content_hash, quality_rating, verbatim_content, owner_id, namespace, permission_mode,
                 source_model, source_provider, source_session, source_agent,
                 created, updated
             )
             VALUES (
                 ?, ?, ?, ?, ?,
-                ?, ?, ?, ?, ?,
+                ?, ?, ?, ?, ?, ?,
                 ?, ?, ?, ?,
                 COALESCE(?, CURRENT_TIMESTAMP), COALESCE(?, CURRENT_TIMESTAMP)
             )
@@ -676,6 +741,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
                 category,
                 subcategory,
                 metadata_json,
+                _content_hash_for_sqlite(content),
                 quality_rating,
                 verbatim_content,
                 owner_id,
@@ -771,6 +837,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         return [{"id": row["id"], "content": row["content"]} for row in rows]
 
     async def upsert_memory_embedding(self, tx: Transaction, memory_id: str, embedding: Sequence[float]) -> None:
+        self._require_dim(embedding, "upsert_memory_embedding")
         embedding_json = json.dumps([float(value) for value in embedding])
         conn = self._conn(tx)
         await _execute(conn, "UPDATE memories SET embedding = ? WHERE id = ?", (embedding_json, memory_id))
@@ -797,6 +864,7 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         boost_recency: bool = False,  # noqa: ARG002 - Postgres-only option.
         recency_weight: float = 0.15,  # noqa: ARG002 - Postgres-only option.
     ) -> list[Row]:
+        self._require_dim(embedding, "semantic_search")
         embedding_json = json.dumps([float(value) for value in embedding])
         conditions: list[str] = ["me.embedding IS NOT NULL"]
         if not include_archived:
@@ -985,9 +1053,12 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
         conn = self._conn(tx)
         keys = list(fields.keys())
         set_clauses = [f"{col} = ?" for col in keys]
+        values: list[Any] = [fields[k] for k in keys]
+        if "content" in fields:
+            set_clauses.append("content_hash = ?")
+            values.append(_content_hash_for_sqlite(fields["content"]))
         set_clauses.append("updated = CURRENT_TIMESTAMP")
         set_sql = ", ".join(set_clauses)
-        values: list[Any] = [fields[k] for k in keys]
         # WHERE id=? + visibility predicate. Authorization folded into
         # the same UPDATE/RETURNING — same TOCTOU-safe shape as the
         # Postgres impl.
@@ -1006,12 +1077,153 @@ class SqliteMemoryRepository(_SqliteRepository, MemoryRepository):
             )
         return await _fetch_one(conn, sql, params)
 
+    async def find_active_duplicate_by_content_hash(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        content_hash: str,
+        cross_namespace: bool = False,
+    ) -> Row | None:
+        conditions = [
+            "owner_id = ?",
+            "deleted_at IS NULL",
+            "archived_at IS NULL",
+            "consolidated_into IS NULL",
+            "content_hash = ?",
+        ]
+        params: list[Any] = [owner_id, content_hash]
+        if not cross_namespace:
+            conditions.insert(1, "namespace = ?")
+            params.insert(1, namespace)
+        return await _fetch_one(
+            self._conn(tx),
+            "SELECT id, last_recalled_at FROM memories "
+            f"WHERE {' AND '.join(conditions)} "
+            "ORDER BY created ASC, id ASC LIMIT 1",
+            params,
+        )
+
+    async def bump_recall_and_get_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        conn = self._conn(tx)
+        params: list[Any] = [memory_id]
+        vis_clause = _render_sqlite_visibility(visibility, params)
+        if vis_clause:
+            sql = (
+                "UPDATE memories "
+                "SET recall_count = recall_count + 1, last_recalled_at = CURRENT_TIMESTAMP "
+                f"WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL AND {vis_clause} "
+                f"RETURNING {_sqlite_memory_cols()}"
+            )
+        else:
+            sql = (
+                "UPDATE memories "
+                "SET recall_count = recall_count + 1, last_recalled_at = CURRENT_TIMESTAMP "
+                "WHERE id = ? AND deleted_at IS NULL AND archived_at IS NULL "
+                f"RETURNING {_sqlite_memory_cols()}"
+            )
+        return await _fetch_one(conn, sql, params)
+
+    async def find_duplicate_content_groups(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        params: list[Any] = []
+        namespace_clause = ""
+        if namespace is not None:
+            namespace_clause = "AND namespace = ?"
+            params.append(namespace)
+        rows = await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT
+                owner_id,
+                namespace,
+                content_hash,
+                COUNT(*) AS duplicate_count,
+                GROUP_CONCAT(id, char(31)) AS memory_ids,
+                substr(GROUP_CONCAT(id, char(31)), 1, instr(GROUP_CONCAT(id, char(31)) || char(31), char(31)) - 1)
+                    AS canonical_id
+            FROM (
+                SELECT id, owner_id, namespace, content_hash, created
+                FROM memories
+                WHERE deleted_at IS NULL
+                  AND archived_at IS NULL
+                  AND consolidated_into IS NULL
+                  AND content_hash IS NOT NULL
+                  {namespace_clause}
+                ORDER BY owner_id ASC, namespace ASC, content_hash ASC, created ASC, id ASC
+            )
+            GROUP BY owner_id, namespace, content_hash
+            HAVING COUNT(*) > 1
+            ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
+            """.format(namespace_clause=namespace_clause),
+            params,
+        )
+        normalized: list[dict[str, Any]] = []
+        for row in rows:
+            values = dict(row)
+            raw_ids = values.get("memory_ids") or ""
+            values["memory_ids"] = [part for part in str(raw_ids).split("\x1f") if part]
+            values["duplicate_count"] = int(values.get("duplicate_count") or 0)
+            normalized.append(values)
+        return normalized
+
+    async def consolidate_duplicate_memories(
+        self,
+        tx: Transaction,
+        *,
+        canonical_id: str,
+        duplicate_ids: Sequence[str],
+    ) -> int:
+        if not duplicate_ids:
+            return 0
+        params: list[Any] = [canonical_id, *duplicate_ids, canonical_id, canonical_id]
+        placeholders = _placeholders(duplicate_ids)
+        return await _execute_count(
+            self._conn(tx),
+            f"""
+            UPDATE memories
+            SET consolidated_into = ?,
+                consolidated_at = CURRENT_TIMESTAMP,
+                deleted_at = COALESCE(deleted_at, CURRENT_TIMESTAMP),
+                updated = CURRENT_TIMESTAMP
+            WHERE id IN ({placeholders})
+              AND id <> ?
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM memories
+                  WHERE id = ?
+                    AND deleted_at IS NULL
+                    AND archived_at IS NULL
+                    AND consolidated_into IS NULL
+              )
+            """,
+            params,
+        )
+
     async def delete_memory(
         self,
         tx: Transaction,
         memory_id: str,
         *,
         visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
     ) -> Row | None:
         conn = self._conn(tx)
         params: list[Any] = [memory_id]
@@ -1874,6 +2086,33 @@ class SqliteConsultationAuditRepository(_SqliteRepository, ConsultationAuditRepo
 
 
 class SqliteFederationRepository(_SqliteRepository, FederationRepository):
+    _ALLOWED_PEER_COLS = {
+        "name",
+        "base_url",
+        "auth_token",
+        "namespace_filter",
+        "category_filter",
+        "enabled",
+        "sync_interval_secs",
+        "compat_mode",
+    }
+
+    @staticmethod
+    def _peer_row(row: Row | None) -> Row | None:
+        if row is None:
+            return None
+        out = dict(row)
+        out["enabled"] = bool(out.get("enabled"))
+        out["namespace_filter"] = _json_list(out.get("namespace_filter")) or None
+        out["category_filter"] = _json_list(out.get("category_filter")) or None
+        out["created"] = out.get("created") or out.get("created_at")
+        out["updated"] = out.get("updated") or out.get("updated_at")
+        out["last_sync_cursor"] = out.get("last_sync_cursor") or out.get("cursor_updated")
+        return out
+
+    def _conn(self, tx: Transaction) -> Any:
+        return super()._conn(tx)
+
     async def fetch_memory_page(
         self,
         tx: Transaction,
@@ -1895,6 +2134,82 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             params,
         )
 
+    async def create_peer(
+        self,
+        tx: Transaction,
+        *,
+        name: str,
+        base_url: str,
+        auth_token: str,
+        namespace_filter: Sequence[str] | None,
+        category_filter: Sequence[str] | None,
+        enabled: bool,
+        sync_interval_secs: int,
+        compat_mode: str,
+    ) -> Row:
+        peer_id = str(uuid.uuid4())
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO federation_peers
+              (id, name, base_url, auth_token, api_key, namespace_filter,
+               category_filter, enabled, sync_interval_secs, compat_mode,
+               created, updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            """,
+            (
+                peer_id,
+                name,
+                base_url,
+                auth_token,
+                auth_token,
+                _json_array_text(namespace_filter),
+                _json_array_text(category_filter),
+                int(enabled),
+                sync_interval_secs,
+                compat_mode,
+            ),
+        )
+        row = await self.get_peer(tx, peer_id)
+        assert row is not None
+        return row
+
+    async def list_peers(self, tx: Transaction) -> list[Row]:
+        rows = await _fetch_all(self._conn(tx), "SELECT * FROM federation_peers ORDER BY name")
+        return [self._peer_row(row) for row in rows]  # type: ignore[list-item]
+
+    async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        return self._peer_row(await _fetch_one(
+            self._conn(tx),
+            "SELECT * FROM federation_peers WHERE id = ?",
+            (peer_id,),
+        ))
+
+    async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
+        bad = set(updates) - self._ALLOWED_PEER_COLS
+        if bad:
+            raise ValueError(f"unknown federation peer fields: {sorted(bad)}")
+        if not updates:
+            return await self.get_peer(tx, peer_id)
+        assignments: list[str] = []
+        params: list[Any] = []
+        for col, value in updates.items():
+            assignments.append(f"{col} = ?")
+            if col in {"namespace_filter", "category_filter"}:
+                params.append(_json_array_text(value))
+            elif col == "enabled":
+                params.append(int(bool(value)))
+            else:
+                params.append(value)
+        assignments.append("updated = CURRENT_TIMESTAMP")
+        params.append(peer_id)
+        await _execute(
+            self._conn(tx),
+            f"UPDATE federation_peers SET {', '.join(assignments)} WHERE id = ?",
+            params,
+        )
+        return await self.get_peer(tx, peer_id)
+
     async def upsert_peer(
         self,
         tx: Transaction,
@@ -1912,12 +2227,516 @@ class SqliteFederationRepository(_SqliteRepository, FederationRepository):
             (peer_id, base_url, name, int(enabled)),
         )
 
+    async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
+        return await _execute_count(
+            self._conn(tx),
+            "DELETE FROM federation_peers WHERE id = ?",
+            (peer_id,),
+        ) > 0
+
+    async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT id, started_at, finished_at, memories_pulled,
+                   memories_new, memories_updated, error,
+                   cursor_before, cursor_after
+            FROM federation_sync_log
+            WHERE peer_id = ?
+            ORDER BY started_at DESC
+            LIMIT ?
+            """,
+            (peer_id, limit),
+        )
+
+    async def feed_query(
+        self,
+        tx: Transaction,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+    ) -> list[Row]:
+        if prefer_compressed:
+            raise NotImplementedError(
+                "SQLite federation feed does not support prefer_compressed; "
+                "use the Postgres server profile for compressed federation feeds."
+            )
+        memory_query_parts = [
+            "m.federation_source IS NULL",
+            "(m.permission_mode % 10) >= 4",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+        ]
+        tombstone_query_parts = [
+            "m.federation_source IS NULL",
+            "m.consolidated_into IS NOT NULL",
+            "m.consolidated_at IS NOT NULL",
+        ]
+        memory_params: list[Any] = []
+        tombstone_params: list[Any] = []
+        if since_updated is not None:
+            memory_query_parts.append("(m.updated > ? OR (m.updated = ? AND m.id > ?))")
+            memory_params.extend([since_updated, since_updated, since_id])
+            tombstone_query_parts.append("(m.consolidated_at > ? OR (m.consolidated_at = ? AND m.id > ?))")
+            tombstone_params.extend([since_updated, since_updated, since_id])
+        if namespaces:
+            placeholders = _placeholders(namespaces)
+            memory_query_parts.append(f"m.namespace IN ({placeholders})")
+            tombstone_query_parts.append(f"m.namespace IN ({placeholders})")
+            memory_params.extend(namespaces)
+            tombstone_params.extend(namespaces)
+        if categories:
+            placeholders = _placeholders(categories)
+            memory_query_parts.append(f"m.category IN ({placeholders})")
+            tombstone_query_parts.append(f"m.category IN ({placeholders})")
+            memory_params.extend(categories)
+            tombstone_params.extend(categories)
+
+        memory_where_clause = " AND ".join(memory_query_parts)
+        tombstone_where_clause = " AND ".join(tombstone_query_parts)
+        return await _fetch_all(
+            self._conn(tx),
+            f"""
+            SELECT *
+            FROM (
+                SELECT NULL AS type,
+                       m.id,
+                       m.content,
+                       m.category,
+                       m.subcategory,
+                       m.metadata,
+                       m.quality_rating,
+                       m.verbatim_content,
+                       m.owner_id,
+                       m.namespace,
+                       m.permission_mode,
+                       m.source_model,
+                       m.source_provider,
+                       m.source_session,
+                       m.source_agent,
+                       m.created,
+                       m.updated,
+                       m.archived_at,
+                       NULL AS consolidated_into,
+                       NULL AS consolidated_at,
+                       NULL AS compressed_content
+                FROM memories m
+                WHERE {memory_where_clause}
+
+                UNION ALL
+
+                SELECT 'consolidation' AS type,
+                       m.id,
+                       NULL AS content,
+                       NULL AS category,
+                       NULL AS subcategory,
+                       NULL AS metadata,
+                       NULL AS quality_rating,
+                       NULL AS verbatim_content,
+                       NULL AS owner_id,
+                       m.namespace,
+                       NULL AS permission_mode,
+                       NULL AS source_model,
+                       NULL AS source_provider,
+                       NULL AS source_session,
+                       NULL AS source_agent,
+                       m.created,
+                       m.consolidated_at AS updated,
+                       NULL AS archived_at,
+                       m.consolidated_into,
+                       m.consolidated_at,
+                       NULL AS compressed_content
+                FROM memories m
+                WHERE {tombstone_where_clause}
+            ) feed
+            ORDER BY updated ASC, id ASC
+            LIMIT ?
+            """,
+            [*memory_params, *tombstone_params, limit],
+        )
+
+    async def get_feed_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+    ) -> Row | None:
+        query_parts = [
+            "m.federation_source IS NULL",
+            "(m.permission_mode % 10) >= 4",
+            "m.archived_at IS NULL",
+            "m.consolidated_into IS NULL",
+            "m.id = ?",
+        ]
+        params: list[Any] = [memory_id]
+        if namespaces:
+            query_parts.append(f"m.namespace IN ({_placeholders(namespaces)})")
+            params.extend(namespaces)
+        if categories:
+            query_parts.append(f"m.category IN ({_placeholders(categories)})")
+            params.extend(categories)
+        return await _fetch_one(
+            self._conn(tx),
+            f"""
+            SELECT id, content, category, subcategory, metadata, quality_rating,
+                   verbatim_content, owner_id, namespace, permission_mode,
+                   source_model, source_provider, source_session, source_agent,
+                   created, updated, archived_at
+            FROM memories m
+            WHERE {' AND '.join(query_parts)}
+            """,
+            params,
+        )
+
+    async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        return self._peer_row(await _fetch_one(
+            self._conn(tx),
+            """
+            SELECT id, name, base_url, auth_token, namespace_filter,
+                   category_filter, enabled, last_sync_cursor,
+                   compat_mode
+            FROM federation_peers WHERE id = ?
+            """,
+            (peer_id,),
+        ))
+
+    async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            UPDATE federation_peers
+            SET peer_mnemos_version = ?, last_schema_check_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (peer_version, peer_id),
+        )
+
+    async def record_schema_abort(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        peer_version: str | None,
+        cursor_before: Any,
+        error: str,
+        is_transient: bool,
+    ) -> None:
+        await self.update_peer_schema_check(tx, peer_id, peer_version)
+        log_id = await self.create_sync_log(tx, peer_id, cursor_before)
+        await self.finish_sync_log(
+            tx,
+            log_id=log_id,
+            memories_pulled=0,
+            memories_new=0,
+            memories_updated=0,
+            error=error,
+            cursor_after=cursor_before,
+        )
+        if is_transient:
+            await _execute(
+                self._conn(tx),
+                """
+                UPDATE federation_peers
+                SET last_sync_at = datetime(
+                        CURRENT_TIMESTAMP,
+                        printf('-%d seconds', sync_interval_secs),
+                        '+60 seconds'
+                    ),
+                    last_error = ?,
+                    last_error_at = CURRENT_TIMESTAMP
+                WHERE id = ?
+                """,
+                (error, peer_id),
+            )
+        else:
+            await self.record_sync_error(tx, peer_id, error)
+
+    async def create_sync_log(self, tx: Transaction, peer_id: str, cursor_before: Any) -> Any:
+        log_id = str(uuid.uuid4())
+        await _execute(
+            self._conn(tx),
+            """
+            INSERT INTO federation_sync_log
+              (id, peer_id, direction, status, started_at, cursor_before)
+            VALUES (?, ?, 'pull', 'started', CURRENT_TIMESTAMP, ?)
+            """,
+            (log_id, peer_id, cursor_before),
+        )
+        return log_id
+
+    async def finish_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        log_id: Any,
+        memories_pulled: int,
+        memories_new: int,
+        memories_updated: int,
+        error: str | None,
+        cursor_after: Any,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            UPDATE federation_sync_log
+            SET finished_at = CURRENT_TIMESTAMP,
+                memories_pulled = ?,
+                memories_new = ?,
+                memories_updated = ?,
+                records_seen = ?,
+                records_written = ?,
+                status = ?,
+                error = ?,
+                cursor_after = ?
+            WHERE id = ?
+            """,
+            (
+                memories_pulled,
+                memories_new,
+                memories_updated,
+                memories_pulled,
+                memories_new + memories_updated,
+                "error" if error else "ok",
+                error,
+                cursor_after,
+                str(log_id),
+            ),
+        )
+
+    async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            UPDATE federation_peers
+            SET last_sync_at = CURRENT_TIMESTAMP,
+                last_error = ?,
+                last_error_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+            """,
+            (error, peer_id),
+        )
+
+    async def record_sync_success(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        cursor: Any,
+        total_pulled: int,
+    ) -> None:
+        await _execute(
+            self._conn(tx),
+            """
+            UPDATE federation_peers
+            SET last_sync_at = CURRENT_TIMESTAMP,
+                last_sync_cursor = ?,
+                cursor_updated = ?,
+                last_error = NULL,
+                last_error_at = NULL,
+                total_pulled = total_pulled + ?
+            WHERE id = ?
+            """,
+            (cursor, cursor, total_pulled, peer_id),
+        )
+
+    async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
+        return await _fetch_all(
+            self._conn(tx),
+            """
+            SELECT id, name, sync_interval_secs, last_sync_at
+            FROM federation_peers
+            WHERE enabled = 1
+              AND (
+                last_sync_at IS NULL
+                OR datetime(last_sync_at, printf('+%d seconds', sync_interval_secs)) <= CURRENT_TIMESTAMP
+              )
+            ORDER BY COALESCE(
+                datetime(last_sync_at, printf('+%d seconds', sync_interval_secs)),
+                '1970-01-01T00:00:00'
+            )
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
+        return await _fetch_one(
+            self._conn(tx),
+            "SELECT federation_remote_updated FROM memories WHERE id = ?",
+            (local_id,),
+        )
+
+    async def insert_federated_memory(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        peer_name: str,
+        remote_updated: Any,
+    ) -> bool:
+        try:
+            await _execute(
+                self._conn(tx),
+                """
+                INSERT INTO memories
+                  (id, content, category, subcategory, metadata, verbatim_content,
+                   quality_rating, owner_id, namespace, permission_mode,
+                   source_model, source_provider, source_session, source_agent,
+                   federation_source, federation_remote_updated, created, updated)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'federation', ?, 644,
+                        ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?)
+                """,
+                (
+                    local_id,
+                    content,
+                    category,
+                    subcategory,
+                    metadata_json,
+                    verbatim_content,
+                    quality_rating,
+                    namespace,
+                    source_model,
+                    source_provider,
+                    source_session,
+                    source_agent,
+                    peer_name,
+                    remote_updated,
+                    remote_updated,
+                ),
+            )
+            return True
+        except sqlite3.IntegrityError:
+            return False
+
+    async def update_federated_memory_if_newer(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        remote_updated: Any,
+    ) -> bool:
+        return await _execute_count(
+            self._conn(tx),
+            """
+            UPDATE memories SET
+              content = ?,
+              category = ?,
+              subcategory = ?,
+              metadata = ?,
+              verbatim_content = ?,
+              quality_rating = ?,
+              namespace = ?,
+              federation_remote_updated = ?,
+              updated = ?
+            WHERE id = ?
+              AND (
+                  federation_remote_updated IS NULL
+                  OR federation_remote_updated < ?
+              )
+            """,
+            (
+                content,
+                category,
+                subcategory,
+                metadata_json,
+                verbatim_content,
+                quality_rating,
+                namespace,
+                remote_updated,
+                remote_updated,
+                local_id,
+                remote_updated,
+            ),
+        ) > 0
+
+    async def apply_consolidation_tombstone(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        local_canonical_id: str,
+        consolidated_at: Any,
+        remote_id: str,
+        canonical_remote_id: str,
+        peer_name: str,
+    ) -> bool:
+        return await _execute_count(
+            self._conn(tx),
+            """
+            UPDATE memories
+            SET consolidated_into = ?,
+                consolidated_at = COALESCE(?, CURRENT_TIMESTAMP),
+                permission_mode = 400,
+                metadata = json_set(
+                    COALESCE(NULLIF(metadata, ''), '{}'),
+                    '$.federation_consolidation',
+                    json_object(
+                        'remote_id', ?,
+                        'remote_consolidated_into', ?,
+                        'peer', ?
+                    )
+                )
+            WHERE id = ?
+              AND (consolidated_into IS NULL OR consolidated_into <> ?)
+              AND EXISTS (
+                  SELECT 1 FROM memories
+                  WHERE id = ?
+              )
+            """,
+            (
+                local_canonical_id,
+                consolidated_at,
+                remote_id,
+                canonical_remote_id,
+                peer_name,
+                local_id,
+                local_canonical_id,
+                local_canonical_id,
+            ),
+        ) > 0
+
+    async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        local_id = f"fed:{peer_name}:{memory_id}"
+        return await _execute_count(
+            self._conn(tx),
+            """
+            DELETE FROM memories
+            WHERE id = ?
+              AND federation_source = ?
+            """,
+            (local_id, peer_name),
+        )
+
 
 class SqliteStateRepository(_SqliteRepository, StateRepository):
     async def get(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> Row | None:
         return await _fetch_one(
             self._conn(tx),
-            "SELECT key, value, owner_id, namespace FROM state WHERE owner_id = ? AND namespace = ? AND key = ?",
+            "SELECT key, value, updated, version, owner_id, namespace FROM state "
+            "WHERE owner_id = ? AND namespace = ? AND key = ? AND deleted_at IS NULL",
             (owner_id, namespace, key),
         )
 
@@ -1929,19 +2748,56 @@ class SqliteStateRepository(_SqliteRepository, StateRepository):
         *,
         owner_id: str = "default",
         namespace: str = "default",
-    ) -> None:
-        await _execute(
+        expires_at: Any | None = None,
+    ) -> Row | None:
+        _ = expires_at
+        return await _fetch_one(
             self._conn(tx),
-            "INSERT INTO state (owner_id, namespace, key, value) VALUES (?, ?, ?, ?) "
-            "ON CONFLICT(owner_id, namespace, key) DO UPDATE SET value = excluded.value, updated = CURRENT_TIMESTAMP",
+            "INSERT INTO state (owner_id, namespace, key, value, updated) VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(owner_id, namespace, key) DO UPDATE SET "
+            "value = excluded.value, updated = CURRENT_TIMESTAMP, version = state.version + 1 "
+            "WHERE state.deleted_at IS NULL "
+            "RETURNING key, value, updated, version, owner_id, namespace",
             (owner_id, namespace, key, value),
         )
 
-    async def delete(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> None:
-        await _execute(
+    async def delete(self, tx: Transaction, key: str, *, owner_id: str = "default", namespace: str = "default") -> bool:
+        return await _execute_count(
             self._conn(tx),
-            "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND key = ?",
+            "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND key = ? AND deleted_at IS NULL",
             (owner_id, namespace, key),
+        ) > 0
+
+    async def list_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Row]:
+        params: list[Any] = [owner_id, namespace]
+        sql = (
+            "SELECT key, updated, version, owner_id, namespace FROM state "
+            "WHERE owner_id = ? AND namespace = ? AND deleted_at IS NULL ORDER BY key"
+        )
+        if limit is not None:
+            sql += " LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+        return await _fetch_all(self._conn(tx), sql, params)
+
+    async def delete_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> int:
+        return await _execute_count(
+            self._conn(tx),
+            "DELETE FROM state WHERE owner_id = ? AND namespace = ? AND deleted_at IS NULL",
+            (owner_id, namespace),
         )
 
 
@@ -1997,7 +2853,14 @@ class SqliteBackend(PersistenceBackend):
         await self._register_functions(conn)
         await self._load_sqlite_vec(conn)
         await self._apply_migrations(conn)
+        await self._ensure_repository_columns(conn)
         await self._create_vec_virtual_table(conn)
+        # Wire the configured dim into the memory repository so the runtime
+        # search + upsert paths can enforce the same invariant the startup
+        # checks established. Without this, a misconfigured embedding
+        # endpoint after open() could poison the table or silently degrade
+        # search until the next restart.
+        self._memories._expected_embedding_dim = self._resolve_embedding_dim()
         await _commit(conn)
 
     async def _check_sqlite_version(self, conn: Any) -> None:
@@ -2013,6 +2876,7 @@ class SqliteBackend(PersistenceBackend):
 
     async def _register_functions(self, conn: Any) -> None:
         await _call(conn.create_function, "mnemos_cosine_similarity", 2, _cosine_similarity)
+        await _call(conn.create_function, "mnemos_content_sha256", 1, _content_hash_for_sqlite)
 
     async def _load_sqlite_vec(self, conn: Any) -> None:
         try:
@@ -2059,17 +2923,206 @@ class SqliteBackend(PersistenceBackend):
                     continue
                 raise
 
+    async def _ensure_repository_columns(self, conn: Any) -> None:
+        await self._ensure_columns(
+            conn,
+            "state",
+            {
+                "updated_by": "updated_by TEXT",
+                "version": "version INTEGER NOT NULL DEFAULT 1",
+                "deleted_at": "deleted_at TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "memories",
+            {
+                "federation_remote_updated": "federation_remote_updated TEXT",
+                "archived_at": "archived_at TEXT",
+                "consolidated_into": "consolidated_into TEXT",
+                "consolidated_at": "consolidated_at TEXT",
+                "deleted_at": "deleted_at TEXT",
+                "content_hash": "content_hash TEXT",
+            },
+        )
+        await _execute(
+            conn,
+            "UPDATE memories SET content_hash = mnemos_content_sha256(content) WHERE content_hash IS NULL",
+        )
+        await self._ensure_columns(
+            conn,
+            "federation_peers",
+            {
+                "auth_token": "auth_token TEXT",
+                "namespace_filter": "namespace_filter TEXT",
+                "category_filter": "category_filter TEXT",
+                "sync_interval_secs": "sync_interval_secs INTEGER NOT NULL DEFAULT 300",
+                "last_sync_cursor": "last_sync_cursor TEXT",
+                "last_error": "last_error TEXT",
+                "last_error_at": "last_error_at TEXT",
+                "total_pulled": "total_pulled INTEGER NOT NULL DEFAULT 0",
+                "compat_mode": "compat_mode TEXT NOT NULL DEFAULT 'strict'",
+                "peer_mnemos_version": "peer_mnemos_version TEXT",
+                "last_schema_check_at": "last_schema_check_at TEXT",
+                "created": "created TEXT",
+                "updated": "updated TEXT",
+            },
+        )
+        await self._ensure_columns(
+            conn,
+            "federation_sync_log",
+            {
+                "started_at": "started_at TEXT",
+                "finished_at": "finished_at TEXT",
+                "memories_pulled": "memories_pulled INTEGER NOT NULL DEFAULT 0",
+                "memories_new": "memories_new INTEGER NOT NULL DEFAULT 0",
+                "memories_updated": "memories_updated INTEGER NOT NULL DEFAULT 0",
+                "cursor_before": "cursor_before TEXT",
+                "cursor_after": "cursor_after TEXT",
+            },
+        )
+
+    async def _ensure_columns(self, conn: Any, table: str, definitions: dict[str, str]) -> None:
+        rows = await _fetch_all(conn, f"PRAGMA table_info({table})")
+        existing = {row["name"] for row in rows}
+        for column, definition in definitions.items():
+            if column not in existing:
+                await _execute(conn, f"ALTER TABLE {table} ADD COLUMN {definition}")
+
     async def _create_vec_virtual_table(self, conn: Any) -> None:
+        dim = self._resolve_embedding_dim()
+        # Guard 1: if the vec0 virtual table already exists at a different dim,
+        # the CREATE ... IF NOT EXISTS DDL would be a silent no-op and the
+        # service would run searches against the wrong dim. Fatal — operator
+        # must explicitly migrate.
+        existing_vec_dim = await self._existing_vec_table_dim(conn)
+        if existing_vec_dim is not None and existing_vec_dim != dim:
+            raise RuntimeError(
+                f"SQLite vec0 dimension mismatch: memory_embedding_vec exists "
+                f"at dim={existing_vec_dim} but MNEMOS_EMBEDDING_DIM resolves "
+                f"to {dim}. The vec0 virtual table cannot be re-sized in place. "
+                f"To migrate: stop this service, run "
+                f"`sqlite3 {self._db_path} 'DROP TABLE memory_embedding_vec; "
+                f"DELETE FROM memory_embeddings;'`, then restart the service to "
+                f"recreate the table at the new dim and re-embed all memories. "
+                f"Refusing to start to prevent silent search degradation."
+            )
+        # Guard 2: scan ALL fallback memory_embeddings rows. Stale-dim rows
+        # would silently score 0.0 in cosine similarity against new-dim
+        # queries — search degrades to "rank by recency" with no warning.
+        # We can't trust a single-row sample because a DB poisoned before
+        # the runtime dim guard landed (c9007dd) can have mixed-dim rows.
+        fb_histogram = await self._scan_fallback_embedding_dims(conn)
+        bad_dims = {d: c for d, c in fb_histogram.items() if d != dim}
+        if bad_dims:
+            shape = ", ".join(f"dim={d} x{c}" for d, c in sorted(bad_dims.items()))
+            raise RuntimeError(
+                f"SQLite fallback embedding dimension mismatch: "
+                f"memory_embeddings has {sum(bad_dims.values())} rows at "
+                f"non-configured dims ({shape}); MNEMOS_EMBEDDING_DIM "
+                f"resolves to {dim}. Searching new-dim queries against "
+                f"stale-dim rows produces meaningless cosine scores. To "
+                f"migrate: stop this service, run "
+                f"`sqlite3 {self._db_path} 'DELETE FROM memory_embeddings;'`, "
+                f"then restart and re-embed all memories at the new dim. "
+                f"Refusing to start to prevent silent search degradation."
+            )
         if not self._vec_loaded:
             return
         try:
             await _execute(
                 conn,
-                "CREATE VIRTUAL TABLE IF NOT EXISTS memory_embedding_vec USING vec0(embedding float[768])",
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS memory_embedding_vec USING vec0(embedding float[{dim}])",
             )
         except Exception as exc:
             self._vec_loaded = False
             logger.debug("sqlite-vec virtual table creation failed; using fallback memory_embeddings table: %s", exc)
+
+    async def _existing_vec_table_dim(self, conn: Any) -> Optional[int]:
+        """Return the embedded float[N] dim of memory_embedding_vec if it exists.
+
+        Returns None if the table doesn't exist (fresh install) or if the DDL
+        can't be parsed. Parses the DDL string from sqlite_master.sql; format is
+        ``CREATE VIRTUAL TABLE ... USING vec0(embedding float[<N>])`` where N
+        is a positive integer.
+        """
+        row = await _fetch_one(
+            conn,
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='memory_embedding_vec'",
+        )
+        if not row:
+            return None
+        ddl = row.get("sql") if isinstance(row, dict) else row[0]
+        if not ddl:
+            return None
+        match = re.search(r"float\[(\d+)\]", ddl, re.IGNORECASE)
+        if not match:
+            return None
+        try:
+            return int(match.group(1))
+        except ValueError:
+            return None
+
+    async def _scan_fallback_embedding_dims(self, conn: Any) -> dict[int, int]:
+        """Return a histogram of {dim: row_count} across all memory_embeddings.
+
+        A DB that was running BEFORE the runtime dim guard landed could have
+        accumulated mixed-dim rows from a misconfigured embedding endpoint
+        (e.g. the model was switched mid-flight). Sampling a single row could
+        miss this — if the sample happened to match the configured dim,
+        startup would succeed while stale-dim rows lurked in the table and
+        silently scored 0.0 in cosine similarity.
+
+        This scans every row. The query uses sqlite's json_array_length
+        which is O(1) per row given the stored format. For the PYTHIA fleet
+        (~9k memories) this is millisecond-scale at boot. Returns empty
+        dict if the table is absent or has no rows.
+        """
+        row_meta = await _fetch_one(
+            conn,
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name='memory_embeddings'",
+        )
+        if not row_meta:
+            return {}
+        rows = await _fetch_all(
+            conn,
+            "SELECT json_array_length(embedding) AS dim, COUNT(*) AS cnt "
+            "FROM memory_embeddings WHERE embedding IS NOT NULL "
+            "GROUP BY json_array_length(embedding)",
+        )
+        histogram: dict[int, int] = {}
+        for r in rows:
+            dim = r.get("dim") if isinstance(r, dict) else r[0]
+            cnt = r.get("cnt") if isinstance(r, dict) else r[1]
+            if dim is None:
+                continue
+            try:
+                histogram[int(dim)] = int(cnt)
+            except (TypeError, ValueError):
+                continue
+        return histogram
+
+    def _resolve_embedding_dim(self) -> int:
+        # Settings can be None in tests + lite-CLI paths. Fall back to 768
+        # (nomic-embed-text default) when no override is available.
+        try:
+            dim = self._settings.database.embedding_dim
+        except AttributeError:
+            return 768
+        # sqlite-vec's SQLITE_VEC_VEC0_MAX_DIMENSIONS upstream caps at 8192;
+        # values above silently fail the CREATE VIRTUAL TABLE and drop us to
+        # the slower JSON/UDF path. Reject those before they bite.
+        if not isinstance(dim, int) or dim < 1 or dim > 8192:
+            logger.warning(
+                "MNEMOS_EMBEDDING_DIM=%r out of supported range [1, 8192] "
+                "(sqlite-vec SQLITE_VEC_VEC0_MAX_DIMENSIONS); falling back to "
+                "768. Set the env var to your model's actual dim.",
+                dim,
+            )
+            return 768
+        return dim
 
     @asynccontextmanager
     async def transactional(self) -> AsyncIterator[Transaction]:

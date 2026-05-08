@@ -74,6 +74,7 @@ def _write_env_file(config: Config, env_path: str) -> bool:
             f"MNEMOS_LISTEN_PORT={config.listen_port}",
             f"MNEMOS_SERVICE_USER={config.service_user}",
             f"INFERENCE_EMBED_HOST={config.inference_embed_host}",
+            f"MNEMOS_EMBEDDING_DIM={config.embedding_dim}",
         ]
         for provider, key in config.graeae_providers.items():
             lines.append(f"{provider.upper()}_API_KEY={key}")
@@ -296,24 +297,11 @@ def start_service(service_name: str) -> bool:
     return True
 
 
-def service_status(service_name: str) -> str:
-    """Return 'active', 'inactive', 'failed', or 'unknown'."""
-    if sys.platform == "darwin":
-        rc, out, _ = _run(["launchctl", "list", service_name])
-        if rc == 0:
-            return "active"
-        return "inactive"
-
-    if not _which_exists("systemctl"):
-        return "unknown"
-
-    rc, out, _ = _run(["systemctl", "is-active", service_name])
-    state = out.strip().lower()
-    if state in ("active", "inactive", "failed"):
-        return state
-    return "unknown"
-
-
-def _which_exists(name: str) -> bool:
-    rc, _, _ = _run(["which", name])
-    return rc == 0
+# #187: removed `service_status` — defined but never called.
+# Also removed `_which_exists`, its only call site. Verified across
+# mnemos/+tests/+docs/+scripts/+systemd/+console_scripts. Installer
+# __main__ imports create_service_user / enable_service /
+# install_launchd / install_systemd / start_service from this
+# module but NOT service_status. Operators use `systemctl is-active
+# mnemos` (Linux) or `launchctl list ai.mnemos` (macOS) directly
+# when post-install status is needed.

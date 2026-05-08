@@ -40,26 +40,9 @@ def _cost_ok(model: dict[str, Any], max_cost: float | None) -> bool:
     return max_cost is None or (cost is not None and float(cost) <= max_cost)
 
 
-def _select_cheapest(
-    models: list[dict[str, Any]],
-    *,
-    required_capability: str | None = None,
-    quality_floor: float = 0.0,
-    max_cost: float | None = None,
-) -> dict[str, Any] | None:
-    candidates = _available(models)
-    if required_capability:
-        candidates = [
-            model for model in candidates
-            if required_capability in set(model.get("capabilities") or [])
-        ]
-    candidates = [
-        model for model in candidates
-        if _quality_ok(model, quality_floor) and _cost_ok(model, max_cost)
-    ]
-    if not candidates:
-        return None
-    return sorted(candidates, key=_cost_sort_value)[0]
+# #183: removed `_select_cheapest` helper — defined but never
+# called. Selection is done by the route handler with a different
+# scoring shape that doesn't go through this helper.
 
 
 def _candidate_pool(

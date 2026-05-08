@@ -30,6 +30,7 @@ class Config:
     install_docling: bool = True
     create_service: bool = True
     create_new_db: bool = True       # True = create DB, False = use existing
+    embedding_dim: int = 768         # vec0/embedding dimension; honors MNEMOS_EMBEDDING_DIM
 
 
 _PROVIDERS = [

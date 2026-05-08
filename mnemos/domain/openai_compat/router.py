@@ -368,7 +368,7 @@ async def chat_completion(
         except OpenAICompatError:
             raise
         except Exception as e:
-            logger.error("[MNEMOS] Streaming request failed before response start: %s", e)
+            logger.error("[MNEMOS] Streaming request failed before response start: %s", e, exc_info=True)
             raise _stream_preflight_exception(e) from e
 
         return StreamingChatCompletion(
@@ -392,7 +392,7 @@ async def chat_completion(
     except OpenAICompatError:
         raise
     except Exception as e:
-        logger.error("[MNEMOS] Request failed: %s", e)
+        logger.error("[MNEMOS] Request failed: %s", e, exc_info=True)
         raise OpenAICompatError(status_code=503, detail=f"Request failed: {str(e)}") from e
 
     choices = _provider_choices(provider_response)

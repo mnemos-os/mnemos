@@ -4,7 +4,7 @@
 
 # MNEMOS + GRAEAE
 
-**MNEMOS v5.0.0 is the memory operating system for serious agentic work: a
+**MNEMOS v5.0.1 is the memory operating system for serious agentic work: a
 packaged FastAPI runtime, multi-backend persistence layer, GRAEAE reasoning bus,
 operator-audited compression stack, divergent dream-state pipeline (REPLAY →
 CLUSTER → CONSOLIDATE → SYNTHESISE → EXTRACT), GDPR right-to-be-forgotten
@@ -31,11 +31,11 @@ federate, export, import, and operate**.
   the `/v1/` REST surface are services built on top of the kernel, not retrofits
   onto a vector store.
 
-The v5.0 codebase is a coherent `mnemos/` package: `api/routes`, `core`, `db`,
+The v5.x codebase is a coherent `mnemos/` package: `api/routes`, `core`, `db`,
 `domain` (compression, morpheus, persephone, pantheon, kronos, federation,
-graeae), `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`,
-`nats`, `tools`, and `cli`. The old top-level script sprawl is gone; operators
-use the single `mnemos` command.
+graeae, portability), `persistence`, `mcp`, `webhooks`, `workers`,
+`installer`, `nats`, `tools`, and `cli`. The old top-level script sprawl is
+gone; operators use the single `mnemos` command.
 
 ## What You Get
 
@@ -65,41 +65,43 @@ use the single `mnemos` command.
   isolation, multi-worker smoke, and Postgres/SQLite persistence parity.
 
 MNEMOS has been in daily production use since December 2025. The current release
-line is **v5.0.0**, shipped on **2026-05-02**, closing the v3.6 + v4.x charters
-and rolling up the v4.2.0a14 alpha line. v5.0 is the first release that ships
-the full divergent dream-state pipeline (CONSOLIDATE + EXTRACT phases),
-right-to-be-forgotten worker, PERSEPHONE archival, PANTHEON unified LLM facade,
-and KRONOS recall observability — alongside the v4.1 foundation of multi-backend
-persistence, deployment profiles, single-binary builds, and multi-worker
-coordination.
+line is **v5.0.1**, on top of the v5.0.0 GA shipped on **2026-05-02** which
+closed the v3.6 + v4.x charters and rolled up the v4.2.0a14 alpha line. The v5.0
+release was the first to ship the full divergent dream-state pipeline
+(CONSOLIDATE + EXTRACT phases), right-to-be-forgotten worker, PERSEPHONE
+archival, PANTHEON unified LLM facade, and KRONOS recall observability —
+alongside the v4.1 foundation of multi-backend persistence, deployment profiles,
+single-binary builds, and multi-worker coordination. The v5.0.x line iterates
+on top with timezone hardening, MCP HTTP/SSE expansion, MPF v0.2 portability,
+and a tightening of the dead-code surface across the audit slices.
 
 ## Quick Install
 
 ```bash
-pip install 'mnemos-os[edge]==5.0.0'
+pip install 'mnemos-os[edge]==5.0.1'
 mnemos serve --profile dev
 ```
 
 | Shape | Command |
 |---|---|
-| Core | `pip install mnemos-os==5.0.0` |
-| Edge | `pip install 'mnemos-os[edge]==5.0.0'` |
-| Server | `pip install 'mnemos-os[server]==5.0.0'` |
-| ML | `pip install 'mnemos-os[ml]==5.0.0'` |
-| Full | `pip install 'mnemos-os[full]==5.0.0'` |
+| Core | `pip install mnemos-os==5.0.1` |
+| Edge | `pip install 'mnemos-os[edge]==5.0.1'` |
+| Server | `pip install 'mnemos-os[server]==5.0.1'` |
+| ML | `pip install 'mnemos-os[ml]==5.0.1'` |
+| Full | `pip install 'mnemos-os[full]==5.0.1'` |
 
-Mix bundles as needed, for example `pip install 'mnemos-os[server,ml]==5.0.0'`.
+Mix bundles as needed, for example `pip install 'mnemos-os[server,ml]==5.0.1'`.
 See [`docs/INSTALL.md`](./docs/INSTALL.md) for the full matrix and migration
 notes.
 
 ```bash
-docker pull ghcr.io/mnemos-os/mnemos:5.0.0
+docker pull ghcr.io/mnemos-os/mnemos:5.0.1
 ```
 
 For a single binary with no host Python:
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -127,13 +129,52 @@ MNEMOS is designed to be the memory layer for the agentic tooling you already us
 2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, propagated generation controls (`temperature`, `max_tokens`, `top_p`), streaming SSE, and explicit 400s when the selected provider cannot honor tools, response formats, penalties, or multimodal content. Request-level opt-out is available with `X-Mnemos-Inject-Memory: false` or body field `mnemos_inject_memory: false`. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
 3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
 
-Current MCP tools come from one registry shared by stdio and HTTP/SSE:
-`search_memories`, `list_memories`, `get_memory`, `create_memory`,
-`update_memory`, `delete_memory`, `bulk_create_memories`, `get_stats`,
+Current MCP tools come from one registry shared by stdio and HTTP/SSE
+(23 tools total): `search_memories`, `list_memories`, `get_memory`,
+`create_memory`, `update_memory`, `delete_memory`,
+`bulk_create_memories`, `list_deletions`, `get_stats`,
 `kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`,
 `delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`,
 `checkout_memory`, `recommend_model`, `pantheon_list_models`,
 `pantheon_route_explain`, `kronos_anomalies`, and `kronos_forecast`.
+
+### Bridge family (Phase 2 of the consolidation, shipped 2026-05-04)
+
+For agent surfaces that don't speak MCP natively, the **`mnemos-bridge-*`**
+package family provides per-surface adapters that translate MCP tool
+definitions into each target SDK's tool-call shape and dispatch tool calls
+back through MCP to MNEMOS. All adapters share a single
+**`mnemos-bridge-core`** library that handles transport, schema
+translation (OpenAI / Gemini / Anthropic dialects), result rendering,
+auth resolution, and dispatch.
+
+```
+gitlab.com/mnemos-os/
+├── mnemos-bridge-core              v0.1.3   shared lib (32 tier-1 + live MCP smoke)
+├── mnemos-bridge-openai            v0.1.1   OpenAI Chat Completions + Agents SDK (gpt-5 verified live)
+├── mnemos-bridge-gemini            v0.1.1   Google Gemini SDK + Vertex AI (gemini-3-pro-preview verified live)
+├── mnemos-bridge-anthropic         v0.1.0   Anthropic API (claude-opus-4-7 verified live)
+├── mnemos-bridge-aider             v0.1.0   Aider CLI sidecar + plugin
+├── mnemos-bridge-crewai            v0.1.0   CrewAI BaseTool wrapper (8/8 tests against crewai 1.14)
+└── mnemos-bridge-claude-connector  v0.1.0   OAuth 2.1 + PKCE shim for Claude.ai Connectors
+```
+
+Install whichever you need:
+
+```bash
+pip install mnemos-bridge-openai          # or any other adapter; each pulls core
+```
+
+Each adapter exposes the same shape — `MnemosXxxAdapter.connect(mcp_url, mcp_token)`
+returns a context-manageable adapter with `.openai_tools()` /
+`.gemini_tools()` / `.anthropic_tools()` (etc.) plus a per-target
+`.handle_tool_call()` round-trip helper. The connector docs in
+[`docs/connectors/`](./docs/connectors/) show the registration recipe
+per surface.
+
+Tier-2 live integration tests run against real model APIs whenever
+`OPENAI_API_KEY`, `GOOGLE_API_KEY`, and `ANTHROPIC_API_KEY` are present.
+The bridges are tested against PYTHIA's MCP HTTP/SSE on port 5003.
 
 ### Today's integration inventory
 
@@ -166,7 +207,7 @@ MNEMOS was built to solve those problems in a way that reflects real platform ex
 
 Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
 
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape; **v5.0.0 is the current shipped GA line**, adding the divergent dream-state pipeline (CONSOLIDATE + EXTRACT), GDPR right-to-be-forgotten worker, PERSEPHONE archival, PANTHEON unified LLM facade, KRONOS recall observability, DAG wiring for compression derivations, and the V4 §6.4 cross-tenant security gates on top of the v4.1 foundation. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
+**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape; **v5.0.0 is the GA line that closed the v3.6 + v4.x charters**, adding the divergent dream-state pipeline (CONSOLIDATE + EXTRACT), GDPR right-to-be-forgotten worker, PERSEPHONE archival, PANTHEON unified LLM facade, KRONOS recall observability, DAG wiring for compression derivations, and the V4 §6.4 cross-tenant security gates on top of the v4.1 foundation. **v5.0.1 is the current shipped release**, iterating on top with timezone hardening, MCP HTTP/SSE expansion, MPF v0.2 portability, and audit-driven dead-code cleanup. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
 
 For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
 
@@ -273,7 +314,7 @@ The shared premise — that agent memory deserves first-class treatment — is t
 
 ## What works now
 
-This is the current state of the v5.0.0 release line. Features described here are implemented unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
+This is the current state of the v5.x release line (current release `v5.0.1`). Features described here are implemented unless explicitly called out as forward-looking in [`ROADMAP.md`](./ROADMAP.md).
 
 The API surface is namespaced under `/v1/*`.
 
@@ -600,10 +641,6 @@ Compression has been operator-batched since v4.0. It is not an automatic session
 - The plugin `CompressionEngine` ABC is open to operator-registered engines. The contest logs the winner plus every loser with its score and rejection reason.
 - `/v1/memories/search` still carries reserved `compression_applied` / `compression_metadata` response fields from the v3.2 API shape; current search responses set `compression_applied=false`. Use `/v1/memories/rehydrate` or `/v1/memories/{id}/compression-manifests` when you need to know whether a compressed variant was used.
 
-### Memory tier selector (advisory)
-
-The `mnemos/domain/memory_categorization` package still exposes a hot/warm/cold/archive selector for hook-side prompt budgeting. It is advisory metadata used by integrations; it is not the removed `sessions.compression_tier` database column and does not drive automatic background compression.
-
 ### Versioning and audit
 
 - Memory version history (`memory_versions` table) — every mutation auto-snapshots previous state
@@ -643,7 +680,7 @@ Landed with the v3.0 release line:
 - ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
 - ✅ **Webhook retry state machine + leases + outbox discipline** — persisted leases, one-success-per-chain guards, repair worker separation, bulk-create parity, and terminal success trigger.
-- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 18 tools from `mnemos/mcp/tools/`, including CRUD, KG, DAG, bulk create, stats, and model recommendation.
+- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 23 tools from `mnemos/mcp/tools/`, including CRUD, KG, DAG, bulk create, stats, deletion-request management, model recommendation, KRONOS observability, and the PANTHEON model facade.
 - ✅ **Faithful OpenAI-compatible gateway** — propagated generation controls, OpenAI-format SSE, registry-honest model discovery, and explicit 400/404 responses when the selected provider cannot honor a requested feature.
 - ✅ **Namespace-uniform tenancy** — state, journal, entities, sessions, consultations, webhooks, and memory read/history paths use the owner+namespace discipline.
 - ✅ **PostgreSQL streaming-replication doctrine** — single-site HA uses Postgres primary/standby replication; MNEMOS federation is for remote or curated data flows.
@@ -662,7 +699,7 @@ v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/r
 - ✅ **KRONOS v0.1** — recall-pattern anomaly detection (z-score over `recall_count` history), namespace drift detection, recall-load forecasting (EWMA), PERSEPHONE eligibility forecast. CPU-only via numpy; Tesseract GPU integration deferred to v5.1.
 - ✅ **DAG wiring for compression derivations** — every successful compression contest persists a child row in `memory_versions` parented to the source memory's `branch='main'` HEAD on `branch='distilled'` or `branch='narrated'`; `change_type='compress'` extends the CHECK constraint; commit hash is content-derived.
 - ✅ **NATS substrate v0.2** — bounded next slice. PANTHEON routing-log → `mnemos.pantheon.routing` opt-in publish; `pantheon_routing_audit` table fed by an optional consumer worker.
-- ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 18 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
+- ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 23 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
 - ✅ **Document-import retry-safety** — content-derived `import_chunk_key` prevents duplicate chunk insertion on retry; ON CONFLICT (key) DO UPDATE returns canonical row id.
 - ✅ **Connector smoke gallery** — end-to-end smoke per surface (Claude Code, Cursor, Codex CLI, Continue, Cline, Claude Desktop, ChatGPT) with mechanically-validated JSON snippets.
 - ✅ **Rust hot-path accelerator (mnemos_hot v0.2)** — Rust implementations of cosine, top_k, batch cosine, embedding parse, embedding L2-normalize, composite search re-rank, deterministic judge scoring, and SHA-256 batch hashing. All wired with MNEMOS_HOT_RS_ENABLED=1 opt-in plus identical Python fallback.
@@ -740,7 +777,7 @@ mnemos.core lifecycle/config/visibility
 ### Edge install (single binary)
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -749,7 +786,7 @@ chmod +x mnemos
 ### Package install
 
 ```bash
-pip install 'mnemos-os[edge]==5.0.0'
+pip install 'mnemos-os[edge]==5.0.1'
 mnemos install --profile dev
 mnemos serve --profile dev
 ```

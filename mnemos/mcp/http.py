@@ -69,7 +69,9 @@ logger = logging.getLogger(__name__)
 
 
 HTTP_TOOL_REGISTRY = TOOL_REGISTRY
-DEFAULT_NATS_SSE_SUBJECT = "mnemos.*.*.default"
+# #181: removed `DEFAULT_NATS_SSE_SUBJECT = "mnemos.*.*.default"` —
+# defined but never referenced. SSE subject defaults are derived
+# per-principal from auth context, not a global string constant.
 NATS_SSE_PATH = "/mcp/events/stream"
 NATS_SSE_QUEUE_MAXSIZE = 256
 NATS_SSE_MAX_CONSECUTIVE_DROPS = 1000
@@ -173,7 +175,7 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     client knows what scheme to use."""
 
     async def dispatch(self, request, call_next):
-        if request.url.path == "/healthz":
+        if request.url.path in {"/health", "/healthz"}:
             return await call_next(request)
         auth = request.headers.get("authorization", "")
         if not auth.lower().startswith("bearer "):
@@ -657,14 +659,54 @@ async def healthz(_request):
     return PlainTextResponse("ok")
 
 
+async def _drain_audit_tasks_on_shutdown() -> None:
+    """Round-3 residual #2 of #146 (#149): drain in-flight MCP audit
+    persist tasks before the loop closes.
+
+    Without this, the SSE bridge can deliver tool results and the
+    Starlette teardown can cancel outstanding fire-and-forget audit
+    tasks before the HTTP POST completes.
+    """
+    from mnemos.mcp.tools._security import drain_pending_audit_tasks
+
+    try:
+        drained = await drain_pending_audit_tasks(timeout=5.0)
+        if drained:
+            logger.info(
+                "drained %d pending mcp_audit_log persist task(s) on shutdown",
+                drained,
+            )
+    except Exception:
+        # Drain failures must NOT propagate through Starlette
+        # shutdown; the underlying logger entry is the always-on
+        # surface and the dropped row is recoverable from logs.
+        logger.exception("mcp_audit drain on http shutdown failed")
+
+
+@asynccontextmanager
+async def _mcp_http_lifespan(_app: Starlette):
+    """Lifespan context manager wrapping the audit-drain on
+    shutdown. Replaces the pre-Starlette-1.0 `on_shutdown=[...]`
+    kwarg, which was removed in Starlette 1.0.0
+    (deprecated in 0.x). Caught by the PROTEUS fresh-install
+    barrage on 2026-05-08; a fresh install on Python 3.13 + the
+    current Starlette pin would 9-fail in test_mcp_nats_sse +
+    test_mcp_http_health + test_connector_smoke without this.
+    """
+    yield
+    await _drain_audit_tasks_on_shutdown()
+
+
 starlette_app = Starlette(
     routes=[
+        Route("/health", endpoint=healthz),
         Route("/healthz", endpoint=healthz),
         Route("/sse", endpoint=handle_sse),
         Route(NATS_SSE_PATH, endpoint=handle_nats_event_stream),
         Mount("/messages/", app=handle_post_message),
     ],
     middleware=[Middleware(BearerAuthMiddleware)],
+    lifespan=_mcp_http_lifespan,
 )
 
 

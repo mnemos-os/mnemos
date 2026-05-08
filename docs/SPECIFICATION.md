@@ -1,7 +1,7 @@
 # MNEMOS Specification
 
-**Version**: v5.0.0 current; shipped 2026-05-02
-**Status**: Authoritative for the checked-out v5.0.0 tree. Behavior not
+**Version**: v5.0.1 current (on top of v5.0.0 GA shipped 2026-05-02)
+**Status**: Authoritative for the checked-out v5.0.1 tree. Behavior not
 described here is either undefined (report as a bug) or scoped to a
 future release via `ROADMAP.md`.
 **Purpose**: supply enough structural detail that a scoping tool
@@ -42,7 +42,7 @@ for compression derivations, and MCP cross-tenant security gates. Apache-2.0.
 
 ## 2. System Scope
 
-### 2.1 In scope at v5.0.0
+### 2.1 In scope at v5.0.1
 
 - **Memory**: CRUD, search, DAG versioning with branch/merge, knowledge-graph
   triples, categories + namespaces, background compression with persisted audit.
@@ -91,7 +91,7 @@ for compression derivations, and MCP cross-tenant security gates. Apache-2.0.
 - **Two-protocol surface**: REST over HTTP plus MCP over stdio and HTTP/SSE
   from one tool registry.
 
-### 2.2 Explicitly out of scope at v5.0.0
+### 2.2 Explicitly out of scope at v5.0.1
 
 - A target-scope write fence for the GDPR final-verify race. The v5.0
   deletion-request workflow ships with the bounded verify loop documented in
@@ -126,7 +126,6 @@ mnemos/
   mcp/             stdio + HTTP/SSE transports and tool registry
   webhooks/        validation, dispatcher, delivery/recovery/repair workers
   workers/         out-of-process background workers
-  hooks/           integration hooks
   installer/       install wizard, db bootstrap, service generation
   tools/           CHaron/MPF utilities and adapters
   cli/             unified Typer command surface
@@ -196,7 +195,7 @@ warning when used with multiple workers.
 |---|---|---|
 | API | `mnemos.api.main:app` via `mnemos serve` | REST service on port 5002 |
 | CLI | `mnemos.cli.main:app` | `serve`, `install`, `worker`, `export`, `import`, `consult`, `health`, `version` |
-| MCP | `mnemos.mcp.stdio`, `mnemos.mcp.http` | 18 tools from `mnemos/mcp/tools/` |
+| MCP | `mnemos.mcp.stdio`, `mnemos.mcp.http` | 23 tools from `mnemos/mcp/tools/` |
 | Distillation worker | `mnemos/workers/distillation.py` | Drains `memory_compression_queue`; runs APOLLO + ARTEMIS contests |
 | Registry sync | `scripts/sync_provider_models.py` | Scheduled provider + Arena/LMArena sync |
 
@@ -369,7 +368,7 @@ Rate limiting: SlowAPI, opt-in via `RATE_LIMIT_ENABLED=true`.
 Body size: default 5 MB, `MAX_BODY_BYTES` override. Chunked-transfer
 aware streaming limiter (not just Content-Length check).
 
-### 5.2 MCP (stdio and HTTP/SSE, 18 tools)
+### 5.2 MCP (stdio and HTTP/SSE, 23 tools)
 
 Entry points: `mnemos.mcp.stdio` and `mnemos.mcp.http`. Both use
 the shared tool registry under `mnemos/mcp/tools/`. Tool manifest:
@@ -386,7 +385,7 @@ the shared tool registry under `mnemos/mcp/tools/`. Tool manifest:
 | `get_stats`           | `GET /stats` |
 | `kg_create_triple`    | `POST /v1/kg/triples` |
 | `kg_search`           | `GET /v1/kg/triples` |
-| `kg_timeline`         | `GET /v1/kg/timeline` |
+| `kg_timeline`         | `GET /v1/kg/timeline/{subject}` |
 | `update_triple`       | `PATCH /v1/kg/triples/{id}` |
 | `delete_triple`       | `DELETE /v1/kg/triples/{id}` |
 | `log_memory`          | `GET /v1/memories/{id}/log` |
@@ -532,7 +531,7 @@ timestamp)`. Chain-verify endpoint: `GET /v1/consultations/audit/verify`
 | GPU endpoint down | `gpu_guard` opens circuit | gpu_required engines return `error='gpu_guard circuit open ...'`; contest records reject_reason='error'; gpu_optional falls back to CPU path |
 | Worker dequeues and crashes mid-run | Row stuck in `running` | Next batch's stranded-running sweep reclaims: reset-to-pending if `attempts < max`, terminal-fail otherwise |
 | Postgres unreachable at startup | Fail-fast with clear log | No silent degraded mode; service does not start |
-| Rate-limit exceeded | `429 Too Many Requests` | With `X-Request-ID` header correlating to server logs (middleware outermost as of v3.2 tail) |
+| Rate-limit exceeded | `429 Too Many Requests` | With `X-Request-ID` header correlating to server logs (middleware outermost since v3.2 tail) |
 | Body too large | `413 Payload Too Large` | Pure-ASGI streaming limiter handles chunked uploads (no in-memory buffering) |
 | OAuth state cookie absent | `400 invalid_request` | Typically caused by `MNEMOS_SESSION_SECRET` rotation mid-flight |
 | Federation peer lies | Size caps (1 MB/memory, 64 KB metadata) | Bounded blast radius; cap tripped logs peer identity |
@@ -640,11 +639,13 @@ Grouped by concern:
 
 **Bind + DB**
 - `MNEMOS_BIND` (127.0.0.1), `MNEMOS_PORT` (5002)
-- `MNEMOS_DB_HOST`, `MNEMOS_DB_PORT`, `MNEMOS_DB_NAME`,
-  `MNEMOS_DB_USER`, `MNEMOS_DB_PASSWORD`
+- `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD`
+  (the `_DatabaseSettings` class in `mnemos/core/config.py`
+  uses `env_prefix="PG_"`)
+- `PG_POOL_MIN` (5), `PG_POOL_MAX` (20)
 
 **Auth**
-- `MNEMOS_API_KEY` (default root), `MNEMOS_KEY`, `MNEMOS_KEYS_PATH`
+- `MNEMOS_API_KEY` (default root), `MNEMOS_KEYS_PATH`
 - `MNEMOS_SESSION_SECRET`, `MNEMOS_SESSION_HTTPS_ONLY`
 
 **Compression / queue / workers**
@@ -726,7 +727,7 @@ Plus non-`MNEMOS_`-prefixed standards: `GPU_PROVIDER_HOST`,
   application visibility after
   `db/migrations_v3_5_rls_group_select_unix_bits.sql`.
 
-### 10.4 Known gaps (as of v5.0.0)
+### 10.4 Known gaps (as of v5.0.1)
 
 - GDPR deletion requests can still hit the documented final-verify race or
   sweep-verifying exhaustion under sustained target writes; see
@@ -773,7 +774,7 @@ circuit-breaker, and concurrency state can drift between processes.
 
 ## 12. Complexity Indicators
 
-Raw metrics at v5.0.0, measured from the checked-out tree unless noted.
+Raw metrics at v5.0.1, measured from the checked-out tree unless noted.
 
 | Metric | Value | Notes |
 |--------|-------|-------|

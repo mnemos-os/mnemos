@@ -1522,7 +1522,12 @@ async def test_state_kv_is_namespace_scoped(backend_case: BackendCase):
 @pytest.mark.asyncio
 async def test_sqlite_vector_semantic_search(tmp_path):
     from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
-    backend = SqliteBackend(tmp_path / "vector.sqlite3", SimpleNamespace())
+    # The runtime dim guard (added in the embed-dim slice) requires
+    # _expected_embedding_dim to match the fixture vector length. Pass
+    # a settings shim with embedding_dim=3 so the 3-D fixture vectors
+    # don't trip ValueError in upsert_memory_embedding/semantic_search.
+    settings = SimpleNamespace(database=SimpleNamespace(embedding_dim=3))
+    backend = SqliteBackend(tmp_path / "vector.sqlite3", settings)
     await backend.open()
     visibility = VisibilityFilter(
         scope=VisibilityScope.ROOT_BYPASS, user_id=None, group_ids=(), namespace=None,

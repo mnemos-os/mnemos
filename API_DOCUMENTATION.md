@@ -1,7 +1,7 @@
 # MNEMOS API Documentation
 
 **Base URL**: `http://localhost:5002`
-**Version**: v5.0.0 current; shipped 2026-05-02
+**Version**: v5.0.1 current (on top of v5.0.0 GA shipped 2026-05-02)
 **Format**: JSON
 
 ---
@@ -63,7 +63,7 @@ Liveness + readiness check (no auth required).
   "status": "healthy",
   "timestamp": "2026-05-02T14:30:00.000Z",
   "database_connected": true,
-  "version": "5.0.0",
+  "version": "5.0.1",
   "profile": "edge",
   "distillation_worker": "idle"
 }

@@ -36,7 +36,6 @@ import logging
 import math
 import re
 from collections.abc import AsyncIterator
-from dataclasses import dataclass
 from difflib import SequenceMatcher
 from itertools import combinations
 from typing import Any, Dict, Optional
@@ -72,14 +71,10 @@ from mnemos.domain.graeae.provider_worker import (
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class ProviderResponse:
-    provider: str
-    status: str
-    response_text: str
-    latency_ms: int
-    model_id: str
-    final_score: float = 0.0
+# #192: removed `ProviderResponse` (dataclass) — declared but
+# never instantiated or referenced anywhere. The live provider-
+# response shape is `ProviderQueryResponse` (used by
+# `_provider_worker_payload`).
 
 
 class ProviderStreamError(RuntimeError):
@@ -168,7 +163,7 @@ def _load_providers() -> dict[str, dict]:
 
     Falls back to _BUILTIN_PROVIDERS if the section is absent.
     Providers with enabled=false are excluded.
-    The TOML 'api' field is kept as-is; dispatch in _query_provider() reads it.
+    The TOML 'api' field is kept as-is; dispatch in _call_provider_worker() reads it.
     """
     try:
         from mnemos.core.config import GRAEAE_CONFIG
@@ -1050,7 +1045,7 @@ class GraeaeEngine:
                 # tracker so the weight reflects reality.
                 await call_maybe_async(self._circuit_breakers.record_failure, provider)
                 await call_maybe_async(self._quality.record_failure, provider)
-                logger.error(f"[GRAEAE] route({provider}) failed: {e}")
+                logger.error(f"[GRAEAE] route({provider}) failed: {e}", exc_info=True)
                 return _unavailable(
                     provider_config["model"],
                     error=f"{type(e).__name__}: {e}",
@@ -1193,23 +1188,12 @@ class GraeaeEngine:
         ))
         return self._provider_worker_payload(response)
 
-    async def _query_provider(
-        self, provider_name: str, prompt: str, task_type: str, timeout: int,
-        model_override: Optional[str] = None,
-        generation_params: Optional[Dict[str, Any]] = None,
-        request_params: Optional[Dict[str, Any]] = None,
-        messages: Optional[list[dict]] = None,
-    ) -> Dict:
-        return await self._call_provider_worker(
-            provider_name,
-            prompt,
-            task_type,
-            timeout,
-            model_override=model_override,
-            generation_params=generation_params,
-            request_params=request_params,
-            messages=messages,
-        )
+    # #189: removed `_query_provider` — thin pass-through wrapper
+    # over `_call_provider_worker` with no callers. The 3 real
+    # call sites (lines 695, 1046, 1132) invoke
+    # `_call_provider_worker` directly. Stale doc refs at
+    # `_load_providers` and `_probe_model` updated to point at
+    # `_call_provider_worker` instead.
 
     def _provider_worker_payload(self, response: ProviderQueryResponse) -> Dict:
         return response.raw_provider_payload
@@ -1872,7 +1856,7 @@ async def _probe_model(client: httpx.AsyncClient, provider_cfg: dict,
                        model_id: str, api_key: str, timeout: int = 15) -> bool:
     """Probe model_id with a tiny generate call; True iff HTTP 200.
 
-    Probe bodies match the shape of _query_provider so a passing probe
+    Probe bodies match the shape of _call_provider_worker so a passing probe
     means the model can actually be dispatched against — not just that
     it appears in /v1/models. Token budgets are tuned per family:
 

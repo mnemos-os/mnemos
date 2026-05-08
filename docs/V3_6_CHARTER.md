@@ -142,6 +142,15 @@ command = ["python3", "-m", "mnemos.iris.server"]
 env = {PANTHEON_API_KEY = "..."}
 ```
 
+> **Note (historical):** `mnemos.iris.server` was never implemented
+> as a standalone module. The discovery role it described is now
+> served by the unified MCP model tools at
+> `mnemos/mcp/tools/models.py` (`pantheon_list_models` +
+> `pantheon_route_explain`). The config snippet above is preserved
+> as the original v3.6 plan; for current configurations point
+> agents at the canonical MNEMOS MCP server (stdio or HTTP/SSE)
+> instead.
+
 **v3.6 work (per framework):**
 1. **Hermes (Nous Research):** Write `docs/IRIS_HERMES_CONFIG.md` with exact MCP setup snippet. One smoke test to verify Hermes agent can call `find_model()` tool.
    - Effort: ~1 hour + community outreach.

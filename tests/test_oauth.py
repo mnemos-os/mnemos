@@ -56,6 +56,37 @@ class TestOAuthWiring:
         assert req.scope == "openid profile email"
         assert req.enabled is True
 
+    def test_oauth_kind_literal_accepts_oidc_and_oauth2(self):
+        """#169: kind is now Literal["oidc", "oauth2"]."""
+        from mnemos.domain.models import OAuthProviderCreateRequest
+
+        for kind in ("oidc", "oauth2"):
+            req = OAuthProviderCreateRequest(
+                name="t",
+                display_name="T",
+                kind=kind,
+                client_id="c",
+                client_secret="s",
+            )
+            assert req.kind == kind
+
+    def test_oauth_kind_literal_rejects_other_values(self):
+        """#169: invalid kind values must 422 at the model level
+        (Pydantic auto-422 replaces the runtime route handler check)."""
+        import pytest
+        from pydantic import ValidationError
+        from mnemos.domain.models import OAuthProviderCreateRequest
+
+        for invalid in ("saml", "OIDC", "oidc ", "", "unknown"):
+            with pytest.raises(ValidationError):
+                OAuthProviderCreateRequest(
+                    name="t",
+                    display_name="T",
+                    kind=invalid,
+                    client_id="c",
+                    client_secret="s",
+                )
+
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
         paths = {r.path for r in api_server.app.routes}

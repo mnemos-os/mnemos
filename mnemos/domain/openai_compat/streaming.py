@@ -145,7 +145,7 @@ async def _route_to_provider_stream(
         ):
             yield chunk
     except Exception as e:
-        logger.error("[MNEMOS] Streaming route to %s failed: %s", provider, e)
+        logger.error("[MNEMOS] Streaming route to %s failed: %s", provider, e, exc_info=True)
         raise
 
 
@@ -182,7 +182,7 @@ async def stream_event_source(
             ):
                 yield event
     except Exception as e:
-        logger.error("[MNEMOS] Streaming response failed after response start: %s", e)
+        logger.error("[MNEMOS] Streaming response failed after response start: %s", e, exc_info=True)
         error_type = e.error_type if isinstance(e, ProviderStreamError) else "provider_stream_error"
         yield _stream_error_event(str(e), error_type=error_type)
     finally:

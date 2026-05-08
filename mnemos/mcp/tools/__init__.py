@@ -40,6 +40,10 @@ from .dag import (
     tool_diff_memory_commits,
     tool_log_memory,
 )
+from .deletions import (
+    TOOLS as DELETION_TOOLS,
+    tool_list_deletions,
+)
 from .kg import (
     TOOLS as KG_TOOLS,
     tool_delete_triple,
@@ -83,7 +87,14 @@ else:
         return {"success": False, "error": "KRONOS not installed"}
 
 _DOMAIN_TOOLS: dict[str, dict[str, Any]] = {}
-for _domain_tools in (MEMORY_TOOLS, KG_TOOLS, DAG_TOOLS, MODEL_TOOLS, KRONOS_TOOLS):
+for _domain_tools in (
+    MEMORY_TOOLS,
+    KG_TOOLS,
+    DAG_TOOLS,
+    MODEL_TOOLS,
+    DELETION_TOOLS,
+    KRONOS_TOOLS,
+):
     _DOMAIN_TOOLS.update(_domain_tools)
 
 _TOOL_ORDER = [
@@ -107,6 +118,7 @@ _TOOL_ORDER = [
     "recommend_model",
     "pantheon_list_models",
     "pantheon_route_explain",
+    "list_deletions",
     "kronos_anomalies",
     "kronos_forecast",
 ]
@@ -197,7 +209,7 @@ async def execute_tool(
                 role=caller_role,
                 tool_name=tool_name,
                 parameters=audit_parameters,
-                outcome="error",
+                outcome="denied",
                 error_class="ContextMismatch",
             )
             return {"success": False, "error": "MCP caller context mismatch"}
@@ -207,7 +219,7 @@ async def execute_tool(
                 role=context_role,
                 tool_name=tool_name,
                 parameters=audit_parameters,
-                outcome="error",
+                outcome="denied",
                 error_class="ContextMismatch",
             )
             return {"success": False, "error": "MCP caller context mismatch"}
@@ -217,7 +229,7 @@ async def execute_tool(
                 role=caller_role,
                 tool_name=tool_name,
                 parameters=audit_parameters,
-                outcome="error",
+                outcome="denied",
                 error_class="ContextMismatch",
             )
             return {"success": False, "error": "MCP caller context mismatch"}
@@ -247,12 +259,20 @@ async def execute_tool(
         )
         result = await handler(**call_parameters)
         if isinstance(result, dict) and result.get("success") is False:
+            # #157: distinguish handler-returned failure from raised
+            # exception. The schema's CHECK constraint already
+            # permits "failure"; mapping the success=False return
+            # path to it lets operators query
+            #   WHERE outcome = 'failure'   -- tool said no
+            # vs
+            #   WHERE outcome = 'error'     -- tool blew up
+            # without substring-matching error_class.
             _mcp_log_tool_audit(
                 caller_id=caller_id,
                 role=caller_role,
                 tool_name=tool_name,
                 parameters=audit_parameters,
-                outcome="error",
+                outcome="failure",
                 error_class="ToolError",
             )
         else:
@@ -322,13 +342,22 @@ async def execute_tool(
         )
         return {"success": False, "error": "Invalid tool input"}
     except PermissionError as e:
-        error = "Rate limit exceeded" if "rate limit" in str(e) else "Resource not found"
+        is_rate_limit = "rate limit" in str(e).lower()
+        error = "Rate limit exceeded" if is_rate_limit else "Resource not found"
+        # #154: distinguish rate-limit denials from generic permission
+        # errors. The schema's CHECK constraint accepts both "denied"
+        # and "error", but operators querying the audit log for
+        # rate-limit events shouldn't have to substring-match the
+        # error_class. A separate outcome makes
+        #   SELECT * FROM mcp_audit_log WHERE outcome = 'denied'
+        # cheap and unambiguous.
+        outcome = "denied" if is_rate_limit else "error"
         _mcp_log_tool_audit(
             caller_id=caller_id,
             role=caller_role,
             tool_name=tool_name,
             parameters=audit_parameters,
-            outcome="error",
+            outcome=outcome,
             error_class=type(e).__name__,
         )
         return {"success": False, "error": error}
@@ -338,6 +367,7 @@ async def execute_tool(
             tool_name,
             type(e).__name__,
             caller_id or "unknown",
+            exc_info=True,
         )
         _mcp_log_tool_audit(
             caller_id=caller_id,
@@ -387,6 +417,7 @@ __all__ = [
     "tool_kg_timeline",
     "tool_kronos_anomalies",
     "tool_kronos_forecast",
+    "tool_list_deletions",
     "tool_list_memories",
     "tool_log_memory",
     "tool_pantheon_list_models",

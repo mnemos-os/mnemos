@@ -18,15 +18,15 @@ Subcommands:
   stats     Show current MNEMOS memory statistics
 
 Usage:
-  python tools/memory_import.py json     --file memories.json --endpoint http://localhost:5002
-  python tools/memory_import.py json     --file memories.jsonl --jsonl --endpoint http://localhost:5002
-  python tools/memory_import.py json     --file memories.jsonl --jsonl --preserve-metadata \
+  python -m mnemos.tools.memory_import json     --file memories.json --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import json     --file memories.jsonl --jsonl --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import json     --file memories.jsonl --jsonl --preserve-metadata \
                                          --api-key $MNEMOS_API_KEY --endpoint http://localhost:5002
-  python tools/memory_import.py csv      --file data.csv --content-col text --endpoint http://localhost:5002
-  python tools/memory_import.py chatgpt  --file conversations.json --endpoint http://localhost:5002
-  python tools/memory_import.py obsidian --vault /path/to/vault --endpoint http://localhost:5002
-  python tools/memory_import.py text     --source /path --category notes --endpoint http://localhost:5002
-  python tools/memory_import.py stats    --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import csv      --file data.csv --content-col text --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import chatgpt  --file conversations.json --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import obsidian --vault /path/to/vault --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import text     --source /path --category notes --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_import stats    --endpoint http://localhost:5002
 
 Preserve-metadata mode (the cross-version-migration path):
   When --preserve-metadata is set, the importer posts an MPF envelope

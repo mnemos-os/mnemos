@@ -336,5 +336,5 @@ Fresh installs of v4.2.0a14 round-73+ get the non-partial index directly and do 
 ## See Also
 
 - [Docling Documentation](https://github.com/DS4SD/docling)
-- [Memory API Reference](./API.md#memories)
-- [MNEMOS Semantic Search Guide](./SEMANTIC_SEARCH.md)
+- [Memory API Reference](./API_DOCUMENTATION.md) (root)
+- [Spec for `/v1/memories/*` and search](./docs/SPECIFICATION.md)

@@ -69,6 +69,7 @@ class Config:
     inference_embed_host: str = "http://localhost:11434"
     install_docling: bool = False
     create_service: bool = True
+    embedding_dim: int = 768         # vec0/embedding dimension; honors MNEMOS_EMBEDDING_DIM
 
 
 # ── Environment detection ─────────────────────────────────────────────────────

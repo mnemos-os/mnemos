@@ -1,4 +1,9 @@
-"""Backend-neutral persistence interfaces for MNEMOS."""
+"""Backend-neutral persistence interfaces for MNEMOS.
+
+D.1 backend abstraction is complete for the primary memory graph,
+federation, and state key-value surfaces; API and domain orchestration
+code should depend on this facade instead of driver-specific SQL.
+"""
 
 from __future__ import annotations
 
@@ -238,12 +243,62 @@ class MemoryRepository(ABC):
         ...
 
     @abstractmethod
+    async def find_active_duplicate_by_content_hash(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        content_hash: str,
+        cross_namespace: bool = False,
+    ) -> Row | None:
+        """Find an active memory with identical normalized content."""
+        ...
+
+    @abstractmethod
+    async def bump_recall_and_get_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+    ) -> Row | None:
+        """Increment recall counters for one memory and return it."""
+        ...
+
+    @abstractmethod
+    async def find_duplicate_content_groups(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        """Return active duplicate-content groups for ARTEMIS sweeps."""
+        ...
+
+    @abstractmethod
+    async def consolidate_duplicate_memories(
+        self,
+        tx: Transaction,
+        *,
+        canonical_id: str,
+        duplicate_ids: Sequence[str],
+    ) -> int:
+        """Soft-consolidate duplicate memories into a canonical row."""
+        ...
+
+    @abstractmethod
     async def delete_memory(
         self,
         tx: Transaction,
         memory_id: str,
         *,
         visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
     ) -> Row | None:
         """Delete a memory if it exists and the filter admits.
 
@@ -572,17 +627,275 @@ class ConsultationAuditRepository(ABC):
 
 
 class FederationRepository(ABC):
-    """Federation persistence surface.
+    """Federation persistence surface."""
 
-    Federation SQL has not been extracted into mnemos/db repositories in D.1.
-    """
+    @abstractmethod
+    async def fetch_memory_page(
+        self,
+        tx: Transaction,
+        *,
+        updated_after: Any | None = None,
+        id_after: str | None = None,
+        limit: int = 100,
+    ) -> list[Row]:
+        ...
+
+    @abstractmethod
+    async def create_peer(
+        self,
+        tx: Transaction,
+        *,
+        name: str,
+        base_url: str,
+        auth_token: str,
+        namespace_filter: Sequence[str] | None,
+        category_filter: Sequence[str] | None,
+        enabled: bool,
+        sync_interval_secs: int,
+        compat_mode: str,
+    ) -> Row:
+        ...
+
+    @abstractmethod
+    async def list_peers(self, tx: Transaction) -> list[Row]:
+        ...
+
+    @abstractmethod
+    async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def upsert_peer(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        base_url: str,
+        name: str | None = None,
+        enabled: bool = True,
+    ) -> None:
+        ...
+
+    @abstractmethod
+    async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
+        ...
+
+    @abstractmethod
+    async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
+        ...
+
+    @abstractmethod
+    async def feed_query(
+        self,
+        tx: Transaction,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+    ) -> list[Row]:
+        ...
+
+    @abstractmethod
+    async def get_feed_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+    ) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def update_peer_schema_check(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        peer_version: str | None,
+    ) -> None:
+        ...
+
+    @abstractmethod
+    async def record_schema_abort(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        peer_version: str | None,
+        cursor_before: Any,
+        error: str,
+        is_transient: bool,
+    ) -> None:
+        ...
+
+    @abstractmethod
+    async def create_sync_log(self, tx: Transaction, peer_id: str, cursor_before: Any) -> Any:
+        ...
+
+    @abstractmethod
+    async def finish_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        log_id: Any,
+        memories_pulled: int,
+        memories_new: int,
+        memories_updated: int,
+        error: str | None,
+        cursor_after: Any,
+    ) -> None:
+        ...
+
+    @abstractmethod
+    async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
+        ...
+
+    @abstractmethod
+    async def record_sync_success(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        cursor: Any,
+        total_pulled: int,
+    ) -> None:
+        ...
+
+    @abstractmethod
+    async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
+        ...
+
+    @abstractmethod
+    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def insert_federated_memory(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        peer_name: str,
+        remote_updated: Any,
+    ) -> bool:
+        ...
+
+    @abstractmethod
+    async def update_federated_memory_if_newer(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        remote_updated: Any,
+    ) -> bool:
+        ...
+
+    @abstractmethod
+    async def apply_consolidation_tombstone(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        local_canonical_id: str,
+        consolidated_at: Any,
+        remote_id: str,
+        canonical_remote_id: str,
+        peer_name: str,
+    ) -> bool:
+        ...
+
+    @abstractmethod
+    async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        ...
 
 
 class StateRepository(ABC):
-    """State key-value persistence surface.
+    """State key-value persistence surface."""
 
-    State SQL has not been extracted into mnemos/db repositories in D.1.
-    """
+    @abstractmethod
+    async def get(
+        self,
+        tx: Transaction,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def set(
+        self,
+        tx: Transaction,
+        key: str,
+        value: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        expires_at: Any | None = None,
+    ) -> Row | None:
+        ...
+
+    @abstractmethod
+    async def delete(
+        self,
+        tx: Transaction,
+        key: str,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> bool:
+        ...
+
+    @abstractmethod
+    async def list_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Row]:
+        ...
+
+    @abstractmethod
+    async def delete_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> int:
+        ...
 
 
 class PersistenceBackend(ABC):

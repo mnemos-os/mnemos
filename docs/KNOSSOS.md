@@ -85,7 +85,7 @@ the MemPalace tool-response shape.
 | Compression (APOLLO/ARTEMIS contest) | AAAK only (~30× on a subset) | Full contest — APOLLO schema + ARTEMIS extractive, judge-scored |
 | Federation across instances | ❌ | ✅ — `/v1/federation/*`, pull-based |
 | Knowledge graph (temporal) | ✅ — SQLite-backed | ✅ — Postgres-backed server profile or SQLite edge profile, same temporal semantics |
-| MCP surface | 29 native tools | 16 MemPalace-compatible phase-1 tools via KNOSSOS, plus the native 18-tool MNEMOS MCP surface |
+| MCP surface | 29 native tools | 16 MemPalace-compatible phase-1 tools via KNOSSOS, plus the native 23-tool MNEMOS MCP surface |
 | Retrieval benchmark R@5 (LongMemEval) | 96.6% raw / 98.4% hybrid | (see `benchmarks/compression_corpus_v3_3.jsonl`) |
 
 MemPalace is not wrong for its use case. KNOSSOS exists for the

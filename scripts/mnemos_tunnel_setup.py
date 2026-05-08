@@ -2,7 +2,17 @@
 """mnemos-tunnel-setup — interactive helper for connecting MNEMOS to
 ChatGPT Pro Developer Mode, Claude Desktop, Cursor, or Codex CLI.
 
-Walks the user through:
+⚠️ ASPIRATIONAL HELPER — currently inert as of v5.0.1. The
+daemon-side ``/admin/tunnels/*`` REST surface and the
+``mnemos.tunnels.ngrok_bridge`` module that this script depends on
+have not shipped yet. Running the script today will fail at the
+``/admin/tunnels/start`` HTTP call. Use the manual `mnemos serve
+mcp-http` + ngrok path documented per-agent under
+``docs/connectors/`` until the daemon-side endpoints land. The
+docstring + script body are preserved as the contract these
+endpoints should implement when they do ship.
+
+Designed flow (when the contract ships):
 
   1. Confirm MNEMOS is reachable.
   2. If no ngrok authtoken on file: open the signup page in their
@@ -11,9 +21,8 @@ Walks the user through:
   4. Pretty-print connector-ready snippets for each agent surface.
      Copy the relevant one to the system clipboard if available.
 
-This is the "easy button" for end users who don't want to know what
-ngrok or SSE or bearer auth means. They run one command and get a
-URL + token they paste into ChatGPT.
+The "easy button" for end users who don't want to know what ngrok
+or SSE or bearer auth means.
 
 Designed to be runnable as:
     python3 scripts/mnemos_tunnel_setup.py
@@ -22,8 +31,9 @@ or installed via pyproject as a console script:
 
 Depends only on stdlib + httpx (already a MNEMOS runtime dep). No
 ngrok-python SDK needed in this script — the SDK lives inside the
-MNEMOS daemon's `mnemos.tunnels.ngrok_bridge` module; this script
-just calls the admin API.
+(planned) MNEMOS daemon's `mnemos.tunnels.ngrok_bridge` module;
+this script calls the admin API once that module + the
+``/admin/tunnels/*`` routes are wired in.
 """
 from __future__ import annotations
 
@@ -240,10 +250,27 @@ def _list_surfaces(arg: str) -> list[str]:
 
 
 def main() -> int:
+    _err(
+        "⚠️  mnemos-tunnel-setup is currently inert as of v5.0.1.\n"
+        "    The daemon-side /admin/tunnels/* REST routes and the\n"
+        "    `mnemos.tunnels.ngrok_bridge` module this script depends\n"
+        "    on have not shipped yet. The next /admin/tunnels/start\n"
+        "    HTTP call below will return 404. Use the manual\n"
+        "    `mnemos serve mcp-http` + ngrok path documented in\n"
+        "    docs/connectors/<agent>.md until the daemon endpoints\n"
+        "    land. Continuing with --force; pass nothing to abort."
+    )
+    if "--force" not in sys.argv:
+        _err("    Aborting. Re-run with --force if you want to try anyway.")
+        return 2
+
     p = argparse.ArgumentParser(
         prog="mnemos-tunnel-setup",
         description="Connect MNEMOS to a public URL for ChatGPT, Claude, Cursor, or Codex.",
     )
+    p.add_argument("--force", action="store_true",
+                   help="Acknowledge that the daemon-side tunnel API "
+                        "is not implemented yet and run anyway.")
     p.add_argument("surface", nargs="?", default="all",
                    choices=["chatgpt", "claude", "cursor", "codex", "all"],
                    help="Which agent surface to emit connector config for "

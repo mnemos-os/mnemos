@@ -39,7 +39,16 @@ async def fetch_memory_export(
         "SELECT id, content, category, subcategory, created, updated, "
         "owner_id, namespace, permission_mode, quality_rating, "
         "source_model, source_provider, source_session, source_agent, "
-        "metadata "
+        "metadata, "
+        # Provenance-bearing columns for MPF v0.2 emission. Morpheus
+        # writes (provenance='morpheus_local', morpheus_run_id,
+        # source_memories[]); federation pulls write
+        # (federation_source). The serializer's _record_provenance_v0_2
+        # helper uses these to populate PROV-DM wasGeneratedBy +
+        # wasInfluencedBy with real lineage rather than heuristic
+        # source_agent guesses.
+        "provenance AS prov_kind, morpheus_run_id::text AS morpheus_run_id, "
+        "source_memories, federation_source "
         "FROM memories "
         f"{where} "
         f"ORDER BY created ASC "
@@ -124,6 +133,85 @@ async def fetch_kg_triples_for_export(
         hard_limit=hard_limit,
         null_ok=include_unattached,
     )
+
+
+async def fetch_deletion_log_for_export(
+    conn,
+    *,
+    effective_owner: Optional[str],
+    effective_ns: Optional[str],
+    hard_limit: int,
+    from_executed_at: Optional[str] = None,
+    to_executed_at: Optional[str] = None,
+    cursor_executed_at: Optional[str] = None,
+    cursor_id: Optional[str] = None,
+    export_as_of: Optional[str] = None,
+):
+    """Fetch deletion_log rows for an MPF v0.2 export.
+
+    Unlike the other sidecars, deletion_log is NOT bound to live memory
+    rows — its entire purpose is tracking deleted/tombstoned ones. Scope
+    by owner/namespace only.
+
+    Pagination shapes:
+    - `from_executed_at` / `to_executed_at`: inclusive time-window. Good
+      for the common case where executed_at varies enough to split.
+    - `cursor_executed_at` + `cursor_id`: keyset pagination over the
+      composite (executed_at, id). Strict-greater so each row appears
+      in exactly one page even when many rows share an executed_at
+      (the bulk-wipe case where time-window alone can't split).
+      The two shapes can be combined: cursor + to_executed_at lets an
+      operator chunk a single bulk wipe into multiple pages.
+
+    Order: executed_at ASC, id ASC — stable composite cursor.
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+    idx = 1
+    if effective_owner:
+        conditions.append(f"owner_id = ${idx}")
+        params.append(effective_owner)
+        idx += 1
+    if effective_ns:
+        conditions.append(f"namespace = ${idx}")
+        params.append(effective_ns)
+        idx += 1
+    if from_executed_at:
+        conditions.append(f"executed_at >= ${idx}::timestamptz")
+        params.append(from_executed_at)
+        idx += 1
+    if to_executed_at:
+        conditions.append(f"executed_at <= ${idx}::timestamptz")
+        params.append(to_executed_at)
+        idx += 1
+    # Keyset cursor: strict-greater on (executed_at, id) tuple. The row-
+    # comparison shape works because Postgres compares tuples
+    # lexicographically and we have a matching composite index from
+    # migrations_v5_3_3_deletion_log_export_index.sql.
+    if cursor_executed_at and cursor_id:
+        conditions.append(
+            f"(executed_at, id) > (${idx}::timestamptz, ${idx + 1}::uuid)"
+        )
+        params.append(cursor_executed_at)
+        params.append(cursor_id)
+        idx += 2
+    # Snapshot anchor: rows committed after the export started don't
+    # appear in any page. The first page picks now() and encodes it in
+    # the cursor; later pages reuse it. Without this, concurrent wipes
+    # during a paginated export would either be missed (race window
+    # before lower-bound) or duplicated (between pages).
+    if export_as_of:
+        conditions.append(f"executed_at <= ${idx}::timestamptz")
+        params.append(export_as_of)
+        idx += 1
+    where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+    sql = (
+        "SELECT id::text AS id, memory_id, content_hash, owner_id, namespace, "
+        "requested_by, requested_at, executed_at, request_kind, reason, source "
+        f"FROM deletion_log {where} "
+        f"ORDER BY executed_at ASC, id ASC LIMIT {hard_limit + 1}"
+    )
+    return await conn.fetch(sql, *params)
 
 
 async def fetch_memory_versions_for_export(

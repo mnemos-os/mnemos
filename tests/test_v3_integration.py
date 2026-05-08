@@ -5,6 +5,8 @@ import hashlib
 import pytest
 from httpx import AsyncClient
 
+from mnemos._version import __version__
+
 pytestmark = pytest.mark.asyncio
 
 
@@ -236,7 +238,7 @@ class TestVersions:
         resp = await client.get("/health")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["version"] == "5.0.0"
+        assert data["version"] == __version__
 
     async def test_api_version_in_responses(self, client: AsyncClient, auth_headers: dict):
         resp = await client.get("/v1/providers/health", headers=auth_headers)

@@ -5,9 +5,10 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from typing import Optional
+from uuid import uuid4
 
 import asyncpg
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 import mnemos.core.lifecycle as _lc
@@ -26,6 +27,10 @@ from mnemos.core.lifecycle import (
 )
 from mnemos.core.security import is_root
 from mnemos.core.visibility import handle_trigger_pgerror
+from mnemos.domain.artemis_dedup import (
+    duplicate_content_error_body,
+    evaluate_memory_create_dedup,
+)
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.persistence.base import DuplicateMemoryError
 from mnemos.domain.models import (
@@ -44,6 +49,11 @@ from mnemos.domain.models import (
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1", tags=["memories"])
 NatsPublishIntent = tuple[str, dict, str]
+
+
+def _log_search_phase(trace_id: str, started_at: float, phase: str) -> None:
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    logger.info("[search:%s] %s done in %dms", trace_id, phase, elapsed_ms)
 
 
 @asynccontextmanager
@@ -197,19 +207,10 @@ def _is_memory_owner(row, user: UserContext) -> bool:
     return owner_id == user.user_id
 
 
-def _read_visibility_predicate(
-    user: UserContext, start_param_idx: int
-) -> tuple[str, list]:
-    """Thin adapter over mnemos.core.visibility.read_visibility_predicate
-    that takes a UserContext directly. The shared module powers
-    list/get here AND the search/rehydrate helpers in
-    api/lifecycle.py — single source of truth for the predicate
-    that mirrors the v1_multiuser RLS policies.
-    """
-    from mnemos.core.visibility import read_visibility_predicate
-    return read_visibility_predicate(
-        user.user_id, list(user.group_ids), start_param_idx,
-    )
+# #183: removed `_read_visibility_predicate` adapter — defined but
+# never called. Callers either pull `read_visibility_predicate`
+# directly from mnemos.core.visibility or use one of the
+# `_listing_visibility_for` / `_mutation_visibility_for` helpers.
 
 
 async def _insert_memory_with_created_webhook(
@@ -673,7 +674,10 @@ async def search_memories(
     user: UserContext = Depends(get_current_user),
 ):
     """Search memories with optional 5-minute response caching."""
+    search_trace_id = uuid4().hex[:8]
+    search_started_at = time.monotonic()
     request_limit = min(request.limit, 500)  # server-side cap regardless of model field
+    _log_search_phase(search_trace_id, search_started_at, "parse")
 
     # v3.1.2 Tier 3: pin owner_id + namespace to the caller's identity
     # for non-root searches. Previously request.namespace was caller-
@@ -734,6 +738,7 @@ async def search_memories(
             cached = await _lc._cache.get(cache_key)
             if cached:
                 logger.debug(f"[CACHE] /memories/search hit for '{request.query[:30]}'")
+                _log_search_phase(search_trace_id, search_started_at, "serialize")
                 return MemoryListResponse(**json.loads(cached))
         except Exception as e:
             logger.warning(f"[CACHE] search read error: {e}")
@@ -749,6 +754,7 @@ async def search_memories(
         await _maybe_set_pg_rls(tx, user)
         if request.semantic:
             embedding = await _get_embedding(request.query)
+            _log_search_phase(search_trace_id, search_started_at, "embed")
             if not embedding:
                 logger.warning("[VECTOR] Embedding failed, falling back to FTS")
                 rows = await backend.memories.fts_search(
@@ -762,11 +768,15 @@ async def search_memories(
                     source_model=request.source_model,
                     source_agent=request.source_agent,
                     include_archived=bool(request.include_archived),
-                    boost_recency=bool(request.boost_recency),
-                    recency_weight=float(request.recency_weight),
                 )
             else:
                 logger.info(f"[VECTOR] Semantic search: {len(embedding)}-dim vector")
+                semantic_trace_kwargs = {}
+                if getattr(backend, "supports_pgvector", False):
+                    semantic_trace_kwargs = {
+                        "search_trace_id": search_trace_id,
+                        "search_started_at": search_started_at,
+                    }
                 rows = await backend.memories.semantic_search(
                     tx,
                     embedding=embedding,
@@ -778,6 +788,7 @@ async def search_memories(
                     source_model=request.source_model,
                     source_agent=request.source_agent,
                     include_archived=bool(request.include_archived),
+                    **semantic_trace_kwargs,
                 )
         else:
             rows = await backend.memories.fts_search(
@@ -793,6 +804,7 @@ async def search_memories(
                 include_archived=bool(request.include_archived),
             )
 
+    _log_search_phase(search_trace_id, search_started_at, "metadata_fetch")
     memories = [_row_to_memory(r, include_compressed=request.include_compressed) for r in rows]
 
     # Fire-and-forget recall-frequency bump for the hit set.
@@ -811,6 +823,7 @@ async def search_memories(
         compression_applied=compression_applied,
         compression_metadata=compression_metadata if compression_applied else None,
     )
+    _log_search_phase(search_trace_id, search_started_at, "serialize")
 
     if _lc._cache and not request.include_compressed and not compression_applied:
         try:
@@ -824,6 +837,7 @@ async def search_memories(
 @router.post("/memories", response_model=MemoryItem, status_code=201)
 async def create_memory(
     request: MemoryCreateRequest,
+    response: Response,
     user: UserContext = Depends(get_current_user),
 ):
     if not request.content or not request.content.strip():
@@ -847,6 +861,32 @@ async def create_memory(
     try:
         async with backend.transactional() as tx:
             await _maybe_set_pg_rls(tx, user)
+            dedup = await evaluate_memory_create_dedup(
+                backend.memories,
+                tx,
+                owner_id=owner_id,
+                namespace=namespace,
+                content=request.content,
+                logger=logger,
+            )
+            if dedup.action == "reject" and dedup.existing_id:
+                return JSONResponse(
+                    status_code=409,
+                    content=duplicate_content_error_body(dedup.existing_id),
+                )
+            if dedup.action == "merge" and dedup.existing_id:
+                row = await backend.memories.bump_recall_and_get_memory(
+                    tx,
+                    dedup.existing_id,
+                    visibility=_read_visibility_for(user, namespace=namespace),
+                )
+                if row is None:
+                    return JSONResponse(
+                        status_code=409,
+                        content=duplicate_content_error_body(dedup.existing_id),
+                    )
+                response.status_code = 200
+                return _row_to_memory(row)
             # The Postgres trg_memory_version_insert trigger writes
             # version 1 + branch automatically; the SQLite path does
             # not have that trigger today (deferred to v4.2 with
@@ -966,6 +1006,28 @@ async def bulk_create_memories(
         try:
             async with backend.transactional() as tx:
                 await _maybe_set_pg_rls(tx, user)
+                dedup = await evaluate_memory_create_dedup(
+                    backend.memories,
+                    tx,
+                    owner_id=owner_id,
+                    namespace=namespace,
+                    content=mem.content,
+                    logger=logger,
+                )
+                if dedup.action == "reject" and dedup.existing_id:
+                    errors.append(f"[{i}] duplicate_content: {dedup.existing_id}")
+                    continue
+                if dedup.action == "merge" and dedup.existing_id:
+                    row = await backend.memories.bump_recall_and_get_memory(
+                        tx,
+                        dedup.existing_id,
+                        visibility=_read_visibility_for(user, namespace=namespace),
+                    )
+                    if row is None:
+                        errors.append(f"[{i}] duplicate_content: {dedup.existing_id}")
+                        continue
+                    created_ids.append(row["id"])
+                    continue
                 await backend.memories.insert_memory(
                     tx,
                     memory_id=mid,
@@ -1138,7 +1200,14 @@ async def delete_memory(
             await _maybe_set_pg_rls(tx, user)
             try:
                 row = await backend.memories.delete_memory(
-                    tx, memory_id, visibility=visibility,
+                    tx,
+                    memory_id,
+                    visibility=visibility,
+                    requested_by=user.user_id,
+                    requested_at=None,
+                    request_kind="admin_purge",
+                    reason=None,
+                    source=["api.delete_memory"],
                 )
             except asyncpg.PostgresError as exc:
                 handle_trigger_pgerror(exc)

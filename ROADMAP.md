@@ -6,7 +6,7 @@ This document is kept intentionally narrow. It lists what the next release will 
 
 ---
 
-## Current status — v5.0.0 shipped on 2026-05-02
+## Current status — v5.0.1 shipped on 2026-05-08
 
 v5.0 closes the v3.6 + v4.x charters and rolls up the v4.2.0a14
 alpha line. Major new surfaces in this release:
@@ -22,9 +22,10 @@ alpha line. Major new surfaces in this release:
 - ✅ KRONOS v0.1: recall-pattern anomaly detection + forecasting.
 - ✅ DAG wiring for compression derivations.
 - ✅ NATS substrate v0.2: PANTHEON routing pub/sub bounded slice.
-- ✅ MCP §6.4 cross-tenant security gates across 22 tools,
+- ✅ MCP §6.4 cross-tenant security gates across 23 tools,
   including `pantheon_list_models`, `pantheon_route_explain`,
-  `tool_kronos_anomalies`, and `tool_kronos_forecast`.
+  `tool_kronos_anomalies`, `tool_kronos_forecast`, and
+  `list_deletions`.
 - ✅ Rust hot-path accelerator (mnemos_hot v0.2): cosine/top-k,
   batch cosine, embedding parse, embedding L2-normalize, composite
   search rerank, deterministic judge scoring, and SHA-256 batch
@@ -35,6 +36,14 @@ alpha line. Major new surfaces in this release:
   return 503 with install hint; MCP tools are filtered from
   `tools/list`; workers gracefully no-op.
 - ✅ Document-import retry-safety with content-derived idempotency.
+- ✅ ARTEMIS write-time duplicate-content detection and dedup sweep CLI.
+- ✅ Document-import active-project scoping via required project tags and
+  archive-snapshot rejection.
+- ✅ v5.0.3 timezone hardening: legacy Postgres `TIMESTAMP` lifecycle
+  columns upgrade to `TIMESTAMPTZ`, and DB-bound runtime datetimes are
+  UTC-aware.
+- ✅ Federation + state KV extracted into `PersistenceBackend`; D.1
+  backend-abstraction work complete.
 - ✅ Connector smoke tests across 8 surfaces.
 - ✅ RFC-002 re-engagement memo + design paper draft.
 
@@ -190,9 +199,10 @@ v3.5.0 shipped the audit-driven hardening branch that followed v3.4.1. It is not
 
 Remaining after v3.5.0:
 
-- 🔵 **Dedicated deletion-log / GDPR wipe workflow.** v3.5 keeps DELETE tombstone snapshots live in the version DAG, but no separate deletion-log table ships.
+- ✅ **Dedicated deletion-log / GDPR wipe workflow.** v3.5 keeps DELETE tombstone snapshots live in the version DAG, but no separate deletion-log table ships.
 - ✅ **PANTHEON + IRIS v0.2 shipped.** The opt-in facade now includes per-session `consultation_only` caps, MNEMOS `pantheon_routing` memory writes, rolling-window adaptive `auto:*` routing, and expanded route explanations; Redis-backed cap sharing and full streaming/tool passthrough remain next-slice work.
-- ✅ **NATS substrate v0.2 proof-of-life.** Landed on the v4.2.0a14 line: PANTHEON routing decisions can optionally publish to `mnemos.pantheon.routing`, `db/migrations_v4_2_pantheon_routing_audit.sql` adds the separate `pantheon_routing_audit` table, and `mnemos/workers/pantheon_routing_audit_consumer.py` mirrors events into that audit table when explicitly enabled. Webhook outbox migration and federation rewire remain 🔵 deferred to NATS substrate v0.3.
+- ✅ **NATS substrate v0.3.** v5.2.0 keeps Postgres as the webhook outbox source of truth while optionally fanning out `mnemos.webhooks.outbox.{tenant}.{event_type}` nudges, adds `nats_dispatch_log` consumer idempotency, and introduces direct federation memory upsert pub/sub on `mnemos.federation.memory.{namespace}` alongside the existing HTTP-poll federation path.
+- 🟡 **Patroni HA automation.** v5.3.0 designs Patroni-managed automatic failover for the PYTHIA/CERBERUS pg16 + pgvector deployment, with etcd3 quorum via PROTEUS and HAProxy primary/replica discovery. Designed but not yet exercised in CI; see `docs/HA_AUTOMATION.md` and `ops/patroni/`.
 - ✅ **RFC-002 / MemPalace re-engagement.** Re-open memo drafted with v3.4 CHARON evidence and KNOSSOS interop framing; see `docs/RFC-002-REENGAGEMENT.md`.
 - ✅ **Compression hot-path expansion.** All three v3.6 §2.5 surfaces shipped: federation feed `prefer_compressed=true` (v4.2.0a14 round-1, byte-gated to `to_json(text)::text` exact measurement), HTTP `GET /v1/memories/{id}` Accept-header negotiation (round-12, ``text/plain`` → prose, ``application/x-apollo-dense`` → raw dense), and MCP `get_memory` `format=prose|dense` parameter (round-24, surfaces the same prose/dense variants to stdio + HTTP-SSE MCP clients). `compression_applied` / `compression_metadata` on search remain reserved-but-always-false; real compressed reads use the routes above.
 - ✅ **Design paper draft.** Git-like DAG + LLM-synthesized distillation/narration + judge-verified fidelity, carried from the v3.4 charter; see `docs/papers/mnemos-dag-distillation.md`.
@@ -211,6 +221,37 @@ Remaining after v3.5.0:
 - DAG merge conflict resolution (three-way merge with operator-assisted resolution).
 - Embedding-axis quantization beyond pgvector's built-in `halfvec` and `bit` types — revisit when official TurboQuant / PolarQuant / QJL reference implementations land with compatible licenses.
 - Migration rollback tooling.
+
+---
+
+## MPF v0.2 — independent evolution + MIF idea adoption — SHIPPED 2026-05-06
+
+**Strategy 2026-05-06:** MNEMOS's Memory Portability Format (`mnemos-os/mpf`) resumes independent evolution. MIF (Zircote, mif-spec.dev) is treated as an idea source for specific concepts worth adopting, not an alignment target. MNEMOS does not contribute upstream to MIF; both formats coexist in the ecosystem. (Supersedes the 2026-04-26 alignment posture.)
+
+Spec landed at `mnemos-os/mpf` tag `v0.2.0` (commit `fd2e7f7`). Pushed to all three remotes (gitlab + github + argonas).
+
+Scope for v0.2:
+
+- ✅ **W3C PROV-DM provenance section** — adopt PROV's `who/what/when` model for memory creation + transformation history. Schema lives at `schema/mpf-v0.2.json`; MNEMOS's existing CHARON sidecars carry most of this data already, v0.2 makes the shape explicit + standards-aligned. Test vector: `vectors/provenance_full_chain.json`.
+- ✅ **Bi-temporal tracking** — `valid_time` (when the fact was true) vs. `transaction_time` (when the system recorded it) as first-class envelope fields. Test vector: `vectors/memory_bitemporal.json`.
+- ✅ **Migration guides** — one markdown + executable Python adapter per source memory store under `migrations/`: `mem0`, `zep`, `letta`, `subcog`, `basic-memory`, `mempalace`, `graphiti`, `cognee`. Shared `_adapter_common.py` factored out. Mirrors MIF's pattern; gives operators a concrete on-ramp.
+- ✅ **MIF interop (read-only)** — `migrations/mif.py` + `migrations/mif.md` cover the one-way import path (no merge or alignment). Test vector: `vectors/migration_from_mif_round_trip.json`.
+- ✅ **Test-vector conformance suite** — extended hand-crafted vectors covering the new PROV + bi-temporal fields, structured the way MIF's conformance suite is. README at `vectors/README.md`.
+
+Live deployment proof (CHARON round-trip 2026-05-06): STUDIO claude exported PYTHIA's memory base via `GET /v1/export?limit=500` (07:43–07:44 UTC) and imported the MPF envelope into the cix box (.66 / NCZ Reinhardt MS-R1) — 50 of 51 memories on .66 carry `subcategory=from-pythia` with `metadata.original_id` preserved. First production round-trip outside PYTHIA.
+
+What's next (v0.3 candidates, not committed):
+
+- CHARON server-side rendering of the v0.2 envelope shape (currently the running `/v1/export` handler emits v0.1 + sidecars; v0.3 would mint native v0.2 envelopes with the new PROV + bi-temporal fields populated from existing DB columns).
+- Migration adapter integration tests against a real Mem0 / Letta / Graphiti instance.
+
+MPF strengths the v0.2 spec keeps + documents:
+- DAG version chain (`parent_hash`, `branch`, `commit`)
+- Deletion-log audit trail (v5.1.0 — content_hash + requester + kind + reason)
+- Compression-manifest provenance (v5.0.x — distillation lineage + judge confidence)
+- Federation source attribution (`fed:<peer>` provenance markers)
+
+These are MPF-specific (no MIF analogs) and stay as differentiators.
 
 ---
 
@@ -248,15 +289,16 @@ Same code, same API, same KNOSSOS interop. Single-binary, embeddable, MemPalace-
 - ✅ KRONOS v0.1 scaffold ships the CPU-only forward path for recall-pattern
   anomalies, namespace drift, recall-load forecasts, and PERSEPHONE eligibility
   forecasting. Breadcrumb: `mnemos/domain/kronos`.
-- 🔵 KRONOS v0.2 moves large-history EWMA computation onto the Tesseract/CUDA
+- ✅ KRONOS v0.2 moves large-history EWMA computation onto the Tesseract/CUDA
   path while preserving the v0.1 NumPy implementation as fallback.
+  (v5.1.1 — pluggable cpu/gpu backends; CuPy optional via [kronos-gpu] extra).
 
 ### Track 6 — surface integrations (multi-vendor MCP + REST connectors) — v4.1
 
 MNEMOS exposes mature MCP transports (`mnemos.mcp.stdio`, `mnemos.mcp.http`) and
-22 tools from one canonical registry. v4.0 keeps the working MCP surface and the
-initial connector docs; broad connector-gallery packaging and bridge tooling are
-v4.1 work.
+23 tools from one canonical registry. v4.0 kept the working MCP surface and the
+initial connector docs; broad connector-gallery packaging and bridge tooling
+landed in v4.1.
 
 | Surface | MCP support | Plan |
 |---|---|---|
@@ -273,9 +315,9 @@ v4.1 work.
 
 Deliverables:
 - ✅ Initial `docs/connectors/` directory exists with ChatGPT Pro Developer Mode guidance.
-- 🔵 v4.1: one Markdown per surface with exact config snippets.
+- ✅ v4.1: one Markdown per surface with exact config snippets.
 - ✅ v4.1: `mnemos-openapi.json` artifact for Custom GPTs and OpenAPI-aware clients — landed v4.2.0a14 round-36/37 as the new ``mnemos dump-openapi [-o PATH] [--indent N] [--title TITLE] [--target full|gpt-actions]`` CLI command. Builds the FastAPI OpenAPI spec without booting the server; suitable for CI / static-distribution workflows. ``--target gpt-actions`` truncates endpoint summary/description (300 chars) and parameter description (700 chars) per OpenAI's Custom GPT Actions production limits, so a Custom GPT importing the artifact does not silently truncate or fail. Operators with a running server can also continue to ``curl /openapi.json``.
-- 🔵 v4.1: Gemini and OpenAI Actions bridge packages if demand holds.
+- ✅ Bridge family v0.1.x — shipped 2026-05-04 as the `mnemos-bridge-*` package family at `gitlab.com/mnemos-os/mnemos-bridge-{core,openai,gemini,anthropic,aider,crewai,claude-connector}`. Per-surface adapters translate MCP tool definitions into each target SDK's tool-call shape, dispatching back through MCP. Shared core lib (`mnemos-bridge-core` v0.1.3) handles transport, schema translation, dispatch, result rendering, auth resolution. Tier-2 verified live against gpt-5, gemini-2.0-flash (after the v0.2.0 `google-genai` SDK migration), and claude-opus-4-7. Nightly tier-2 cron on PYTHIA exercises all three model paths and writes summary memories. Supersedes the earlier "Gemini + OpenAI Actions bridge packages if demand holds" item: the demand materialized + was answered.
 - ✅ v4.1: smoke tests per surface where automatable — landed v4.2.0a14 in `tests/test_connector_smoke.py`, with operator runbook notes in `docs/connectors/README.md`.
 
 ---
@@ -311,7 +353,7 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 
 - ✅ `federation.py` non-UTC ISO 8601 cursor handling — UTC-normalize before strip-tzinfo (v3.2.1).
 - ✅ Startup-time GRAEAE manifest reload stalls boot + holds DB conn — moved to `_schedule_background()` with 120s `wait_for` cap; Phase 1 (DB) releases conn before Phase 2 (parallel probes) (v3.2.1).
-- ✅ Background reload undone by concurrent consult overrides — overrides via `model_override` param; `_query_provider` snapshots provider config (v3.2.1).
+- ✅ Background reload undone by concurrent consult overrides — overrides via `model_override` param; `_call_provider_worker` snapshots provider config (v3.2.1).
 - ✅ Override refactor broke gateway model-override path — `engine.route()` now passes `model_override`; gateway strips matching prefix (v3.2.1).
 - ✅ Gateway prefix-strip breaks legitimate slash-bearing model IDs — strip only matching `<provider>/`; resolver tries bare + namespaced lookups (v3.2.1).
 - ✅ Bare `claude-opus-4-7` resolves to `anthropic` not `claude` (engine key) — reverse-map `_REGISTRY_MAP`; strip accepts either name as prefix (v3.2.1).
@@ -332,7 +374,7 @@ Every Codex / GRAEAE / stop-hook audit finding from the v3.2.x and v3.3.x cycles
 - ✅ Docker pip metadata stale at 3.1.0: `.dockerignore` drops `*.egg-info`; Dockerfile installs the package after `COPY . .` (v3.2.3).
 - ✅ `/v1/documents/import` bypass: now uses `mem_<hex12>` ids, populates `verbatim_content` / `quality_rating` / `permission_mode`, dispatches `memory.created` webhooks per chunk, invalidates search cache (v3.2.3).
 - ✅ Stale docs: README current-version paragraph rewritten to v3.2.3; SPECIFICATION endpoint count 91→96; release-history extended (v3.2.3).
-- 🔵 MPF portability partial (`kind=memory` only) — deferred to v3.4 CHARON v0.2.
+- ✅ MPF portability partial (`kind=memory` only) — fully closed by v3.4 CHARON v0.2 (`kg_triples` + `memory_versions` + `compression_manifest` + `deletion_log` sidecars) and the standalone MPF v0.2.0 spec (2026-05-06).
 - ✅ `/v1/memories/search` `compression_applied` / `compression_metadata` reserved-but-always-false — formally documented as reserved in v3.5.1. Real compressed reads use `/v1/memories/rehydrate` and compression manifests.
 
 ### Codex round-2 portability + APOLLO audit (after v3.2.3)

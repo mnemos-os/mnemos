@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 import pytest
@@ -34,6 +35,28 @@ class _Pool:
         return _Acquire(self.conn)
 
 
+class _NoopRawTx:
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
+class _Backend:
+    def __init__(self, pool):
+        from mnemos.persistence.postgres import PostgresFederationRepository
+
+        self.pool = pool
+        self.federation = PostgresFederationRepository()
+
+    @asynccontextmanager
+    async def transactional(self):
+        from mnemos.persistence.postgres import PostgresTransaction
+
+        yield PostgresTransaction(self.pool.conn, _NoopRawTx())
+
+
 @pytest.mark.asyncio
 async def test_feed_emits_consolidation_tombstone(monkeypatch):
     import mnemos.core.lifecycle as lc
@@ -63,7 +86,9 @@ async def test_feed_emits_consolidation_tombstone(monkeypatch):
         "consolidated_at": consolidated_at,
         "compressed_content": None,
     })
-    monkeypatch.setattr(lc, "_pool", _Pool(conn))
+    pool = _Pool(conn)
+    monkeypatch.setattr(lc, "_pool", pool)
+    monkeypatch.setattr(lc, "_persistence_backend", _Backend(pool))
 
     response = await handler.federation_feed(
         None, None, since=None, namespace=None, category=None, limit=10
@@ -104,11 +129,13 @@ class _StoreConn:
 @pytest.mark.asyncio
 async def test_peer_applies_consolidation_redirect_for_imported_duplicate():
     from mnemos.domain.federation import _store_memories
+    from mnemos.persistence.postgres import PostgresFederationRepository, PostgresTransaction
 
     conn = _StoreConn()
 
     new_n, upd_n = await _store_memories(
-        conn,
+        PostgresFederationRepository(),
+        PostgresTransaction(conn, _NoopRawTx()),
         "peer",
         [{
             "type": "consolidation",

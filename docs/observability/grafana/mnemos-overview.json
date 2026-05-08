@@ -1,5 +1,5 @@
 {
-  "__comment": "Grafana dashboard for the MNEMOS HTTP surface. Import via Grafana → Dashboards → Import → paste this JSON. Built against the metric names shipped by mnemos/core/observability.py as of v4.2.0a11. As more metrics land (compression queue, federation lag, NATS consumer pending), additional panels go in the dashboard via panel append; the layout reserves the right column for future surface coverage.",
+  "__comment": "Grafana dashboard for the MNEMOS HTTP surface. Import via Grafana → Dashboards → Import → paste this JSON. Built against the metric names shipped by mnemos/core/observability.py as of v5.0.1. As more metrics land (compression queue, federation lag, NATS consumer pending), additional panels go in the dashboard via panel append; the layout reserves the right column for future surface coverage.",
   "title": "MNEMOS — Overview",
   "uid": "mnemos-overview",
   "schemaVersion": 38,

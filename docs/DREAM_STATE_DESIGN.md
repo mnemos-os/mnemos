@@ -509,6 +509,15 @@ endpoint.
 A dream becomes a fact only through explicit action. Three paths, all
 expressed as DAG operations.
 
+> **Note (historical, did not ship as designed):** the
+> `/v1/dreams/*` and `/admin/dreams/run` endpoint names below are
+> the original draft surface. The shipped MORPHEUS subsystem
+> exposes its lifecycle via `/v1/morpheus/runs*` and
+> `/admin/morpheus/runs` instead (see
+> `mnemos/api/routes/morpheus.py`). The promote / acknowledge
+> mutation paths described here remain forward-looking and have
+> no live REST surface yet.
+
 ### 9.1 Manual operator review — merge
 
 `POST /v1/dreams/{version_id}/promote` — admin/root only. The
@@ -644,6 +653,8 @@ in v3.4.
 - Retrieval surfacing: `POST /v1/memories/search` facts/dreams split.
 - Manual promotion via merge commit (single-parent dreams only).
 - Manual trigger endpoint (`/admin/dreams/run`); no idle scheduler.
+  *[Shipped as `/admin/morpheus/runs` (POST), see
+  `mnemos/api/routes/morpheus.py:282`.]*
 - Prose-form seeds only *[provisional — replaced by APOLLO dense in
   v3.4]*.
 - No coherence critic *[provisional — replaced by APOLLO judge-LLM

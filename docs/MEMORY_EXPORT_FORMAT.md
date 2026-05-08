@@ -374,7 +374,7 @@ schema migration.
 
 ### MNEMOS (producer + consumer, reference implementation)
 
-Canonical producer. `POST /v1/export` emits MPF v0.1 with MNEMOS
+Canonical producer. `GET /v1/export` emits MPF v0.1 with MNEMOS
 memories as `kind: memory` records. `POST /v1/import` accepts MPF v0.1
 and transforms payloads at the declared `payload_version` into the
 target schema. For the PYTHIA v2.3 → CERBERUS v3.1 migration, the
@@ -421,7 +421,7 @@ MNEMOS v3.1.x accepts MPF on `POST /v1/import`. When a record has
   `category="document"` and `metadata.docling_document` preserving the
   full payload (lossless), OR
 - Decomposes the document into per-section memories via the existing
-  `tools/docling_import.py` adapter and adds a `relations[]` entry
+  `mnemos/tools/docling_import.py` adapter and adds a `relations[]` entry
   linking each section memory to the source document record.
 
 The operator picks the mode per import. Both preserve round-trip
@@ -576,22 +576,26 @@ Roundtrip invariants that MUST hold:
 ## Reference implementation
 
 MNEMOS v3.1.x adds:
-- `POST /v1/export` — returns a download of the full corpus as MPF
+- `GET /v1/export` — returns a download of the full corpus as MPF
   (single-file JSON for corpora under ~100 MB, directory JSONL for
   larger)
 - `POST /v1/import` — accepts MPF upload; validates envelope; stages
   into a transaction; commits on success or rolls back with a
   per-record error list
-- `tools/mpf_dump.py` — CLI that hits `/v1/export` and writes either
-  shape
-- `tools/mpf_load.py` — CLI that reads from either shape and POSTs to
-  `/v1/import`
-- `tools/mpf_validate.py` — standalone JSON Schema validator
+- `mnemos/tools/memory_export.py` — CLI that hits `/v1/export` and
+  writes either shape
+- `mnemos/tools/memory_import.py` — CLI that reads from either
+  shape and POSTs to `/v1/import`
+- `mnemos/tools/mpf_validate.py` — standalone JSON Schema validator
 
 MNEMOS v2.4.x backports `/v1/export` and `/v1/import` with the v2.4
 memory payload schema (fewer optional fields, no compression sidecar).
 Both implementations share the envelope parser and schema validator
-via the `mnemos.mpf` module.
+via the `mnemos.domain.portability` package (specifically
+`mnemos.domain.portability.schemas`,
+`mnemos.domain.portability.serializers`, and
+`mnemos.domain.portability.import_` /
+`mnemos.domain.portability.export`).
 
 ---
 

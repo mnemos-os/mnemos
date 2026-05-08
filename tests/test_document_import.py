@@ -107,7 +107,7 @@ class TestDocumentImportEndpoints:
         response = await client.post(
             "/v1/documents/import",
             files={"file": ("test.pdf", pdf_bytes)},
-            data={"category": "documents"}
+            data={"category": "documents", "project_tag": "mnemos"}
         )
 
         # Should return 501 Not Implemented
@@ -121,7 +121,7 @@ class TestDocumentImportEndpoints:
         response = await client.post(
             "/v1/documents/import",
             files={"file": ("empty.pdf", b"")},
-            data={"category": "documents"}
+            data={"category": "documents", "project_tag": "mnemos"}
         )
 
         assert response.status_code == 400
@@ -164,7 +164,7 @@ class TestDocumentImportEndpoints:
         response = await client.post(
             "/v1/documents/import",
             files={"file": ("test.pdf", pdf_bytes)},
-            data={"category": "documents", "subcategory": "papers"}
+            data={"category": "documents", "project_tag": "mnemos", "subcategory": "papers"}
         )
 
         # Should succeed
@@ -199,7 +199,7 @@ class TestDocumentImportEndpoints:
                 ("file", ("doc1.pdf", b"%PDF-1.4\ntest1")),
                 ("file", ("doc2.pdf", b"%PDF-1.4\ntest2")),
             ],
-            data={"category": "documents"}
+            data={"category": "documents", "project_tag": "mnemos"}
         )
 
         assert response.status_code == 200

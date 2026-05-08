@@ -18,6 +18,17 @@ from mnemos.core.auth_context import UserContext
 from mnemos.domain.memory_categorization.state import StateManager
 
 
+class _FakeTx:
+    async def start(self) -> None:
+        pass
+
+    async def commit(self) -> None:
+        pass
+
+    async def rollback(self) -> None:
+        pass
+
+
 def _user(user_id: str = "alice", namespace: str = "ns") -> UserContext:
     return UserContext(
         user_id=user_id,
@@ -40,6 +51,12 @@ class _FailingConn:
     async def execute(self, *_args: Any, **_kwargs: Any) -> None:
         raise RuntimeError("simulated DB write failure")
 
+    async def fetchrow(self, *_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("simulated DB write failure")
+
+    def transaction(self) -> _FakeTx:
+        return _FakeTx()
+
 
 class _FailingPool:
     def acquire(self):
@@ -58,6 +75,13 @@ class _RecordingConn:
 
     async def execute(self, *args: Any, **_kwargs: Any) -> None:
         self.execute_calls.append(args)
+
+    async def fetchrow(self, *args: Any, **_kwargs: Any) -> Any:
+        self.execute_calls.append(args)
+        return {"value": args[-1]}
+
+    def transaction(self) -> _FakeTx:
+        return _FakeTx()
 
 
 class _RecordingPool:
@@ -163,6 +187,13 @@ class _SlowConn:
         async with self._inner as real:
             return await real.execute(*args, **kwargs)
 
+    async def fetch(self, *args, **kwargs):
+        async with self._inner as real:
+            return await real.fetch(*args, **kwargs)
+
+    def transaction(self) -> _FakeTx:
+        return _FakeTx()
+
 
 class _CapturingPool:
     """Pool that records the last-written serialized value and replays
@@ -191,9 +222,20 @@ class _CapturingConn:
         self.pool.stored_text = args[-1]
 
     async def fetchrow(self, *_args: Any, **_kwargs: Any) -> Any:
+        if len(_args) >= 5:
+            self.pool.stored_text = _args[-1]
+            return {"value": self.pool.stored_text}
         if self.pool.stored_text is None:
             return None
         return {"value": self.pool.stored_text}
+
+    async def fetch(self, *_args: Any, **_kwargs: Any) -> list[Any]:
+        if self.pool.stored_text is None:
+            return []
+        return [{"key": "k", "updated": None}]
+
+    def transaction(self) -> _FakeTx:
+        return _FakeTx()
 
 
 @pytest.mark.asyncio

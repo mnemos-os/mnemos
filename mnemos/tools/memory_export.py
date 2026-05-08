@@ -16,12 +16,12 @@ Subcommands:
   stats       Dump /stats.
 
 Usage:
-  python tools/memory_export.py json     --out memories.json --endpoint http://localhost:5002
-  python tools/memory_export.py jsonl    --out memories.jsonl --endpoint http://localhost:5002
-  python tools/memory_export.py json     --category documents --out docs.json \\
+  python -m mnemos.tools.memory_export json     --out memories.json --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_export jsonl    --out memories.jsonl --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_export json     --category documents --out docs.json \\
                                          --api-key $MNEMOS_API_KEY
-  python tools/memory_export.py markdown --out memories.md
-  python tools/memory_export.py stats    --endpoint http://localhost:5002
+  python -m mnemos.tools.memory_export markdown --out memories.md
+  python -m mnemos.tools.memory_export stats    --endpoint http://localhost:5002
 
 The ``json`` subcommand produces an MPF envelope compatible with
 ``memory_import.py json --preserve-metadata`` for cross-version

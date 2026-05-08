@@ -82,10 +82,11 @@ _SIGNATURE_PATTERNS: List[re.Pattern] = [
     re.compile(r"\b(?:public|private|protected)?\s*(?:static\s+)?\w+\s+(?P<name>\w+)\s*\([^)]*\)\s*\{"),  # Java-ish
 ]
 
-# snake_case / camelCase identifier references that look like
-# programmatic symbols when surrounded by code markers (parens,
-# brackets, dots).
-_SYMBOL_RE = re.compile(r"\b([a-z_]\w*(?:\(\))?|[A-Z]\w+(?:\.\w+)+)\b")
+# #181: removed `_SYMBOL_RE` — defined but never referenced. The
+# code schema's actual symbol detection runs through
+# `_CODE_PUNCT_RE` + the `_FUNC_DEF_PATTERNS` heuristic above; this
+# orphaned identifier-shape regex was likely an early draft never
+# wired to the extraction path.
 
 
 class CodeSchema(Schema):

@@ -3,11 +3,12 @@
 ## Supported versions
 
 The most recently maintained release branch is supported. The current
-release line is `v4.0.x`. v4.0.0 shipped on 2026-04-29.
+release line is `v5.0.x`. v5.0.1 shipped on 2026-05-06 (on top of the
+v5.0.0 GA from 2026-05-02 and v4.0.0 from 2026-04-29).
 
 ## Current security invariants
 
-As of v4.0.0:
+As of v5.0.1 (carried forward from v4.0.0):
 
 - Memory read visibility is symmetric across list/get/search/rehydrate,
   OpenAI-compatible gateway context, version history, DAG history, and MCP

@@ -1,7 +1,11 @@
-"""Replacement body for api/auth.py with session-cookie support.
+"""FastAPI auth dependencies (Bearer + session-cookie).
 
-Drop-in replacement. Existing Bearer flow preserved; session-cookie flow
-added as a secondary path. Auth-disabled mode unchanged.
+Live home of the `get_current_user` dependency consumed by the route
+modules. Existing Bearer flow preserved; session-cookie flow added
+as a secondary path. Auth-disabled mode unchanged.
+
+(Originally split out from a pre-v4 `api/auth.py` module that no
+longer exists.)
 """
 import hashlib
 import logging

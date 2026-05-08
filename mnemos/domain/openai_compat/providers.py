@@ -323,7 +323,7 @@ async def _route_to_provider_response(
     except OpenAICompatError:
         raise
     except Exception as e:
-        logger.error("[MNEMOS] Routing to %s failed: %s", provider, e)
+        logger.error("[MNEMOS] Routing to %s failed: %s", provider, e, exc_info=True)
         raise OpenAICompatError(status_code=503, detail=f"Routing error: {str(e)}")
 
 

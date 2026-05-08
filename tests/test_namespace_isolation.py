@@ -96,6 +96,7 @@ async def pg_app(monkeypatch):
     import mnemos.core.lifecycle as lc
     from mnemos.api.dependencies import configure_auth
     from mnemos.api.main import app
+    from mnemos.persistence.postgres import PostgresBackend
 
     assert PG_URL is not None
     prefix = f"nsiso{uuid.uuid4().hex[:12]}"
@@ -108,6 +109,7 @@ async def pg_app(monkeypatch):
         return task
 
     monkeypatch.setattr(lc, "_pool", pool)
+    monkeypatch.setattr(lc, "_persistence_backend", PostgresBackend(pool, object()))
     monkeypatch.setattr(lc, "_cache", None)
     monkeypatch.setattr(lc, "_schedule_background", _schedule_background)
     app.state.pool = pool

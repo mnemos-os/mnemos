@@ -1,10 +1,12 @@
-"""Small NumPy helpers for KRONOS v0.1."""
+"""Small helpers for KRONOS."""
 
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
+
+from mnemos.domain.kronos.backends.cpu import ewma as ewma
 
 
 def z_score(value: float, mean: float, std: float) -> float:
@@ -14,20 +16,6 @@ def z_score(value: float, mean: float, std: float) -> float:
     if abs(std) <= 1e-12:
         return 0.0 if abs(diff) <= 1e-12 else diff
     return diff / std
-
-
-def ewma(values: np.ndarray, alpha: float = 0.3) -> np.ndarray:
-    """Exponentially weighted moving average, oldest to newest."""
-    if not 0.0 < alpha <= 1.0:
-        raise ValueError("alpha must be in the range (0, 1]")
-    arr = np.asarray(values, dtype=float)
-    if arr.size == 0:
-        return arr.astype(float)
-    result = np.empty_like(arr, dtype=float)
-    result[0] = arr[0]
-    for idx in range(1, arr.size):
-        result[idx] = alpha * arr[idx] + (1.0 - alpha) * result[idx - 1]
-    return result
 
 
 def hourly_buckets(timestamps: list[datetime], window_hours: int) -> np.ndarray:

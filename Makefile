@@ -43,7 +43,7 @@ lint-fix:      ## Run ruff with auto-fix
 	$(RUFF) check . --fix --exclude venv,archive
 
 setup-db:      ## Run database migrations (requires PostgreSQL running)
-	$(PYTHON) install.py --migrations-only
+	$(PYTHON) -m mnemos.installer --upgrade
 
 docker-build:  ## Build Docker image
 	docker build -t mnemos:dev .
@@ -65,16 +65,16 @@ clean:         ## Remove build artifacts and caches
 # ── Installer targets ─────────────────────────────────────────────────────────
 
 install-agent:  ## Run agentic LLM-guided installer (default)
-	$(PYTHON) -m installer --agent
+	$(PYTHON) -m mnemos.installer --agent
 
 install-wizard: ## Run traditional interactive wizard installer
-	$(PYTHON) -m installer --wizard
+	$(PYTHON) -m mnemos.installer --wizard
 
 install-check:  ## Check environment prerequisites only (no changes)
-	$(PYTHON) -m installer --check
+	$(PYTHON) -m mnemos.installer --check
 
 install-upgrade: ## Re-run migrations only (upgrade existing install)
-	$(PYTHON) -m installer --upgrade
+	$(PYTHON) -m mnemos.installer --upgrade
 
 bootstrap:      ## Run install.sh bootstrap (installs system packages first)
 	bash install.sh
@@ -82,16 +82,16 @@ bootstrap:      ## Run install.sh bootstrap (installs system packages first)
 # ── Import utilities ──────────────────────────────────────────────────────────-
 
 import-docling: ## Import documents via IBM Docling (ARGS='--source DIR')
-	$(VENV)/bin/python tools/docling_import.py $(ARGS)
+	$(VENV)/bin/python -m mnemos.tools.docling_import $(ARGS)
 
 import-json:    ## Import memories from JSON file (ARGS='--file memories.json')
-	$(VENV)/bin/python tools/memory_import.py json $(ARGS)
+	$(VENV)/bin/python -m mnemos.tools.memory_import json $(ARGS)
 
 import-chatgpt: ## Import ChatGPT conversation export (ARGS='--file conversations.json')
-	$(VENV)/bin/python tools/memory_import.py chatgpt $(ARGS)
+	$(VENV)/bin/python -m mnemos.tools.memory_import chatgpt $(ARGS)
 
 import-obsidian: ## Import Obsidian vault (ARGS='--vault /path/to/vault')
-	$(VENV)/bin/python tools/memory_import.py obsidian $(ARGS)
+	$(VENV)/bin/python -m mnemos.tools.memory_import obsidian $(ARGS)
 
 import-stats:   ## Show MNEMOS memory statistics
-	$(VENV)/bin/python tools/memory_import.py stats --endpoint http://localhost:5002
+	$(VENV)/bin/python -m mnemos.tools.memory_import stats --endpoint http://localhost:5002

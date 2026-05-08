@@ -1,6 +1,6 @@
 # MNEMOS Single-Binary Distribution
 
-MNEMOS v5.0.0 publishes platform-native `mnemos` executables that bundle the
+MNEMOS v5.0.1 publishes platform-native `mnemos` executables that bundle the
 Python interpreter, runtime dependencies, and the sqlite-vec native extension.
 Operators can copy one file onto an edge host, mark it executable, and start the
 service without installing Python or running `pip`.

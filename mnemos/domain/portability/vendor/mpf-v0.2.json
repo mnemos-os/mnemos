@@ -1,0 +1,705 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/mnemos-os/mpf/blob/master/schema/mpf-v0.2.json",
+  "title": "Memory Portability Format (MPF) v0.2",
+  "description": "MNEMOS memory portability envelope. v0.2 keeps the v0.1 record and sidecar model while adding W3C PROV-DM-inspired record provenance and optional bi-temporal tracking fields.",
+  "type": "object",
+  "required": ["mpf_version", "exported_at", "records"],
+  "additionalProperties": true,
+  "properties": {
+    "mpf_version": {
+      "type": "string",
+      "description": "Envelope schema version. Consumers implement per-version readers.",
+      "pattern": "^0\\.2(\\.[0-9]+)?$"
+    },
+    "source_system": {
+      "type": ["string", "null"],
+      "description": "Emitting system identifier. Convention: lowercase ASCII, e.g. 'mnemos', 'mem0', 'letta', 'graphiti', 'cognee', 'mempalace'. Diagnostic only; null ≈ absent."
+    },
+    "source_version": {
+      "type": ["string", "null"],
+      "description": "Version of the emitting system. Diagnostic only; null ≈ absent."
+    },
+    "source_instance": {
+      "type": ["string", "null"],
+      "description": "Emitting deployment identifier (hostname, cluster name, etc). Diagnostic only; null ≈ absent."
+    },
+    "source_commit": {
+      "type": ["string", "null"],
+      "description": "Emitting system's VCS commit hash. Diagnostic only; null ≈ absent."
+    },
+    "exported_at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "When this envelope was emitted. RFC 3339 / ISO 8601."
+    },
+    "record_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total records in the envelope. If absent, consumers compute from records.length."
+    },
+    "records": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/record" },
+      "description": "Discriminated union of payload records. Consumers MUST accept and skip records whose 'kind' they don't understand (forward-compatibility ratchet)."
+    },
+    "kg_triples": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/kg_triple" },
+      "description": "Knowledge-graph triples. Covers Graphiti temporal edges via valid_from/valid_until."
+    },
+    "relations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/relation" },
+      "description": "Cross-record provenance links (derived_from, answers, derived_memory_of, ...). References record_id values."
+    },
+    "compression_manifest": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/compression_manifest_entry" },
+      "description": "Compressed forms of records. Record-ID-keyed; consumers may regenerate."
+    },
+    "compression_candidates": {
+      "type": "array",
+      "items": { "type": "object" },
+      "description": "Full compression-contest audit history. Opaque at the envelope level; consumers that don't run contests skip."
+    },
+    "memory_versions": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/memory_version_entry" },
+      "description": "Memory DAG history (per-version snapshots + parent links). Optional. Consumers that lack DAG support skip."
+    },
+    "deletion_log": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/deletion_log_entry" },
+      "description": "Append-only audit trail for tombstones and deletes. Consumers that lack delete-log support skip."
+    },
+    "embeddings": {
+      "$ref": "#/$defs/embedding_sidecar",
+      "description": "Embedding sidecar descriptor. Vector data lives either inline per-record or in a parquet sidecar file."
+    },
+    "attestations": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/attestation" },
+      "description": "Optional detached signatures over canonical envelope form for signed exports."
+    }
+  },
+
+  "$defs": {
+
+    "record": {
+      "type": "object",
+      "required": ["id", "kind", "payload_version", "payload"],
+      "additionalProperties": true,
+      "description": "Base record envelope. 'kind' selects the payload schema.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable, unique within the envelope. Preserved on round-trip. Recommendation: ULID or UUID v4."
+        },
+        "kind": {
+          "type": "string",
+          "description": "Registered kind (document/memory/fact/event) OR namespaced producer-defined kind (e.g. 'acme.observation'). Unknown kinds MUST be skipped by consumers."
+        },
+        "payload_version": {
+          "type": "string",
+          "description": "Version of the payload schema. For 'document': docling SemVer (e.g. '1.10.0'). For 'memory': producing system's native version (e.g. 'mnemos-3.1', 'letta-0.9', 'mem0-0.1'). For MPF-defined kinds ('fact', 'event'): 'mpf-0.1'."
+        },
+        "payload": {
+          "description": "Opaque to the envelope. The payload schema is owned by the payload_version; consumers validate it with their system's schema.",
+          "oneOf": [
+            { "type": "object" },
+            { "type": "array" },
+            { "type": "string" }
+          ]
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance",
+          "description": "W3C PROV-DM-inspired who/what/when provenance for this memory record. Required for kind='memory' in MPF v0.2."
+        },
+        "valid_time_start": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional bi-temporal valid-time start: when the fact was true in the world. If absent, MNEMOS importers default it to transaction_time."
+        },
+        "valid_time_end": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Optional bi-temporal valid-time end. Null means open-ended/current."
+        },
+        "transaction_time": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional bi-temporal transaction time: when the system recorded the memory. Often aliases payload.created."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "memory" }
+            },
+            "required": ["kind"]
+          },
+          "then": {
+            "required": ["provenance"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "fact" },
+              "payload_version": { "const": "mpf-0.1" }
+            },
+            "required": ["kind", "payload_version"]
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/fact_payload_v0_1" }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "kind": { "const": "event" },
+              "payload_version": { "const": "mpf-0.1" }
+            },
+            "required": ["kind", "payload_version"]
+          },
+          "then": {
+            "properties": {
+              "payload": { "$ref": "#/$defs/event_payload_v0_1" }
+            }
+          }
+        }
+      ]
+    },
+
+    "provenance": {
+      "type": "object",
+      "required": ["wasAttributedTo", "wasGeneratedBy", "generatedAtTime"],
+      "additionalProperties": true,
+      "description": "W3C PROV-DM-inspired provenance. MPF intentionally uses compact JSON field names while preserving PROV's agent/activity/entity model.",
+      "properties": {
+        "wasAttributedTo": {
+          "$ref": "#/$defs/prov_agent",
+          "description": "Agent, user, or system responsible for the memory entity."
+        },
+        "wasGeneratedBy": {
+          "$ref": "#/$defs/prov_activity",
+          "description": "Activity that produced the memory entity."
+        },
+        "wasInfluencedBy": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/prov_influence" },
+          "description": "Other memory IDs or external source URIs that influenced this memory."
+        },
+        "generatedAtTime": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Transaction-time timestamp when the memory entity was generated."
+        }
+      }
+    },
+
+    "prov_agent": {
+      "type": "object",
+      "required": ["type", "id"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["agent", "user", "system"],
+          "description": "Explicit discriminator for the responsible actor."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable actor identifier. Federation producers SHOULD use fed:<peer> prefixes when appropriate."
+        },
+        "name": { "type": "string" },
+        "uri": { "type": "string", "format": "uri" }
+      }
+    },
+
+    "prov_activity": {
+      "type": "object",
+      "required": ["type", "id"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["chat_session", "etl_job", "federation_pull", "distillation", "activity"],
+          "description": "Explicit discriminator for the activity that produced the memory."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "startedAtTime": { "type": "string", "format": "date-time" },
+        "endedAtTime": { "type": ["string", "null"], "format": "date-time" },
+        "description": { "type": "string" }
+      }
+    },
+
+    "prov_influence": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": true,
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["memory", "external_uri"],
+          "description": "Explicit discriminator for an internal memory influence or external source URI."
+        },
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Referenced MPF records[].id when type='memory'."
+        },
+        "uri": {
+          "type": "string",
+          "format": "uri",
+          "description": "External source URI when type='external_uri'."
+        },
+        "relationship": {
+          "type": "string",
+          "description": "Optional producer-defined relation such as derived_from, cites, or fed:<peer>."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "type": { "const": "memory" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["id"] }
+        },
+        {
+          "if": {
+            "properties": { "type": { "const": "external_uri" } },
+            "required": ["type"]
+          },
+          "then": { "required": ["uri"] }
+        }
+      ]
+    },
+
+    "fact_payload_v0_1": {
+      "type": "object",
+      "required": ["statement"],
+      "additionalProperties": true,
+      "description": "MPF-defined 'fact' payload. Models an extracted atomic claim. Covers Mem0-style extracted facts, Graphiti edges as literals, Cognee KG entries, LLM-distilled assertions.",
+      "properties": {
+        "statement": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Human-readable claim in natural language. Required; the canonical representation of the fact."
+        },
+        "subject": {
+          "type": "string",
+          "description": "Subject of the triple, if the statement decomposes. Free-form."
+        },
+        "predicate": {
+          "type": "string",
+          "description": "Relation/verb of the triple, if the statement decomposes. Convention: camelCase or snake_case, e.g. 'capitalOf', 'works_at'."
+        },
+        "object": {
+          "type": "string",
+          "description": "Object of the triple, if the statement decomposes. Free-form string (literal) or a record id reference."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Extraction/assertion confidence in [0, 1]."
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this fact was extracted/asserted. RFC 3339."
+        },
+        "updated": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this fact was last updated."
+        },
+        "valid_from": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Optional temporal validity window start. Covers Graphiti's temporal-edge semantics."
+        },
+        "valid_until": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Optional temporal validity window end. Null means 'still valid'."
+        },
+        "source_record_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Record IDs this fact was extracted from. Enables provenance round-trip back to source documents or memories."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot. Producer-namespaced keys (e.g. 'mem0_agent_id', 'graphiti_group_id') are encouraged to avoid collision."
+        }
+      }
+    },
+
+    "event_payload_v0_1": {
+      "type": "object",
+      "required": ["event_type", "occurred_at"],
+      "additionalProperties": true,
+      "description": "MPF-defined 'event' payload. Models a session turn, agent action, or temporal event. Covers Letta/Zep session turns, Graphiti episodes, agent-action logs.",
+      "properties": {
+        "event_type": {
+          "type": "string",
+          "description": "Event class. Convention: snake_case. Common values: 'session_turn', 'agent_action', 'tool_call', 'ingest_event'."
+        },
+        "session_id": {
+          "type": "string",
+          "description": "Session/conversation identifier. Optional."
+        },
+        "actor": {
+          "type": "string",
+          "description": "Who produced the event. Convention: 'user', 'assistant', 'system', 'tool:<name>', or a free-form identifier."
+        },
+        "content": {
+          "type": "string",
+          "description": "Textual content associated with the event (message body, tool output, narration). Optional."
+        },
+        "occurred_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the event occurred. RFC 3339. Required."
+        },
+        "source_record_ids": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Records this event relates to (e.g. the document the user asked about, the memory the assistant retrieved)."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot. Producer-namespaced keys encouraged."
+        }
+      }
+    },
+
+    "kg_triple": {
+      "type": "object",
+      "required": ["id", "predicate"],
+      "additionalProperties": true,
+      "description": "Knowledge-graph triple. Subject and object may be either record IDs (internal) or free-form literals (external). Supports Graphiti-style temporal validity windows.",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable triple identifier, unique within the envelope."
+        },
+        "subject_id": {
+          "type": "string",
+          "description": "Record ID of the subject. Mutually exclusive with subject_literal."
+        },
+        "subject_literal": {
+          "type": "string",
+          "description": "Free-form subject when not a record. Mutually exclusive with subject_id."
+        },
+        "predicate": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Relation/verb. Convention: camelCase or snake_case. Required."
+        },
+        "object_id": {
+          "type": "string",
+          "description": "Record ID of the object. Mutually exclusive with object_literal."
+        },
+        "object_literal": {
+          "type": "string",
+          "description": "Free-form object when not a record. Mutually exclusive with object_id."
+        },
+        "subject_type": {
+          "type": ["string", "null"],
+          "description": "Optional type tag for the subject (e.g. 'person', 'concept', 'memory'). Producer-defined. MNEMOS uses this to discriminate record-id references from literals when the producer didn't honor the subject_id/literal split."
+        },
+        "object_type": {
+          "type": ["string", "null"],
+          "description": "Optional type tag for the object. Same semantics as subject_type."
+        },
+        "memory_id": {
+          "type": ["string", "null"],
+          "description": "Optional pointer to the source memory record this triple was extracted from. Distinct from subject_id/object_id (which model the triple's content); memory_id models its provenance."
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Extraction/assertion confidence in [0, 1]. Defaults to 1.0 when absent."
+        },
+        "valid_from": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Start of temporal validity window. Matches Graphiti edge semantics."
+        },
+        "valid_until": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "End of temporal validity window; null means open-ended."
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the triple was first recorded."
+        },
+        "owner_id": {
+          "type": "string",
+          "description": "Tenancy owner for multi-tenant systems."
+        },
+        "namespace": {
+          "type": "string",
+          "description": "Tenancy namespace."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot."
+        }
+      },
+      "anyOf": [
+        { "required": ["subject_id"] },
+        { "required": ["subject_literal"] }
+      ]
+    },
+
+    "relation": {
+      "type": "object",
+      "required": ["from", "rel", "to"],
+      "additionalProperties": true,
+      "description": "Cross-record provenance link. Covers 'derived_from', 'answers', 'cites', 'block_contains_passage' (Letta), 'chunk_of_document' (Cognee), etc.",
+      "properties": {
+        "from": {
+          "type": "string",
+          "description": "Source record ID."
+        },
+        "rel": {
+          "type": "string",
+          "description": "Relation type. Convention: snake_case. Consumers MAY ignore unknown rel values."
+        },
+        "to": {
+          "type": "string",
+          "description": "Target record ID."
+        },
+        "created": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the relation was established."
+        },
+        "metadata": {
+          "type": "object",
+          "description": "Free-form extension slot."
+        }
+      }
+    },
+
+    "compression_manifest_entry": {
+      "type": "object",
+      "required": ["record_id", "engine_id"],
+      "additionalProperties": true,
+      "description": "One compressed form of a record, selected via contest.",
+      "properties": {
+        "record_id": { "type": "string" },
+        "engine_id": { "type": "string" },
+        "engine_version": { "type": "string" },
+        "compressed_content": { "type": "string" },
+        "compressed_tokens": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Token count of compressed_content per the engine's tokenizer. Null if the engine doesn't measure."
+        },
+        "compression_ratio": { "type": "number", "minimum": 0 },
+        "quality_score": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Judge-derived quality score in [0, 1]. Null if no judge ran. Distinct from composite_score, which folds quality + ratio + speed under a scoring_profile."
+        },
+        "composite_score": { "type": "number" },
+        "scoring_profile": { "type": "string" },
+        "judge_model": {
+          "type": ["string", "null"],
+          "description": "Model identifier of the judge that produced quality_score. Null when quality_score is null."
+        },
+        "distillation_lineage": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Record IDs or compression entry IDs that formed the distillation chain."
+        },
+        "judge_confidence": {
+          "type": ["number", "null"],
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Judge confidence for the selected distilled content, distinct from quality_score when producers separate correctness from confidence."
+        },
+        "selected_at": { "type": "string", "format": "date-time" },
+        "winner_contest_id": { "type": "string" },
+        "owner_id": {
+          "type": ["string", "null"],
+          "description": "Tenancy owner of the source record. Importers MUST keep this aligned with the corresponding memory record's owner_id."
+        }
+      }
+    },
+
+    "memory_version_entry": {
+      "type": "object",
+      "required": ["id", "record_id", "version_num", "content"],
+      "additionalProperties": true,
+      "description": "One snapshot in a record's DAG history. Content-addressed via commit_hash when present. Carries the full tenancy + provenance fields of the parent record so a snapshot is round-trippable on its own (the linked record may not be present in a partial export).",
+      "properties": {
+        "id": { "type": "string" },
+        "record_id": { "type": "string" },
+        "version_num": { "type": "integer", "minimum": 1 },
+        "commit_hash": { "type": "string" },
+        "branch": { "type": "string" },
+        "parent_hash": {
+          "type": ["string", "null"],
+          "description": "Commit hash of the primary parent. Optional alias for systems that track parent content hashes directly."
+        },
+        "parent_version_id": { "type": ["string", "null"] },
+        "merge_parents": {
+          "type": ["array", "null"],
+          "items": { "type": "string" },
+          "description": "Additional parent version ids for merge commits (parent_version_id is the primary parent; this lists secondary parents)."
+        },
+        "content": { "type": "string" },
+        "category": {
+          "type": ["string", "null"],
+          "description": "Snapshot of the parent record's category at the time of this version."
+        },
+        "subcategory": {
+          "type": ["string", "null"],
+          "description": "Snapshot of the parent record's subcategory at the time of this version."
+        },
+        "metadata": {
+          "type": ["object", "null"],
+          "description": "Snapshot of the parent record's metadata blob at the time of this version."
+        },
+        "verbatim_content": {
+          "type": ["string", "null"],
+          "description": "Original verbatim copy of the content before any compression/distillation; preserved for provenance even when content has been replaced by a distilled form."
+        },
+        "owner_id": {
+          "type": ["string", "null"],
+          "description": "Tenancy owner snapshot. Importers honor caller-identity rewrite rules same as memory records."
+        },
+        "namespace": {
+          "type": ["string", "null"],
+          "description": "Tenancy namespace snapshot."
+        },
+        "permission_mode": {
+          "type": ["integer", "null"],
+          "description": "Unix-style permission mode snapshot (e.g. 600, 400)."
+        },
+        "source_model": { "type": ["string", "null"] },
+        "source_provider": { "type": ["string", "null"] },
+        "source_session": { "type": ["string", "null"] },
+        "source_agent": { "type": ["string", "null"] },
+        "snapshot_at": { "type": "string", "format": "date-time" },
+        "snapshot_by": {
+          "type": ["string", "null"],
+          "description": "User identifier of who triggered the snapshot. Diagnostic; not used for authorization on import."
+        },
+        "change_type": {
+          "type": "string",
+          "enum": ["create", "update", "delete", "revert", "merge", "branch"]
+        }
+      }
+    },
+
+    "deletion_log_entry": {
+      "type": "object",
+      "required": ["id", "record_id", "deleted_at"],
+      "additionalProperties": true,
+      "description": "One deletion/tombstone audit event. Payloads may be absent from records[] while delete intent remains auditable.",
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "record_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Deleted record ID or tombstoned memory ID."
+        },
+        "deleted_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the system recorded the deletion."
+        },
+        "deleted_by": {
+          "type": ["string", "null"],
+          "description": "User, agent, or system actor that requested the delete."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "description": "Optional human-readable delete reason."
+        },
+        "tombstone_hash": {
+          "type": ["string", "null"],
+          "description": "Optional hash of the tombstone or final visible payload state."
+        },
+        "provenance": {
+          "$ref": "#/$defs/provenance",
+          "description": "Optional PROV section for the delete event."
+        }
+      }
+    },
+
+    "embedding_sidecar": {
+      "type": "object",
+      "required": ["model", "dim", "encoding"],
+      "additionalProperties": true,
+      "description": "Describes how embeddings are delivered for this envelope.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "description": "Embedding model identifier (e.g. 'nomic-embed-text', 'text-embedding-3-small'). Importers that change models regenerate embeddings."
+        },
+        "dim": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Embedding dimensionality."
+        },
+        "encoding": {
+          "type": "string",
+          "enum": ["inline_base64_f32", "sidecar"],
+          "description": "'inline_base64_f32' stores each vector in its record's payload.embedding as base64(float32 bytes). 'sidecar' references an external parquet file via sidecar_file."
+        },
+        "sidecar_file": {
+          "type": "string",
+          "description": "Path to parquet sidecar (when encoding='sidecar'). Relative to the envelope file."
+        }
+      }
+    },
+
+    "attestation": {
+      "type": "object",
+      "required": ["alg", "signature"],
+      "additionalProperties": true,
+      "description": "Detached signature over canonical envelope JSON.",
+      "properties": {
+        "alg": {
+          "type": "string",
+          "description": "Signing algorithm, e.g. 'ed25519'."
+        },
+        "signature": {
+          "type": "string",
+          "description": "Base64-encoded signature bytes over canonical envelope form (records sorted by id, keys sorted)."
+        },
+        "kid": {
+          "type": "string",
+          "description": "Signer key identifier."
+        },
+        "signed_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    }
+  }
+}

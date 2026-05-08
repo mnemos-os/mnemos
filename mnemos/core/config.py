@@ -100,6 +100,19 @@ class _DatabaseSettings(BaseSettings):
     password: str = ""
     pool_min_size: int = Field(5, validation_alias="PG_POOL_MIN")
     pool_max_size: int = Field(20, validation_alias="PG_POOL_MAX")
+    embedding_dim: int = Field(
+        768,
+        validation_alias=AliasChoices("MNEMOS_EMBEDDING_DIM", "PG_EMBEDDING_DIM"),
+        description=(
+            "Vector dimension for the embedding column / sqlite-vec virtual table. "
+            "Default 768 matches nomic-embed-text and the OpenAI text-embedding-3-small "
+            "default. Override to match your embedding model: e.g. 512 for bge-small-zh-v1.5 "
+            "(used on Cix Sky1 NPU substrate), 1536 for OpenAI text-embedding-3-small at "
+            "full dim, 3072 for text-embedding-3-large. SQLite valid range is [1, 8192] "
+            "per sqlite-vec SQLITE_VEC_VEC0_MAX_DIMENSIONS. Postgres backends are sized "
+            "at schema-init time; switching dim on a populated DB requires a re-embed."
+        ),
+    )
 
     @field_validator("sqlite_path", mode="before")
     @classmethod
@@ -133,6 +146,16 @@ class _ServerSettings(BaseSettings):
     base: str = Field("http://localhost:5002", validation_alias="MNEMOS_BASE")
     base_configured: bool = False
     api_key: str = Field("", validation_alias="MNEMOS_API_KEY")
+    # Round-3 residual #1 of #146: bridge-only credential for the
+    # MCP audit ingestion endpoint. Bridges include
+    # `X-Mnemos-Audit-Token: <value>` on POST /v1/internal/mcp_audit.
+    # The route accepts ONLY this token (rejects normal API/session
+    # bearer tokens) so any token holder can't append forged audit
+    # rows. When unset, the endpoint operates in legacy mode (any
+    # authenticated caller) and emits a warning at startup.
+    internal_audit_token: str = Field(
+        "", validation_alias="MNEMOS_INTERNAL_AUDIT_TOKEN"
+    )
     profile: str = Field("personal", validation_alias="MNEMOS_PROFILE")
     max_body_bytes: int = Field(5 * 1024 * 1024, validation_alias="MAX_BODY_BYTES")
     cors_origins: str = Field(
@@ -312,6 +335,22 @@ class _CompressionSettings(BaseSettings):
         except (TypeError, ValueError):
             return 0
         return value if value >= 0 else 0
+
+
+class _ArtemisSettings(BaseSettings):
+    model_config = _config_model_config()
+
+    dedup_mode: str = Field("reject", validation_alias="MNEMOS_ARTEMIS_DEDUP_MODE")
+    dedup_cross_namespace: bool = Field(
+        False,
+        validation_alias="MNEMOS_ARTEMIS_DEDUP_CROSS_NAMESPACE",
+    )
+
+    @field_validator("dedup_mode", mode="before")
+    @classmethod
+    def _normalize_dedup_mode(cls, raw: Any) -> str:
+        value = str(raw or "reject").strip().lower()
+        return value if value in {"reject", "merge", "warn", "off"} else "reject"
 
 
 class _MorpheusSettings(BaseSettings):
@@ -586,6 +625,7 @@ class Settings(BaseSettings):
     resilience: _ResilienceSettings
     observability: _ObservabilitySettings
     compression: _CompressionSettings
+    artemis: _ArtemisSettings
     morpheus: _MorpheusSettings
     persephone: _PersephoneSettings
     kronos: KronosSettings
@@ -657,8 +697,31 @@ def _build_settings() -> Settings:
     server = _ServerSettings(**server_toml)
     server.profile = normalize_profile(_profile_from_sources(toml_config, server_toml, server))
     server.base_configured = "MNEMOS_BASE" in os.environ or "base" in server_toml
+    # `[database].password = ""` is the documented production shape (secret
+    # supplied via PG_PASSWORD env). Drop empty-string values across the
+    # full set of env-aliased database fields so they don't win over the
+    # BaseSettings env-alias resolution. backend / port / sqlite_path are
+    # all common shapes operators sometimes leave empty in config expecting
+    # env to fill them; without dropping them, an empty TOML `backend = ""`
+    # would block PG_BACKEND and lifecycle would refuse to start with
+    # `Unsupported persistence backend ''`.
+    db_section = dict(_toml_section(toml_config, "database"))
+    _ENV_BACKED_DB_FIELDS = (
+        "backend",
+        "dsn",
+        "url",
+        "host",
+        "port",
+        "database",
+        "user",
+        "password",
+        "sqlite_path",
+    )
+    for env_filled_field in _ENV_BACKED_DB_FIELDS:
+        if env_filled_field in db_section and db_section[env_filled_field] == "":
+            db_section.pop(env_filled_field)
     groups = {
-        "database": _DatabaseSettings(**_toml_section(toml_config, "database")),
+        "database": _DatabaseSettings(**db_section),
         "graeae": _GraeaeSettings(**_toml_section(toml_config, "graeae")),
         "server": server,
         "webhook": _WebhookSettings(**_toml_section(toml_config, "webhook")),
@@ -668,6 +731,7 @@ def _build_settings() -> Settings:
         "resilience": _ResilienceSettings(**_toml_section(toml_config, "resilience")),
         "observability": _ObservabilitySettings(**_toml_section(toml_config, "observability")),
         "compression": _CompressionSettings(**_toml_section(toml_config, "compression")),
+        "artemis": _ArtemisSettings(**_toml_section(toml_config, "artemis")),
         "morpheus": _MorpheusSettings(**_toml_section(toml_config, "morpheus")),
         "persephone": _PersephoneSettings(**_toml_section(toml_config, "persephone")),
         "kronos": KronosSettings(**_toml_section(toml_config, "kronos")),
@@ -691,6 +755,7 @@ def _build_settings() -> Settings:
         resilience=groups["resilience"],
         observability=groups["observability"],
         compression=groups["compression"],
+        artemis=groups["artemis"],
         morpheus=groups["morpheus"],
         persephone=groups["persephone"],
         kronos=groups["kronos"],

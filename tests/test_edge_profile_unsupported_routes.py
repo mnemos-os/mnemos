@@ -44,7 +44,6 @@ def test_edge_profile_postgres_only_routes_return_503(edge_client):
     cases = [
         ("post", "/v1/sessions", {"json": {}}),
         ("get", "/entities", {}),
-        ("get", "/state", {}),
         ("get", "/v1/morpheus/runs", {}),
     ]
     for method, path, kwargs in cases:
@@ -59,6 +58,15 @@ def test_edge_profile_postgres_only_routes_return_503(edge_client):
         # SQLite/edge-profile cause obvious to operators, so accept
         # either phrasing here.
         assert "Postgres backend" in resp.text
+
+
+def test_edge_profile_state_route_uses_sqlite_backend(edge_client):
+    resp = edge_client.put("/state/edge-key", json={"value": {"ok": True}})
+    assert resp.status_code == 200, resp.text
+
+    resp = edge_client.get("/state/edge-key")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["value"] == '{"ok": true}'
 
 
 def test_edge_profile_documents_import_returns_503_with_correct_route_label(
@@ -82,6 +90,7 @@ def test_edge_profile_documents_import_returns_503_with_correct_route_label(
     resp = edge_client.post(
         "/v1/documents/import",
         files={"file": ("doc.txt", b"hello", "text/plain")},
+        data={"project_tag": "mnemos"},
     )
     assert resp.status_code == 503
     assert "POST /v1/documents/import" in resp.text
@@ -116,6 +125,7 @@ def test_edge_profile_documents_batch_import_returns_top_level_503(
             ("files", ("a.txt", b"hello", "text/plain")),
             ("files", ("b.txt", b"world", "text/plain")),
         ],
+        data={"project_tag": "mnemos"},
     )
     assert resp.status_code == 503
     assert "POST /v1/documents/batch-import" in resp.text

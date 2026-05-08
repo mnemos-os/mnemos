@@ -16,7 +16,10 @@ logger = logging.getLogger("mnemos.webhooks.nats_trigger")
 SUBJECT = "mnemos.webhook.delivery.queued.>"
 STREAM = "MNEMOS_WEBHOOK"
 DURABLE = "mnemos_webhook_delivery_trigger"
-QUEUE_GROUP = "mnemos_webhook_delivery_workers"
+# #181: removed `QUEUE_GROUP = "mnemos_webhook_delivery_workers"` —
+# defined but never referenced. The actual queue group flows from
+# the MNEMOS_WEBHOOK_NATS_QUEUE_GROUP env var via settings, and a
+# per-worker computed group via _queue_group_durable().
 
 
 async def consumer_loop(

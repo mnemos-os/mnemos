@@ -1,29 +1,26 @@
-# Cursor → MNEMOS
+# Cursor -> MNEMOS
 
-> **Status: stable.** Cursor's MCP support is mature and the
-> setup mirrors the Claude Code stdio shape closely. Tested
-> against Cursor v0.45+.
+Cursor can load MNEMOS through `~/.cursor/mcp.json` so its chat and agent flows share memory with the rest of your MCP clients.
 
-## What this gets you
+## What you need — token, host (192.168.207.67), relevant port(s)
 
-Cursor's chat panel and inline-edit flows can read and write
-the same MNEMOS memory other agents see. Useful for
-cross-IDE memory continuity ("Search MNEMOS for the API key
-the OpenAI helper sets up") and for capturing decisions
-during a coding session ("Save this rationale to MNEMOS as
-category=architecture").
+- A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
+- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- Cursor with MCP support enabled.
+- Config path: `~/.cursor/mcp.json`.
+- The `mnemos` CLI installed on the same machine as Cursor.
+- Optional HTTP/SSE MCP bridge reachable at `http://192.168.207.67:5003/sse`.
+- A Cursor restart after changing MCP server config.
+- A model profile allowed to call tools.
+- Network access from Cursor's machine to `192.168.207.67`.
+- `jq` available for the verification command below.
 
-## Prerequisites
+## Configuration — copy-paste-runnable code block; use $MNEMOS_TOKEN placeholder (never the live token)
 
-- Cursor v0.45 or later (MCP support landed there).
-- A running MNEMOS instance.
-- Bearer token (`MNEMOS_API_KEY`).
+> Set MNEMOS_TOKEN from ~/.api_keys_master.json or source your shell env.
 
-## Setup — local stdio (recommended)
-
-Cursor's MCP config lives at `~/.cursor/mcp.json` (macOS / Linux)
-or `%APPDATA%\Cursor\User\globalStorage\anysphere.cursor\mcp.json`
-(Windows / WSL2 — edit the WSL2 file from inside WSL).
+Create `~/.cursor/mcp.json` or merge this object with your existing MCP
+servers. Cursor reads this file only during startup.
 
 ```json
 {
@@ -32,129 +29,58 @@ or `%APPDATA%\Cursor\User\globalStorage\anysphere.cursor\mcp.json`
       "command": "mnemos",
       "args": ["serve", "mcp-stdio"],
       "env": {
-        "MNEMOS_BASE": "http://localhost:5002",
-        "MNEMOS_API_KEY": "<your bearer token>"
+        "MNEMOS_BASE": "http://192.168.207.67:5002",
+        "MNEMOS_API_KEY": "$MNEMOS_TOKEN"
       }
     }
   }
 }
 ```
 
-For a remote MNEMOS, change `MNEMOS_BASE` to the LAN URL.
-
-## Setup — HTTP/SSE (remote, no SSH)
+If Cursor runs on Windows and MNEMOS tooling is installed inside WSL, prefer
+running a local HTTP/SSE bridge and using a URL entry. Cross-boundary stdio
+with `wsl.exe` is fragile because environment and quoting rules differ.
 
 ```json
 {
   "mcpServers": {
-    "mnemos": {
-      "url": "https://mnemos.example.com/sse",
+    "mnemos-sse": {
+      "url": "http://192.168.207.67:5003/sse",
       "headers": {
-        "Authorization": "Bearer <your bearer token>"
+        "Authorization": "Bearer $MNEMOS_TOKEN"
       }
     }
   }
 }
 ```
 
-Cursor follows the standard MCP HTTP/SSE wire format; no Cursor-
-specific quirks here.
+Cursor may show tool names with a display prefix such as
+`mnemos_search_memories`. Approval lists and MNEMOS logs still use the
+canonical registry name, for example `search_memories`.
 
-## Restart Cursor
+Restart Cursor after saving `~/.cursor/mcp.json`; a window reload is often
+insufficient for MCP registration changes.
 
-After editing the config, do a full restart (not just a window
-reload) — Cursor caches MCP server registrations at startup.
+## Verification — one curl or one tool-list call that proves registration worked
 
-## Smoke test
+```bash
+# Server up?
+curl -fsS http://192.168.207.67:5002/health | jq -r '.status'    # → "healthy"
 
-Open Cursor's chat panel, type:
-
-```
-@mnemos search "smoke test"
-```
-
-The `@mnemos` mention should auto-complete to the MCP server
-once Cursor sees it. Tools should appear in the tool drawer
-under names like ``mnemos_search_memories``,
-``mnemos_create_memory``, etc.
-
-**The ``mnemos_`` prefix is Cursor's UI display convention.**
-The actual MCP registry names (used in config / autoApprove
-arrays / per-tool permissions) are bare:
-``search_memories``, ``create_memory``, etc. — see the
-[canonical tool surface table](./README.md#canonical-mcp-tool-surface).
-Strip the ``mnemos_`` prefix when configuring per-tool
-controls.
-
-If you don't see `@mnemos`, check Cursor's MCP server panel
-(Settings → Cursor Settings → MCP) — it should show the
-`mnemos` entry as `connected`.
-
-## Troubleshooting
-
-| Symptom                                  | Likely cause                                | Fix                                                    |
-|------------------------------------------|---------------------------------------------|--------------------------------------------------------|
-| `@mnemos` autocomplete doesn't appear    | Config edited but Cursor not fully restarted | Quit Cursor entirely, relaunch                         |
-| MCP panel shows `failed to start`        | `mnemos` binary not on PATH                 | Use absolute path in `command` field                   |
-| All tool calls return `MNEMOS UNREACHABLE` | Wrong `MNEMOS_BASE` URL                   | `curl <MNEMOS_BASE>/health` from a separate shell      |
-| Tool calls return 401                    | Bearer token wrong / not in env             | Verify token via `curl -H "Authorization: Bearer ..."` |
-| Cursor freezes on tool call              | MCP server hung waiting on slow downstream  | Check MNEMOS `/metrics` for p99 latency                |
-| WSL2: tool calls fail with "no such file" | Cursor running on Windows but `mnemos` is in WSL2 | Use HTTP/SSE shape; OR Cursor-in-WSL2 with stdio    |
-
-## Cursor-on-Windows + MNEMOS-in-WSL2
-
-If Cursor runs on the Windows side but MNEMOS runs inside WSL2,
-the stdio path doesn't work cleanly (Cursor would need to
-`wsl.exe mnemos serve mcp-stdio` which has quoting hazards).
-Two cleaner options:
-
-1. **Run Cursor inside WSL2** — open Cursor from inside the WSL
-   distro shell. The stdio shape works normally.
-2. **Use HTTP/SSE** — bring up the MCP HTTP/SSE bridge inside
-   WSL2 (it auto-forwards to `localhost:5004` on the Windows
-   side). Point Cursor's config at `http://localhost:5004/sse`.
-
-The HTTP/SSE path is preferred for most Windows users because it
-doesn't require any WSL2 plumbing on Cursor's side.
-
-## Memory namespace per-workspace
-
-If you want different Cursor projects to have isolated memory
-scopes, set ``MNEMOS_DEFAULT_NAMESPACE`` per server entry:
-
-```json
-{
-  "mcpServers": {
-    "mnemos-this-project": {
-      "command": "mnemos",
-      "args": ["serve", "mcp-stdio"],
-      "env": {
-        "MNEMOS_BASE": "...",
-        "MNEMOS_API_KEY": "...",
-        "MNEMOS_DEFAULT_NAMESPACE": "<project-name>"
-      }
-    }
-  }
-}
+# Confirm the canonical MCP tool registry includes search_memories:
+python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY; print("search_memories" in TOOL_REGISTRY)'  # → True
 ```
 
-Drop a `.cursor/mcp.json` at the project root with the per-project
-config; Cursor merges it with the global one.
+(MCP discovery is the protocol's `tools/list` JSON-RPC method over
+SSE/stdio, not a REST endpoint.) Then open Cursor's tool panel and
+confirm `mnemos` appears with memory and KG tools.
 
-Same caveat as in [claude-code.md](./claude-code.md): the env var
-is a **write stamp**, not an enforced scope. For real isolation
-between Cursor projects, provision per-project non-root **users**
-(each with its own ``users.namespace`` value) and issue API keys
-for those users. Distinct keys under the same user share a
-namespace — isolation is per-user, not per-key.
+## Common gotchas — 2-4 bullets of real failure modes
 
-## Cross-references
-
-- [README.md](./README.md) — connector subsystem framing.
-- [claude-code.md](./claude-code.md) — same stdio shape, different
-  config file location.
-- `MEMORY_ARCHITECTURE.md` §3 — namespace semantics.
-
----
-
-*v1.0 — 2026-05-01. Tracks MNEMOS server v4.2.0a11.*
+- Cursor requires a restart to reload MCP servers after editing
+  `~/.cursor/mcp.json`.
+- A literal `$MNEMOS_TOKEN` may not expand in all launch contexts; use an
+  absolute wrapper script if Cursor starts outside your shell.
+- Tool approval rules match exact names such as `delete_triple`, not display
+  names like `mnemos_delete_triple`.
+- Remote SSE on `:5003` must keep the event stream unbuffered.

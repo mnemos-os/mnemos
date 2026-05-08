@@ -100,5 +100,5 @@ async def get_stats() -> StatsResponse:
         return result
 
     except Exception as e:
-        logger.error(f"Stats error: {e}")
+        logger.error(f"Stats error: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail=f"Internal error: {e}")

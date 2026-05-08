@@ -191,7 +191,7 @@ def test_at_least_one_doc_per_surface():
         "claude-desktop.md",
         "cursor.md",
         "codex-cli.md",
-        "continue-dev.md",
+        "continue.md",
         "cline.md",
         "chatgpt-pro-developer-mode.md",
         "openai-custom-gpt.md",

@@ -523,7 +523,7 @@ async def lifespan(app):
                 f"(min={PG_CONFIG['pool_min_size']}, max={PG_CONFIG['pool_max_size']})"
             )
     except Exception as e:
-        logger.error(f"Failed to initialize {backend_type} persistence backend: {e}")
+        logger.error(f"Failed to initialize {backend_type} persistence backend: {e}", exc_info=True)
         raise
 
     # Configure auth (personal profile: auth.enabled=false -> no-op beyond singleton).
@@ -721,12 +721,9 @@ def _get_cache_key(prefix: str, *args) -> str:
     return f"mnemos:{prefix}:{digest}"
 
 
-async def _get_db():
-    """Acquire a connection from the pool."""
-    global _pool
-    if not _pool:
-        raise HTTPException(status_code=503, detail="Database pool not available")
-    return _pool.acquire()
+# #184: removed `_get_db` — dead code. Callers use
+# `get_pool_manager().acquire()` directly (which the
+# `require_postgres_pool_or_503` helper enforces).
 
 
 def get_pool_manager() -> PoolManager:
@@ -762,8 +759,10 @@ async def _get_embedding(text: str) -> list:
         OpenAI, vLLM)
 
     Tries OpenAI first (newer; faster llama.cpp SYCL path on PYTHIA),
-    falls through to Ollama on 404. Same model (nomic-embed-text-v1.5),
-    same 768-dim output — only the wire shape differs.
+    falls through to Ollama on 404. The dim depends on the model: 768
+    for nomic-embed-text-v1.5 (PYTHIA default), 512 for bge-small-zh-v1.5
+    (Cix Sky1 NPU substrate). Match the SQLite vec column to your model
+    via MNEMOS_EMBEDDING_DIM (see _DatabaseSettings.embedding_dim).
     """
     truncated = text[:2000]
     try:
@@ -844,7 +843,7 @@ async def _vector_search(conn, embedding: list, limit: int,
     try:
         return await conn.fetch(sql, *params)
     except Exception as e:
-        logger.error(f"[VECTOR] pgvector search failed: {e}")
+        logger.error(f"[VECTOR] pgvector search failed: {e}", exc_info=True)
         return []
 
 
@@ -918,5 +917,5 @@ async def _fts_fetch(conn, query: str, limit: int,
         try:
             return await conn.fetch(ilike_sql, *ilike_params)
         except Exception as e2:
-            logger.error(f"[FTS] Both FTS and ILIKE failed: {e2}")
+            logger.error(f"[FTS] Both FTS and ILIKE failed: {e2}", exc_info=True)
             return []

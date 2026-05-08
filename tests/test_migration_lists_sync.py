@@ -64,6 +64,13 @@ EXPECTED_MIGRATIONS = [
     "migrations_v4_2_pantheon_routing_audit.sql",
     "migrations_v5_0_consolidated_at.sql",
     "migrations_v5_0_morpheus_extract_run_memories.sql",
+    "migrations_v5_0_2_artemis_dedup.sql",
+    "migrations_v5_0_3_timestamp_tz_upgrade.sql",
+    "migrations_v5_1_0_deletion_log.sql",
+    "migrations_v5_2_0_nats_outbox_idempotency.sql",
+    "migrations_v5_2_2_fts_gin_index.sql",
+    "migrations_v5_3_3_deletion_log_export_index.sql",
+    "migrations_v5_3_4_mcp_audit_log.sql",
 ]
 
 EXPECTED_SQLITE_MIGRATIONS = [
@@ -112,6 +119,11 @@ EXPECTED_SQLITE_MIGRATIONS = [
     "migrations_v4_2_pantheon_routing_audit_sqlite.sql",
     "migrations_v5_0_consolidated_at_sqlite.sql",
     "migrations_v5_0_morpheus_extract_run_memories_sqlite.sql",
+    "migrations_v5_0_2_artemis_dedup_sqlite.sql",
+    "migrations_v5_0_3_timestamp_tz_upgrade_sqlite.sql",
+    "migrations_v5_1_0_deletion_log_sqlite.sql",
+    "migrations_v5_2_0_nats_outbox_idempotency_sqlite.sql",
+    "migrations_v5_3_4_mcp_audit_log_sqlite.sql",
 ]
 
 

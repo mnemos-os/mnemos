@@ -71,7 +71,10 @@ def _webhook_delivery_worker(pool: Any):
 def _federation_sync_worker(pool: Any):
     from mnemos.domain.federation import federation_worker_loop
 
-    return federation_worker_loop(pool)
+    backend = lifecycle._persistence_backend
+    if backend is None:
+        raise RuntimeError("federation worker requires an initialized persistence backend")
+    return federation_worker_loop(backend)
 
 
 def _deletion_request_worker(pool: Any):
@@ -157,10 +160,23 @@ def register_lifespan_hooks() -> None:
     if _registered:
         return
     from mnemos.mcp.tools._runtime import _close_rest_client
+    from mnemos.mcp.tools._security import drain_pending_audit_tasks
+
+    async def _drain_audit_tasks() -> None:
+        """Round-3 residual #2 of #146 (#149): drain in-flight MCP
+        audit persist tasks before the lifecycle pool closes."""
+        drained = await drain_pending_audit_tasks(timeout=5.0)
+        if drained:
+            import logging as _logging
+            _logging.getLogger("mnemos.mcp.audit").info(
+                "drained %d pending mcp_audit_log persist task(s) on shutdown",
+                drained,
+            )
 
     lifecycle.register_auth_configurer(configure_auth)
     lifecycle.register_provider_manifest_reloader(_reload_provider_manifest)
     lifecycle.register_lifespan_cleanup_hook("mcp rest client", _close_rest_client)
+    lifecycle.register_lifespan_cleanup_hook("mcp audit drain", _drain_audit_tasks)
     lifecycle.register_lifespan_worker(
         "distillation_worker",
         _run_distillation_worker,

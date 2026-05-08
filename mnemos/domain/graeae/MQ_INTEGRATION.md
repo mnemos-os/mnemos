@@ -179,7 +179,7 @@ The coordinator must treat timeout and cancellation differently:
 1. Add `MNEMOS_GRAEAE_NATS_FANOUT` as a dark feature flag. Keep it default false.
 2. Add `MNEMOS_GRAEAE_WORKFLOW` stream declaration for
    `mnemos.graeae.consult.>` and `mnemos.graeae.provider.>`.
-3. Extract the existing `_query_provider()` call into a provider-worker handler
+3. Extract the existing `_call_provider_worker()` call into a provider-worker handler
    that can execute one request payload and return the existing provider
    response dict shape.
 4. Migrate one low-risk provider first, preferably an OpenAI-compatible provider

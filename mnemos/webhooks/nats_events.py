@@ -9,5 +9,6 @@ already import from ``mnemos.webhooks.nats_events``.
 from __future__ import annotations
 
 from mnemos.nats.webhook_events import publish_delivery_queued, safe_namespace
+from mnemos.persistence.nats_events import publish_webhook_outbox_insert
 
-__all__ = ["publish_delivery_queued", "safe_namespace"]
+__all__ = ["publish_delivery_queued", "publish_webhook_outbox_insert", "safe_namespace"]

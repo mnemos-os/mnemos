@@ -1,0 +1,80 @@
+scope: mnemos-pg16
+namespace: /mnemos/patroni/
+name: cerberus
+
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: 192.168.207.96:8008
+
+etcd3:
+  hosts: "192.168.207.67:2379,192.168.207.96:2379,192.168.207.25:2379"
+
+bootstrap:
+  method: initdb
+  dcs:
+    ttl: 30
+    loop_wait: 10
+    retry_timeout: 10
+    maximum_lag_on_failover: 16777216
+    synchronous_mode: false
+    postgresql:
+      use_pg_rewind: true
+      use_slots: true
+      parameters:
+        listen_addresses: "*"
+        port: 5434
+        wal_level: replica
+        hot_standby: "on"
+        wal_keep_size: 1GB
+        max_wal_senders: 10
+        max_replication_slots: 10
+        password_encryption: scram-sha-256
+      pg_hba:
+        - local all all trust
+        - host all all 127.0.0.1/32 scram-sha-256
+        - host all all 192.168.207.0/24 scram-sha-256
+        - host replication replicator 127.0.0.1/32 scram-sha-256
+        - host replication replicator 192.168.207.0/24 scram-sha-256
+      slots:
+        cerberus_standby:
+          type: physical
+  initdb:
+    - encoding: UTF8
+    - locale: C.UTF-8
+    - data-checksums
+  users:
+    mnemos_user:
+      password: mnemos_local
+      options:
+        - createrole
+        - createdb
+
+postgresql:
+  listen: 0.0.0.0:5434
+  connect_address: 192.168.207.96:5434
+  data_dir: /var/lib/postgresql/data
+  bin_dir: /usr/lib/postgresql/16/bin
+  pgpass: /var/lib/postgresql/.pgpass
+  authentication:
+    superuser:
+      username: postgres
+      password: postgres_local
+    replication:
+      username: replicator
+      password: replicator_local
+  parameters:
+    unix_socket_directories: /var/run/postgresql
+  create_replica_methods:
+    - basebackup
+  basebackup:
+    checkpoint: fast
+    max-rate: 100M
+
+watchdog:
+  mode: "off"
+
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

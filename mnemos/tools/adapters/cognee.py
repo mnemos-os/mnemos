@@ -88,9 +88,11 @@ except ImportError:
     _COGNEE_AVAILABLE = False
 
 
-# Canonical edge names Cognee writes during cognify. Everything else
-# coming out of LLM extraction is treated as a kg_triple predicate.
-_STRUCTURAL_EDGES = {"is_part_of", "contains", "made_from"}
+# #181: removed `_STRUCTURAL_EDGES = {"is_part_of", "contains",
+# "made_from"}` — defined but never referenced. Earlier rounds may
+# have used this set to short-circuit edge classification, but the
+# current code path treats every Cognee-emitted edge as a candidate
+# kg_triple predicate.
 
 
 # ─── Cognee access ───────────────────────────────────────────────────────────

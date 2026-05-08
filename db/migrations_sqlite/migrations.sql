@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS memories (
   optimized_at TEXT,
   federation_source TEXT,
   federation_synced_at TEXT,
+  federation_remote_updated TEXT,
   morpheus_run_id TEXT,
   morpheus_cluster_id TEXT,
   source_memory_ids TEXT NOT NULL DEFAULT '[]',
@@ -145,6 +146,9 @@ CREATE TABLE IF NOT EXISTS state (
   key TEXT NOT NULL,
   value TEXT,
   updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_by TEXT,
+  version INTEGER NOT NULL DEFAULT 1,
+  deleted_at TEXT,
   PRIMARY KEY (owner_id, namespace, key)
 );
 
@@ -562,11 +566,24 @@ CREATE TABLE IF NOT EXISTS federation_peers (
   name TEXT,
   base_url TEXT NOT NULL UNIQUE,
   api_key TEXT,
+  auth_token TEXT,
+  namespace_filter TEXT,
+  category_filter TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
+  sync_interval_secs INTEGER NOT NULL DEFAULT 300,
   last_sync_at TEXT,
+  last_sync_cursor TEXT,
+  last_error TEXT,
+  last_error_at TEXT,
+  total_pulled INTEGER NOT NULL DEFAULT 0,
+  compat_mode TEXT NOT NULL DEFAULT 'strict',
+  peer_mnemos_version TEXT,
+  last_schema_check_at TEXT,
   cursor_updated TEXT,
   cursor_id TEXT,
   metadata TEXT NOT NULL DEFAULT '{}',
+  created TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -577,11 +594,18 @@ CREATE INDEX IF NOT EXISTS idx_federation_peers_enabled
 CREATE TABLE IF NOT EXISTS federation_sync_log (
   id TEXT PRIMARY KEY DEFAULT (lower(hex(randomblob(16)))),
   peer_id TEXT NOT NULL REFERENCES federation_peers(id) ON DELETE CASCADE,
-  direction TEXT NOT NULL,
-  status TEXT NOT NULL,
+  direction TEXT NOT NULL DEFAULT 'pull',
+  status TEXT NOT NULL DEFAULT 'started',
+  started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  finished_at TEXT,
+  memories_pulled INTEGER NOT NULL DEFAULT 0,
+  memories_new INTEGER NOT NULL DEFAULT 0,
+  memories_updated INTEGER NOT NULL DEFAULT 0,
   records_seen INTEGER NOT NULL DEFAULT 0,
   records_written INTEGER NOT NULL DEFAULT 0,
   error TEXT,
+  cursor_before TEXT,
+  cursor_after TEXT,
   synced_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 

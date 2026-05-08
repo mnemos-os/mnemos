@@ -2,7 +2,8 @@
 import hashlib
 import json
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import asyncpg
@@ -23,6 +24,42 @@ from mnemos.core.ids import new_memory_id
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/v1/documents", tags=["document-import"])
+
+_PROJECT_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
+_ARCHIVE_SNAPSHOT_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "datapool_backups",
+        re.compile(r"(?m)^\[[^\]\n]+\]\s+/mnt/datapool/backups/"),
+    ),
+    (
+        "claude_plugin_cache",
+        re.compile(r"(?m)^\[[^\]\n]+\]\s+/Users/[^/\n]+/\.claude/plugins/cache/"),
+    ),
+    (
+        "home_backups",
+        re.compile(r"(?m)^\[[^\]\n]+\]\s+/home/[^/\n]+/backups/"),
+    ),
+)
+
+
+def _validate_project_tag(project_tag: str) -> str:
+    value = (project_tag or "").strip()
+    if not value:
+        raise HTTPException(status_code=422, detail="project_tag is required")
+    if not _PROJECT_TAG_RE.fullmatch(value):
+        raise HTTPException(
+            status_code=422,
+            detail="project_tag must be a non-empty token using letters, digits, '.', '_' or '-'",
+        )
+    return value
+
+
+def _archive_snapshot_reason(*values: str | None) -> str | None:
+    text = "\n".join(value for value in values if value)
+    for name, pattern in _ARCHIVE_SNAPSHOT_PATTERNS:
+        if pattern.search(text):
+            return name
+    return None
 
 
 class DoclingImporter:
@@ -56,7 +93,7 @@ class DoclingImporter:
             metadata = {
                 "source_file": filename,
                 "source_type": self._get_document_type(filename),
-                "parsed_at": datetime.utcnow().isoformat(),
+                "parsed_at": datetime.now(timezone.utc).isoformat(),
                 "page_count": len(doc.pages) if hasattr(doc, "pages") else None,
             }
 
@@ -73,7 +110,7 @@ class DoclingImporter:
             return full_text, metadata, chunks
 
         except Exception as e:
-            logger.error(f"[DOCLING] Parse error for {filename}: {e}")
+            logger.error(f"[DOCLING] Parse error for {filename}: {e}", exc_info=True)
             raise HTTPException(
                 status_code=400,
                 detail=f"Document parsing failed: {str(e)}"
@@ -188,6 +225,8 @@ async def import_memories_from_document(
     category: str = Form("documents"),
     subcategory: Optional[str] = Form(None),
     permission_mode: Optional[int] = Form(None),
+    project_tag: str = Form(...),
+    allow_archive_snapshot: bool = Form(False),
     user: UserContext = Depends(get_current_user),
     *,
     route_label: str = "POST /v1/documents/import",
@@ -244,6 +283,7 @@ async def import_memories_from_document(
     in per-file results.
     """
     perm_mode = _validate_permission_mode(permission_mode, default=600)
+    project_tag_value = _validate_project_tag(project_tag)
 
     # Pool check FIRST — an edge-profile / SQLite deployment can't
     # serve this route regardless of whether Docling is installed,
@@ -269,6 +309,29 @@ async def import_memories_from_document(
     full_text, doc_metadata, chunks = importer.parse_document(
         content, file.filename or "document"
     )
+    archive_reason = _archive_snapshot_reason(
+        file.filename,
+        full_text,
+        *(chunk.get("content") for chunk in chunks),
+    )
+    if archive_reason and not allow_archive_snapshot:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "document import looks like a historical archive snapshot; "
+                "pass --allow-archive-snapshot only when intentionally importing it"
+            ),
+        )
+    doc_metadata = {
+        **doc_metadata,
+        "project_tag": project_tag_value,
+        "import_source": "doc-import",
+    }
+    if archive_reason and allow_archive_snapshot:
+        doc_metadata.update({
+            "archive_override_at": datetime.now(timezone.utc).isoformat(),
+            "archive_override_reason": archive_reason,
+        })
 
     # Create memories from chunks. Match the canonical /v1/memories create
     # path exactly: timestamped `mem_...` id, populate verbatim_content +
@@ -376,7 +439,7 @@ async def import_memories_from_document(
 
         Components: ``owner_id`` + ``namespace`` + ``filename`` +
         ``chunk_num`` + ``sha256(content)`` + ``permission_mode``
-        + ``category`` + ``subcategory``. The content digest binds
+        + ``category`` + ``subcategory`` + ``project_tag``. The content digest binds
         the key to a specific document revision; the
         permission_mode + category + subcategory triple binds the
         key to the exact ACL/categorization the caller asked for.
@@ -421,6 +484,8 @@ async def import_memories_from_document(
                 + (category or "")
                 + "\x00"
                 + (subcategory or "")
+                + "\x00"
+                + project_tag_value
             ).encode("utf-8")
         ).hexdigest()
     try:
@@ -437,6 +502,8 @@ async def import_memories_from_document(
                         **doc_metadata,
                         **chunk["metadata"],
                         "chunk_title": chunk["title"],
+                        "project_tag": project_tag_value,
+                        "import_source": "doc-import",
                     }
 
                     chunk_key = _chunk_key(chunk["chunk_num"], chunk["content"])
@@ -645,7 +712,8 @@ async def import_memories_from_document(
                         unconfirmed_memory_ids.append(in_flight_id)
                         raise
                     logger.error(
-                        f"[DOCLING] Failed to create memory for chunk {chunk['chunk_num']}: {chunk_err}"
+                        f"[DOCLING] Failed to create memory for chunk {chunk['chunk_num']}: {chunk_err}",
+                        exc_info=True,
                     )
                     errors.append({"chunk": chunk["chunk_num"], "error": str(chunk_err)})
     except HTTPException:
@@ -758,6 +826,8 @@ async def import_document(
     category: str = Form("documents"),
     subcategory: Optional[str] = Form(None),
     permission_mode: Optional[int] = Form(None),
+    project_tag: str = Form(...),
+    allow_archive_snapshot: bool = Form(False),
     user: UserContext = Depends(get_current_user),
 ):
     """Import document file into MNEMOS as memory records.
@@ -775,7 +845,13 @@ async def import_document(
     }
     """
     payload, status_code = await import_memories_from_document(
-        file, category, subcategory, permission_mode, user,
+        file,
+        category,
+        subcategory,
+        permission_mode,
+        project_tag,
+        allow_archive_snapshot,
+        user,
         route_label="POST /v1/documents/import",
     )
     if status_code == 200:
@@ -789,6 +865,8 @@ async def batch_import_documents(
     files: List[UploadFile] = File(...),
     category: str = Form("documents"),
     permission_mode: Optional[int] = Form(None),
+    project_tag: str = Form(...),
+    allow_archive_snapshot: bool = Form(False),
     user: UserContext = Depends(get_current_user),
 ):
     """Batch import multiple documents into MNEMOS.
@@ -799,6 +877,7 @@ async def batch_import_documents(
     # fails the whole request fast — otherwise the per-file try/except
     # below would swallow the 422 into a per-file error result.
     _validate_permission_mode(permission_mode, default=600)
+    _validate_project_tag(project_tag)
     # Pre-loop pool check so an edge-profile 503 (SQLite-only deployment
     # being asked to serve a Postgres-only route) escapes uncaught with
     # the BATCH route label, not the per-file one. The per-file
@@ -819,6 +898,8 @@ async def batch_import_documents(
                 category=category,
                 subcategory=None,
                 permission_mode=permission_mode,
+                project_tag=project_tag,
+                allow_archive_snapshot=allow_archive_snapshot,
                 user=user,
                 route_label="POST /v1/documents/batch-import",
             )

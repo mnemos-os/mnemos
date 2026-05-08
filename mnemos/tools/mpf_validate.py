@@ -8,9 +8,9 @@ shipping them. The schema file it validates against is the authoritative
 wire-format definition.
 
 Usage:
-  python tools/mpf_validate.py --file export.json
-  python tools/mpf_validate.py --file - < export.json        # stdin
-  python tools/mpf_validate.py --file export.json --schema docs/mpf_v0.1.json
+  python -m mnemos.tools.mpf_validate --file export.json
+  python -m mnemos.tools.mpf_validate --file - < export.json        # stdin
+  python -m mnemos.tools.mpf_validate --file export.json --schema docs/mpf_v0.1.json
 
 Exit codes:
   0 — envelope validates
@@ -30,7 +30,10 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+# `parents[2]` is the repo root: this file is mnemos/tools/mpf_validate.py.
+# (The pre-v4 layout had this script at tools/, which is why an older
+# `parent.parent` resolved correctly.)
+REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCHEMA = REPO_ROOT / "docs" / "mpf_v0.1.json"
 
 

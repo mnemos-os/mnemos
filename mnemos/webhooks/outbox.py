@@ -9,7 +9,7 @@ from typing import Any, Dict, Iterable, Optional
 import asyncpg
 
 from . import types as webhook_types
-from .nats_events import publish_delivery_queued
+from .nats_events import publish_delivery_queued, publish_webhook_outbox_insert
 
 
 async def _matching_subscriptions(
@@ -71,6 +71,15 @@ async def _dispatch_on_conn(
             sub["id"], event_type, body, body_hash, webhook_types.NEW_CODE_WRITER_REVISION,
         )
         await publish_delivery_queued(
+            delivery_id=str(delivery_id),
+            subscription_id=sub["id"],
+            event_type=event_type,
+            url=sub["url"],
+            payload_hash=body_hash,
+            namespace=sub["namespace"],
+            owner_id=sub["owner_id"],
+        )
+        await publish_webhook_outbox_insert(
             delivery_id=str(delivery_id),
             subscription_id=sub["id"],
             event_type=event_type,

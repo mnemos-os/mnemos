@@ -9,8 +9,15 @@ from fastapi import HTTPException
 
 from mnemos.core.auth_context import UserContext
 
-_IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-_CAST_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\[\])?$")
+# #166: use \A and \Z (start/end of string) instead of ^ and $.
+# In Python regex, $ matches before a trailing newline by default,
+# so "uuid\n" would slip through the cast validator (a single
+# trailing newline before the actual end-of-string). Real Postgres
+# treats the newline as whitespace, so the immediate impact is
+# limited, but the validator's contract is "no whitespace, no
+# control chars" — fail closed on trailing newlines too.
+_IDENTIFIER_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*\Z")
+_CAST_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_]*(?:\[\])?\Z")
 
 _NOT_FOUND_DETAILS = {
     "entities": "Entity not found",

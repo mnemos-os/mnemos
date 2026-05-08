@@ -29,7 +29,7 @@ def _connector_namespace() -> str | None:
     Reads ``MNEMOS_DEFAULT_NAMESPACE`` and stamps it on
     create_memory / search_memories / list_memories /
     bulk_create_memories REST calls. The connector-gallery docs
-    (claude-code.md, cursor.md, codex-cli.md, continue-dev.md,
+    (claude-code.md, cursor.md, codex-cli.md, continue.md,
     cline.md) explicitly retract any claim that this is an
     enforced isolation boundary — it's a default-namespace
     convenience for ergonomic per-connector write scoping.

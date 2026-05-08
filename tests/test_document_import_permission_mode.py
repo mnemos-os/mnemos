@@ -13,7 +13,7 @@ async def test_import_document_rejects_invalid_permission_mode(client, auth_head
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("test.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents", "permission_mode": "999"},
+        data={"category": "documents", "project_tag": "mnemos", "permission_mode": "999"},
         headers=auth_headers,
     )
     assert resp.status_code == 422
@@ -24,7 +24,7 @@ async def test_batch_import_rejects_invalid_permission_mode(client, auth_headers
     resp = await client.post(
         "/v1/documents/batch-import",
         files=[("files", ("doc1.pdf", b"%PDF-1.4\nx"))],
-        data={"category": "documents", "permission_mode": "888"},
+        data={"category": "documents", "project_tag": "mnemos", "permission_mode": "888"},
         headers=auth_headers,
     )
     assert resp.status_code == 422
@@ -110,7 +110,7 @@ async def test_import_document_persists_explicit_permission_mode(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("fed.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents", "permission_mode": "644"},
+        data={"category": "documents", "project_tag": "mnemos", "permission_mode": "644"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
@@ -204,7 +204,7 @@ async def test_import_document_defaults_to_600(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("default.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text

@@ -150,6 +150,13 @@ async def ensure_streams(js) -> bool:
         _stream_config("MNEMOS_CONSULTATION", ["mnemos.consultation.>"]),
         _stream_config("MNEMOS_WEBHOOK", ["mnemos.webhook.>"]),
         _stream_config("MNEMOS_PANTHEON", ["mnemos.pantheon.>"]),
+        # v5.2.0 NATS substrate v0.3 — webhooks outbox + federation pub/sub.
+        # The publisher uses the prefix "mnemos.webhooks.outbox.>" (plural)
+        # and the federation publisher uses "mnemos.federation.memory.>".
+        # Both need their own JetStream streams or publishes 503 with
+        # "no response from stream".
+        _stream_config("MNEMOS_WEBHOOKS_OUTBOX", ["mnemos.webhooks.outbox.>"]),
+        _stream_config("MNEMOS_FEDERATION", ["mnemos.federation.>"]),
     ]
     for cfg in streams:
         try:
@@ -175,6 +182,7 @@ async def ensure_streams(js) -> bool:
                     "NATS stream %s declaration failed (canonical + fallback both rejected): %s",
                     cfg.name,
                     fallback_exc,
+                    exc_info=True,
                 )
                 return False
 
@@ -233,6 +241,7 @@ async def ensure_streams(js) -> bool:
                     cfg.name,
                     drift or "(none in compared dimensions; see broker)",
                     cfg.name,
+                    exc_info=True,
                 )
                 return False
             # Transient failure during fallback probe — DON'T
@@ -247,6 +256,7 @@ async def ensure_streams(js) -> bool:
                 "is stable.",
                 cfg.name,
                 fallback_exc,
+                exc_info=True,
             )
             return False
     return True

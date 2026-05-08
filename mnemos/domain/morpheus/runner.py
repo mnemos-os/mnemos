@@ -15,11 +15,14 @@ from dataclasses import dataclass, replace
 import json
 import logging
 import math
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, List, Optional, Tuple
 from uuid import UUID, uuid4
 
 import asyncpg
+
+from mnemos.db.deletion_log import log_morpheus_run_memory_deletions
 import numpy as np
 
 from mnemos.core.config import get_settings, hot_rs_enabled
@@ -30,6 +33,26 @@ logger = logging.getLogger(__name__)
 
 _PRE_CONSOLIDATE_PERMISSION_KEY = "pre_consolidate_permission_mode"
 _CONSOLIDATED_PERMISSION_MODE = 400
+_DEFAULT_ORPHAN_TIMEOUT_HOURS = 2.0
+_ORPHAN_TIMEOUT_ENV = "MNEMOS_MORPHEUS_ORPHAN_TIMEOUT_HOURS"
+_ORPHAN_TIMEOUT_ERROR = "orphan_timeout_sweep"
+
+_SWEEP_ORPHAN_RUNS_SQL = """
+WITH orphaned AS (
+    SELECT id, started_at
+    FROM morpheus_runs
+    WHERE status = 'running'
+      AND started_at < NOW() - ($1::double precision * INTERVAL '1 hour')
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE morpheus_runs r
+SET status      = 'failed',
+    error       = $2,
+    finished_at = NOW()
+FROM orphaned o
+WHERE r.id = o.id
+RETURNING r.id, o.started_at
+"""
 
 # Optional Rust hot-path accelerator. Loaded lazily so the absence of
 # the wheel on a given build host does NOT break the import - the
@@ -148,16 +171,42 @@ def _command_count(result: str) -> int:
         return 0
 
 
-def _metadata_has_key(raw: object, key: str) -> bool:
-    if isinstance(raw, dict):
-        return key in raw
-    if isinstance(raw, str):
+def _orphan_timeout_hours(max_age_hours: Optional[float] = None) -> float:
+    if max_age_hours is not None:
         try:
-            parsed = json.loads(raw)
-        except json.JSONDecodeError:
-            return False
-        return isinstance(parsed, dict) and key in parsed
-    return False
+            hours = float(max_age_hours)
+        except (TypeError, ValueError):
+            hours = _DEFAULT_ORPHAN_TIMEOUT_HOURS
+        return hours if hours > 0 else _DEFAULT_ORPHAN_TIMEOUT_HOURS
+
+    raw = os.environ.get(_ORPHAN_TIMEOUT_ENV)
+    if raw is None or not raw.strip():
+        return _DEFAULT_ORPHAN_TIMEOUT_HOURS
+    try:
+        hours = float(raw)
+    except ValueError:
+        logger.warning(
+            "[MORPHEUS] invalid %s=%r; using %.1fh orphan timeout",
+            _ORPHAN_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_ORPHAN_TIMEOUT_HOURS,
+        )
+        return _DEFAULT_ORPHAN_TIMEOUT_HOURS
+    if hours <= 0:
+        logger.warning(
+            "[MORPHEUS] non-positive %s=%r; using %.1fh orphan timeout",
+            _ORPHAN_TIMEOUT_ENV,
+            raw,
+            _DEFAULT_ORPHAN_TIMEOUT_HOURS,
+        )
+        return _DEFAULT_ORPHAN_TIMEOUT_HOURS
+    return hours
+
+
+# #183: removed `_metadata_has_key` — defined but never called.
+# Metadata key checks are done inline at the call sites that need
+# them, with the runtime type of the metadata field already
+# normalized by the surrounding code.
 
 
 def _consolidate_enabled(config: Optional[dict]) -> bool:
@@ -283,6 +332,28 @@ async def update_counters(
         )
 
 
+async def increment_extract_counters(
+    conn: asyncpg.Connection,
+    run_id: str,
+    *,
+    triples_extracted: int,
+    memories_processed: int,
+) -> None:
+    """Increment extract counters as each source memory commits."""
+    await conn.execute(
+        """
+        UPDATE morpheus_runs
+        SET triples_extracted = COALESCE(triples_extracted, 0) + $2,
+            memories_processed_for_extraction =
+                COALESCE(memories_processed_for_extraction, 0) + $3
+        WHERE id = $1::uuid
+        """,
+        run_id,
+        int(triples_extracted),
+        int(memories_processed),
+    )
+
+
 async def finish_run(pool: asyncpg.Pool, run_id: str) -> None:
     async with pool.acquire() as conn:
         await conn.execute(
@@ -303,7 +374,42 @@ async def fail_run(pool: asyncpg.Pool, run_id: str, error: str) -> None:
     logger.warning("[MORPHEUS] run %s finished FAILED: %s", run_id, error[:200])
 
 
-async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
+async def sweep_orphan_runs(
+    pool: asyncpg.Pool,
+    *,
+    max_age_hours: Optional[float] = None,
+) -> int:
+    """Fail MORPHEUS runs stranded in status='running' past the timeout.
+
+    Mirrors the compression worker contest stale-running sweep: this is a
+    best-effort reclaim path for workers or API triggers that crashed after a
+    run row opened but before any terminal status was recorded.
+    """
+    threshold_hours = _orphan_timeout_hours(max_age_hours)
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            _SWEEP_ORPHAN_RUNS_SQL,
+            threshold_hours,
+            _ORPHAN_TIMEOUT_ERROR,
+        )
+
+    for row in rows:
+        logger.info(
+            "[MORPHEUS] orphan timeout sweep marked run %s failed "
+            "(started_at=%s, max_age_hours=%.2f)",
+            row["id"],
+            row["started_at"],
+            threshold_hours,
+        )
+    return len(rows)
+
+
+async def rollback_run(
+    pool: asyncpg.Pool,
+    run_id: str,
+    *,
+    requested_by: str = "morpheus_rollback",
+) -> Tuple[int, int]:
     """Undo every memory mutation tagged with this run and roll it back.
 
     Returns (memories_deleted, run_rows_updated).
@@ -363,6 +469,15 @@ async def rollback_run(pool: asyncpg.Pool, run_id: str) -> Tuple[int, int]:
             )
             n_restored = _command_count(restore_result)
             # Per-row tagging means rollback never crosses runs.
+            await log_morpheus_run_memory_deletions(
+                conn,
+                run_id,
+                requested_by=requested_by,
+                requested_at=None,
+                request_kind="admin_purge",
+                reason=f"MORPHEUS rollback {run_id}",
+                source=["morpheus.rollback", run_id],
+            )
             del_result = await conn.execute(
                 "DELETE FROM memories WHERE morpheus_run_id=$1::uuid "
                 "AND provenance='morpheus_local' "
@@ -905,15 +1020,16 @@ async def phase_extract(pool: asyncpg.Pool, run_id: str) -> int:
                         row["namespace"],
                     )
 
+                await increment_extract_counters(
+                    conn,
+                    run_id,
+                    triples_extracted=len(triples),
+                    memories_processed=1,
+                )
+
         memories_processed += 1
         triples_extracted += len(triples)
 
-    await update_counters(
-        pool,
-        run_id,
-        triples_extracted=triples_extracted,
-        memories_processed_for_extraction=memories_processed,
-    )
     logger.info(
         "[MORPHEUS] run %s extracted %d KG triple(s) from %d prose memor%s",
         run_id,
@@ -1207,7 +1323,7 @@ async def _synthesise_cluster_summary(
         )
         result = await engine.consult(prompt=prompt, task_type="summarisation")
         for resp in (result.get("all_responses") or {}).values():
-            if resp.get("status") == "ok" and resp.get("response_text"):
+            if resp.get("status") in ("ok", "success") and resp.get("response_text"):
                 return str(resp["response_text"]).strip()
         # No usable response — fall through to extractive.
     except Exception as exc:  # pragma: no cover — defensive
@@ -1237,6 +1353,11 @@ async def run_dream(
 
     `namespace`, when set, scopes the run to that tenant's memories.
     """
+    try:
+        await sweep_orphan_runs(pool)
+    except Exception:
+        logger.exception("[MORPHEUS] orphan timeout sweep failed; continuing to open run")
+
     run_id = await begin_run(
         pool,
         triggered_by=triggered_by,

@@ -21,6 +21,7 @@ import inspect
 
 import pytest
 from fastapi import HTTPException
+from starlette.responses import Response
 
 from mnemos.api.dependencies import UserContext
 from mnemos.api.routes import consultations, dag
@@ -28,9 +29,6 @@ from mnemos.api.routes import memories
 from mnemos.domain.models import MemoryCreateRequest
 
 from tests._fake_backend import install_fake_backend
-
-pytestmark = pytest.mark.asyncio
-
 
 def _user() -> UserContext:
     return UserContext(
@@ -65,6 +63,7 @@ def _memory_row(memory_id: str = "mem_test") -> dict:
     }
 
 
+@pytest.mark.asyncio
 async def test_memory_create_commits_memory_and_webhook_delivery(monkeypatch):
     """Successful create: insert_memory + dispatch_event both fire in
     the same transactional() block, the txn commits, and HTTP delivery
@@ -82,6 +81,7 @@ async def test_memory_create_commits_memory_and_webhook_delivery(monkeypatch):
 
     response = await memories.create_memory(
         MemoryCreateRequest(content="remember this", category="facts"),
+        Response(),
         user=_user(),
     )
 
@@ -98,6 +98,7 @@ async def test_memory_create_commits_memory_and_webhook_delivery(monkeypatch):
     assert scheduled == ["delivery_1"]
 
 
+@pytest.mark.asyncio
 async def test_webhook_delivery_failure_rolls_back_memory_insert(monkeypatch):
     """Failure in dispatch_event tears down the transaction. The
     backend records a rollback (not a commit), and the handler
@@ -115,6 +116,7 @@ async def test_webhook_delivery_failure_rolls_back_memory_insert(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await memories.create_memory(
             MemoryCreateRequest(content="remember this", category="facts"),
+            Response(),
             user=_user(),
         )
 

@@ -4,7 +4,6 @@ End-to-End Tests for MNEMOS API
 Tests the importable surface of api_server (Pydantic models, app instance).
 """
 
-import asyncio
 
 import pytest
 
@@ -45,13 +44,9 @@ class TestAPIEndpoints:
             pytest.skip("API server models not available")
 
 
-# Test fixtures
-@pytest.fixture(scope="session")
-def event_loop():
-    """Create event loop for async tests"""
-    loop = asyncio.get_event_loop_policy().new_event_loop()
-    yield loop
-    loop.close()
+# #192: removed unused `event_loop` session-scope fixture. No test
+# in this file requested it as a parameter; pytest-asyncio
+# (mode=Mode.STRICT) provides the loop for async tests.
 
 
 if __name__ == "__main__":

@@ -243,17 +243,10 @@ FOR UPDATE
 # to zero on infra retries, started_at cleared so the sweep
 # ignores it, error set to an 'infra_retry' breadcrumb for
 # operator visibility.
-_INFRA_RESET_SQL = """
-UPDATE memory_compression_queue
-SET status      = 'pending',
-    attempts    = GREATEST(attempts - 1, 0),
-    started_at  = NULL,
-    finished_at = NULL,
-    error       = $2
-WHERE id = $1
-  AND status = 'running'
-"""
-
+# #181: removed `_INFRA_RESET_SQL` (single-row variant) — never
+# referenced; the batch variant `_INFRA_RESET_BATCH_SQL` below
+# handles both single-row (with a 1-element UUID array) and
+# batch-tail cases.
 
 # Batch variant of the reset SQL — used when an infra error fires
 # mid-batch and the un-processed tail rows must also be reset back
@@ -271,6 +264,82 @@ SET status      = 'pending',
 WHERE id = ANY($1::uuid[])
   AND status = 'running'
 """
+
+
+def _engine_name(engine: Any) -> str:
+    return str(getattr(engine, "id", type(engine).__name__))
+
+
+class _EngineCompressBoundary:
+    """Worker-side guard around untrusted engine code."""
+
+    def __init__(self, engine: CompressionEngine) -> None:
+        self._engine = engine
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+    @property
+    def id(self) -> str:
+        return _engine_name(self._engine)
+
+    @property
+    def label(self) -> str:
+        return str(getattr(self._engine, "label", self.id))
+
+    @property
+    def version(self) -> str:
+        return str(getattr(self._engine, "version", "unknown"))
+
+    @property
+    def gpu_intent(self) -> Any:
+        return getattr(self._engine, "gpu_intent", None)
+
+    def supports(self, request: CompressionRequest) -> bool:
+        return self._engine.supports(request)
+
+    async def compress(self, request: CompressionRequest) -> Any:
+        try:
+            return await self._engine.compress(request)
+        except Exception as exc:
+            logger.warning(
+                "contest_queue[%s]: engine %s compress() raised %s: %s",
+                request.memory_id,
+                self.id,
+                type(exc).__name__,
+                exc,
+                exc_info=True,
+            )
+            raise
+
+
+def _guard_engines(
+    engines: Sequence[CompressionEngine],
+) -> list[_EngineCompressBoundary]:
+    return [_EngineCompressBoundary(engine) for engine in engines]
+
+
+def _candidate_error_details(outcome: Any) -> list[str]:
+    details: list[str] = []
+    for candidate in outcome.candidates:
+        result = candidate.result
+        if candidate.reject_reason != "error" or not result.error:
+            continue
+        details.append(f"{result.engine_id}: {result.error}")
+    return details
+
+
+def _format_no_winner_error(outcome: Any) -> str:
+    reasons = Counter(c.reject_reason or "unknown" for c in outcome.candidates)
+    reason_summary = ", ".join(
+        f"{reason}={count}"
+        for reason, count in reasons.most_common()
+    )
+    error = f"no winner: {reason_summary}"
+    engine_errors = _candidate_error_details(outcome)
+    if engine_errors:
+        error = f"{error}; engine_errors: {'; '.join(engine_errors)}"
+    return error
 
 
 async def _reset_rows_for_infra_retry(
@@ -312,14 +381,12 @@ async def _reset_rows_for_infra_retry(
             )
 
 
-async def _reset_row_for_infra_retry(
-    pool: Any, queue_id: Any, error_marker: str,
-) -> None:
-    """Single-row form of ``_reset_rows_for_infra_retry``. Kept for
-    backward compatibility with the round-32 single-site call shape;
-    new sites should prefer the batch helper to amortise the
-    acquire when more than one row needs resetting."""
-    await _reset_rows_for_infra_retry(pool, [queue_id], error_marker)
+# #183: removed `_reset_row_for_infra_retry` single-row shim —
+# the docstring admitted it was kept "for backward compatibility
+# with the round-32 single-site call shape." No callers ever
+# materialized post-round-32; new sites already use the batch
+# helper. CLAUDE.md explicitly bans backward-compat hacks like
+# this one.
 
 
 async def _sweep_stale_running(
@@ -619,7 +686,25 @@ async def _process_one(
         scoring_profile=scoring_profile,
         identifier_policy=IdentifierPolicy.STRICT,
     )
-    outcome = await run_contest(engines, request, judge=judge)
+    try:
+        outcome = await run_contest(_guard_engines(engines), request, judge=judge)
+    except Exception as exc:
+        logger.warning(
+            "contest_queue[%s]: compression contest raised %s: %s; "
+            "marking row failed",
+            memory_id,
+            type(exc).__name__,
+            exc,
+            exc_info=True,
+        )
+        async with pool.acquire() as conn:
+            await conn.execute(
+                _MARK_FAILED_SQL,
+                queue_id,
+                f"{type(exc).__name__}: {exc}",
+            )
+        counts["failed"] += 1
+        return
 
     # persist + queue-finalization must commit together so a failure
     # between them cannot leave a contest durable with the queue row
@@ -658,20 +743,12 @@ async def _process_one(
                 await persist_contest(conn, outcome, judge_model=judge_model)
 
                 if outcome.winner is None:
-                    reasons = Counter(
-                        c.reject_reason or "unknown"
-                        for c in outcome.candidates
-                    )
-                    reason_summary = ", ".join(
-                        f"{reason}={count}"
-                        for reason, count in reasons.most_common()
-                    )
                     await conn.execute(
                         _MARK_FAILED_SQL,
                         queue_id,
-                        f"no winner: {reason_summary}",
+                        _format_no_winner_error(outcome),
                     )
-                    mark_result = ("no_winner", reason_summary)
+                    mark_result = ("no_winner",)
                 else:
                     await conn.execute(_MARK_DONE_SQL, queue_id)
                     mark_result = ("winner",)
@@ -750,7 +827,7 @@ async def _process_one(
     else:
         counts["failed"] += 1
         logger.info(
-            "contest_queue[%s]: no winner (%s)", memory_id, mark_result[1]
+            "contest_queue[%s]: no winner", memory_id
         )
 
 

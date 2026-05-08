@@ -2,7 +2,7 @@
 
 The version numbers on releases are tidy. The actual path was not. This
 document is the honest version — decisions, refactors, mistakes, and the
-reasoning that got us from the original prototype to the current v5.0.0 release line. If you
+reasoning that got us from the original prototype to the current v5.0.1 release line. If you
 are considering MNEMOS for your own stack, you should know where it came
 from; if you are contributing, you should know which doors have been closed
 and why.

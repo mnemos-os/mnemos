@@ -1,4 +1,4 @@
-# Known limitations — v5.0.0
+# Known limitations — v5.0.1 (covers master through the unreleased v5.3.4 line)
 
 This file lists known operational caveats that aren't bugs in
 the strict sense but are worth surfacing for self-hosting
@@ -6,31 +6,90 @@ operators. Each entry includes the trigger conditions and the
 recovery path so a deployment that hits one of these can be
 unstuck without filing an issue.
 
-## MCP tool-call audit trail — Phase-D deferred
+## MCP tool-call audit trail — Phase-D shipped with residual gaps (v5.3.4)
 
-**Where:** `mnemos/mcp/tools/__init__.py`.
+**Where:** `mnemos/db/mcp_audit_repo.py` +
+`mnemos/mcp/tools/_security.py` + migration
+`migrations_v5_3_4_mcp_audit_log.sql` +
+`mnemos/api/routes/mcp_audit.py`.
 
-**Trigger:** an operator needs a durable answer to "who called
-which MCP tool, with which parameters, and when".
+**What shipped:** durable audit table `mcp_audit_log`. The Python
+logger entry remains the always-on surface; every MCP tool call is
+also persisted to the table when a Postgres pool is available, via
+fire-and-forget `create_task` inside `_mcp_log_tool_audit`. Standalone
+MCP bridge processes (mcp-stdio, mcp-http) fall back to httpx POST
+against `/v1/internal/mcp_audit` so they too persist via the API
+process's pool.
 
-**Symptom:** MNEMOS does not yet have a shared audit-log table for
-generic MCP tool calls. The dispatcher has a Phase-D TODO at the
-call site, but it deliberately does not invent a parallel MCP-only
-audit stream because tool parameters can include memory content and
-must be handled by one shared redaction-aware facility.
+**Outcome labels:** `called`, `success`, `failure`, `error`,
+`denied`, `root_bypass`. Root-bypass entries are tagged so
+operators can query for elevation events.
 
-**Recovery / workaround:** issue per-user MCP tokens/API keys,
-avoid the legacy shared `MNEMOS_MCP_TOKEN`, and retain reverse
-proxy/API access logs long enough to correlate MCP clients with the
-REST writes they trigger. For high-assurance deployments, place the
-MCP HTTP edge behind an access gateway that records authenticated
-caller, request time, and body hash until the Phase-D shared audit
-slice lands.
+**Indexes:** by `created_at DESC`, by `(caller_user_id,
+created_at DESC)`, and by `(tool, created_at DESC)`.
 
-**Fix scope:** add one durable, redaction-aware audit surface shared
-by MCP transports and REST routes. The MCP dispatcher should wire
-tool-call records into that shared facility when it exists rather
-than inventing a parallel MCP-only table.
+**SQLite parity:** schema mirror exists in
+`db/migrations_sqlite/migrations_v5_3_4_mcp_audit_log_sqlite.sql`
+but the writer is postgres-only (matches the `deletion_log`
+pattern). SQLite-only deploys keep the logger-only surface.
+
+### Residual gaps (round-3 deferred to v5.3.5+)
+
+These are real but did not block the v5.3.4 cut — the audit table
+is materially better than the logger-only baseline. Two follow-up
+slices are tracked:
+
+1. ✅ **Trust boundary on /v1/internal/mcp_audit (closed in v5.3.4
+   #148; default-on via #150).** The endpoint now requires
+   `X-Mnemos-Audit-Token: <value>` matching the configured
+   `MNEMOS_INTERNAL_AUDIT_TOKEN` env var (constant-time compare).
+   When that env var is set, normal API token holders cannot POST
+   audit rows — only processes that share the env (the API itself
+   + bridges configured with the same token) can write. When the
+   env var is unset, the endpoint falls back to legacy bearer-token
+   mode. Caller attribution remains locked (derived from auth
+   context, body fields ignored). Bridges include the header
+   automatically when the env var is configured.
+
+   **#150 made this default-on for new installs.** The installer
+   now autogenerates `[server].internal_audit_token` (256-bit
+   `secrets.token_hex(32)`) on first install and persists it to
+   config.toml (mode 0600). Operators no longer need to set the env
+   var manually — the lockdown engages automatically. The resolver
+   honors `MNEMOS_INTERNAL_AUDIT_TOKEN` env (operator override /
+   rotation), then any existing token at the runtime-resolved
+   config path (honors `MNEMOS_CONFIG_PATH` to avoid token skew
+   between API and bridges), then any token in the in-memory config
+   being patched, and finally falls back to fresh-generate. The
+   `_set()` regex was hardened in the same slice to be line-anchored
+   (rejecting commented `# key = ...` lines and IPv6 URL literals
+   like `base = "http://[::1]:5002"`), with post-write `tomllib`
+   validation that the parsed `[server].internal_audit_token` is
+   non-empty before the file gets replaced.
+
+2. ✅ **Tracked audit task with shutdown drain (closed in v5.3.4
+   #149).** `_schedule_audit_persist` now tracks each created
+   `asyncio.Task` in `_INFLIGHT_AUDIT_TASKS` and removes via
+   `add_done_callback`. A new `drain_pending_audit_tasks(timeout)`
+   helper awaits the in-flight set and is wired into:
+   - **API process:** `register_lifespan_cleanup_hook("mcp audit
+     drain", ...)` runs during FastAPI lifespan teardown before the
+     pool closes.
+   - **MCP stdio bridge:** `main()` awaits the drain in a `finally:`
+     block before `asyncio.run` returns.
+   - **MCP HTTP/SSE bridge:** Starlette `on_shutdown=[...]` hook
+     awaits the drain.
+   The set is bounded at 1024; under audit-DB outage, additional
+   schedules log a warning instead of unbounded-growing the set.
+   Drain timeouts log a warning naming the still-pending count but
+   don't propagate (shutdown must complete).
+
+3. **Forgeable parameter_shape via type allowlist gap (closed in
+   round-3 with a fixed allowlist):** parameter_shape[*].type and
+   item_types now reject any value not in the closed allowlist
+   (str/bool/int/float/list/dict/none/bytes/tuple/set/frozenset/
+   NoneType), so raw values like `{type: "sk_live_secret"}` are
+   rejected at the validator. ✅ closed.
 
 ## MCP direct-DB write quota — local branch guard
 

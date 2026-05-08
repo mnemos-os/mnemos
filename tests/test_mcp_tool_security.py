@@ -38,6 +38,7 @@ EXPECTED_USER_TOOLS = [
     "recommend_model",
     "pantheon_list_models",
     "pantheon_route_explain",
+    "list_deletions",
     "kronos_anomalies",
     "kronos_forecast",
 ]
@@ -321,6 +322,308 @@ async def test_direct_dag_path_rejects_traversal_before_pool_access(monkeypatch)
 
     with pytest.raises(ValueError):
         await tool_checkout_memory("../../metrics", "abc123", user=_alice())
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_rate_limit_denial_emits_outcome_denied(monkeypatch):
+    """#154: PermissionError with "rate limit" in the message must
+    audit as outcome="denied" (not "error"). Lets operators query
+    `WHERE outcome = 'denied'` for rate-limit events without
+    substring-matching the error_class."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({
+            "caller_id": caller_id,
+            "role": role,
+            "tool_name": tool_name,
+            "outcome": outcome,
+            "error_class": error_class,
+        })
+
+    async def _rate_limited(*, tool_name, user_id, kind):
+        raise PermissionError(f"rate limit exceeded for {tool_name}")
+
+    monkeypatch.setattr(mcp_tools, "_mcp_consult_rate_limit", _rate_limited)
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert result == {"success": False, "error": "Rate limit exceeded"}
+    assert len(captured) == 1
+    assert captured[0]["outcome"] == "denied"
+    assert captured[0]["error_class"] == "PermissionError"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_non_rate_limit_permission_error_remains_error(monkeypatch):
+    """#154: a PermissionError that is NOT a rate-limit must continue
+    to emit outcome="error" (no semantic change for the
+    Resource-not-found / non-rate-limit denial case)."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    async def _denied(*, tool_name, user_id, kind):
+        # No "rate limit" substring — generic permission error.
+        raise PermissionError("some other denial reason")
+
+    monkeypatch.setattr(mcp_tools, "_mcp_consult_rate_limit", _denied)
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert result == {"success": False, "error": "Resource not found"}
+    assert len(captured) == 1
+    assert captured[0]["outcome"] == "error"
+    assert captured[0]["error_class"] == "PermissionError"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_context_mismatch_emits_outcome_denied(monkeypatch):
+    """#156: when an MCP transport context (caller_id / role /
+    namespace) doesn't match the authenticated user, dispatch must
+    audit as outcome="denied" with error_class="ContextMismatch".
+    Operators auditing denials see context mismatches alongside
+    rate-limit denials in `WHERE outcome = 'denied'`."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+    # Force a stale backend caller_id != user.user_id mismatch.
+    monkeypatch.setattr(
+        mcp_tools, "current_mcp_backend_user_id", lambda: "stale-bob"
+    )
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert result == {"success": False, "error": "MCP caller context mismatch"}
+    assert captured == [
+        {"outcome": "denied", "error_class": "ContextMismatch"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_role_mismatch_emits_outcome_denied(monkeypatch):
+    """Role mismatch (transport-side role != user-claimed role) is a
+    privilege-escalation signal — must audit as denied."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+    monkeypatch.setattr(mcp_tools, "current_mcp_backend_user_id", lambda: None)
+    # Backend says "root", caller asserts "user" — that's a privilege drift.
+    monkeypatch.setattr(mcp_tools, "current_mcp_backend_role", lambda: "root")
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),  # role="user"
+    )
+
+    assert result == {"success": False, "error": "MCP caller context mismatch"}
+    assert captured == [
+        {"outcome": "denied", "error_class": "ContextMismatch"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_namespace_mismatch_emits_outcome_denied(monkeypatch):
+    """Namespace mismatch (transport-side namespace != user-claimed
+    namespace) is a tenancy boundary violation — must audit as
+    denied."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+    monkeypatch.setattr(mcp_tools, "current_mcp_backend_user_id", lambda: None)
+    monkeypatch.setattr(mcp_tools, "current_mcp_backend_role", lambda: None)
+    monkeypatch.setattr(
+        mcp_tools, "current_mcp_backend_namespace", lambda: "wrong-namespace"
+    )
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),  # namespace="alice-ns"
+    )
+
+    assert result == {"success": False, "error": "MCP caller context mismatch"}
+    assert captured == [
+        {"outcome": "denied", "error_class": "ContextMismatch"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_rate_limit_match_is_case_insensitive(monkeypatch):
+    """A `Rate Limit` (capitalized) error must still classify as denied.
+    Defends against future raise-call variations."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome})
+
+    async def _rate_limited(*, tool_name, user_id, kind):
+        raise PermissionError("Rate Limit Exceeded for this user")
+
+    monkeypatch.setattr(mcp_tools, "_mcp_consult_rate_limit", _rate_limited)
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+
+    await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert captured[0]["outcome"] == "denied"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_handler_returning_success_false_emits_outcome_failure(
+    monkeypatch,
+):
+    """#157: handler returning {"success": False, ...} = the tool ran
+    but reported failure. Distinct from a raised exception (=
+    outcome="error"). After this change, operators can query
+        WHERE outcome = 'failure'   -- tool said no
+    vs
+        WHERE outcome = 'error'     -- tool raised
+    without substring-matching error_class."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    async def _failing_handler(**_kwargs):
+        return {"success": False, "error": "tool said no"}
+
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+    monkeypatch.setitem(
+        mcp_tools.TOOL_REGISTRY["get_memory"],
+        "handler",
+        _failing_handler,
+    )
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert result == {"success": False, "error": "tool said no"}
+    assert captured == [
+        {"outcome": "failure", "error_class": "ToolError"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_handler_raising_emits_outcome_error(monkeypatch):
+    """Regression: a raised exception still maps to outcome="error"
+    (not "failure"). Distinguishes "tool blew up" from "tool said no"."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    async def _raising_handler(**_kwargs):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+    monkeypatch.setitem(
+        mcp_tools.TOOL_REGISTRY["get_memory"],
+        "handler",
+        _raising_handler,
+    )
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert result == {"success": False, "error": "Tool execution failed"}
+    assert captured == [
+        {"outcome": "error", "error_class": "RuntimeError"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_handler_returning_success_emits_outcome_success(
+    monkeypatch,
+):
+    """Regression: a successful handler return continues to map to
+    outcome="success"."""
+    import mnemos.mcp.tools as mcp_tools
+
+    captured = []
+
+    def _capture_audit(*, caller_id, role, tool_name, parameters, outcome,
+                      error_class=None):
+        captured.append({"outcome": outcome, "error_class": error_class})
+
+    async def _ok_handler(**_kwargs):
+        return {"success": True, "data": "ok"}
+
+    monkeypatch.setattr(mcp_tools, "_mcp_log_tool_audit", _capture_audit)
+    monkeypatch.setitem(
+        mcp_tools.TOOL_REGISTRY["get_memory"],
+        "handler",
+        _ok_handler,
+    )
+
+    result = await mcp_tools.execute_tool(
+        "get_memory",
+        {"memory_id": "mem_1"},
+        user=_alice(),
+    )
+
+    assert result == {"success": True, "data": "ok"}
+    assert captured == [
+        {"outcome": "success", "error_class": None}
+    ]
 
 
 @pytest.mark.asyncio

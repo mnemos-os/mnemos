@@ -1,0 +1,65 @@
+# MNEMOS-OS Dockerfile — `full` build (all extras incl. mnemos_hot)
+# Multi-stage build with uv for fast dependency resolution
+
+FROM python:3.11-slim as builder
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ libpq-dev curl git && \
+    rm -rf /var/lib/apt/lists/*
+
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:$PATH"
+
+COPY pyproject.toml .
+COPY requirements.txt .
+COPY mnemos ./mnemos
+
+# Base runtime deps
+RUN uv pip install --system -r requirements.txt
+
+# Full extras: morpheus, persephone, pantheon, kronos, knossos, apollo,
+# artemis (numpy + networkx + scipy), nats, hot (mnemos-hot wheel), edge
+RUN uv pip install --system \
+    "numpy>=1.24" \
+    "scipy>=1.11" \
+    "networkx>=3.3" \
+    "zstandard>=0.25" \
+    "nats-py>=2.14.0" \
+    "aiosqlite>=0.20.0" \
+    "sqlite-vec>=0.1.6"
+
+# mnemos_hot Rust wheel (not on PyPI — copied from build context)
+COPY mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl /tmp/
+RUN uv pip install --system /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl && \
+    rm /tmp/mnemos_hot-0.2.0-cp311-abi3-manylinux_2_34_x86_64.whl
+
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libpq5 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /usr/local/lib/python3.11/site-packages /usr/local/lib/python3.11/site-packages
+
+COPY . .
+
+RUN python -m pip install --no-deps --no-build-isolation .
+
+ENV PG_USER=mnemos_user \
+    PG_DATABASE=mnemos \
+    PG_HOST=postgres \
+    INFERENCE_EMBED_HOST=http://ollama:11434 \
+    MNEMOS_BIND=0.0.0.0 \
+    MNEMOS_PORT=5002 \
+    PYTHONUNBUFFERED=1
+
+EXPOSE 5002
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:5002/health').read()" || exit 1
+
+CMD ["mnemos", "serve"]

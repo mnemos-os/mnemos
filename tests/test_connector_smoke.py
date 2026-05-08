@@ -40,7 +40,7 @@ STDIO_SURFACES = [
     ("claude-desktop", CONNECTOR_DIR / "claude-desktop.md"),
     ("cursor", CONNECTOR_DIR / "cursor.md"),
     ("codex-cli", CONNECTOR_DIR / "codex-cli.md"),
-    ("continue-dev", CONNECTOR_DIR / "continue-dev.md"),
+    ("continue-dev", CONNECTOR_DIR / "continue.md"),
     ("cline", CONNECTOR_DIR / "cline.md"),
 ]
 HTTP_SURFACES = [
@@ -234,7 +234,11 @@ def _assert_search_payload(call_result: Any) -> dict[str, Any]:
 
 
 def _assert_backend_search_request(requests: list[dict[str, Any]]) -> None:
-    assert requests == [
+    # Filter out /v1/internal/mcp_audit calls — those are the
+    # Phase-D durable audit fallback (#146 round-1), orthogonal to
+    # the tool dispatch behavior this test validates.
+    tool_calls = [r for r in requests if r.get("path") != "/v1/internal/mcp_audit"]
+    assert tool_calls == [
         {
             "method": "POST",
             "path": "/v1/memories/search",

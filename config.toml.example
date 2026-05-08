@@ -208,7 +208,7 @@ profile = "server"
 
 # ── Auth (edge/dev profiles: disabled by default) ──────────────────────────────
 [auth]
-enabled = true          # Enable bearer token auth; create root key with: python3 install.py
+enabled = true          # Enable bearer token auth; create root key with: python3 -m mnemos.installer --upgrade
 personal_user_id = "default"
 default_namespace = "default"
 mode = "bearer"

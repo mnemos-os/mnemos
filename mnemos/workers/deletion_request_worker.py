@@ -20,6 +20,8 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
+from mnemos.db.deletion_log import log_target_memory_deletions
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_BATCH_SIZE = 10
@@ -37,7 +39,7 @@ SELECT id, target_user_id, target_namespace
 """
 
 _DEQUEUE_HARD_DELETE_SQL = """
-SELECT id, target_user_id, target_namespace
+SELECT id, target_user_id, target_namespace, requested_by, requested_at, notes
   FROM deletion_requests
  WHERE status = 'soft_deleted'
    AND restore_by < NOW()
@@ -584,6 +586,16 @@ def _parse_update_count(result: str) -> int:
         return 0
 
 
+def _row_get(row: Any, key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, TypeError):
+        getter = getattr(row, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return default
+
+
 async def invalidate_deletion_scope_caches(
     target_user_id: str,
     target_namespace: str | None,
@@ -663,10 +675,25 @@ async def hard_delete_target(
     target_user_id: str,
     target_namespace: str | None,
     *,
+    requested_by: str = "deletion_request_worker",
+    requested_at: Any = None,
+    request_kind: str = "tombstone_collected",
+    reason: str | None = None,
+    source: list[str] | tuple[str, ...] | None = None,
     invalidate_cache: bool = True,
 ) -> dict[str, int]:
     counts: dict[str, int] = {}
     await conn.execute("SET LOCAL mnemos.suppress_version_snapshot = '1'")
+    await log_target_memory_deletions(
+        conn,
+        target_user_id,
+        target_namespace,
+        requested_by=requested_by,
+        requested_at=requested_at,
+        request_kind=request_kind,
+        reason=reason,
+        source=source,
+    )
     for label, _table, sql in _HARD_DELETE_SQL:
         result = await conn.execute(sql, target_user_id, target_namespace)
         counts[label] = _parse_update_count(result)
@@ -774,6 +801,11 @@ async def hard_delete_soft_deleted_request(
         conn,
         request["target_user_id"],
         request["target_namespace"],
+        requested_by=_row_get(request, "requested_by", "deletion_request_worker"),
+        requested_at=_row_get(request, "requested_at"),
+        request_kind="tombstone_collected",
+        reason=_row_get(request, "notes"),
+        source=["deletion_request_worker", str(request["id"])],
         invalidate_cache=False,
     )
     marked = await conn.fetchrow(_MARK_HARD_DELETED_SQL, request["id"])

@@ -1,6 +1,6 @@
 # MNEMOS Deployment & Configuration Guide
 
-**Status**: v5.0.0 current. v5.0.0 shipped 2026-05-02.
+**Status**: v5.0.1 current (released on top of the v5.0.0 GA shipped 2026-05-02).
 
 ---
 
@@ -38,7 +38,7 @@ mnemos serve --profile dev
 ### Installation
 
 ```bash
-python -m pip install mnemos-os==5.0.0
+python -m pip install mnemos-os==5.0.1
 mnemos install --profile dev
 mnemos serve --profile dev
 ```
@@ -48,7 +48,7 @@ The API will be available at `http://localhost:5002`.
 For the no-Python edge path:
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -544,7 +544,8 @@ PG_HOST=db.example.com
 PG_DATABASE=mnemos_prod
 PG_USER=mnemos
 PG_PASSWORD=secure_password_here
-PG_POOL_SIZE=50
+PG_POOL_MIN=5
+PG_POOL_MAX=50
 
 MNEMOS_BIND=0.0.0.0
 MNEMOS_PORT=5002

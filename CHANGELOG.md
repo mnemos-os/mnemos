@@ -2,6 +2,1547 @@
 
 All notable changes to MNEMOS are documented here.
 
+## [5.0.1] — 2026-05-08
+
+
+### Fixed — Webhook DNS validation now bounded by WEBHOOK_DNS_TIMEOUT (#200)
+
+Audit MED finding (`mem_1778221719390_8cb1ba`): `mnemos/webhooks/
+validation.py:54` `_resolve_addrs()` called `loop.getaddrinfo()`
+without `asyncio.wait_for`, so slow DNS could stall the async
+webhook validation path indefinitely. The configured timeout
+(`WEBHOOK_DNS_TIMEOUT`, default 10.0s, lives in
+`_WebhookSettings.dns_timeout`) was used by
+`_derive_lease_defaults` for lease-budget arithmetic but never
+applied to the actual resolution.
+
+Fix: wrap the `getaddrinfo` call in `asyncio.wait_for(...)` with
+the configured timeout. Translate the resulting
+`asyncio.TimeoutError` into a 422 `HTTPException` with a
+distinct `"url host DNS resolution timed out"` detail so
+operator logs distinguish slow-DNS from un-resolvable-host.
+
+NB: the timeout `except` clause must come BEFORE the
+`(socket.gaierror, OSError)` catch — in Python 3.11+
+`asyncio.TimeoutError` aliases builtin `TimeoutError` which is
+an `OSError` subclass. Without the explicit ordering the timeout
+path silently degrades into the generic
+`"url host could not be resolved"` message.
+
+Pinned by `tests/test_webhook_dns_timeout.py` (3 tests):
+hang→TimeoutError under tiny `dns_timeout`, TimeoutError→422
+translation with the specific detail string, fast resolution
+still returns the address list.
+
+### Fixed — Starlette 1.0 compat + pydantic-settings precedence pin (#199)
+
+Surfaced by a fresh-install barrage on PROTEUS (Python 3.13 +
+Postgres 17 + clean `pip install -e .[dev,server,edge,...]`).
+Two real downstream regressions hidden by stale local
+dependency pins:
+
+1. **Starlette 1.0 removed `on_shutdown=`** — `mnemos/mcp/http.py:686`
+   passed `on_shutdown=[_drain_audit_tasks_on_shutdown]` to
+   `Starlette(...)`. That kwarg was deprecated in 0.x and removed
+   in 1.0; fresh installs pull 1.0 → `TypeError:
+   Starlette.__init__() got an unexpected keyword argument
+   'on_shutdown'` → 9 hard failures across `test_mcp_nats_sse`,
+   `test_mcp_http_health`, and `test_connector_smoke`. Local env
+   had Starlette 0.x where the deprecation warning fired but
+   tests passed.
+
+   Fix: converted the audit-drain hook to an `@asynccontextmanager`
+   `_mcp_http_lifespan(app)` that yields then awaits
+   `_drain_audit_tasks_on_shutdown()` on exit. Starlette
+   constructor now uses `lifespan=_mcp_http_lifespan`. Behavior
+   identical — drain still runs on shutdown — but compatible
+   with Starlette 1.0+.
+
+   Updated `tests/test_mcp_audit_log.py::
+   test_http_transport_registers_drain_on_shutdown` to assert the
+   new shape (`lifespan=_mcp_http_lifespan` + `await
+   _drain_audit_tasks_on_shutdown()` inside the context manager).
+
+2. **pydantic-settings 2.12 inverted env vs init-kwarg precedence**
+   — between 2.11 and 2.12, the rule for `validation_alias` env
+   vars vs constructor kwargs flipped. MNEMOS instantiates
+   `_DatabaseSettings(**db_section)` from TOML (line 724) and
+   relies on `PG_BACKEND` / `PG_DSN` / etc. env vars to override
+   empty/inherited TOML values. On 2.12+ env vars no longer
+   override init kwargs.
+
+   Fix: pinned `pydantic-settings>=2.0.0,<2.12` in pyproject.toml
+   with an inline comment explaining why. The runtime override
+   path is preserved; lifting the pin requires either upgrading
+   to a precedence-agnostic config-loading shape or accepting
+   the new precedence rule as the documented behavior.
+
+   Test:
+   `tests/test_postgres_embedding_dim.py::test_runtime_settings_pg_backend_overrides_toml_init`
+   was already pinning the expected behavior — it just failed
+   silently against modern pydantic-settings on the local box
+   because the local pin was stale.
+
+**Barrage results on PROTEUS** (HEAD `110651c` + this slice):
+- All 2521 unit/integration tests pass on Python 3.13 + clean
+  install + the 23-tool MCP registry from `_TOOL_ORDER`.
+- ruff clean.
+- Live serve on :5202 against fresh `mnemos_v532_barrage`
+  Postgres DB. /health 200, auth probes 401/200, POST/search/
+  bulk-create/export/stats all return correct shapes. 100
+  OpenAPI paths.
+- Server log shows only expected configuration warnings (no
+  SESSION_SECRET, no INTERNAL_AUDIT_TOKEN, Redis fallback) and
+  zero ERROR-level events, zero tracebacks.
+
+### Fixed — Aspirational endpoint references marked historical (#198)
+
+Surfaced by the deep documentation-sweep codex audit at HEAD
+`de13b51` (saved as MNEMOS `mem_1778221719446_2cdcad`). Two doc
+surfaces described REST endpoints that don't exist on the daemon:
+
+- `docs/DREAM_STATE_DESIGN.md` (the original Jungian-framed
+  divergent-ideation design) describes
+  `/v1/dreams/{version_id}/promote`,
+  `/v1/dreams/{version_id}/acknowledge`, and
+  `/admin/dreams/run`. None of those exist; the shipped MORPHEUS
+  subsystem uses `/v1/morpheus/runs*` + `/admin/morpheus/runs`
+  (`mnemos/api/routes/morpheus.py:156, 190, 282, 334`). Added an
+  inline "did not ship as designed" callout at §9 so the
+  promotion-workflow section's endpoint names are clearly
+  forward-looking, plus a "[Shipped as `/admin/morpheus/runs`]"
+  inline mark on §X's bullet list.
+- `docs/connectors/chatgpt-pro-developer-mode.md` and
+  `docs/connectors/README.md` describe an experimental
+  `mnemos-tunnel-setup` helper that calls daemon-side
+  `/admin/tunnels/*` endpoints. As of v5.3.2 the
+  `mnemos.tunnels.ngrok_bridge` module + the daemon-side
+  endpoints are NOT implemented; the script is aspirational.
+  Reworded both doc references to make this explicit and steer
+  operators to the manual `mnemos serve mcp-http` + ngrok path
+  that works today.
+
+This is the deferred half of the #194 endpoint-name slice — at
+that time the audit-driven scope was doc-name correction, while
+this slice surfaces the underlying script + missing-endpoint
+contract. Keeping the design content as-is preserves the
+intentional historical narrative; only the framing was tightened
+so future readers don't grep for non-existent routes.
+
+Pinned by `tests/test_doc_aspirational_endpoints_marked.py`
+(4 tests): "did not ship as designed" callout near `/v1/dreams/*`
++ live `/admin/morpheus/runs` named; "currently inert" /
+"not implemented" warnings near `/admin/tunnels/*` in both
+connector doc surfaces; live morpheus routes still in
+`mnemos/api/routes/morpheus.py`.
+
+### Fixed — MCP tool-count + hooks-package doc drift (#197)
+
+Surfaced by the deep documentation-sweep codex audit at HEAD
+`de13b51` (saved as MNEMOS `mem_1778221719446_2cdcad`). Live MCP
+`TOOL_REGISTRY` has 23 tools as of HEAD `07e1154`, but the docs
+were stuck in two prior eras:
+
+- 18-tool claims pre-dated the addition of `pantheon_list_models`,
+  `pantheon_route_explain`, `kronos_anomalies`, `kronos_forecast`,
+  and `recommend_model`.
+- 22-tool claims pre-dated the addition of `list_deletions`.
+
+Fixed:
+
+- `README.md` — top-level package layout dropped the (removed)
+  `hooks` subpackage; current-state v5.x description; MCP tool
+  enumeration now includes `list_deletions`; "18 tools" claims
+  on lines 682 + 701 → 23.
+- `ROADMAP.md` — cross-tenant security gates "across 22 tools"
+  → 23 (with `list_deletions` added to the example list);
+  "22 tools from one canonical registry" line → 23.
+- `docs/SPECIFICATION.md` — Module-tree dropped `hooks/` (already
+  removed in #182); "18 tools from `mnemos/mcp/tools/`" → 23;
+  "MCP (stdio and HTTP/SSE, 18 tools)" section heading → 23.
+- `docs/connectors/README.md` — "Source of truth" path now
+  includes `kronos.py` and `deletions.py` alongside
+  memory/kg/dag/models; "canonical 18-tool registry" → 23.
+
+Historical `hooks` mentions in v4.0.0/v4.1.1 "what shipped"
+sections of README + ROADMAP are deliberately preserved — they
+describe what was real at those tagged releases.
+
+Pinned by `tests/test_doc_mcp_tool_count.py` (4 tests):
+
+- No stale "X tools" / "X MCP tools" count in operator docs
+  (live count read at runtime via `len(TOOL_REGISTRY)`).
+- `docs/connectors/README.md` "source of truth" line names all
+  six canonical MCP tool modules.
+- `README.md` MCP enumeration includes `list_deletions`.
+- `TOOL_REGISTRY` keeps the canonical tool set.
+
+### Fixed — Doc module-path drift + broken cross-links (#196)
+
+Surfaced by the deep documentation-sweep codex audit at HEAD
+`de13b51` (saved as MNEMOS `mem_1778221719446_2cdcad`). Operator
++ architecture docs referenced module paths that no longer exist
+in the v4 package layout, plus several broken cross-links to
+docs that were never written.
+
+Module-path corrections:
+
+- `docs/MEMORY_ARCHITECTURE.md` named `mnemos/api/lifecycle.py`.
+  Updated to describe the actual split:
+  `mnemos/core/lifecycle.py` (boot/shutdown + globals),
+  `mnemos/api/lifecycle_hooks.py` (FastAPI startup/shutdown),
+  and `mnemos/api/main.py` (`add_middleware` registration).
+- `docs/OPERATIONS.md:841` named `mnemos/api/observability.py`;
+  corrected to `mnemos/core/observability.py`.
+- `docs/OBSERVABILITY.md:249` named `mnemos.api.lifecycle._cache`;
+  corrected to `mnemos.core.lifecycle._cache`.
+- `docs/OBSERVABILITY.md:251` named `mnemos.domain.graeae.providers`
+  (no such module). Replaced with the live
+  `mnemos.domain.graeae.provider_worker` +
+  `mnemos.domain.graeae.provider_sync`.
+- `docs/MEMORY_EXPORT_FORMAT.md:594` referenced `mnemos.mpf`.
+  Real portability code lives under `mnemos.domain.portability`.
+  Same file's `tools/mpf_dump.py` / `tools/mpf_load.py` updated to
+  `mnemos/tools/memory_export.py` / `mnemos/tools/memory_import.py`
+  / `mnemos/tools/mpf_validate.py`.
+- `docs/V3_5_CHARTER.md:328` + `V3_6_CHARTER.md:141` show
+  `python3 -m mnemos.iris.server` as a planned MCP server. The
+  module was never implemented; added a "historical" note next
+  to each block pointing readers at the live MCP model tools at
+  `mnemos/mcp/tools/models.py`.
+
+Broken cross-links:
+
+- `DOCUMENT_IMPORT_GUIDE.md:339-340` linked to `./API.md#memories`
+  and `./SEMANTIC_SEARCH.md` — neither file exists. Replaced with
+  `API_DOCUMENTATION.md` (root) and `docs/SPECIFICATION.md`.
+- `docs/OPERATIONS.md:838-839` named `docs/ARCHITECTURE.md`,
+  `docs/API.md`, and `examples/` in the contributor reference;
+  none of those paths exist. Replaced with the live docs:
+  `README.md`, `docs/MEMORY_ARCHITECTURE.md`,
+  `docs/SPECIFICATION.md`, `API_DOCUMENTATION.md`, and the live
+  FastAPI OpenAPI spec at `/docs` on a running instance.
+
+Pinned by `tests/test_doc_module_paths_match_code.py` (10 tests):
+5 forbidden module-path strings × no-references-anywhere; 2
+unqualified pre-restructure prefixes (`api/observability.py`,
+`api/auth.py`); no `mnemos.mpf`; live module paths actually exist;
+charter docs keep the "never implemented" callout near
+`mnemos.iris.server`.
+
+### Fixed — Doc env-var drift (PG_* runtime + MNEMOS_API_KEY) (#195)
+
+Surfaced by the deep documentation-sweep codex audit at HEAD
+`de13b51` (saved as MNEMOS `mem_1778221719446_2cdcad`).
+
+- `docs/SPECIFICATION.md` listed `MNEMOS_DB_HOST/PORT/NAME/USER/
+  PASSWORD` and `MNEMOS_KEY` as runtime config. The runtime
+  `_DatabaseSettings` class in `mnemos/core/config.py` uses
+  `env_prefix="PG_"`, so the canonical runtime names are
+  `PG_HOST/PG_PORT/PG_DATABASE/PG_USER/PG_PASSWORD`. The API key
+  is `MNEMOS_API_KEY` (`MNEMOS_KEY` is only used by
+  `tests/test_live_e2e.py`, not fleet config). Updated the
+  Bind+DB and Auth subsections to match.
+- `DEPLOYMENT.md` showed `PG_POOL_SIZE=50` in the production
+  `.env` example; replaced with `PG_POOL_MIN=5` + `PG_POOL_MAX=50`
+  per the actual `_DatabaseSettings.pool_min_size` /
+  `pool_max_size` validation aliases.
+- `docs/OBSERVABILITY.md` named `MNEMOS_DB_POOL_MAX_SIZE` as the
+  pool cap; corrected to `PG_POOL_MAX`.
+- `docs/OPERATIONS.md` restore-test command set
+  `MNEMOS_DB_NAME=mnemos_restore_test`; corrected to
+  `PG_DATABASE=...`.
+- `docs/MEMORY_ARCHITECTURE.md` claimed operators select the
+  compression engine via `MNEMOS_COMPRESSION_ENGINE`. No such
+  env var is read anywhere; the engine choice runs through the
+  contest mechanism (every registered engine produces a
+  candidate; best-by-quality wins). Reworded to describe the
+  contest, kept the `MNEMOS_JUDGE_MODE` reference (real, lives
+  at `_CompressionSettings.judge_mode`).
+
+Note: `MNEMOS_DB_*` is a legitimate INSTALLER alias accepted by
+`mnemos/installer/__main__.py` for env-only deploys; it is not
+the runtime-config shape. The CHANGELOG entry from a4eaf5b that
+mentions both names side-by-side is therefore historically
+accurate and kept as-is.
+
+Pinned by `tests/test_doc_env_vars_match_config.py` (3 tests):
+PG_POOL_MIN/MAX validation aliases live; `_DatabaseSettings`
+keeps `env_prefix="PG_"`; no forbidden env names
+(`MNEMOS_DB_POOL_MAX_SIZE`, `PG_POOL_SIZE`, `MNEMOS_KEY`,
+`MNEMOS_COMPRESSION_ENGINE`) appear in operator/runtime docs.
+
+### Fixed — Endpoint-name corrections in connector + portability docs (#194)
+
+Surfaced by the deep documentation-sweep codex audit at HEAD
+`de13b51` (saved as MNEMOS `mem_1778221719446_2cdcad`).
+
+- `docs/MEMORY_EXPORT_FORMAT.md` (lines 377, 579) said
+  `POST /v1/export`. The live route is `GET /v1/export` per
+  `mnemos/api/routes/portability.py:41`.
+- `docs/connectors/openai-custom-gpt.md:184` referenced
+  `/v1/health` for an auth probe. Health is unversioned
+  (`/health`).
+- `docs/connectors/{claude-desktop,cline,continue,cursor}.md`
+  + `docs/connectors/README.md` all referenced
+  `/v1/mcp/discovery`. That route does not exist — MCP
+  discovery is the protocol's `tools/list` JSON-RPC method
+  over SSE/stdio, not a REST endpoint. Replaced the curl
+  examples with two practical checks: `/health` for server-up
+  + a Python one-liner against the canonical `TOOL_REGISTRY`
+  (`python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY;
+  ...'`). The connectors README's reference to a now-missing
+  `mnemos serve mcp-stdio --print-schema` flag was also
+  replaced with the same Python-side registry check.
+
+Pinned by `tests/test_doc_endpoints_match_routes.py` (3 tests):
+the live `@router.get("/export"...)` shape, the absence of any
+`/mcp/discovery` route in `mnemos/api/routes/` AND in any doc
+under `docs/`, and that `/health` is in the unversioned
+`mnemos/api/routes/health.py` router (not behind `/v1`).
+
+### Fixed — Doc version drift across operator surfaces (#193)
+
+Surfaced by the deep documentation-sweep codex audit at HEAD
+`de13b51` (saved as MNEMOS `mem_1778221719446_2cdcad`). Both
+`pyproject.toml` and `mnemos/_version.py` were at 5.3.2, but
+~10+ operator-facing docs still claimed "current is v5.0.0" or
+worse — `SYSTEM_REQUIREMENTS.md` + `QUICK_START_REQUIREMENTS.md`
++ `SECURITY.md` were claiming current is v4.0.0.
+
+Updated "current state" claims (left historical mentions alone):
+
+- `README.md` — header, install commands, docker pull, single-
+  binary URL, "current GA line" summary paragraph.
+- `DEPLOYMENT.md`, `API_DOCUMENTATION.md` — header status lines +
+  install pins.
+- `SYSTEM_REQUIREMENTS.md`, `QUICK_START_REQUIREMENTS.md`
+  — release-line headers (4.0.0 → 5.3.2!) + install pins +
+  download URLs.
+- `ROADMAP.md` — "Current status" header.
+- `EVOLUTION.md` — "current vX.Y release line" line.
+- `docs/OPERATIONS.md` — header + §11.1 Architecture banner.
+- `docs/INSTALL.md` — install matrix + bundle commands.
+- `docs/SPECIFICATION.md` — header version + "Authoritative for
+  the checked-out vX.Y tree" line.
+- `docs/GRAEAE_FEATURES.md` — header status.
+- `SECURITY.md` — "current release line" paragraph + "as of"
+  marker.
+- `docs/papers/mnemos-dag-distillation.md` — IRIS reference
+  paragraph.
+
+Pinned by `tests/test_doc_version_pins_match_code.py` (13 tests):
+
+- `pyproject.toml` ↔ `mnemos/_version.py` agreement
+- "current vX" phrase across 10 operator docs
+- no stale `==<old>` install pins in install/quick-start docs
+- no stale `releases/download/v<old>/` URLs in download docs
+
+The test file reads `__version__` at run time so future bumps
+auto-update without churning the test against a literal.
+
+### Removed — 7 audit-flagged dead helpers + 2 orphan fixtures (#192)
+
+Surfaced by the deep cross-code codex audit at HEAD `de13b51`
+(saved as MNEMOS `mem_1778221719390_8cb1ba`). All confirmed zero
+callers across the corrected #186-onwards scope (mnemos/, tests/,
+scripts/, systemd/, deploy.sh, pyproject.toml).
+
+Helpers:
+
+- `ProviderResponse` Pydantic class (mnemos/domain/models.py) —
+  declared but no route used it as `response_model=`.
+- `ProviderResponse` `@dataclass` (mnemos/domain/graeae/engine.py)
+  — declared but never instantiated. Live shape is
+  `ProviderQueryResponse` (used by `_provider_worker_payload`).
+- `ModelRecommendation` Pydantic class (mnemos/domain/models.py) —
+  duplicate of the live dataclass at
+  `mnemos/persistence/types.py` (which is re-exported via
+  `mnemos/persistence/__init__.py`).
+- `JournalEntry` (mnemos/api/routes/journal.py) — Pydantic
+  response model; routes return raw dict/list.
+- `_sha256_hex` (mnemos/db/deletion_log.py) — PostgreSQL
+  `digest(..., 'sha256')` is the live hashing path inside the
+  deletion-log SQL.
+- `_looks_like_sqlite_conn` (mnemos/db/deletion_log.py) —
+  duplicate of the live function in
+  `mnemos/db/mcp_audit_repo.py`.
+- `_row_get` (mnemos/db/deletion_log.py) — declared but never
+  called inside the module.
+- `drain_routing_log_queue_for_tests`
+  (mnemos/domain/pantheon/routing_log.py) — exported in
+  `__all__` but no test/script ever called it. `__all__` entry
+  also removed.
+
+Plus 2 orphan pytest fixtures:
+
+- `event_loop` in `tests/__init__.py` — pytest only collects
+  fixtures from `conftest.py`, not package `__init__`, so this
+  was silent dead code since the v4.0 restructure.
+- `event_loop` (session scope) in `tests/test_e2e.py` — no
+  test in the file requested it as a parameter; pytest-asyncio
+  `mode=Mode.STRICT` auto-manages the loop.
+
+`hashlib` import in `deletion_log.py` removed (only consumer
+was `_sha256_hex`); `asyncio` import in `tests/test_e2e.py`
+auto-removed by ruff (only consumer was the dropped fixture).
+
+Pinned by `tests/test_dead_audit_helpers_192_removed.py` (18
+tests). Helpers with intentional duplicates in other modules
+(`ModelRecommendation`, `_looks_like_sqlite_conn`, `_row_get`)
+are pinned by per-file `definition_removed` checks; the
+external-caller scan skips them to avoid false positives on
+the live duplicates.
+
+### Removed — Dead memory-tier API + stale README claim (#191)
+
+127-line `mnemos/domain/memory_categorization/tiers.py` was an
+entire dead API: `MemoryTier` dataclass, `TIER_1..4` instances,
+`TIERS` registry, `TIER_NAMES`, `get_tier`, `get_tier_by_name`,
+`list_tiers`. After #188 removed `JournalManager` and
+`TierSelector` (the only modules that knew about the hot/warm/
+cold/archive tier model), the entire tier API was orphaned.
+
+`memory_categorization/__init__.py` slimmed: now only exports
+`EntityManager` + `StateManager` (the two classes with live
+callers in tests + `mnemos/api/routes/state.py`).
+
+README:641-643 also corrected — claimed the package "still
+exposes a hot/warm/cold/archive selector for hook-side prompt
+budgeting." Hooks were removed in #182, the selector itself had
+no callers, and the claim painted a feature that no longer
+existed. Section dropped from README. Surfaced by the deep
+codex audit at HEAD `de13b51`.
+
+Pinned by `tests/test_dead_tier_api_removed.py` (14 tests:
+file-absence × 1, __all__-entries × 1, no-imports-anywhere × 10,
+no-bare-module-import × 1, README-claim-absent × 1).
+
+### Removed — 4 dead compat-shim / placeholder modules (#190)
+
+Four modules with zero imports anywhere — three were thin
+re-export shims over the canonical `mnemos.core.resilience`
+location, one was an empty placeholder docstring:
+
+- `mnemos/db/repositories.py` (1 line) — empty placeholder
+  ("Repository placeholders for future SQL extraction work.").
+  No symbols, no callers.
+- `mnemos/domain/graeae/_concurrency.py` (10 lines) — re-exported
+  `ConcurrencyLimiterPool` / `ProviderConcurrencyLimiter` from
+  `mnemos.core.resilience`.
+- `mnemos/domain/graeae/_circuit_breaker.py` (11 lines) —
+  re-exported `CircuitBreaker` / `CircuitBreakerPool` /
+  `CircuitState`.
+- `mnemos/domain/graeae/_rate_limiter.py` (10 lines) —
+  re-exported `RateLimiter` / `RateLimiterPool`.
+
+Live callers (engine.py, _cache.py, _quality.py,
+tests/test_resilience.py) all import from
+`mnemos.core.resilience` directly. Sibling `_cache.py` and
+`_quality.py` ARE imported and remain.
+
+Pinned by `tests/test_dead_compat_shim_modules_removed.py`
+(8 parametrized cases: file-absence × 4 + no-imports × 4).
+
+### Removed — Dead `GraeaeEngine._query_provider` wrapper (#189)
+
+Thin pass-through wrapper at `mnemos/domain/graeae/engine.py:1196`
+over `_call_provider_worker` with no callers. The 3 real call
+sites (lines ~695, ~1046, ~1132) all invoke
+`_call_provider_worker` directly. The wrapper added a function-
+call layer with no behavior of its own.
+
+Two stale doc references in the same module (`_load_providers`
+docstring and `_probe_model` docstring) updated to point at
+`_call_provider_worker`. One stale reference in
+`MQ_INTEGRATION.md` (migration step 3) likewise updated.
+
+Pinned by `tests/test_dead_query_provider_wrapper_removed.py`
+(3 tests: method-absence, no-references-anywhere with engine.py
+slice-marker allowlist, allowlist-exception-must-be-comment-only
+to prevent regression doorway).
+
+### Removed — Dead JournalManager + TierSelector classes (#188)
+
+Two entire classes dead since v4.0 A.1 (commit 72508a5): both
+re-exported from `mnemos/domain/memory_categorization/__init__.py`'s
+`__all__` but never imported by any other module.
+
+- `JournalManager` in `mnemos/domain/memory_categorization/
+  journal.py` (224 lines, full file removed) — date-partitioned
+  journal entry management. Sibling `StateManager` in
+  `state.py` is the live state-tracking class (imported in
+  `tests/test_state_manager_durability.py` and used by
+  `mnemos/api/routes/state.py`).
+- `TierSelector` in `mnemos/domain/memory_categorization/
+  tier_selector.py` (156 lines, full file removed) — task-to-
+  tier mapping prototype. (At the time of #188 the live tier
+  accessors `get_tier`, `get_tier_by_name`, `list_tiers` in
+  `tiers.py` were retained; #191 then removed those too once
+  it was confirmed they had no callers.)
+
+`__init__.py` `__all__` updated. Sibling `EntityManager`
+(entities.py) and `StateManager` (state.py) ARE imported in
+tests and remain.
+
+Pinned by `tests/test_dead_categorization_managers_removed.py`
+(6 parametrized cases: file-absence × 2, __all__ entry × 2,
+no-imports-anywhere × 2).
+
+### Removed — 3 dead installer helpers (#187)
+
+First slice run with the corrected dead-code scan scope (#186
+lesson): now also greps `scripts/*.py`, `systemd/*.service`,
+console_scripts in `pyproject.toml`, and shell scripts.
+
+- `pgvector_installed(config)` in `mnemos/installer/db.py` —
+  defined but never called. Installer `__main__` imports
+  `run_migrations`, `setup_database`, `setup_sqlite_database`,
+  `create_api_key`, `verify_connection` from this module — but
+  not `pgvector_installed`. Pgvector is installed unconditionally
+  via `CREATE EXTENSION IF NOT EXISTS vector` in `setup_database`.
+- `service_status(service_name)` in `mnemos/installer/service.py`
+  — defined but never called. Installer `__main__` imports
+  `create_service_user`, `enable_service`, `install_launchd`,
+  `install_systemd`, `start_service` from this module — but not
+  `service_status`. Operators use `systemctl is-active mnemos`
+  / `launchctl list ai.mnemos` directly when post-install status
+  is needed.
+- `_which_exists(name)` in `mnemos/installer/service.py` —
+  was only called by `service_status`; cascade-dead.
+
+Pinned by `tests/test_dead_installer_helpers_removed.py` (6
+parametrized cases). Test scope explicitly covers
+`scripts/*.py`, `scripts/*.sh`, `systemd/*.service`, `deploy.sh`,
+and `pyproject.toml` to prevent the #186-style false positive.
+
+### Removed — 3 small dead public helpers (#185)
+
+Continuing the dead-code audit:
+
+- `publish_federation_memory_upsert(row)` (row-form overload) in
+  `mnemos/persistence/nats_events.py` — defined but never called.
+  Live callers use the `_event(event)` variant directly
+  (`postgres.py` + integration tests).
+- `get_tier_compression_budget` and `get_tier_compression_ratio`
+  in `mnemos/domain/memory_categorization/tiers.py` — single-
+  line accessors over `get_tier(level).token_budget` /
+  `.compression_ratio`. Dead since the v4.0 package restructure.
+
+Larger update_graeae_config / update_openclaw_models functions
+in `mnemos/domain/graeae/model_registry.py` (also dead since v4.0)
+deferred — those are 100+ lines each and need a careful review of
+whether they're stale prototypes worth removing or in-progress
+features worth wiring up. `register_task_classifier` (public-API
+setter pair where the getter IS used by openai_compat router)
+also kept — possible contract preservation rather than dead code.
+
+### Removed — 3 more dead helpers (#184)
+
+Continuing the #183 dead-code audit:
+
+- `_get_db()` in `mnemos/core/lifecycle.py` — async helper that
+  returned `_pool.acquire()`. No callers; everything uses
+  `get_pool_manager().acquire()` directly (with the
+  `require_postgres_pool_or_503` guard).
+- `_executemany()` in `mnemos/persistence/sqlite.py` — wrapped
+  `conn.executemany` with sqlite-value normalization. No callers;
+  multi-row writes go through individual `await conn.execute(...)`
+  calls. Sibling `_executescript` is still live.
+- `log_deleted_memory_row()` (public-named, single-row variant)
+  in `mnemos/db/deletion_log.py` — superseded by the set-scope
+  `log_target_memory_deletions` (used by the deletion request
+  worker) and `log_morpheus_run_memory_deletions` (used by the
+  morpheus runner). The single-row form had no callers.
+
+### Removed — 5 dead private helper functions (#183)
+
+AST scan flagged 16 module-level non-decorated functions with
+single-occurrence names. Five underscore-prefixed (private) ones
+were genuine dead code:
+
+- `_read_visibility_predicate` in `api/routes/memories.py`
+- `_federation_tombstone_filters` in `api/routes/federation.py`
+- `_metadata_has_key` in `domain/morpheus/runner.py`
+- `_select_cheapest` in `domain/pantheon/aliases.py`
+- `_reset_row_for_infra_retry` in
+  `domain/compression/worker_contest.py` (its own docstring
+  admitted "kept for backward compatibility with the round-32
+  single-site call shape" — exactly the kind of stale shim
+  CLAUDE.md says to avoid)
+
+Public-API candidates (e.g. `register_task_classifier`,
+`pgvector_installed`, `get_tier_compression_*`) deferred to a
+separate audit — those need extra-careful "is anyone importing
+this externally?" review before removal.
+
+### Removed — Dead mnemos/hooks/ package (#182)
+
+The entire `mnemos/hooks/` tree (640 lines: `hook_registry.py`,
+`prompt_submit.py`, `session_start.py`, `__init__.py`) was dead
+since v4.0 — no imports anywhere in `mnemos/`, `tests/`, or
+`docs/`. Only reference was `pyproject.toml`'s
+`setuptools.packages.find` list (circular: listing it for
+packaging doesn't make it used).
+
+Removed the directory + the pyproject.toml entry. 3 regression
+tests in `tests/test_dead_hooks_package_removed.py` pin:
+- directory does not exist
+- pyproject.toml doesn't list `"mnemos.hooks"`
+- no source file imports from `mnemos.hooks` (catches a merge
+  that re-introduces a stale import)
+
+If a hook system is needed in the future, build it deliberately
+rather than recovering this dead variant — the patterns it used
+will be out of date with the rest of the codebase.
+
+### Removed — 7 dead module-level constants (#181)
+
+AST scan for module-level `UPPER_CASE = ...` assignments with
+only one occurrence in the entire `mnemos/`+`tests/` tree (the
+definition itself) found 8 candidates. 7 were genuine dead code
+and removed:
+
+- `TUNNEL_PREDICATE_PREFIX` in `mnemos/tools/knossos_mcp.py`
+- `DEFAULT_NATS_SSE_SUBJECT` in `mnemos/mcp/http.py`
+- `QUEUE_GROUP` in `mnemos/webhooks/nats_trigger.py`
+- `_STRUCTURAL_EDGES` in `mnemos/tools/adapters/cognee.py`
+- `_VALID_REASONS` + `_VALID_PROFILES` in
+  `mnemos/api/routes/admin.py` (kept speculatively in #170 "for
+  any operator-introspection callers"; no such callers exist)
+- `_INFRA_RESET_SQL` (single-row variant) in
+  `mnemos/domain/compression/worker_contest.py` (replaced by the
+  batch variant `_INFRA_RESET_BATCH_SQL`)
+- `_SYMBOL_RE` in `mnemos/domain/compression/apollo_schemas/code.py`
+
+`_REGISTRY_LOCK` in `gpu_guard.py` was also flagged but kept —
+defensive code in a single-threaded asyncio context where the
+lock would never serialize a real race anyway.
+
+8 parametrized tests in
+`tests/test_dead_module_constants_removed.py` pin the removals.
+
+### Removed — Dead ProviderListResponse model (#180)
+
+`ProviderListResponse` was declared in `mnemos/domain/models.py`
+but never used by any route — only `OAuthProviderListResponse`
+appears in the codebase. Removed; same dead-model shape as
+`SessionHistoryRequest` in #179.
+
+Found by extending the #178/#179 declared-vs-consumed audit to
+*Response* models. Test pins the removal so a future
+re-introduction without wiring fails loudly.
+
+### Removed — Dead Pydantic request fields (#179)
+
+Continuing the #178 declared-vs-consumed audit, two more silent
+gaps closed:
+
+- `ConsultationRequest.context` was declared but never read by
+  the `consult_graeae` route handler. Removed.
+- `SessionHistoryRequest` was an entire dead model — route uses
+  `Query()` params directly, model was never imported. Removed.
+
+3 tests in `tests/test_dead_pydantic_fields.py`: pin both
+removals + best-effort scan over all `*Request` models in
+`mnemos/domain/models.py` for fields not referenced in
+`mnemos/api/routes/`. Fields consumed indirectly (via
+`model_dump()` or `**body.dict()`) are listed in a
+`_KNOWN_INDIRECT_REFERENCES` allowlist; a future model field that
+silently isn't consumed AND isn't in the allowlist will fail the
+test, prompting a manual review.
+
+### Removed — Unused MemoryUpdateRequest.quality_rating field (#178)
+
+`MemoryUpdateRequest.quality_rating` was declared in the Pydantic
+model but never consumed by the `update_memory` route handler.
+Clients setting it expected updates that silently never happened —
+a doc-vs-behavior gap. Removed the field.
+
+Pydantic v2's default `extra="ignore"` means existing clients
+that still pass `quality_rating` parse through unchanged; the
+field simply no longer appears in the OpenAPI schema as a
+"supported" update.
+
+3 tests in `tests/test_memory_update_request_no_quality_rating.py`
+pin the removal so a future re-introduction without handler
+wiring fails loudly.
+
+### Changed — Universal exc_info=True regression covers entire mnemos/ tree (#177)
+
+Replaced the four parametrized regression tests added in
+#173/#174/#175/#176 (which covered routes, workers, domain+core,
+nats+mcp = 122 modules) with a single universal sweep over the
+ENTIRE `mnemos/` tree (212 modules). Empty/trivial modules pass
+the guard via `assert not missing`; only modules with an
+`except Exception as <name>:` block calling `logger.error(...)`
+without `exc_info=True` fail.
+
+A new module added anywhere under `mnemos/` that doesn't follow
+the contract will fail this test the moment its file lands —
+even in trees that didn't have any matching handlers when the
+sweep was originally written (installer, persistence, federation,
+hooks, etc.).
+
+### Fixed — Final exc_info=True sweep across nats + mcp (#176)
+
+8 except-block logger.error calls across `mnemos/nats/` and
+`mnemos/mcp/` lacked `exc_info=True`:
+- `nats/client.py`: 2 (drift detection + transient probe failure)
+- `mcp/tools/__init__.py`: 1 (generic tool failure)
+- `mcp/tools/dag.py`: 4 (log_memory, branch_memory,
+  diff_memory_commits, checkout_memory)
+- `mcp/tools/models.py`: 1 (recommend_model)
+
+Combined with #161/#172/#173/#174/#175, the entire codebase under
+`mnemos/api/routes/`, `mnemos/workers/`, `mnemos/domain/`,
+`mnemos/core/`, `mnemos/nats/`, and `mnemos/mcp/` now consistently
+uses `exc_info=True` for except-block logger.error calls.
+
+Extended the parametrized regression test to cover nats + mcp (14
+new test parameters). Total coverage: 119 modules across 4 trees.
+
+### Fixed — exc_info=True sweep across domain + core (#175)
+
+10 except-block logger.error calls across `mnemos/domain/` and
+`mnemos/core/` lacked `exc_info=True`:
+- `domain/graeae/api_keys.py`: 1 (PRF parse failure)
+- `domain/graeae/engine.py`: 1 (provider routing failed)
+- `domain/openai_compat/providers.py`: 1 (routing failed)
+- `domain/openai_compat/router.py`: 2 (streaming preflight + sync)
+- `domain/openai_compat/streaming.py`: 2 (route + response)
+- `core/lifecycle.py`: 3 (persistence init + pgvector + FTS fallback)
+
+Combined with #161/#172/#173/#174, the entire codebase under
+`mnemos/api/routes/`, `mnemos/workers/`, `mnemos/domain/`, and
+`mnemos/core/` now consistently uses `exc_info=True` for
+except-block logger.error calls. Extended the parametrized
+regression test to cover all four trees (75 new domain+core test
+parameters).
+
+### Fixed — Workers exc_info coverage + extended regression test (#174)
+
+`mnemos/workers/distillation.py`'s nested DB-reconnect except
+handler logged without `exc_info=True`. Fixed and extended the
+parametrized regression test from #173 to cover all worker modules
+in addition to routes — same logging contract applies (operators
+need stack traces in worker logs, doubly so for retried/async
+batch processing).
+
+### Fixed — All route except handlers now log with exc_info=True (#173)
+
+10 `except Exception as e:` blocks across 5 route modules
+(`document_import.py`, `health.py`, `ingest.py`, `providers.py`,
+`sessions.py`) called `logger.error(...)` without `exc_info=True`.
+Combined with #161 (entities) + #172 (dag), the entire
+`mnemos/api/routes/` tree now uses `exc_info=True` consistently.
+
+A new parametrized regression test in
+`tests/test_routes_exc_info_coverage.py` walks every route file in
+`mnemos/api/routes/` and asserts the contract — any future "polish"
+pass that drops `exc_info=True` from any route gets caught.
+Implementation uses a line-based scan rather than a multiline regex
+(catastrophic backtracking made the regex variant hang on dag.py).
+
+### Fixed — dag.py except blocks now log with exc_info=True (#172)
+
+5 `except Exception as e:` blocks in `mnemos/api/routes/dag.py`
+called `logger.error(f"... {e}")` without `exc_info=True`.
+Operators saw the exception's `__str__` in logs but no stack
+trace — hard to diagnose where the failure originated.
+
+Added `exc_info=True` to all 5 (DAG Log, Branches, Branch
+creation, Commit fetch, Merge failures), matching the #161
+entities-route pattern.
+
+2 tests in `tests/test_dag_route_error_logging.py`: source-level
+guard that every `except Exception as e:` block in dag.py
+calling `logger.error` includes `exc_info=True`; module-level
+guard that `logger` is defined at module scope.
+
+### Changed — EntityCreateRequest.entity_type tightened to Literal (#171)
+
+Last remaining `if request.X not in ENUM_CONSTANT` runtime check.
+`EntityCreateRequest.entity_type` is now `Literal["person",
+"project", "concept", "document", "decision", "event"]` mirroring
+the `ENTITY_TYPES` constant. Removed the runtime check at
+`create_entity` (was `HTTPException(400)`).
+
+Because `Literal[*ENTITY_TYPES]` (PEP 646 unpacking) isn't
+supported in stable Python yet, the values are duplicated. A
+parity test in `tests/test_entities_create_literal.py` reads the
+Literal annotations via `typing.get_type_hints` and asserts they
+equal `set(ENTITY_TYPES)` — a future addition to one without the
+other will fail loudly.
+
+13 tests: parity guard + 6 parametrized accepts (one per
+documented type) + 6 parametrized rejects (uppercase, trailing
+whitespace, trailing newline, undocumented value, empty,
+comma-injected).
+
+### Changed — Remaining enum-string fields tightened to Pydantic Literal (#170)
+
+Continuing the #168/#169 pattern, three more `str` fields validated
+at the route handler against fixed enums are now Literal[...]:
+
+- `MergeRequest.strategy` → `Literal["latest-wins", "manual"]`
+  (in mnemos/api/routes/dag.py)
+- `CompressionEnqueueRequest.reason` →
+  `Literal["on_write", "manual", "scheduled", "reprocess"]`
+- `CompressionEnqueueRequest.scoring_profile` →
+  `Literal["balanced", "quality_first", "speed_first", "custom"]`
+- Same Literal types applied to `CompressionEnqueueAllRequest`
+  (alias the type so the two models stay in sync).
+
+Removed 5 redundant runtime checks in
+`mnemos/api/routes/dag.py::merge_branch` and
+`mnemos/api/routes/admin.py::compression_enqueue` +
+`compression_enqueue_all`.
+
+4 existing tests updated from `HTTPException(422)`-from-handler to
+`ValidationError`-at-parse-time semantics. Two `_VALID_REASONS` /
+`_VALID_PROFILES` sets retained for any operator-introspection
+callers, with new public type aliases `CompressionReason` /
+`CompressionProfile` mirroring the Literal enums.
+
+### Changed — UserCreate.role + OAuthProvider.kind tightened to Pydantic Literal (#169)
+
+- `UserCreateRequest.role` was `str` validated at the route handler;
+  fixed comment said "user or root" but runtime accepted three
+  values. Tightened to `Literal["user", "root", "federation"]`.
+- `OAuthProviderCreateRequest.kind` was `str` validated at the
+  route handler. Tightened to `Literal["oidc", "oauth2"]`.
+- Removed the redundant runtime checks in
+  `mnemos/api/routes/admin.py`'s `create_user` and
+  `oauth_create_provider` handlers.
+- 1 existing test (`test_admin_still_rejects_arbitrary_roles`)
+  updated to expect `ValidationError` at model parse time instead
+  of `HTTPException` from the handler. 2 new tests in
+  `tests/test_oauth.py`: kind accepts "oidc"/"oauth2"; rejects
+  invalid (saml, uppercase, trailing whitespace, empty, unknown).
+
+### Changed — compat_mode tightened to Pydantic Literal (#168)
+
+- `FederationPeerCreateRequest.compat_mode` was `str` validated at
+  the route handler via `if request.compat_mode not in ("strict",
+  "permissive")`. Moved to
+  `Literal["strict", "permissive"]` so Pydantic auto-422s before
+  the handler runs, with field-level error detail and a proper
+  enum in the OpenAPI schema. Same tightening applied to
+  `FederationPeerUpdateRequest.compat_mode` (now
+  `Optional[Literal["strict", "permissive"]]`).
+- Removed the redundant runtime checks in
+  `mnemos/api/routes/federation.py`'s register_peer + update_peer
+  handlers.
+- 4 tests in `tests/test_federation.py`: accepts strict +
+  permissive; rejects invalid (loose, STRICT, trailing-space, "",
+  "off"); update path accepts None + valid value; update path
+  rejects invalid.
+
+### Fixed — Enforce FederationPeerCreateRequest.name constraint (#167)
+
+- The Pydantic field's docstring claimed "lowercase alnum + dash,
+  3-64 chars" but the field had no actual validator. Even though
+  only root can register peers, peer names get spliced into
+  federated memory IDs downstream — weird chars (newlines,
+  underscores, slashes) leaked into IDs.
+- Added `pattern=r"\A[a-z][a-z0-9\-]{2,63}\z"` (Pydantic v2 uses
+  Rust regex; `\z` is the end-of-string anchor) plus
+  `min_length=3`/`max_length=64` so the docstring's claim is now
+  enforced.
+- 2 tests in `tests/test_federation.py`: 5 valid shapes accepted
+  (peer-1, alpha-beta, p123, etc.); 13 invalid shapes rejected
+  (empty, too-short, too-long, uppercase, underscore, period,
+  whitespace, newline, null byte, leading digit/dash, slash,
+  non-ASCII).
+
+### Fixed — _sql_identifier / _sql_cast reject trailing newline (#166)
+
+- Added 45 boundary tests for `_sql_identifier` and `_sql_cast` in
+  `mnemos/core/security.py` — these helpers prevent SQL injection
+  via dynamic table/column/cast names interpolated into f-string
+  queries (used by `assert_owned_context`). They previously had no
+  direct test coverage; only their integration paths were
+  exercised.
+- The new tests caught a real validator gap: the regexes used
+  `^...$` anchors, but Python's `$` matches before a trailing
+  newline by default. So `_sql_cast("uuid\n")` returned without
+  raising. Postgres treats `\n` as whitespace so the immediate
+  exploit surface was limited, but the validator's contract is
+  "no whitespace, no control chars" — fixed by switching to `\A`
+  and `\Z` anchors which match only at start/end of string.
+
+### Added — Verify warning emission on bounded-backlog drop (#165)
+
+- `test_schedule_audit_persist_bounded_backlog` previously only
+  asserted the `_INFLIGHT_AUDIT_TASKS` set count didn't grow when
+  the cap was reached. Without verifying the warning log line, a
+  future refactor could silently drop the diagnostic — operators
+  hitting the cap would have no signal that audit rows were being
+  dropped. Test now uses `caplog` to assert the warning fires AND
+  names the dropped tool + caller (so operators can tell which
+  invocations they're losing).
+
+### Added — Parametrized writer coverage for all VALID_OUTCOMES (#164)
+
+- `tests/test_mcp_audit_log.py` parametrized
+  `test_insert_audit_record_accepts_each_valid_outcome` over all 6
+  values of `VALID_OUTCOMES` (called/success/failure/error/denied/
+  root_bypass). Earlier coverage only exercised "error" + the
+  garbage-rejection case; the new emission paths from #154
+  (rate-limit → "denied"), #156 (context-mismatch → "denied"), and
+  #157 (handler-failure → "failure") would have silently regressed
+  if the schema CHECK or repo validation drifted out of sync with
+  the dispatcher.
+
+### Fixed — Stdio bridge logs drained audit task count on shutdown (#163)
+
+- `mcp/stdio.py`'s drain finally-block discarded the
+  `drain_pending_audit_tasks()` return value, so stdio operators
+  had no observable signal that audit writes were waiting at
+  shutdown. The HTTP/SSE bridge already logged this; stdio now has
+  parity (`drained N pending mcp_audit_log persist task(s) on
+  shutdown`).
+- Source-level test in `tests/test_mcp_audit_log.py` pins the
+  capture+log pattern so a future refactor can't silently drop the
+  observability.
+
+### Fixed — Reject empty owner_id/namespace at /v1/export route (#162)
+
+- Added `min_length=1` constraint on `owner_id` and `namespace`
+  query parameters in `mnemos/api/routes/portability.py`. Empty
+  strings now fail-fast with HTTP 422 at the FastAPI validator
+  rather than silently reaching `export_memories` and producing
+  empty result sets (the SQL would filter `owner_id=""` /
+  `namespace=""`, which never matches a real memory).
+- Defense-in-depth alongside #159 (cursor decoder rejects empty
+  strings) and #160 (cursor encoder rejects empty strings). Now
+  the entire pipeline — request → validate → encode → decode —
+  rejects empty-string scope at every layer.
+- 2 tests in `tests/test_portability_v02_emission.py`: empty
+  owner_id rejected with 422; empty namespace rejected with 422.
+
+### Fixed — Entities route 500s now log the underlying exception (#161)
+
+- 4 `except Exception:` blocks in `mnemos/api/routes/entities.py`
+  raised HTTP 500 with no log entry. Operators saw "Internal
+  server error" in the response without any breadcrumb to diagnose
+  the underlying cause (DB connection drop, asyncpg error, etc.).
+  Added `logger.error(..., exc_info=True)` calls to all 4 (matching
+  the pattern that the create-entity handler already used).
+- 2 tests in `tests/test_entities_route_error_logging.py`: source-
+  level regression guard that every `except Exception:` block
+  contains `logger.error(..., exc_info=True)`; module-import guard
+  that `logger` is defined at module scope.
+
+### Fixed — Encoder also rejects empty-string scope (#160)
+
+- Defense-in-depth follow-up to #159: `_encode_deletion_log_cursor`
+  now also raises `ValueError` when `effective_owner=""` or
+  `effective_ns=""` is passed. Without this, the encoder would
+  happily pack an empty string into a cursor that the decoder
+  (post-#159) then rejects on the next page — symmetrical
+  validation at the source prevents the bug from propagating into
+  a cursor in the first place.
+- 2 tests in `tests/test_portability_v02_emission.py`: encoder
+  rejects empty string for both fields; encoder + decoder
+  round-trip continues to work for null scope (regression).
+
+### Fixed — Reject empty-string scope in deletion_log cursor decode (#159)
+
+- `_decode_deletion_log_cursor` previously accepted
+  `effective_owner=""` / `effective_ns=""` because the type check
+  was `isinstance(val, str)` and empty string passed. Cursors
+  produced by this server use `null` for unscoped, never an empty
+  string — an attacker constructing a cursor with empty-string
+  scope bypassed the per-tenant guard for root callers (the SQL
+  query would filter on `owner_id=""` / `namespace=""`, an
+  unexpected query shape that never matches a real memory but
+  shouldn't be reachable).
+- Tightened the type check to also reject empty strings with HTTP
+  400 ("must be a non-empty string or null"). Null remains the
+  documented value for unscoped root exports.
+- 3 new tests in `tests/test_portability_v02_emission.py`: empty
+  effective_owner rejected, empty effective_ns rejected, null scope
+  accepted (regression — must continue working for unscoped exports).
+
+### Added — Boundary tests for parameter_shape size limits + dead-code cleanup (#158)
+
+- 5 new tests in `tests/test_mcp_audit_log.py` covering the
+  `_validate_parameter_shape` size limits that previously had no
+  coverage:
+  - rejects key names over `_MAX_PARAMETER_SHAPE_KEY_LENGTH` (128)
+  - accepts key names at exactly the limit (boundary)
+  - rejects `item_types` lists over `_MAX_PARAMETER_SHAPE_ITEM_TYPES` (16)
+  - accepts `item_types` at exactly the limit (boundary)
+  - asserts `_MAX_PARAMETER_SHAPE_TYPE_NAME` was removed
+- Removed `_MAX_PARAMETER_SHAPE_TYPE_NAME = 32` — defined but never
+  read. The closed `_ALLOWED_SHAPE_TYPE_NAMES` allowlist is strictly
+  more restrictive than any 32-char ceiling would be, so the
+  constant was dead code. The new test pins the cleanup so a future
+  reintroduction can't go uncovered.
+
+### Changed — Handler "failure" return distinguished from raised "error" (#157)
+
+- `execute_tool` now emits `outcome="failure"` (instead of "error")
+  when a handler returns `{"success": False, ...}` without raising.
+  A raised exception continues to emit `outcome="error"`. The
+  schema's CHECK constraint already permitted both values; mapping
+  them to distinct outcomes lets operators query
+  `WHERE outcome = 'failure'` ("tool ran but said no") vs
+  `WHERE outcome = 'error'` ("tool raised") cleanly.
+- 3 tests in `tests/test_mcp_tool_security.py`: handler-returning-
+  False maps to "failure" with error_class="ToolError"; raised
+  exception maps to "error" with the raised type's name as
+  error_class; successful return maps to "success".
+
+### Changed — Context-mismatch denials emit outcome="denied" (#156)
+
+- The three `ContextMismatch` early-return paths in `execute_tool`
+  (caller_id, role, and namespace mismatch between transport-side
+  context and authenticated user) now audit with `outcome="denied"`
+  instead of `outcome="error"`. These represent attempted
+  cross-tenant or privilege-escalation requests, not internal
+  errors — operators querying denials should see them alongside
+  rate-limit denials.
+- Combined with #154 (rate-limit denials), this makes
+  `SELECT * FROM mcp_audit_log WHERE outcome = 'denied'` a
+  one-stop query for "any tool call that was rejected by policy" —
+  rate-limits + context-mismatches.
+- 3 tests in `tests/test_mcp_tool_security.py`: caller-id mismatch,
+  role mismatch, namespace mismatch.
+
+### Changed — Rate-limit denials in audit log emit outcome="denied" (#154)
+
+- `execute_tool`'s `PermissionError` handler now distinguishes
+  rate-limit denials from generic permission errors. When the
+  exception text contains `rate limit` (case-insensitive), the
+  audit row is recorded with `outcome="denied"` instead of
+  `outcome="error"`. The schema's CHECK constraint already permitted
+  both values (`called/success/failure/error/denied/root_bypass`),
+  but the dispatcher previously only emitted `error`, leaving
+  operators with no way to query rate-limit events distinctly.
+- After this change:
+  ```sql
+  SELECT * FROM mcp_audit_log WHERE outcome = 'denied'
+   ORDER BY created_at DESC;
+  ```
+  cleanly returns rate-limit denials. Generic
+  `PermissionError`/Resource-not-found cases continue to map to
+  `outcome="error"` (no semantic change).
+- 3 tests in `tests/test_mcp_tool_security.py`: rate-limit
+  PermissionError → "denied"; non-rate-limit PermissionError →
+  "error"; case-insensitive match (e.g. "Rate Limit Exceeded") →
+  "denied".
+
+### Added — Route-level trust-boundary tests for /v1/internal/mcp_audit (#153)
+
+- 8 tests in `tests/test_mcp_audit_route_trust_boundary.py` covering
+  the FastAPI dependency-injection wiring of
+  `_require_internal_audit_token` end-to-end via TestClient:
+  legacy mode (token unset) accepts authenticated bearer with no
+  audit header; legacy mode ignores even garbage audit headers;
+  locked-down mode (token set) accepts correct
+  `X-Mnemos-Audit-Token`, rejects missing / wrong / whitespace-only
+  values; constant-time-compare guard catches prefix-match attempts;
+  source-level guard ensures the route signature still wires the
+  trust-boundary dependency.
+- Existing `test_mcp_audit_log.py` covered the writers (insert,
+  persist_via_pool, persist_via_http) but didn't exercise the
+  dependency-injection wiring at the FastAPI route level — a future
+  refactor that dropped `Depends(_require_internal_audit_token)`
+  would have been caught only by manual inspection.
+
+### Added — Length-floor warning for short audit tokens (#155)
+
+- `_warn_if_audit_token_unset` now also warns when the configured
+  `[server].internal_audit_token` is set but shorter than
+  `_AUDIT_TOKEN_MIN_LENGTH` (32 chars / 128 bits). The lockdown
+  itself uses `hmac.compare_digest`, which doesn't care about
+  length — so a short token still locks down the endpoint, but a
+  4-char value is trivially brute-forceable. The autogen path
+  produces 64-char hex; anything dramatically shorter is almost
+  certainly an operator typo or placeholder.
+- Distinct message from the legacy-mode warning so operators can
+  disambiguate from log records. Names a copy-paste-ready remediation
+  (`python -c 'import secrets; print(secrets.token_hex(32))'`).
+- 5 new tests in `tests/test_audit_token_startup_warning.py`: warns
+  when too short, silent at exactly the floor, warns just below the
+  floor, distinguishes unset-vs-short, remediation guide included.
+
+### Added — Startup warning for legacy audit-token mode (#152)
+
+- **`_warn_if_audit_token_unset(settings)`** helper in
+  `mnemos/api/main.py` emits a one-time WARN at API import / boot
+  when `[server].internal_audit_token` is empty. After #150/#151 the
+  installer makes the autogen default-on, so an unset token at
+  runtime usually means an operator-initiated downgrade or a
+  partial/incomplete upgrade — surface it so nobody is surprised
+  that `/v1/internal/mcp_audit` is operating in legacy mode (any
+  authenticated bearer-token caller can POST audit rows).
+- **Remediation paths in the message.** Names BOTH the
+  `python -m mnemos.installer --upgrade` autogen route and the
+  `MNEMOS_INTERNAL_AUDIT_TOKEN` env-var override so operators can
+  pick whichever matches their deployment shape.
+- 6 tests in `tests/test_audit_token_startup_warning.py` (including
+  a source-level guard that the helper is invoked at import time).
+
+### Added — MCP audit token autogen on --upgrade path (#151)
+
+- **Surgical patch helper `_patch_config_toml_internal_audit_token`**
+  mirrors the embedding-dim helper: parse with tomllib, surgically
+  insert into the `[server]` block, atomic `install -m` write
+  preserving owner/group/mode. Idempotent — second call is a no-op
+  when the token is already populated.
+- **Wired into `--upgrade` flow** after the embedding-dim refresh.
+  Brings legacy v5.3.4-era installs (where #148 added the env var
+  but operators rarely set it) up to the #150 default-on posture
+  without rewriting profile-derived defaults the operator may have
+  tuned. Matches the same `MNEMOS_CONFIG_PATH` resolution semantics
+  as the embedding-dim patch — patches the file the runtime reads.
+- **Soft failure mode.** If the patch can't run (unreadable config,
+  malformed TOML, atomic-write failure), the upgrade still
+  succeeds and a warning explains how to hand-edit the token in.
+  This is intentional: the upgrade itself completed, and the audit
+  endpoint operates in legacy mode without the token — degraded
+  but functional.
+- **Honors `MNEMOS_INTERNAL_AUDIT_TOKEN` env** at upgrade time so
+  operators can rotate the token as part of the upgrade.
+- 11 tests in `tests/test_installer_audit_token_upgrade_patch.py`
+  covering: insertion when missing, no-op when populated, replace
+  empty/quoted placeholder, append section when missing, env-var
+  rotation, preservation of unrelated [server] settings (port,
+  profile, base IPv6 URL, workers), unparseable-config soft fail,
+  missing-file soft fail, file-mode preservation, idempotency on
+  repeated runs, source-level guard that the upgrade dispatcher
+  invokes the patcher AFTER the embedding-dim patch.
+
+### Added — MCP audit token autogen at install time (#150)
+
+- **Installer auto-populates `[server].internal_audit_token`** in
+  config.toml on first install (or re-install where the field is
+  empty), via `secrets.token_hex(32)` (256-bit hex). The trust
+  boundary on `/v1/internal/mcp_audit` is now default-on for new
+  installs rather than requiring operators to manually set the env
+  var first — without the autogen, most operators would leave the
+  endpoint in legacy mode (any authenticated caller can POST audit
+  rows).
+- **Resolver priority**: `MNEMOS_INTERNAL_AUDIT_TOKEN` env (operator
+  override / rotation) → existing token in the runtime-resolved
+  config (honors `MNEMOS_CONFIG_PATH` so we read the same file the
+  service reads, avoiding API/bridge token skew) → existing token in
+  the in-memory config being patched → fresh `secrets.token_hex(32)`.
+- **`_resolve_config_write_target` honors MNEMOS_CONFIG_PATH.** The
+  writer now patches the file the runtime actually reads when the
+  env var is set, instead of dumping the autogen token into a stale
+  `repo_path/config.toml` the service will never load.
+- **`_set()` regex hardened** with line-anchored section + key
+  detection — `(?:^|\n)\[<sec>\]` for headers, `\n[ \t]*` consumed
+  before the key (preserves indented TOML keys; rejects
+  commented-out `# key = ...` lines because `\n[ \t]*#` followed by
+  the key char fails). Also rejects mid-line `[` (IPv6 URL literals
+  like `base = "http://[::1]:5002"` are content, not boundaries).
+  Affects ALL fields the installer patches, not just
+  internal_audit_token.
+- **TOML-aware parsing + post-write validation.**
+  `_read_existing_internal_audit_token` uses `tomllib` (stdlib,
+  py3.11+) for the read side; the writer validates the patched
+  content with `tomllib.loads()` AND asserts `parsed[server].
+  internal_audit_token` is non-empty before replacing the file. A
+  regex slip that lands malformed TOML or an empty key fails
+  loudly with the original file unchanged.
+- Wired into both `_write_config_toml` (existing config path) and
+  `_render_minimal_config` (no-example minimal config). config.toml
+  is already written with mode `0o600`, so the secret stays sensitive.
+- 5 codex rounds, 6 commits (`748548e..8e8fac6`); 29 tests in
+  `tests/test_installer_audit_token_autogen.py`; full suite 2080.
+
+### Added — MCP audit Phase-D shutdown drain (#149)
+
+- **Tracked audit tasks** in `_INFLIGHT_AUDIT_TASKS` set; each
+  scheduled task is added on creation and removed via
+  `add_done_callback` so the set always reflects in-flight writes.
+- **`drain_pending_audit_tasks(timeout)` helper.** Called from all
+  three transport teardowns: API FastAPI lifespan
+  (`register_lifespan_cleanup_hook("mcp audit drain", ...)`), MCP
+  stdio `main()` finally block, and MCP HTTP/SSE Starlette
+  `on_shutdown=[...]`. Drain timeouts log a warning with the
+  still-pending count but don't propagate — shutdown must complete.
+- **Bounded backlog.** `_MAX_INFLIGHT_AUDIT_TASKS = 1024`. At the
+  cap, `_schedule_audit_persist` refuses new schedules with a
+  warning log so an audit-DB outage doesn't unbounded-grow the set.
+  The Python logger entry is still emitted (always-on surface), so
+  the call isn't a silent loss.
+
+### Added — MCP audit `/v1/internal/mcp_audit` lockdown (#148)
+
+- **`MNEMOS_INTERNAL_AUDIT_TOKEN` env** (`_ServerSettings.
+  internal_audit_token`). When set, `/v1/internal/mcp_audit`
+  requires `X-Mnemos-Audit-Token: <value>` matching the env
+  (constant-time `hmac.compare_digest`). Any token holder who
+  doesn't share the env can't POST audit rows. When unset, the
+  endpoint operates in legacy bearer-token mode for phased rollout.
+- **Bridge auto-includes the header.**
+  `persist_audit_record_via_http` reads
+  `settings.server.internal_audit_token` and adds the header when
+  configured. Bearer auth on the underlying tool calls still
+  establishes caller_user_id/role attribution; the new token is
+  purely a trust-boundary gate.
+
+### Added — MCP audit Phase-D durable surface (#146)
+
+- **New `mcp_audit_log` table** (`db/migrations_v5_3_4_mcp_audit_log.sql`)
+  with idempotent migration + sqlite parallel + `GRANT SELECT, INSERT
+  TO mnemos_user` for installer-managed Postgres upgrades. Schema:
+  `id, caller_user_id, role, tool, parameter_shape JSONB, outcome,
+  error_class, created_at`. Outcome `CHECK` constraint covers
+  `called/success/failure/error/denied/root_bypass`. Three indexes
+  for the common operator queries (`created_at DESC`,
+  `(caller_user_id, created_at DESC)`, `(tool, created_at DESC)`).
+- **New `mnemos.db.mcp_audit_repo`** with three writers:
+  `insert_audit_record(conn, ...)` (postgres-only, sqlite skipped
+  like `deletion_log`), `persist_audit_record_via_pool` (in-process
+  API path), `persist_audit_record_via_http` (standalone MCP bridge
+  fallback against `/v1/internal/mcp_audit`). The combined
+  `persist_audit_record` entry point tries pool first, falls back
+  to HTTP — so both API-process and standalone bridge deployments
+  persist transparently.
+- **New internal route `POST /v1/internal/mcp_audit`** in
+  `mnemos/api/routes/mcp_audit.py`. Bearer auth via existing MCP
+  token mechanism. `caller_user_id` and `role` derived from the
+  auth context (NOT from body fields) so bridges cannot forge
+  attribution. Strict `_validate_parameter_shape` validator rejects
+  raw values: closed allowlist for `type` and `item_types`
+  (`str/bool/int/float/list/dict/none/bytes/tuple/set/frozenset/
+  NoneType`), max 64 keys, max 16 item_types per entry, no nested
+  dicts. The redaction guarantee documented for this table is
+  enforced at the trust boundary, not just at the dispatcher.
+- **Per-user MCP token preferred over global** in the http
+  fallback. `MNEMOS_MCP_TOKENS=user:mcp_token:api_key` mode sets
+  the per-call backend api_key in MCP context;
+  `persist_audit_record_via_http` reads
+  `current_mcp_backend_api_key()` first, falls back to
+  `settings.server.api_key` for single-user / API-process
+  deployments.
+- **Root-bypass entries tagged.** `_mcp_log_root_bypass` writes
+  with `outcome='root_bypass'`, supporting operator queries like
+  `SELECT * FROM mcp_audit_log WHERE outcome = 'root_bypass'`
+  for elevation-event review.
+- **KNOWN_LIMITATIONS.md updated** to reflect Phase-D shipped with
+  documented residuals: trust boundary on `/v1/internal/mcp_audit`
+  (any token can POST self-attributed rows; needs bridge-only
+  credential or mTLS in v5.3.5+) and untracked audit task on
+  shutdown (stdio bridge can exit before HTTP POST completes;
+  needs bounded lifecycle queue + drain in v5.3.5+).
+
+### Added — MPF v0.2 deletion_log keyset cursor pagination (#142)
+
+- **Composite index on `deletion_log (executed_at, id)`** for
+  keyset performance (`migrations_v5_3_3_deletion_log_export_index.sql`).
+- **Keyset cursor pagination** in
+  `mnemos.domain.portability.export.export_memories`. Tuple
+  comparison `(executed_at, id) > ($cursor::timestamptz, $id::uuid)`
+  splits >50k tied-timestamp tombstone buckets that the round-141
+  time-window pagination couldn't.
+- **Self-contained opaque cursor** carrying keyset position
+  (executed_at, id), snapshot anchor (`export_as_of` from DB-side
+  `SELECT now()`, NOT app clock), original window
+  (`deletion_log_from/to`, with explicit `null` for unbounded
+  sides), and tenant scope (`effective_owner`, `effective_ns`).
+  Subsequent pages derive window AND scope SOLELY from cursor;
+  combining `deletion_log_cursor` with `owner_id`/`namespace`/
+  `deletion_log_from`/`deletion_log_to`/empty-string-cursor is
+  rejected at the route with HTTP 400.
+- **Cursor anti-forgery for non-root callers.** Cursor scope is
+  unsigned base64-JSON, so a non-root attacker could mint a cursor
+  with a victim's owner/namespace. Non-root callers' cursor
+  `effective_owner` and `effective_ns` MUST equal
+  `user.user_id`/`user.namespace`, else HTTP 403. Root accepts
+  cursor scope as canonical (root has explicit cross-tenant
+  authority).
+- **Scope binds ALL envelope surfaces.** Cursor decode happens
+  BEFORE the read-only transaction, so records, KG triples,
+  memory_versions, compression_manifest, AND deletion_log all use
+  the cursor-bound scope on subsequent pages. Round-3 caught the
+  earlier shape where only deletion_log used cursor scope.
+- **Legacy pre-round-4 cursors rejected** with HTTP 400 ("restart
+  pagination from page 1"). No silent fallback to request-derived
+  scope (which the route also rejects).
+- **Route guard:** `deletion_log_cursor` / `deletion_log_from` /
+  `deletion_log_to` require `include_sidecars=true` AND
+  `mpf_version=0.2`; otherwise 400 instead of silent no-op (which
+  could let an operator's pagination loop terminate prematurely).
+- **Late-commit caveat documented.** `executed_at <= export_as_of`
+  is best-effort, not a true cross-call MVCC snapshot. A deletion
+  transaction that begins before page 1 and commits after page 1
+  has its row become visible on later pages, but its `executed_at`
+  may sort before the cursor and be silently skipped. Operational
+  mitigations (quiesce deletes, run pages back-to-back, cross-check
+  by count) documented in `export_memories` docstring; full fix
+  (held-snapshot via `pg_export_snapshot()` + materialized export
+  jobs) roadmap'd for MPF v0.3.
+
+### Changed — Postgres upgrade hardening (#138)
+
+Codex-reviewed across rounds 17-49, closing 33 codex findings; the
+v5.3.4 cut targets the common single-cluster local install + remote-
+DSN reject paths.
+
+- **`_resolve_runtime_backend` now mirrors runtime priority exactly**
+  per pydantic-settings 2.10.1 semantics. `backend` field uses
+  `validation_alias`, so env `PG_BACKEND` overrides init kwargs
+  (TOML); empirically verified.
+  `host`/`port`/`database`/`user` use `env_prefix='PG_'` with no
+  validation_alias, so init kwargs (TOML) win over env. The
+  installer's `_resolve_runtime_backend` and `_resolve_db_field_strict`
+  reflect the per-field split.
+- **`MNEMOS_CONFIG_PATH` honored** across resolver, loader, and
+  post-migration patch+verify. Hardcoded `repo_path/config.toml` was
+  replaced with `_resolve_runtime_config_path` that mirrors runtime
+  `_config_paths` order. Operator-cwd `config.toml` is NOT a
+  candidate (the installer runs in operator's shell, not the
+  service's `WorkingDirectory=repo_path`), so a stray cwd config
+  cannot shadow the actual installed service config.
+- **`_psql_superuser` / `_psql_superuser_file` use `-v ON_ERROR_STOP=1`**
+  so psql exits non-zero on the first SQL error in a `-c` or `-f`
+  invocation. Previously psql could continue past non-fatal errors
+  and exit 0, letting `run_migrations()` report 'OK' on partial
+  schema drift.
+- **`run_migrations` fails fast on the first failed migration file.**
+  Migration order is documented as load-bearing; previous behavior
+  set `success=False` and kept applying later files, leaving
+  ambiguous schema drift. Combined with `ON_ERROR_STOP=1`, the
+  first SQL error in any migration aborts the whole run.
+- **Backend-aware `--upgrade` dispatch.** Profile-only dispatch
+  (which round-19 introduced) was wrong because profile is a
+  deployment-shape signal (where the workload runs), not a DB-
+  backend signal (what the DB actually is). The new
+  `_resolve_runtime_backend` is consulted before dispatch:
+  `sqlite` → `setup_sqlite_database`, `postgres` → `run_migrations`.
+  DSN/url-based configs (DATABASE_URL/MNEMOS_DATABASE_URL/PG_URL +
+  DSN variants + [database].url/[database].dsn in TOML) are
+  explicitly refused with 400; the runner is not DSN-aware.
+- **`_is_local_postgres_host` narrowed.** Accepts only
+  `None`/`""`/`"localhost"`. Explicit IPs (`127.0.0.1`, `::1`)
+  rejected as TCP-intent that diverges from the socket-based
+  migration runner. Whitespace-only and padded values
+  (`" localhost "`, `"127.0.0.1\n"`) fail closed at both the
+  loader (with a clear "trim the whitespace or fix the typo" error)
+  and the locality guard.
+- **Empty/malformed `PG_PORT`/`embedding_dim`/`backend` fail closed**
+  with a `ValueError`, matching runtime Pydantic
+  `ValidationError`. Distinguishes absent (None / empty string,
+  fall through to default) from present-but-malformed (raise).
+- **`run_migrations` validates `db_name` as a bare identifier**
+  (Round-50 finding 2). Without `_validate_identifier`,
+  `psql -d "host=10.0.0.5 port=5432 dbname=staging"` would have
+  bypassed every host/port/DSN/url guard and connected to whatever
+  the conninfo encoded.
+- **Per-user `MNEMOS_PROFILE_OVERRIDE` env supported.** Mirrors
+  runtime `_profile_from_sources` priority:
+  `MNEMOS_PROFILE_OVERRIDE` > `[server].profile` >
+  `[deployment].profile` > `MNEMOS_PROFILE` > backend/conn-field
+  inference > legacy `personal` → `edge`. Installer CLI flag
+  `--profile <p>` now sets `MNEMOS_PROFILE_OVERRIDE` so it wins
+  over stale TOML.
+- **Two residual round-50 limitations documented.** `localhost`
+  with asyncpg uses TCP (resolves via DNS), while psql with no
+  `-h` uses the socket — multi-cluster hosts can have these
+  point to different DBs. Closing this needs a TCP-aware migration
+  runner (out of scope for v5.3.4). And the existing residuals
+  in KNOWN_LIMITATIONS.md (MCP write quota, GDPR write-fence)
+  remain.
+
+### Fixed — Migration list drift across installer/sqlite/docker-compose (#143, #146)
+
+- 4 v5.1+ postgres migrations and 2 sqlite migrations had drifted
+  away from EXPECTED_MIGRATIONS, EXPECTED_SQLITE_MIGRATIONS,
+  docker-compose.yml, and docker-compose.staging.yml. All 4
+  surfaces now sync; the regression test passes 7/7.
+- `migrations_v5_3_4_mcp_audit_log.sql` (#146) appended to all
+  surfaces in the same shape.
+
+### Fixed — Connector gallery references (#144)
+
+- Commit 5b92ab6 deliberately removed `docs/connectors/continue-dev.md`
+  as orphan after v5.0.11 introduced `continue.md` as canonical.
+  Four sites still referenced the old slug, breaking 2 connector
+  smoke tests:
+  - `tests/test_connector_smoke.py:43` (STDIO_SURFACES tuple)
+  - `tests/test_connector_doc_configs.py:194` (EXPECTED_DOCS)
+  - `tests/test_mcp_namespace_isolation.py:4` (module docstring)
+  - `mnemos/mcp/tools/memory.py:32` (_ns_with_default helper docstring)
+  All four updated to canonical `continue.md`.
+
+### Added — Configurable SQLite embedding dim
+
+- `_DatabaseSettings.embedding_dim` (default 768) reads `MNEMOS_EMBEDDING_DIM`
+  or `PG_EMBEDDING_DIM`. Lets the same source build target multiple embedding
+  models — 768 for nomic-embed-text (PYTHIA fleet default), 512 for
+  bge-small-zh-v1.5 (Cix Sky1 NPU substrate), 1536 for OpenAI
+  text-embedding-3-small, 3072 for text-embedding-3-large. Range: [1, 8192]
+  per sqlite-vec `SQLITE_VEC_VEC0_MAX_DIMENSIONS`. Out-of-range values warn
+  and fall back to 768.
+- **Dim-mismatch is now fatal at startup, not silent degradation.** Both the
+  vec0 virtual table (`memory_embedding_vec`) and the fallback shadow table
+  (`memory_embeddings`) are checked on `SqliteBackend.open()`. If the existing
+  dim differs from the resolved dim, a `RuntimeError` is raised with the
+  exact `sqlite3` commands the operator must run to migrate. Refusing to
+  start beats running new-dim queries against stale-dim rows and returning
+  meaningless cosine scores.
+- **Installer threads `embedding_dim` end-to-end.** `MNEMOS_EMBEDDING_DIM`
+  read at install time is persisted to the generated `config.toml`
+  (`[database] embedding_dim = N`) and to the systemd `EnvironmentFile`
+  (`/etc/mnemos/mnemos.env` → `MNEMOS_EMBEDDING_DIM=N`), so subsequent
+  service restarts run with the same dim the install was sized for. Without
+  this, an install at 512 followed by a default-env service start at 768
+  would trip the dim-mismatch guard. All three installer modes — `--unattended`,
+  `--wizard`, and `--agent` — apply `MNEMOS_EMBEDDING_DIM` via the centralized
+  `_apply_embedding_dim_from_env()` helper.
+- **Runtime embedding-dim invariant.** `SqliteMemoryRepository.semantic_search()`
+  and `upsert_memory_embedding()` now validate `len(embedding)` against the
+  configured dim on every call and raise `ValueError` with actionable
+  troubleshooting on mismatch. Without this, a misconfigured embedding
+  endpoint after startup (e.g. swapped to a different model mid-flight)
+  could poison the table or silently degrade search to "rank by recency"
+  (cosine returns 0.0 on length mismatch).
+- **Exhaustive fallback-dim scan at startup.** Replaced the single-row
+  sample with `_scan_fallback_embedding_dims()` that builds a `{dim: count}`
+  histogram across all `memory_embeddings` rows via
+  `json_array_length()`. A DB poisoned before the runtime invariant landed
+  could have mixed-dim rows; sampling could pick a matching row and hide
+  the corruption. The startup guard now reports the exact stale-dim shape
+  (e.g. `dim=768 x42`) in its error message and refuses to start until
+  every row matches the configured dim.
+
+### Added — Postgres embed-dim ALTER on fresh install
+
+- `_alter_postgres_embedding_dim()` runs after migrations apply. When
+  `cfg.embedding_dim != 768` it inspects the existing column type via
+  `format_type(atttypid, atttypmod)` and:
+  - Returns idempotent OK if the column already matches `vector(<dim>)`,
+    even on populated tables. Re-running the installer with the same
+    dim is a no-op.
+  - On a fresh install with type mismatch, ALTERs the column to the
+    target dim. Cheap (no rows to re-embed).
+  - On a populated install with type mismatch, refuses with a
+    Postgres-correct transactional recovery command (`BEGIN; UPDATE
+    memories SET embedding=NULL; ALTER … TYPE vector(<dim>) USING NULL;
+    COMMIT;`). The previous draft mistakenly referenced the SQLite-only
+    `memory_embeddings` table — fixed.
+- Capped at 2000 dimensions for pgvector ivfflat compatibility (the
+  baseline `idx_memories_embedding` is ivfflat). Above 2000-D the
+  installer fails closed — the previous version returned True and
+  silently let the installer persist e.g. 3072 into config while
+  leaving the DB at 768, breaking runtime cosine. Halfvec / no-ANN
+  strategies for >2000-D dims are a separate scope.
+- COUNT(*) safety gate fails closed on any error (psql rc != 0,
+  unparseable output). The ALTER uses `USING NULL` which clears all
+  embedding rows it rewrites — running it under uncertainty about the
+  row count would silently destroy data on a populated DB.
+- COUNT and ALTER run under a single ACCESS EXCLUSIVE table lock via a
+  plpgsql DO block (`LOCK TABLE memories IN ACCESS EXCLUSIVE MODE; …;
+  ALTER …`). Splitting them into separate sessions would race against
+  any concurrent writer that inserts a row between our COUNT-returns-0
+  and our ALTER-takes-its-lock — that row would be silently nulled.
+  Refusal on populated DB happens via `RAISE EXCEPTION` inside the
+  block; the wrapper detects the `MNEMOS_EMBED_DIM_REFUSE` marker and
+  renders operator-facing recovery instructions.
+- `--upgrade` now round-trips `embedding_dim` from `config.toml`. Before,
+  `_load_existing_config()` skipped the field; an existing 512-D install
+  would lose its dim on `--upgrade`, default back to 768, skip the
+  ALTER entirely, and leave config + DB schema mismatched.
+- `--upgrade` also re-persists `embedding_dim` to config.toml and the
+  managed service env file after a successful migration. Without this,
+  a one-shot `MNEMOS_EMBEDDING_DIM=512 ... --upgrade` against a 768-D
+  config would ALTER the DB to 512 but leave config.toml + service env
+  at 768; the next normal service start would then send 768-D queries
+  against a 512-D pgvector column and fail at runtime.
+- The post-migration persistence step is fatal-on-fail. The DB may
+  already be at `vector(<new dim>)` when we try to update config.toml
+  and `/etc/mnemos/mnemos.env`; if either write fails OR the config.toml
+  read-back doesn't reflect the expected dim, `--upgrade` returns 1 with
+  explicit manual-fix instructions. The previous best-effort behavior
+  swallowed exceptions and ignored `_write_env_file()`'s False return,
+  letting automation report a successful upgrade with mismatched config.
+- `_load_existing_config()` now infers `profile=server` from a config.toml
+  that has `[database].backend = "postgres"` or explicit non-default
+  postgres connection fields, even when no `[server].profile` is set.
+  The previous default-to-edge behavior would silently rewrite a postgres
+  install as sqlite on next `_write_config_toml`, since edge/dev profiles
+  imply sqlite. Explicit `[server].profile` still wins.
+- New `_patch_config_toml_embedding_dim()` does a surgical regex update of
+  only `[database].embedding_dim`. The `--upgrade` flow uses this instead
+  of `_write_config_toml()` so it doesn't accidentally rewrite
+  profile-derived defaults like `[database].backend`, `[rate_limit]
+  storage_uri`, `[graeae] mode_default`, `[logging] level`, or
+  `[compression] workers`. A model-swap upgrade preserves every other
+  production setting verbatim.
+- New `_patch_service_env_embedding_dim()` does the same surgical update
+  for `MNEMOS_EMBEDDING_DIM` in the systemd `EnvironmentFile`. The full
+  `_write_env_file()` would rebuild the file from `cfg.graeae_providers`
+  (which `_load_existing_config()` doesn't repopulate on `--upgrade`),
+  silently erasing `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`,
+  `TOGETHER_API_KEY`, and any operator-managed lines. Surgical patch
+  preserves all of them. The temp file is staged in the system temp dir
+  (not in `dirname(env_path)`) so `tempfile.mkstemp` doesn't raise
+  PermissionError on the root-owned `/etc/mnemos` shape; the patcher
+  then tries `os.replace` and falls back to `sudo install` preserving
+  uid/gid/mode of the existing file.
+- `--upgrade` skips the env patch (instead of failing) when the systemd
+  EnvironmentFile doesn't exist. Config-based upgrades can't tell the
+  difference between a systemd install, a no-service install, and a
+  non-Linux deployment — config.toml doesn't persist `cfg.create_service`.
+  `MNEMOS_NO_SERVICE_ENV=1` provides an explicit opt-out for no-service
+  shapes. Operators on launchd / no-service receive a clear note in
+  stderr explaining how to set the env var manually if needed.
+- The env-file replace path always uses `install -m -o -g` (preserving
+  uid/gid/mode from the existing file), with sudo as fallback when
+  permission denied. The previous direct `os.replace` from system temp
+  would install the new file as `root:root` when run as root, locking the
+  `mnemos` service group out, and would also raise `EXDEV` on hosts
+  where /tmp is a separate filesystem.
+- `--upgrade` handles a missing config.toml without unconditionally
+  failing. For env-only / container-shaped deployments where there's no
+  config.toml on disk, the upgrade verifies that `MNEMOS_EMBEDDING_DIM`
+  in the environment matches the upgrade target dim and accepts. If they
+  diverge, the installer refuses with explicit instructions to persist
+  the env var in the launcher before retrying.
+- `_patch_config_toml_embedding_dim()` mirrors the env-file patcher's
+  ownership-preserving pattern. The previous `os.replace` from a
+  0600-mode tempfile would install the patched config.toml as the
+  running uid:gid with 0600 — breaking the `mnemos` service group's
+  read access on a root:mnemos 0640 production shape. The fix reads
+  uid/gid/mode from the existing file and goes through `install -m -o
+  -g` (with sudo fallback) so the metadata is preserved verbatim.
+- `_config_from_env()` now accepts both `MNEMOS_DB_*` (the installer's
+  unattended-install convention) AND `PG_*` (what `service._write_env_file()`
+  emits to the systemd EnvironmentFile, and what runtime config parses).
+  Without the PG_* fallbacks, a container shape that mirrored the
+  service env file would hit `--upgrade` with cfg defaults
+  (localhost/mnemos/mnemos_user) and target the wrong DB.
+  `_load_existing_config()` similarly falls back to env mode when either
+  `MNEMOS_DB_PASSWORD` OR `PG_PASSWORD` is set, so an env-only deploy
+  using just PG_* vars (no config.toml) is supported. MNEMOS_* aliases
+  win when both shapes are set.
+- `_patch_config_toml_embedding_dim()` now uses `tomllib` to validate the
+  file is parseable TOML before patching, and re-validates the result
+  after patching. The header-line regex tolerates leading whitespace and
+  trailing inline comments (both valid TOML). If `tomllib` parses a
+  `[database]` table that the regex can't safely span (e.g.,
+  `[[database]]` array-of-tables), the patcher refuses with a clear
+  error rather than appending a duplicate `[database]` section that
+  would corrupt the file post-ALTER.
+- Installer aborts (`return 1`) if `run_migrations()` returns False,
+  preventing config.toml + service env from getting written at the
+  configured dim while the DB schema stays at the old type.
+- The base `db/migrations.sql` still defines `vector(768)` as the
+  cold-path baseline; `_alter_postgres_embedding_dim()` is invoked
+  unconditionally (idempotent — short-circuits when type already
+  matches). The previous `embedding_dim != 768` short-circuit silently
+  let an existing 512-D install downgrade to a "successful" 768 install
+  while the column stayed at 512.
+
 ## [5.0.0] — 2026-05-02
 
 Major release closing the v3.6 / v4.x charters and absorbing the
@@ -363,10 +1904,10 @@ group by area rather than by intermediate version.
   conn.transaction():`` wraps the memory INSERT and
   ``_dispatch_webhook(conn=conn)`` so the delivery row joins
   the same transaction (corpus-review-2026-04-29 #2 closure).
-  Single-file ``POST /v1/import/document`` returns 207 Multi-
+  Single-file ``POST /v1/documents/import`` returns 207 Multi-
   Status when ``errors`` is non-empty + 502 Bad Gateway when
   every chunk failed on a retryable infra fault; multi-file
-  ``POST /v1/batch-import`` aggregates per-file
+  ``POST /v1/documents/batch-import`` aggregates per-file
   ``status_code`` into a top-level 207 (mixed) or 502
   (every per-file ``status_code == 502``) so HTTP-status-
   only clients see partial / full failure even when the

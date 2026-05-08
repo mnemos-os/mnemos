@@ -34,9 +34,9 @@ CREATE TABLE IF NOT EXISTS model_registry (
     graeae_weight         NUMERIC(5, 4),                 -- normalized weight used by GRAEAE engine (0.50–1.00)
 
     -- Lifecycle timestamps
-    first_seen            TIMESTAMP   NOT NULL DEFAULT NOW(),
-    last_seen             TIMESTAMP   NOT NULL DEFAULT NOW(),
-    last_synced           TIMESTAMP   NOT NULL DEFAULT NOW(),
+    first_seen            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_seen             TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    last_synced           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
     -- Full API response payload for debugging / future fields
     raw                   JSONB       DEFAULT '{}',
@@ -58,7 +58,7 @@ CREATE INDEX IF NOT EXISTS idx_model_registry_last_synced     ON model_registry(
 CREATE TABLE IF NOT EXISTS model_registry_sync_log (
     id           UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
     provider     VARCHAR(50) NOT NULL,
-    synced_at    TIMESTAMP   NOT NULL DEFAULT NOW(),
+    synced_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     models_found INT         NOT NULL DEFAULT 0,
     models_added INT         NOT NULL DEFAULT 0,
     models_updated INT       NOT NULL DEFAULT 0,

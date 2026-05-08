@@ -5,8 +5,8 @@ docling_import.py - IBM Docling integration for importing documents as MNEMOS me
 Supports PDF, DOCX, DOC, HTML, HTM, Markdown, PPTX, TXT via Docling.
 
 CLI usage:
-    python tools/docling_import.py --file /path/to/doc.pdf --endpoint http://localhost:5002
-    python tools/docling_import.py --source /path/to/docs --endpoint http://localhost:5002 \
+    python -m mnemos.tools.docling_import --file /path/to/doc.pdf --endpoint http://localhost:5002
+    python -m mnemos.tools.docling_import --source /path/to/docs --endpoint http://localhost:5002 \
         --category documents --chunk-size 800 --overlap 100 --recursive --tags "tag1,tag2"
 
 Library usage:
@@ -410,14 +410,14 @@ def _build_parser() -> argparse.ArgumentParser:
         epilog="""
 Examples:
   # Single file
-  python tools/docling_import.py --file report.pdf --endpoint http://localhost:5002
+  python -m mnemos.tools.docling_import --file report.pdf --endpoint http://localhost:5002
 
   # Directory (recursive)
-  python tools/docling_import.py --source /docs --recursive --category documents \\
+  python -m mnemos.tools.docling_import --source /docs --recursive --category documents \\
       --tags "project,q1" --dry-run
 
   # With auth
-  python tools/docling_import.py --file deck.pptx --api-key secret123
+  python -m mnemos.tools.docling_import --file deck.pptx --api-key secret123
 """,
     )
 

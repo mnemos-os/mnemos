@@ -97,7 +97,7 @@ async def tool_log_memory(
             }
 
     except Exception as e:
-        logger.error(f"[MCP] log_memory failed: {e}")
+        logger.error(f"[MCP] log_memory failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
@@ -144,7 +144,7 @@ async def tool_branch_memory(
             return await mcp_repo.create_memory_branch(conn, memory_id, name, from_commit, user)
 
     except Exception as e:
-        logger.error(f"[MCP] branch_memory failed: {e}")
+        logger.error(f"[MCP] branch_memory failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
@@ -219,7 +219,7 @@ async def tool_diff_memory_commits(
             }
 
     except Exception as e:
-        logger.error(f"[MCP] diff_memory_commits failed: {e}")
+        logger.error(f"[MCP] diff_memory_commits failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 
@@ -286,7 +286,7 @@ async def tool_checkout_memory(
             }
 
     except Exception as e:
-        logger.error(f"[MCP] checkout_memory failed: {e}")
+        logger.error(f"[MCP] checkout_memory failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 

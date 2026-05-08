@@ -87,11 +87,10 @@ SEED_MEMORY_ID = "mem_charon_alice_001"
 SEED_KG_ID = "kg_charon_alice_001"
 SEED_OWNER = "alice"
 SEED_NAMESPACE = "alice-ns"
-# memories.created/updated are TIMESTAMP (naive) per migrations.sql;
-# memory_versions.snapshot_at and others are TIMESTAMPTZ. Use naive
-# UTC and let the handler's _parse_iso normalize on round-trip.
-SEED_TIMESTAMP = datetime(2026, 1, 15, 10, 30, 0)
-SEED_TIMESTAMP_TZ = datetime(2026, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
+# v5.0.3 upgrades memories.created/updated to TIMESTAMPTZ, matching the
+# sidecar tables. Keep fixture datetimes aware so asyncpg encodes them
+# against the current schema.
+SEED_TIMESTAMP = datetime(2026, 1, 15, 10, 30, 0, tzinfo=timezone.utc)
 
 
 async def _seed(pool):
@@ -143,8 +142,8 @@ async def _seed(pool):
                 """,
                 SEED_KG_ID, "Paris", "capitalOf", "France",
                 "place", "place",
-                SEED_TIMESTAMP_TZ, SEED_MEMORY_ID, 0.95,
-                SEED_TIMESTAMP_TZ, SEED_OWNER, SEED_NAMESPACE,
+                SEED_TIMESTAMP, SEED_MEMORY_ID, 0.95,
+                SEED_TIMESTAMP, SEED_OWNER, SEED_NAMESPACE,
             )
 
             # 3. memory_version: the mnemos_version_snapshot() trigger
@@ -179,7 +178,7 @@ async def _seed(pool):
                 "Paris is the capital of France.",
                 SEED_OWNER, SEED_NAMESPACE, 600,
                 "claude-opus-4-7", "anthropic", "session_charon", "tester",
-                SEED_TIMESTAMP_TZ, "alice", "update",
+                SEED_TIMESTAMP, "alice", "update",
                 "abc123def456", "main",
             )
 
@@ -205,7 +204,7 @@ async def _seed(pool):
                 "apollo", "1.0",
                 "PAR=cap(FRA)", 10, 2.5,
                 0.81, "balanced", False, True,
-                "claude-opus-4-7", SEED_TIMESTAMP_TZ,
+                "claude-opus-4-7", SEED_TIMESTAMP,
             )
             await conn.execute(
                 """
@@ -222,7 +221,7 @@ async def _seed(pool):
                 "apollo", "1.0", "PAR=cap(FRA)",
                 4, 2.5,
                 0.87, 0.81,
-                "balanced", "claude-opus-4-7", SEED_TIMESTAMP_TZ,
+                "balanced", "claude-opus-4-7", SEED_TIMESTAMP,
             )
 
 

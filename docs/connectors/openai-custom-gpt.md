@@ -180,8 +180,10 @@ request with the bearer token you configured on the Action.
   `$ref`. The `--target gpt-actions` form should pass cleanly;
   if it doesn't, file an issue with the offending endpoint name.
 - **All actions return 401:** the bearer token is wrong or has
-  been revoked. Verify with
-  `curl -H "Authorization: Bearer <token>" https://mnemos.example.com/v1/health`.
+  been revoked. `/health` is unauthenticated, so probe an
+  authenticated endpoint instead:
+  `curl -H "Authorization: Bearer <token>" https://mnemos.example.com/v1/memories?limit=1`.
+  401 = bad token; 200 with a JSON body = token is valid.
 - **Actions return 5xx:** look at MNEMOS logs (`docker logs
   mnemos-server` or wherever your stdout lands). The 5xx will
   have a request-id; cross-reference it in the log.

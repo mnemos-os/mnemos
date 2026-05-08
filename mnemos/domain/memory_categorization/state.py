@@ -1,5 +1,5 @@
 """
-StateManager: Key-value session state backed by PostgreSQL.
+StateManager: Key-value session state backed by PersistenceBackend.
 
 Provides:
 - get(key): Load value for key
@@ -11,7 +11,7 @@ Provides:
 
 # Library API: This module provides a programmatic interface to the journal/state/entities
 # subsystem for use in Python applications that embed MNEMOS directly.
-# The REST API handlers (api/handlers/) use direct asyncpg queries for performance.
+# The REST API handlers use the PersistenceBackend state repository.
 
 import asyncio
 import json
@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from mnemos.core.auth_context import UserContext
+from mnemos.persistence.base import PersistenceBackend
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +105,13 @@ def _decode_state_value(raw: Any) -> Any:
 class StateManager:
     """Manages session state as key-value pairs in the state table."""
 
-    def __init__(self, db_pool=None):
+    def __init__(self, db_pool=None, backend: PersistenceBackend | None = None):
         self.db_pool = db_pool
+        self._backend = backend
+        if self._backend is None and db_pool is not None:
+            from mnemos.persistence.postgres import PostgresBackend
+
+            self._backend = PostgresBackend(db_pool, settings=None)
         self._cache: Dict[tuple[str, str, str], Any] = {}
         # Per-(owner, namespace, key) lock to serialize get/set/delete
         # of the same key. Without this, a slow ``get`` mid-DB-fetch
@@ -144,7 +150,7 @@ class StateManager:
         cache_key = (owner_id, namespace, key)
         if cache_key in self._cache:
             return self._cache[cache_key]
-        if not self.db_pool:
+        if self._backend is None:
             return None
         async with self._lock_for(cache_key):
             # Re-check the cache under the lock — a concurrent set
@@ -152,12 +158,12 @@ class StateManager:
             if cache_key in self._cache:
                 return self._cache[cache_key]
             try:
-                async with self.db_pool.acquire() as conn:
-                    row = await conn.fetchrow(
-                        'SELECT value FROM state '
-                        'WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
-                        'AND deleted_at IS NULL',
-                        owner_id, namespace, key,
+                async with self._backend.transactional() as tx:
+                    row = await self._backend.state_kv.get(
+                        tx,
+                        key,
+                        owner_id=owner_id,
+                        namespace=namespace,
                     )
                     if row:
                         raw = row['value']
@@ -202,7 +208,7 @@ class StateManager:
         canonical = json.loads(serialized[len(_SM_ENVELOPE_PREFIX):])
 
         async with self._lock_for(cache_key):
-            if not self.db_pool:
+            if self._backend is None:
                 # In-memory-only mode: cache IS the persistent store.
                 self._cache[cache_key] = canonical
                 return
@@ -211,16 +217,13 @@ class StateManager:
             #    cache. The lock keeps a concurrent ``get`` from
             #    overwriting our about-to-land cache entry with the
             #    pre-write row it just fetched.
-            async with self.db_pool.acquire() as conn:
-                await conn.execute(
-                    '''INSERT INTO state (owner_id, namespace, key, value, updated)
-                       VALUES ($1, $2, $3, $4, NOW())
-                       ON CONFLICT (owner_id, namespace, key) DO UPDATE
-                       SET value = $4,
-                           updated = NOW(),
-                           version = state.version + 1
-                       WHERE state.deleted_at IS NULL''',
-                    owner_id, namespace, key, serialized,
+            async with self._backend.transactional() as tx:
+                await self._backend.state_kv.set(
+                    tx,
+                    key,
+                    serialized,
+                    owner_id=owner_id,
+                    namespace=namespace,
                 )
             # 3. Cache update — only on confirmed durable write. Cache
             #    the canonical (JSON-round-tripped) shape so a warm-
@@ -237,17 +240,16 @@ class StateManager:
         cache_key = (owner_id, namespace, key)
         async with self._lock_for(cache_key):
             self._cache.pop(cache_key, None)
-            if not self.db_pool:
+            if self._backend is None:
                 return False
             try:
-                async with self.db_pool.acquire() as conn:
-                    result = await conn.execute(
-                        'DELETE FROM state '
-                        'WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
-                        'AND deleted_at IS NULL',
-                        owner_id, namespace, key,
+                async with self._backend.transactional() as tx:
+                    return await self._backend.state_kv.delete(
+                        tx,
+                        key,
+                        owner_id=owner_id,
+                        namespace=namespace,
                     )
-                    return result != 'DELETE 0'
             except Exception as e:
                 logger.error(f"Error deleting state key '{key}': {e}", exc_info=True)
                 return False
@@ -255,15 +257,14 @@ class StateManager:
     async def list_keys(self, *, user: UserContext) -> List[Dict[str, Any]]:
         """Return all state keys."""
         owner_id, namespace = self._scope(user)
-        if not self.db_pool:
+        if self._backend is None:
             return []
         try:
-            async with self.db_pool.acquire() as conn:
-                rows = await conn.fetch(
-                    'SELECT key, updated FROM state '
-                    'WHERE owner_id = $1 AND namespace = $2 '
-                    'AND deleted_at IS NULL ORDER BY key',
-                    owner_id, namespace,
+            async with self._backend.transactional() as tx:
+                rows = await self._backend.state_kv.list_namespace(
+                    tx,
+                    owner_id=owner_id,
+                    namespace=namespace,
                 )
                 return [dict(row) for row in rows]
         except Exception as e:

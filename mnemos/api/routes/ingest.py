@@ -112,8 +112,8 @@ async def ingest_session(request: SessionIngestRequest, user: UserContext = Depe
             stored_count=len(stored_ids), memory_ids=stored_ids,
         )
     except asyncpg.PostgresError as e:
-        logger.error(f"Session ingestion DB error: {e}")
+        logger.error(f"Session ingestion DB error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
     except Exception as e:
-        logger.error(f"Session ingestion failed: {e}")
+        logger.error(f"Session ingestion failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")

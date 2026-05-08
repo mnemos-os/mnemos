@@ -46,7 +46,12 @@ class _Conn:
         memories: list[dict] | None = None,
         kg_triples: list[dict] | None = None,
     ):
-        self.run_row = {"config": run_config or {"extract": True}, "namespace": run_namespace}
+        self.run_row = {
+            "config": run_config or {"extract": True},
+            "namespace": run_namespace,
+            "triples_extracted": 0,
+            "memories_processed_for_extraction": 0,
+        }
         self.memories = {row["id"]: row for row in memories or []}
         self.kg_triples = list(kg_triples or [])
         self.extract_run_memories: list[dict] = []
@@ -140,6 +145,9 @@ class _Conn:
             return "DELETE 0"
         if compact.startswith("UPDATE morpheus_runs"):
             self.counter_updates.append((sql, args))
+            if "COALESCE(triples_extracted, 0) +" in compact:
+                self.run_row["triples_extracted"] += args[1]
+                self.run_row["memories_processed_for_extraction"] += args[2]
             return "UPDATE 1"
         return "OK"
 

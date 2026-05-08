@@ -1,8 +1,8 @@
-"""Postgres persistence backend shell.
+"""Postgres persistence backend.
 
-D.1 keeps the existing mnemos/db repository functions as the implementation
-source of truth. These classes only adapt their asyncpg connection parameters
-to the backend-neutral persistence interfaces.
+Most legacy memory/DAG helpers still delegate to ``mnemos.db`` repository
+functions. Federation and state KV SQL now live directly behind this
+backend-neutral persistence interface.
 """
 
 from __future__ import annotations
@@ -11,8 +11,9 @@ import hashlib
 import inspect
 import json
 import logging
+import time
 import uuid
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -24,6 +25,7 @@ from mnemos.core.config import hot_rs_enabled
 from mnemos.core.visibility import (
     read_visibility_predicate as _core_read_visibility_predicate,
 )
+from mnemos.db import eligibility as _eligibility
 from mnemos.db import mcp_repo, openai_compat_repo, portability_repo
 from mnemos.persistence.base import (
     BranchRepository,
@@ -43,9 +45,27 @@ from mnemos.persistence.base import (
 from mnemos.persistence.types import MEMORY_COLS as _MEMORY_COLS, Row
 from mnemos.persistence.visibility import VisibilityFilter, VisibilityScope
 from mnemos.core import webhook_constants
+from mnemos.persistence import nats_events as persistence_nats_events
 
 logger = logging.getLogger(__name__)
 _RECENCY_E_FOLD_SECONDS = 7 * 24 * 60 * 60
+_FEDERATION_NATS_MEMORY_ROW_COLS = (
+    "id, content, category, subcategory, created, updated, metadata, "
+    "quality_rating, verbatim_content, owner_id, namespace, permission_mode, "
+    "source_model, source_provider, source_session, source_agent, archived_at, "
+    "federation_source, deleted_at, consolidated_into"
+)
+
+
+def _log_search_phase(
+    trace_id: str | None,
+    started_at: float | None,
+    phase: str,
+) -> None:
+    if not trace_id or started_at is None:
+        return
+    elapsed_ms = int((time.monotonic() - started_at) * 1000)
+    logger.info("[search:%s] %s done in %dms", trace_id, phase, elapsed_ms)
 
 
 # Optional Rust hot-path accelerator. Loaded lazily so operators do not
@@ -207,6 +227,7 @@ class PostgresTransaction:
         self._conn = conn
         self._tx = tx
         self._closed = False
+        self._after_commit: list[Callable[[], Awaitable[None] | None]] = []
 
     @property
     def conn(self) -> asyncpg.Connection:
@@ -221,18 +242,67 @@ class PostgresTransaction:
             return
         await self._tx.commit()
         self._closed = True
+        callbacks = self._after_commit
+        self._after_commit = []
+        for callback in callbacks:
+            try:
+                result = callback()
+                if inspect.isawaitable(result):
+                    await result
+            except Exception:
+                logger.warning("Postgres post-commit callback failed", exc_info=True)
 
     async def rollback(self) -> None:
         if self._closed:
             return
         await self._tx.rollback()
         self._closed = True
+        self._after_commit = []
+
+    def add_after_commit(self, callback: Callable[[], Awaitable[None] | None]) -> None:
+        if self._closed:
+            raise RuntimeError("cannot register post-commit callback on a closed transaction")
+        self._after_commit.append(callback)
 
 
 def _postgres_tx(tx: Transaction) -> PostgresTransaction:
     if not isinstance(tx, PostgresTransaction):
         raise TypeError("Postgres repositories require a PostgresTransaction")
     return tx
+
+
+def _pg_result_count(result: str | None) -> int:
+    if not result:
+        return 0
+    try:
+        return int(str(result).rsplit(" ", 1)[-1])
+    except (IndexError, ValueError):
+        return 0
+
+
+async def _queue_federation_nats_upsert_from_db(tx: PostgresTransaction, memory_id: str) -> None:
+    if not persistence_nats_events.federation_nats_enabled():
+        return
+    row = await tx.conn.fetchrow(
+        f"""
+        SELECT {_FEDERATION_NATS_MEMORY_ROW_COLS}
+        FROM memories
+        WHERE id = $1
+        """,
+        memory_id,
+    )
+    _queue_federation_nats_upsert(tx, row)
+
+
+def _queue_federation_nats_upsert(tx: PostgresTransaction, row: Row | None) -> None:
+    if row is None or not persistence_nats_events.federation_nats_enabled():
+        return
+    event = persistence_nats_events.federation_memory_upsert_event(row)
+    if event is None:
+        return
+    tx.add_after_commit(
+        lambda event=event: persistence_nats_events.publish_federation_memory_upsert_event(event)
+    )
 
 
 class PostgresMemoryRepository(MemoryRepository):
@@ -323,8 +393,9 @@ class PostgresMemoryRepository(MemoryRepository):
         created: Any,
         updated: Any,
     ) -> str:
-        return await portability_repo.insert_memory(
-            _postgres_tx(tx).conn,
+        pg_tx = _postgres_tx(tx)
+        result = await portability_repo.insert_memory(
+            pg_tx.conn,
             memory_id=memory_id,
             content=content,
             category=category,
@@ -342,6 +413,9 @@ class PostgresMemoryRepository(MemoryRepository):
             created=created,
             updated=updated,
         )
+        if _pg_result_count(result) > 0:
+            await _queue_federation_nats_upsert_from_db(pg_tx, memory_id)
+        return result
 
     async def fetch_memory_by_id(self, tx: Transaction, memory_id: str) -> Row | None:
         return await portability_repo.fetch_memory_by_id(_postgres_tx(tx).conn, memory_id)
@@ -457,14 +531,50 @@ class PostgresMemoryRepository(MemoryRepository):
                 f"WHERE id=$1 AND deleted_at IS NULL AND {vis_clause} "
                 f"RETURNING {_MEMORY_COLS}"
             )
-            return await conn.fetchrow(sql, memory_id, *values, *vis_params)
+            row = await conn.fetchrow(sql, memory_id, *values, *vis_params)
+            if row is not None:
+                await _queue_federation_nats_upsert_from_db(_postgres_tx(tx), memory_id)
+            return row
         sql = (
             f"UPDATE memories SET {set_sql} WHERE id=$1 AND deleted_at IS NULL "
             f"RETURNING {_MEMORY_COLS}"
         )
-        return await conn.fetchrow(sql, memory_id, *values)
+        row = await conn.fetchrow(sql, memory_id, *values)
+        if row is not None:
+            await _queue_federation_nats_upsert_from_db(_postgres_tx(tx), memory_id)
+        return row
 
-    async def delete_memory(
+    async def find_active_duplicate_by_content_hash(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str,
+        namespace: str,
+        content_hash: str,
+        cross_namespace: bool = False,
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        namespace_clause = "" if cross_namespace else "AND namespace=$3"
+        params: list[Any] = [owner_id, content_hash]
+        if not cross_namespace:
+            params.append(namespace)
+        return await conn.fetchrow(
+            f"""
+            SELECT id, last_recalled_at
+            FROM memories
+            WHERE owner_id=$1
+              {namespace_clause}
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND content_hash=$2
+            ORDER BY created ASC, id ASC
+            LIMIT 1
+            """,
+            *params,
+        )
+
+    async def bump_recall_and_get_memory(
         self,
         tx: Transaction,
         memory_id: str,
@@ -473,8 +583,153 @@ class PostgresMemoryRepository(MemoryRepository):
     ) -> Row | None:
         conn = _postgres_tx(tx).conn
         vis_clause, vis_params, _ = _render_postgres_visibility(
+            visibility,
+            start_idx=2,
+        )
+        if vis_clause:
+            sql = (
+                "UPDATE memories "
+                "SET recall_count = recall_count + 1, last_recalled_at = NOW() "
+                f"WHERE id=$1 AND deleted_at IS NULL AND archived_at IS NULL AND {vis_clause} "
+                f"RETURNING {_MEMORY_COLS}"
+            )
+            return await conn.fetchrow(sql, memory_id, *vis_params)
+        return await conn.fetchrow(
+            "UPDATE memories "
+            "SET recall_count = recall_count + 1, last_recalled_at = NOW() "
+            "WHERE id=$1 AND deleted_at IS NULL AND archived_at IS NULL "
+            f"RETURNING {_MEMORY_COLS}",
+            memory_id,
+        )
+
+    async def find_duplicate_content_groups(
+        self,
+        tx: Transaction,
+        *,
+        namespace: str | None = None,
+    ) -> list[Row]:
+        conn = _postgres_tx(tx).conn
+        return list(await conn.fetch(
+            """
+            SELECT
+                owner_id,
+                namespace,
+                content_hash,
+                COUNT(*)::int AS duplicate_count,
+                ARRAY_AGG(id ORDER BY created ASC, id ASC) AS memory_ids,
+                (ARRAY_AGG(id ORDER BY created ASC, id ASC))[1] AS canonical_id
+            FROM memories
+            WHERE deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND content_hash IS NOT NULL
+              AND ($1::text IS NULL OR namespace=$1)
+            GROUP BY owner_id, namespace, content_hash
+            HAVING COUNT(*) > 1
+            ORDER BY duplicate_count DESC, owner_id ASC, namespace ASC, content_hash ASC
+            """,
+            namespace,
+        ))
+
+    async def consolidate_duplicate_memories(
+        self,
+        tx: Transaction,
+        *,
+        canonical_id: str,
+        duplicate_ids: Sequence[str],
+    ) -> int:
+        if not duplicate_ids:
+            return 0
+        result = await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE memories
+            SET consolidated_into = $1,
+                consolidated_at = NOW(),
+                deleted_at = COALESCE(deleted_at, NOW()),
+                updated = NOW()
+            WHERE id = ANY($2::text[])
+              AND id <> $1
+              AND deleted_at IS NULL
+              AND archived_at IS NULL
+              AND consolidated_into IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM memories
+                  WHERE id = $1
+                    AND deleted_at IS NULL
+                    AND archived_at IS NULL
+                    AND consolidated_into IS NULL
+              )
+            """,
+            canonical_id,
+            list(duplicate_ids),
+        )
+        return _pg_result_count(result)
+
+    async def delete_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        visibility: VisibilityFilter,
+        requested_by: str | None = None,
+        requested_at: Any = None,
+        request_kind: str = "admin_purge",
+        reason: str | None = None,
+        source: Sequence[str] | None = None,
+    ) -> Row | None:
+        conn = _postgres_tx(tx).conn
+        vis_clause, vis_params, _ = _render_postgres_visibility(
             visibility, start_idx=2,
         )
+        if requested_by is not None:
+            target_where = "id=$1 AND deleted_at IS NULL"
+            if vis_clause:
+                target_where = f"{target_where} AND {vis_clause}"
+            audit_start = len(vis_params) + 2
+            source_array = list(source) if source is not None else None
+            return await conn.fetchrow(
+                f"""
+                WITH target AS (
+                    SELECT owner_id, namespace, id, content, category, subcategory
+                      FROM memories
+                     WHERE {target_where}
+                ), audit AS (
+                    INSERT INTO deletion_log (
+                        memory_id, content_hash, owner_id, namespace,
+                        requested_by, requested_at, request_kind, reason, source
+                    )
+                    SELECT
+                        id,
+                        encode(digest(COALESCE(content, ''), 'sha256'), 'hex'),
+                        owner_id,
+                        namespace,
+                        ${audit_start},
+                        COALESCE(${audit_start + 1}::timestamptz, NOW()),
+                        ${audit_start + 2},
+                        ${audit_start + 3},
+                        ${audit_start + 4}::text[]
+                      FROM target
+                    RETURNING 1
+                )
+                DELETE FROM memories m
+                 USING target
+                 WHERE m.id = target.id
+                RETURNING
+                    target.owner_id,
+                    target.namespace,
+                    target.id,
+                    target.content,
+                    target.category,
+                    target.subcategory
+                """,
+                memory_id,
+                *vis_params,
+                requested_by,
+                requested_at,
+                request_kind,
+                reason,
+                source_array,
+            )
         if vis_clause:
             sql = (
                 "DELETE FROM memories "
@@ -503,6 +758,8 @@ class PostgresMemoryRepository(MemoryRepository):
         include_archived: bool = False,
         boost_recency: bool = False,
         recency_weight: float = 0.15,
+        search_trace_id: str | None = None,
+        search_started_at: float | None = None,
     ) -> list[Row]:
         conn = _postgres_tx(tx).conn
         # $1 is the embedding vector, used in both SELECT (for the
@@ -550,7 +807,9 @@ class PostgresMemoryRepository(MemoryRepository):
             f"ORDER BY embedding <=> $1::vector LIMIT ${len(params)}"
         )
         rows = list(await conn.fetch(sql, *params))
+        _log_search_phase(search_trace_id, search_started_at, "ann_scan")
         if not boost_recency or len(rows) <= 1:
+            _log_search_phase(search_trace_id, search_started_at, "rerank")
             return rows[:limit]
 
         candidates = [_parse_pgvector_text(row.get("_embedding_text")) for row in rows]
@@ -572,6 +831,7 @@ class PostgresMemoryRepository(MemoryRepository):
             enriched["similarity"] = composite_score
             enriched["_composite_score"] = composite_score
             reranked.append(enriched)
+        _log_search_phase(search_trace_id, search_started_at, "rerank")
         return reranked
 
     async def fts_search(
@@ -1049,6 +1309,15 @@ class PostgresWebhookRepository(WebhookRepository):
                 namespace=sub["namespace"],
                 owner_id=sub["owner_id"],
             )
+            await persistence_nats_events.publish_webhook_outbox_insert(
+                delivery_id=delivery_id,
+                subscription_id=sub["id"],
+                event_type=event_type,
+                url=sub["url"],
+                payload_hash=body_hash,
+                namespace=sub["namespace"],
+                owner_id=sub["owner_id"],
+            )
             delivery_ids.append(delivery_id)
         return delivery_ids
 
@@ -1095,6 +1364,17 @@ class PostgresConsultationAuditRepository(ConsultationAuditRepository):
 
 
 class PostgresFederationRepository(FederationRepository):
+    _ALLOWED_PEER_COLS = {
+        "name",
+        "base_url",
+        "auth_token",
+        "namespace_filter",
+        "category_filter",
+        "enabled",
+        "sync_interval_secs",
+        "compat_mode",
+    }
+
     async def fetch_memory_page(
         self,
         tx: Transaction,
@@ -1129,6 +1409,61 @@ class PostgresFederationRepository(FederationRepository):
             limit,
         )
 
+    async def create_peer(
+        self,
+        tx: Transaction,
+        *,
+        name: str,
+        base_url: str,
+        auth_token: str,
+        namespace_filter: Sequence[str] | None,
+        category_filter: Sequence[str] | None,
+        enabled: bool,
+        sync_interval_secs: int,
+        compat_mode: str,
+    ) -> Row:
+        return await _postgres_tx(tx).conn.fetchrow(
+            """
+            INSERT INTO federation_peers
+              (name, base_url, auth_token, namespace_filter, category_filter,
+               enabled, sync_interval_secs, compat_mode)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            RETURNING *
+            """,
+            name,
+            base_url,
+            auth_token,
+            list(namespace_filter) if namespace_filter is not None else None,
+            list(category_filter) if category_filter is not None else None,
+            enabled,
+            sync_interval_secs,
+            compat_mode,
+        )
+
+    async def list_peers(self, tx: Transaction) -> list[Row]:
+        return list(await _postgres_tx(tx).conn.fetch("SELECT * FROM federation_peers ORDER BY name"))
+
+    async def get_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT * FROM federation_peers WHERE id = $1::uuid",
+            peer_id,
+        )
+
+    async def update_peer(self, tx: Transaction, peer_id: str, updates: dict[str, Any]) -> Row | None:
+        bad = set(updates) - self._ALLOWED_PEER_COLS
+        if bad:
+            raise ValueError(f"unknown federation peer fields: {sorted(bad)}")
+        if not updates:
+            return await self.get_peer(tx, peer_id)
+        set_clauses = [f"{col}=${i + 2}" for i, col in enumerate(updates.keys())]
+        set_clauses.append("updated=NOW()")
+        return await _postgres_tx(tx).conn.fetchrow(
+            f"UPDATE federation_peers SET {', '.join(set_clauses)} "
+            "WHERE id=$1::uuid RETURNING *",
+            peer_id,
+            *updates.values(),
+        )
+
     async def upsert_peer(
         self,
         tx: Transaction,
@@ -1153,6 +1488,501 @@ class PostgresFederationRepository(FederationRepository):
             enabled,
         )
 
+    async def delete_peer(self, tx: Transaction, peer_id: str) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM federation_peers WHERE id = $1::uuid",
+            peer_id,
+        )
+        return _pg_result_count(result) > 0
+
+    async def fetch_sync_log(self, tx: Transaction, peer_id: str, limit: int) -> list[Row]:
+        return list(await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT id::text, started_at, finished_at, memories_pulled,
+                   memories_new, memories_updated, error,
+                   cursor_before, cursor_after
+            FROM federation_sync_log
+            WHERE peer_id = $1::uuid
+            ORDER BY started_at DESC
+            LIMIT $2
+            """,
+            peer_id,
+            limit,
+        ))
+
+    async def feed_query(
+        self,
+        tx: Transaction,
+        *,
+        since_updated: Any | None,
+        since_id: str | None,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+        limit: int,
+        prefer_compressed: bool,
+    ) -> list[Row]:
+        memory_query_parts = [_eligibility.eligible_for_federation("m")]
+        tombstone_query_parts = [
+            "m.federation_source IS NULL",
+            "m.deleted_at IS NULL",
+            "m.consolidated_into IS NOT NULL",
+            "m.consolidated_at IS NOT NULL",
+        ]
+        args: list[Any] = []
+        if since_updated is not None:
+            args.append(since_updated)
+            since_updated_arg = len(args)
+            args.append(since_id)
+            since_id_arg = len(args)
+            memory_query_parts.append(
+                f"(m.updated > ${since_updated_arg} "
+                f"OR (m.updated = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+            )
+            tombstone_query_parts.append(
+                f"(m.consolidated_at > ${since_updated_arg} "
+                f"OR (m.consolidated_at = ${since_updated_arg} AND m.id > ${since_id_arg}))"
+            )
+        if namespaces:
+            args.append(list(namespaces))
+            memory_query_parts.append(f"m.namespace = ANY(${len(args)})")
+            tombstone_query_parts.append(f"m.namespace = ANY(${len(args)})")
+        if categories:
+            args.append(list(categories))
+            memory_query_parts.append(f"m.category = ANY(${len(args)})")
+            tombstone_query_parts.append(f"m.category = ANY(${len(args)})")
+        args.append(limit)
+
+        if prefer_compressed:
+            use_variant = (
+                "m.archived_at IS NULL "
+                "AND v.compressed_content IS NOT NULL "
+                "AND (2 * octet_length(to_json(v.compressed_content)::text)) "
+                "  < (octet_length(to_json(m.content)::text) "
+                "     + COALESCE(octet_length(to_json(m.verbatim_content)::text), 0))"
+            )
+            content_select = (
+                f"CASE WHEN {use_variant} THEN v.compressed_content "
+                "ELSE m.content END AS content,"
+            )
+            compressed_select = (
+                f"CASE WHEN {use_variant} THEN v.compressed_content "
+                "ELSE NULL::text END AS compressed_content,"
+            )
+            verbatim_select = (
+                f"CASE WHEN {use_variant} THEN NULL "
+                "ELSE m.verbatim_content END AS verbatim_content,"
+            )
+            join_compressed = "LEFT JOIN memory_compressed_variants v ON v.memory_id = m.id "
+        else:
+            content_select = "m.content,"
+            compressed_select = "NULL::text AS compressed_content,"
+            verbatim_select = "m.verbatim_content,"
+            join_compressed = ""
+
+        memory_where_clause = " AND ".join(memory_query_parts)
+        tombstone_where_clause = " AND ".join(tombstone_query_parts)
+        return list(await _postgres_tx(tx).conn.fetch(
+            f"""
+            SELECT *
+            FROM (
+                SELECT NULL::text AS type,
+                       m.id, {content_select}
+                       m.category, m.subcategory, m.metadata,
+                       m.quality_rating, {verbatim_select}
+                       m.owner_id, m.namespace,
+                       m.permission_mode, m.source_model, m.source_provider,
+                       m.source_session, m.source_agent, m.created, m.updated,
+                       m.archived_at,
+                       NULL::text AS consolidated_into,
+                       NULL::timestamptz AS consolidated_at,
+                       {compressed_select.rstrip(',')}
+                FROM memories m
+                {join_compressed}
+                WHERE {memory_where_clause}
+
+                UNION ALL
+
+                SELECT 'consolidation'::text AS type,
+                       m.id,
+                       NULL::text AS content,
+                       NULL::text AS category,
+                       NULL::text AS subcategory,
+                       NULL::jsonb AS metadata,
+                       NULL::int AS quality_rating,
+                       NULL::text AS verbatim_content,
+                       NULL::text AS owner_id,
+                       m.namespace,
+                       NULL::smallint AS permission_mode,
+                       NULL::text AS source_model,
+                       NULL::text AS source_provider,
+                       NULL::text AS source_session,
+                       NULL::text AS source_agent,
+                       m.created,
+                       m.consolidated_at AS updated,
+                       NULL::timestamptz AS archived_at,
+                       m.consolidated_into,
+                       m.consolidated_at,
+                       NULL::text AS compressed_content
+                FROM memories m
+                WHERE {tombstone_where_clause}
+            ) feed
+            ORDER BY updated ASC, id ASC
+            LIMIT ${len(args)}
+            """,
+            *args,
+        ))
+
+    async def get_feed_memory(
+        self,
+        tx: Transaction,
+        memory_id: str,
+        *,
+        namespaces: Sequence[str],
+        categories: Sequence[str],
+    ) -> Row | None:
+        query_parts = [_eligibility.eligible_for_federation("m"), "m.id = $1"]
+        args: list[Any] = [memory_id]
+        if namespaces:
+            args.append(list(namespaces))
+            query_parts.append(f"m.namespace = ANY(${len(args)})")
+        if categories:
+            args.append(list(categories))
+            query_parts.append(f"m.category = ANY(${len(args)})")
+        where_clause = " AND ".join(query_parts)
+        return await _postgres_tx(tx).conn.fetchrow(
+            f"""
+            SELECT id, content, category, subcategory, metadata, quality_rating,
+                   verbatim_content, owner_id, namespace, permission_mode,
+                   source_model, source_provider, source_session, source_agent,
+                   created, updated, archived_at
+            FROM memories m
+            WHERE {where_clause}
+            """,
+            *args,
+        )
+
+    async def get_sync_peer(self, tx: Transaction, peer_id: str) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            """
+            SELECT id::text, name, base_url, auth_token, namespace_filter,
+                   category_filter, enabled, last_sync_cursor,
+                   compat_mode
+            FROM federation_peers WHERE id = $1::uuid
+            """,
+            peer_id,
+        )
+
+    async def update_peer_schema_check(self, tx: Transaction, peer_id: str, peer_version: str | None) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE federation_peers
+            SET peer_mnemos_version = $2, last_schema_check_at = NOW()
+            WHERE id = $1::uuid
+            """,
+            peer_id,
+            peer_version,
+        )
+
+    async def record_schema_abort(
+        self,
+        tx: Transaction,
+        *,
+        peer_id: str,
+        peer_version: str | None,
+        cursor_before: Any,
+        error: str,
+        is_transient: bool,
+    ) -> None:
+        conn = _postgres_tx(tx).conn
+        await self.update_peer_schema_check(tx, peer_id, peer_version)
+        log_id = await conn.fetchval(
+            """
+            INSERT INTO federation_sync_log (peer_id, cursor_before)
+            VALUES ($1::uuid, $2) RETURNING id
+            """,
+            peer_id,
+            cursor_before,
+        )
+        await self.finish_sync_log(
+            tx,
+            log_id=log_id,
+            memories_pulled=0,
+            memories_new=0,
+            memories_updated=0,
+            error=error,
+            cursor_after=cursor_before,
+        )
+        if is_transient:
+            await conn.execute(
+                """
+                UPDATE federation_peers
+                SET last_sync_at = NOW()
+                                  - (sync_interval_secs || ' seconds')::interval
+                                  + INTERVAL '60 seconds',
+                    last_error = $2,
+                    last_error_at = NOW()
+                WHERE id = $1::uuid
+                """,
+                peer_id,
+                error,
+            )
+        else:
+            await conn.execute(
+                """
+                UPDATE federation_peers
+                SET last_sync_at = NOW(),
+                    last_error = $2,
+                    last_error_at = NOW()
+                WHERE id = $1::uuid
+                """,
+                peer_id,
+                error,
+            )
+
+    async def create_sync_log(self, tx: Transaction, peer_id: str, cursor_before: Any) -> Any:
+        return await _postgres_tx(tx).conn.fetchval(
+            """
+            INSERT INTO federation_sync_log (peer_id, cursor_before)
+            VALUES ($1::uuid, $2) RETURNING id
+            """,
+            peer_id,
+            cursor_before,
+        )
+
+    async def finish_sync_log(
+        self,
+        tx: Transaction,
+        *,
+        log_id: Any,
+        memories_pulled: int,
+        memories_new: int,
+        memories_updated: int,
+        error: str | None,
+        cursor_after: Any,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE federation_sync_log
+            SET finished_at = NOW(),
+                memories_pulled = $2,
+                memories_new = $3,
+                memories_updated = $4,
+                error = $5,
+                cursor_after = $6
+            WHERE id = $1::uuid
+            """,
+            log_id,
+            memories_pulled,
+            memories_new,
+            memories_updated,
+            error,
+            cursor_after,
+        )
+
+    async def record_sync_error(self, tx: Transaction, peer_id: str, error: str) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE federation_peers
+            SET last_sync_at = NOW(), last_error = $2, last_error_at = NOW()
+            WHERE id = $1::uuid
+            """,
+            peer_id,
+            error,
+        )
+
+    async def record_sync_success(
+        self,
+        tx: Transaction,
+        peer_id: str,
+        cursor: Any,
+        total_pulled: int,
+    ) -> None:
+        await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE federation_peers
+            SET last_sync_at = NOW(),
+                last_sync_cursor = $2,
+                last_error = NULL,
+                last_error_at = NULL,
+                total_pulled = total_pulled + $3
+            WHERE id = $1::uuid
+            """,
+            peer_id,
+            cursor,
+            total_pulled,
+        )
+
+    async def list_due_peers(self, tx: Transaction, *, limit: int = 10) -> list[Row]:
+        return list(await _postgres_tx(tx).conn.fetch(
+            """
+            SELECT id::text, name, sync_interval_secs, last_sync_at
+            FROM federation_peers
+            WHERE enabled
+              AND (last_sync_at IS NULL
+                   OR last_sync_at + (sync_interval_secs || ' seconds')::interval <= NOW())
+            ORDER BY COALESCE(
+                last_sync_at + (sync_interval_secs || ' seconds')::interval,
+                'epoch'::timestamptz
+            )
+            LIMIT $1
+            """,
+            limit,
+        ))
+
+    async def fetch_federated_memory_marker(self, tx: Transaction, local_id: str) -> Row | None:
+        return await _postgres_tx(tx).conn.fetchrow(
+            "SELECT federation_remote_updated FROM memories "
+            "WHERE id = $1 AND deleted_at IS NULL",
+            local_id,
+        )
+
+    async def insert_federated_memory(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        source_model: str | None,
+        source_provider: str | None,
+        source_session: str | None,
+        source_agent: str | None,
+        peer_name: str,
+        remote_updated: Any,
+    ) -> bool:
+        try:
+            await _postgres_tx(tx).conn.execute(
+                """
+                INSERT INTO memories
+                  (id, content, category, subcategory, metadata, verbatim_content,
+                   quality_rating, owner_id, namespace, permission_mode,
+                   source_model, source_provider, source_session, source_agent,
+                   federation_source, federation_remote_updated, created, updated)
+                VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'federation', $8, 644,
+                        $9, $10, $11, $12, $13, $14::timestamptz, NOW(),
+                        $14::timestamptz)
+                """,
+                local_id,
+                content,
+                category,
+                subcategory,
+                metadata_json,
+                verbatim_content,
+                quality_rating,
+                namespace,
+                source_model,
+                source_provider,
+                source_session,
+                source_agent,
+                peer_name,
+                remote_updated,
+            )
+            return True
+        except asyncpg.UniqueViolationError:
+            return False
+
+    async def update_federated_memory_if_newer(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        content: str,
+        category: str,
+        subcategory: str | None,
+        metadata_json: str,
+        verbatim_content: str,
+        quality_rating: int,
+        namespace: str,
+        remote_updated: Any,
+    ) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE memories SET
+              content = $2, category = $3, subcategory = $4,
+              metadata = $5::jsonb, verbatim_content = $6,
+              quality_rating = $7, namespace = $8,
+              federation_remote_updated = $9::timestamptz,
+              updated = $9::timestamptz
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND (
+                  federation_remote_updated IS NULL
+                  OR federation_remote_updated < $9::timestamptz
+              )
+            """,
+            local_id,
+            content,
+            category,
+            subcategory,
+            metadata_json,
+            verbatim_content,
+            quality_rating,
+            namespace,
+            remote_updated,
+        )
+        return _pg_result_count(result) > 0
+
+    async def apply_consolidation_tombstone(
+        self,
+        tx: Transaction,
+        *,
+        local_id: str,
+        local_canonical_id: str,
+        consolidated_at: Any,
+        remote_id: str,
+        canonical_remote_id: str,
+        peer_name: str,
+    ) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
+            """
+            UPDATE memories
+            SET consolidated_into = $2,
+                consolidated_at = COALESCE($3::timestamptz, NOW()),
+                permission_mode = 400,
+                metadata = COALESCE(metadata, '{}'::jsonb)
+                    || jsonb_build_object(
+                        'federation_consolidation', jsonb_build_object(
+                            'remote_id', $4,
+                            'remote_consolidated_into', $5,
+                            'peer', $6
+                        )
+                    )
+            WHERE id = $1
+              AND deleted_at IS NULL
+              AND consolidated_into IS DISTINCT FROM $2
+              AND EXISTS (
+                  SELECT 1 FROM memories
+                  WHERE id = $2 AND deleted_at IS NULL
+              )
+            """,
+            local_id,
+            local_canonical_id,
+            consolidated_at,
+            remote_id,
+            canonical_remote_id,
+            peer_name,
+        )
+        return _pg_result_count(result) > 0
+
+    async def delete_federated_memory(self, tx: Transaction, peer_name: str, memory_id: str) -> int:
+        local_id = f"fed:{peer_name}:{memory_id}"
+        result = await _postgres_tx(tx).conn.execute(
+            """
+            DELETE FROM memories
+            WHERE id = $1
+              AND federation_source = $2
+              AND deleted_at IS NULL
+            """,
+            local_id,
+            peer_name,
+        )
+        return _pg_result_count(result)
+
 
 class PostgresStateRepository(StateRepository):
     """state.value is now TEXT on PG (migrations_v4_2_state_value_text.sql).
@@ -1172,7 +2002,7 @@ class PostgresStateRepository(StateRepository):
         namespace: str = "default",
     ) -> Row | None:
         return await _postgres_tx(tx).conn.fetchrow(
-            "SELECT key, value, owner_id, namespace FROM state "
+            "SELECT key, value, updated::text AS updated, version, owner_id, namespace FROM state "
             "WHERE owner_id = $1 AND namespace = $2 AND key = $3 "
             "AND deleted_at IS NULL",
             owner_id,
@@ -1188,14 +2018,19 @@ class PostgresStateRepository(StateRepository):
         *,
         owner_id: str = "default",
         namespace: str = "default",
-    ) -> None:
-        await _postgres_tx(tx).conn.execute(
+        expires_at: Any | None = None,
+    ) -> Row | None:
+        _ = expires_at
+        return await _postgres_tx(tx).conn.fetchrow(
             """
-            INSERT INTO state (owner_id, namespace, key, value)
-            VALUES ($1, $2, $3, $4)
+            INSERT INTO state (owner_id, namespace, key, value, updated)
+            VALUES ($1, $2, $3, $4, NOW())
             ON CONFLICT (owner_id, namespace, key) DO UPDATE
-            SET value = EXCLUDED.value
+            SET value = $4,
+                updated = NOW(),
+                version = state.version + 1
             WHERE state.deleted_at IS NULL
+            RETURNING key, value, updated::text AS updated, version, owner_id, namespace
             """,
             owner_id,
             namespace,
@@ -1210,14 +2045,49 @@ class PostgresStateRepository(StateRepository):
         *,
         owner_id: str = "default",
         namespace: str = "default",
-    ) -> None:
-        await _postgres_tx(tx).conn.execute(
+    ) -> bool:
+        result = await _postgres_tx(tx).conn.execute(
             "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 "
             "AND deleted_at IS NULL",
             owner_id,
             namespace,
             key,
         )
+        return _pg_result_count(result) > 0
+
+    async def list_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+        limit: int | None = None,
+        offset: int = 0,
+    ) -> list[Row]:
+        args: list[Any] = [owner_id, namespace]
+        sql = (
+            "SELECT key, updated::text AS updated, version, owner_id, namespace FROM state "
+            "WHERE owner_id = $1 AND namespace = $2 "
+            "AND deleted_at IS NULL ORDER BY key"
+        )
+        if limit is not None:
+            args.extend([limit, offset])
+            sql += " LIMIT $3 OFFSET $4"
+        return list(await _postgres_tx(tx).conn.fetch(sql, *args))
+
+    async def delete_namespace(
+        self,
+        tx: Transaction,
+        *,
+        owner_id: str = "default",
+        namespace: str = "default",
+    ) -> int:
+        result = await _postgres_tx(tx).conn.execute(
+            "DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND deleted_at IS NULL",
+            owner_id,
+            namespace,
+        )
+        return _pg_result_count(result)
 
 
 class PostgresBackend(PersistenceBackend):

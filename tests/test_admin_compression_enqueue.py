@@ -13,7 +13,6 @@ from __future__ import annotations
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
 
 from mnemos.api.routes.admin import (
     CompressionEnqueueAllRequest,
@@ -51,28 +50,26 @@ def fake_pool(monkeypatch):
     "reason",
     ["invented_reason", "", "ON_WRITE", "forbidden space"],
 )
-@pytest.mark.asyncio
-async def test_enqueue_rejects_unknown_reason(reason, fake_pool):
-    req = CompressionEnqueueRequest(memory_ids=["mem-1"], reason=reason)
-    with pytest.raises(HTTPException) as exc:
-        await compression_enqueue(request=req, _=None)
-    assert exc.value.status_code == 422
-    assert "reason" in exc.value.detail
+def test_enqueue_rejects_unknown_reason(reason):
+    """#170: reason is now Literal[...] on the model — invalid
+    values are rejected at parse time (FastAPI surfaces this as
+    422). Test now exercises the Pydantic-level rejection."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        CompressionEnqueueRequest(memory_ids=["mem-1"], reason=reason)
+    assert "reason" in str(exc.value).lower()
 
 
 @pytest.mark.parametrize(
     "profile",
     ["invented", "", "BALANCED", "custom_thing"],
 )
-@pytest.mark.asyncio
-async def test_enqueue_rejects_unknown_scoring_profile(profile, fake_pool):
-    req = CompressionEnqueueRequest(
-        memory_ids=["mem-1"], scoring_profile=profile,
-    )
-    with pytest.raises(HTTPException) as exc:
-        await compression_enqueue(request=req, _=None)
-    assert exc.value.status_code == 422
-    assert "scoring_profile" in exc.value.detail
+def test_enqueue_rejects_unknown_scoring_profile(profile):
+    """#170: scoring_profile is now Literal[...] on the model."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError) as exc:
+        CompressionEnqueueRequest(memory_ids=["mem-1"], scoring_profile=profile)
+    assert "scoring_profile" in str(exc.value).lower()
 
 
 @pytest.mark.asyncio
@@ -99,20 +96,18 @@ async def test_enqueue_accepts_every_documented_reason(fake_pool):
 # ---- enqueue-all (bulk) — validation boundaries ----------------------------
 
 
-@pytest.mark.asyncio
-async def test_enqueue_all_rejects_unknown_reason(fake_pool):
-    req = CompressionEnqueueAllRequest(reason="yolo")
-    with pytest.raises(HTTPException) as exc:
-        await compression_enqueue_all(request=req, _=None)
-    assert exc.value.status_code == 422
+def test_enqueue_all_rejects_unknown_reason():
+    """#170: reason is now Literal[...] — Pydantic auto-422s at parse."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        CompressionEnqueueAllRequest(reason="yolo")
 
 
-@pytest.mark.asyncio
-async def test_enqueue_all_rejects_unknown_scoring_profile(fake_pool):
-    req = CompressionEnqueueAllRequest(scoring_profile="yolo")
-    with pytest.raises(HTTPException) as exc:
-        await compression_enqueue_all(request=req, _=None)
-    assert exc.value.status_code == 422
+def test_enqueue_all_rejects_unknown_scoring_profile():
+    """#170: scoring_profile is now Literal[...]."""
+    from pydantic import ValidationError
+    with pytest.raises(ValidationError):
+        CompressionEnqueueAllRequest(scoring_profile="yolo")
 
 
 @pytest.mark.asyncio

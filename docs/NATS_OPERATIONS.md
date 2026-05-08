@@ -407,7 +407,7 @@ Check in this order:
 
 * Pre-NATS: webhook delivery still happens via the polling
   recovery worker (`webhooks.repair_worker_loop` +
-  `webhook_delivery_loop`) in `api/lifecycle_hooks.py`. Latency
+  `webhook_delivery_loop`) in `mnemos/api/lifecycle_hooks.py`. Latency
   goes from ~real-time (NATS push trigger) to the polling cadence
   (`RECOVERY_POLL_INTERVAL`, default 30s).
 * No deliveries are lost. The Postgres `webhook_deliveries`

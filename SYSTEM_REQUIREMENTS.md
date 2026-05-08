@@ -1,7 +1,7 @@
 # MNEMOS System Requirements
 
-**Applies to**: current v4.0.0 release line
-**Updated**: 2026-04-29
+**Applies to**: current v5.0.1 release line
+**Updated**: 2026-05-08
 **Applies To**: Bare Metal, Docker, and Cloud Deployments
 
 ---
@@ -681,6 +681,6 @@ Solution: Check disk usage: df -h
 
 ---
 
-**Last Updated**: 2026-04-28
-**Version**: v4.0.0
+**Last Updated**: 2026-05-08
+**Version**: v5.0.1
 **Status**: Production-ready for tagged releases

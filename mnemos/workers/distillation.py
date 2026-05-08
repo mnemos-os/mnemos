@@ -4,10 +4,13 @@ Background distillation worker: compresses memories using ARTEMIS (extractive,
 identifier-preserving) or LLM fallback, updates embeddings, and maintains
 compression quality metrics.
 
-Lifecycle supervision lives in `api/lifecycle.py::_run_distillation_worker` —
-this class knows how to do the work; that wrapper knows how to keep it alive
-(exponential-backoff restart, capped at 5 min). See EVOLUTION.md ADR-02 for
-the rationale behind the two-file separation.
+Lifecycle supervision lives in
+`mnemos/core/lifecycle.py::_run_distillation_worker` and the FastAPI
+hook wrapper at
+`mnemos/api/lifecycle_hooks.py::_run_distillation_worker` —
+this class knows how to do the work; those wrappers know how to keep
+it alive (exponential-backoff restart, capped at 5 min). See
+EVOLUTION.md ADR-02 for the rationale behind the two-file separation.
 """
 
 import asyncio
@@ -276,7 +279,7 @@ class MemoryDistillationWorker:
                     await self.db_pool.close()
                     self.db_pool = await self._create_pool()
                 except Exception as re:
-                    logger.error(f"DB reconnect failed: {re}")
+                    logger.error(f"DB reconnect failed: {re}", exc_info=True)
 
             await asyncio.sleep(CHECK_INTERVAL)
 

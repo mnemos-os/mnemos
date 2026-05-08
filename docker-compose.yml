@@ -65,6 +65,13 @@ services:
       - ./db/migrations_v4_2_pantheon_routing_audit.sql:/docker-entrypoint-initdb.d/51-pantheon-routing-audit.sql
       - ./db/migrations_v5_0_consolidated_at.sql:/docker-entrypoint-initdb.d/52-consolidated-at.sql
       - ./db/migrations_v5_0_morpheus_extract_run_memories.sql:/docker-entrypoint-initdb.d/53-morpheus-extract-run-memories.sql
+      - ./db/migrations_v5_0_2_artemis_dedup.sql:/docker-entrypoint-initdb.d/54-artemis-dedup.sql
+      - ./db/migrations_v5_0_3_timestamp_tz_upgrade.sql:/docker-entrypoint-initdb.d/55-timestamp-tz-upgrade.sql
+      - ./db/migrations_v5_1_0_deletion_log.sql:/docker-entrypoint-initdb.d/56-deletion-log.sql
+      - ./db/migrations_v5_2_0_nats_outbox_idempotency.sql:/docker-entrypoint-initdb.d/57-nats-outbox-idempotency.sql
+      - ./db/migrations_v5_2_2_fts_gin_index.sql:/docker-entrypoint-initdb.d/58-fts-gin-index.sql
+      - ./db/migrations_v5_3_3_deletion_log_export_index.sql:/docker-entrypoint-initdb.d/59-deletion-log-export-index.sql
+      - ./db/migrations_v5_3_4_mcp_audit_log.sql:/docker-entrypoint-initdb.d/60-mcp-audit-log.sql
     ports:
       - '127.0.0.1:5432:5432'
     healthcheck:
@@ -111,6 +118,13 @@ services:
       - ./db/migrations_v4_2_pantheon_routing_audit.sql:/migrations/51-pantheon-routing-audit.sql:ro
       - ./db/migrations_v5_0_consolidated_at.sql:/migrations/52-consolidated-at.sql:ro
       - ./db/migrations_v5_0_morpheus_extract_run_memories.sql:/migrations/53-morpheus-extract-run-memories.sql:ro
+      - ./db/migrations_v5_0_2_artemis_dedup.sql:/migrations/54-artemis-dedup.sql:ro
+      - ./db/migrations_v5_0_3_timestamp_tz_upgrade.sql:/migrations/55-timestamp-tz-upgrade.sql:ro
+      - ./db/migrations_v5_1_0_deletion_log.sql:/migrations/56-deletion-log.sql:ro
+      - ./db/migrations_v5_2_0_nats_outbox_idempotency.sql:/migrations/57-nats-outbox-idempotency.sql:ro
+      - ./db/migrations_v5_2_2_fts_gin_index.sql:/migrations/58-fts-gin-index.sql:ro
+      - ./db/migrations_v5_3_3_deletion_log_export_index.sql:/migrations/59-deletion-log-export-index.sql:ro
+      - ./db/migrations_v5_3_4_mcp_audit_log.sql:/migrations/60-mcp-audit-log.sql:ro
     command: >
       sh -c "psql -h postgres -U mnemos_user -d mnemos
       -v ON_ERROR_STOP=1
@@ -143,7 +157,14 @@ services:
       -f /migrations/50-persephone.sql
       -f /migrations/51-pantheon-routing-audit.sql
       -f /migrations/52-consolidated-at.sql
-      -f /migrations/53-morpheus-extract-run-memories.sql"
+      -f /migrations/53-morpheus-extract-run-memories.sql
+      -f /migrations/54-artemis-dedup.sql
+      -f /migrations/55-timestamp-tz-upgrade.sql
+      -f /migrations/56-deletion-log.sql
+      -f /migrations/57-nats-outbox-idempotency.sql
+      -f /migrations/58-fts-gin-index.sql
+      -f /migrations/59-deletion-log-export-index.sql
+      -f /migrations/60-mcp-audit-log.sql"
     restart: "no"
 
   ollama:

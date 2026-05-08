@@ -1,7 +1,7 @@
 """Regression for the per-connector MNEMOS_DEFAULT_NAMESPACE wiring.
 
 The connector gallery (claude-code.md, cursor.md, codex-cli.md,
-continue-dev.md, cline.md) documents ``MNEMOS_DEFAULT_NAMESPACE`` as
+continue.md, cline.md) documents ``MNEMOS_DEFAULT_NAMESPACE`` as
 the per-MCP-server isolation knob. Two MCP entries with different
 env vars should write/read distinct namespace scopes even when they
 share the same backing API key.

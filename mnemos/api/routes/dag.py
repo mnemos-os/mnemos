@@ -9,7 +9,7 @@ Implements git-like operations on memory history:
 """
 
 import logging
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -137,7 +137,9 @@ class BranchCreateRequest(BaseModel):
 
 class MergeRequest(BaseModel):
     source_branch: str
-    strategy: str = "latest-wins"  # latest-wins or manual
+    # #170: Literal[...] enforces the enum at parse time (auto-422)
+    # rather than relying on the runtime check at the route handler.
+    strategy: Literal["latest-wins", "manual"] = "latest-wins"
 
 
 class MergeResult(BaseModel):
@@ -299,7 +301,7 @@ async def get_memory_log(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[DAG] Log failed: {e}")
+        logger.error(f"[DAG] Log failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="internal server error")
 
 
@@ -390,7 +392,7 @@ async def get_memory_branches(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[DAG] Branches failed: {e}")
+        logger.error(f"[DAG] Branches failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="internal server error")
 
 
@@ -524,7 +526,7 @@ async def create_branch(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[DAG] Branch creation failed: {e}")
+        logger.error(f"[DAG] Branch creation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="internal server error")
 
 
@@ -622,7 +624,7 @@ async def get_commit(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[DAG] Commit fetch failed: {e}")
+        logger.error(f"[DAG] Commit fetch failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="internal server error")
 
 
@@ -636,8 +638,9 @@ async def merge_branch(
     """Merge source_branch into target_branch."""
     _require_pool(route_label="POST /v1/memories/{memory_id}/merge")
     backend = _require_postgres_backend()
-    if request.strategy not in ("latest-wins", "manual"):
-        raise HTTPException(status_code=400, detail="Invalid merge strategy")
+    # #170: strategy is now Literal["latest-wins", "manual"] in the
+    # request model — Pydantic auto-422s on invalid values before
+    # we get here.
 
     import hashlib as _hashlib
 
@@ -912,5 +915,5 @@ async def merge_branch(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[DAG] Merge failed: {e}")
+        logger.error(f"[DAG] Merge failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="internal server error")

@@ -68,9 +68,9 @@ if WING_AXIS not in ("owner_id", "namespace"):
         f"KNOSSOS_WING_AXIS must be 'owner_id' or 'namespace' (got {WING_AXIS!r})"
     )
 
-# Reserved predicate prefix for MemPalace tunnels projected onto
-# the MNEMOS KG.
-TUNNEL_PREDICATE_PREFIX = "tunnel:"
+# #181: removed `TUNNEL_PREDICATE_PREFIX = "tunnel:"` — defined
+# but never referenced. The MemPalace tunnel projection uses the
+# literal "tunnel:" prefix inline where needed.
 
 server = Server("knossos")
 

@@ -1,6 +1,6 @@
 # MNEMOS Operations — Multi-Node Deployment & Maintenance
 
-**Status:** Canonical (v5.0.0 production line, updated 2026-05-02)
+**Status:** Canonical (v5.0.1 production line, updated 2026-05-08)
 **Audience:** Operators, SREs, release engineers
 **Scope:** Continuous operation and maintenance of MNEMOS production + staging + test clusters
 
@@ -22,8 +22,8 @@ This doc covers:
 
 What this doc does NOT cover:
 - Application code (see `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, etc. for feature roadmap)
-- High-level architecture (see `README.md` and `docs/ARCHITECTURE.md`)
-- User-facing API (see `docs/API.md` and `examples/`)
+- High-level architecture (see `README.md` and `docs/MEMORY_ARCHITECTURE.md`)
+- User-facing API (see `API_DOCUMENTATION.md` (root) and `docs/SPECIFICATION.md`)
 
 **Last verified:** 2026-04-26 (all three remotes converged, prod healthy, staging not yet live)
 
@@ -41,7 +41,7 @@ What this doc does NOT cover:
                      /         \
                     /           \
               PYTHIA (.67)    CERBERUS (.96)
-              v5.0 prod       dark prod / GPU host
+              v5.3 prod       dark prod / GPU host
               pg17 primary    standby + inference
               11,756 memories + Apollo Gemma 4 (ports 8080/8081)
               5,045 compressions
@@ -64,8 +64,8 @@ What this doc does NOT cover:
 
 | Host | IP | OS | CPU | RAM | GPU | Role | MNEMOS version | Status |
 |---|---|---|---|---|---|---|---|---|
-| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v5.0 stable target | ✅ Operational |
-| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v5.0 stable target | ✅ Operational |
+| **PYTHIA** | 192.168.207.67 | Ubuntu 22.04 | 12-core | 30GB | — | Primary (prod) + GRAEAE + CNXN | v5.3 stable target | ✅ Operational |
+| **CERBERUS** | 192.168.207.96 | Debian 12 | 24-core (Threadripper) | 125GB | RTX 4500 ADA 24GB | Secondary/dark prod + Apollo GPU inference | v5.3 stable target | ✅ Operational |
 | **PROTEUS** | 192.168.207.25 | Debian 12 | Intel i7-6700 | 60GB | — | Staging + restore-drill target | latest cut / release drills | ✅ Used for drills |
 | **ARGONAS** | 192.168.207.101 | TrueNAS | — | — | — | NFS + git origin (planned: LB) | nginx 1.26 (TrueNAS UI proxy only) | ✅ Running |
 
@@ -77,7 +77,7 @@ What this doc does NOT cover:
 - **External (today):** Clients hit PYTHIA `192.168.207.67:5002` directly. No fronting LB.
 - **Internal:** Backends communicate directly with each other via private IP; no SSH tunneling needed
 - **Database:** PostgreSQL unix-socket on same host; replication via TCP between PYTHIA and CERBERUS
-- **Auth:** Bearer token in `Authorization: Bearer <token>` header; token validation done by FastAPI middleware in `api/auth.py:validate_token()`
+- **Auth:** Bearer token in `Authorization: Bearer <token>` header; token validation done by FastAPI dependency `get_current_user` in `mnemos/api/dependencies.py`
 - **Federation:** Peer-to-peer sync uses HTTP + bearer tokens; same auth model as client API
 
 ---
@@ -410,7 +410,7 @@ ssh root@192.168.207.25 \
   "gunzip < $BACKUP | psql -U postgres -d mnemos_restore_test"
 
 # 5. Verify app can read
-MNEMOS_DB_NAME=mnemos_restore_test python -m pytest tests/test_memories.py -k "test_list" -v
+PG_DATABASE=mnemos_restore_test python -m pytest tests/test_memories.py -k "test_list" -v
 
 # 6. Cleanup
 ssh root@192.168.207.25 "dropdb -U postgres mnemos_restore_test"
@@ -430,7 +430,7 @@ The pgha-primary/pgha-standby replication layer is **failover**, not **backup**.
 - Grafana + Prometheus + cAdvisor on PYTHIA (4+ days uptime)
 - Per-node `/health` endpoint (returns JSON status + version)
 - Structured logging via `structlog` → stdout → journalctl (or docker logs)
-- Request-ID correlation via `api/observability.py` (550 lines, soft-optional deps)
+- Request-ID correlation via `mnemos/core/observability.py` (soft-optional deps)
 
 **Current gaps:**
 - No Slack/Signal/PagerDuty wiring (manual eyeball only)
@@ -439,7 +439,7 @@ The pgha-primary/pgha-standby replication layer is **failover**, not **backup**.
 - No drift detection (version skew between prod nodes)
 - No federation peer heartbeat detection
 
-### 7.2 Required alerts (to implement by v3.5)
+### 7.2 Required alerts (planned)
 
 | Alert | Condition | Action | Severity |
 |---|---|---|---|
@@ -462,7 +462,7 @@ Response (JSON):
 ```json
 {
   "status": "healthy",
-  "version": "4.0.0",
+  "version": "5.0.1",
   "profile": "server",
   "database_connected": true,
   "distillation_worker": "healthy"
@@ -476,8 +476,8 @@ Response (JSON):
 Simple dashboard (Grafana or custom HTML) that queries each node's `/health` and shows:
 
 ```
-PYTHIA:   4.0.0         (prod target)
-CERBERUS: 4.0.0         (dark prod / GPU host)
+PYTHIA:   5.0.1         (prod target)
+CERBERUS: 5.0.1         (dark prod / GPU host)
 PROTEUS:  next cut      (staging / restore-drill target)
 ```
 
@@ -588,8 +588,8 @@ Implement `scripts/ops/version_check.sh`:
 #!/bin/bash
 # Check each node's version vs. declared target
 
-PYTHIA_DECLARED="4.0.0"
-CERBERUS_DECLARED="4.0.0"
+PYTHIA_DECLARED="5.0.1"
+CERBERUS_DECLARED="5.0.1"
 PROTEUS_DECLARED="next-cut"
 
 PYTHIA_ACTUAL=$(curl -s -H "Authorization: Bearer $TOKEN" \
@@ -654,7 +654,7 @@ See `~/.claude/rules/github-behavior.md` for full rate-limit rules and the ratio
 
 ## 11. Federation health
 
-### 11.1 Architecture (v5.0.0 current)
+### 11.1 Architecture (v5.0.1 current)
 
 Federation (peer-to-peer memory sync) is specified in `mnemos/api/routes/federation.py`. Key points:
 
@@ -748,7 +748,7 @@ Use this checklist before **any** deployment, upgrade, or migration on PYTHIA or
 
 ---
 
-## 13. Deployment artifacts (to be created by v3.5)
+## 13. Deployment artifacts (planned)
 
 The following three shell scripts codify operational patterns and reduce manual error. **Current status:** Not yet written (specifications follow).
 
@@ -834,11 +834,11 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 ## 15. Cross-references
 
-- **Feature roadmap:** `docs/V3_5_CHARTER.md` (PANTHEON + IRIS + ops hardening), `docs/V3_6_CHARTER.md` (APOLLO consolidation + PERSEPHONE archival), `docs/V4_PLAN.md` (API consolidation + GPU stack)
-- **Architecture:** `README.md`, `docs/ARCHITECTURE.md`
-- **API docs:** `docs/API.md`, `examples/`
+- **Feature roadmap:** `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md` (historical planning docs)
+- **Architecture:** `README.md`, `docs/MEMORY_ARCHITECTURE.md`, `docs/SPECIFICATION.md`
+- **API docs:** `API_DOCUMENTATION.md` (root) + the live FastAPI OpenAPI spec at `/docs` on a running instance
 - **Database:** `db/migrations_*.sql` and `db/migrations_sqlite/` (schema changes), `mnemos/installer/db.py` (canonical migration order)
-- **Observability:** `mnemos/api/observability.py` (request-ID middleware, Prometheus, OTEL)
+- **Observability:** `mnemos/core/observability.py` (request-ID middleware, Prometheus, OTEL)
 - **Federation:** `mnemos/api/routes/federation.py` (peer sync logic)
 
 ---
@@ -918,6 +918,6 @@ sudo journalctl -u mnemos -f
 ---
 
 **Document version:** 1.0  
-**Last updated:** 2026-04-26  
+**Last updated:** 2026-05-08  
 **Maintained by:** Operations team  
-**Status:** Active, gaps identified for v3.5 work
+**Status:** Active, current for v5.0.1 production line

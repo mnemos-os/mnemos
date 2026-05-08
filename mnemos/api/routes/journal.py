@@ -29,13 +29,10 @@ class JournalCreateRequest(BaseModel):
     metadata: Optional[dict] = None
 
 
-class JournalEntry(BaseModel):
-    id: str
-    entry_date: str
-    topic: Optional[str]
-    content: Optional[str]
-    metadata: Optional[dict]
-    created: str
+# #192: removed `JournalEntry` Pydantic response model — declared
+# but never used as a `response_model=` annotation. Journal routes
+# return raw dict / list payloads directly.
+
 
 @router.post("/journal", status_code=201)
 async def create_journal_entry(

@@ -27,7 +27,7 @@ import asyncio
 import json
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -376,7 +376,7 @@ async def upsert_models(pool, models: list[dict], dry_run: bool = False) -> tupl
         return 0, 0, 0
 
     added = updated = deprecated = 0
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
 
     async with pool.acquire() as conn:
         async with conn.transaction():

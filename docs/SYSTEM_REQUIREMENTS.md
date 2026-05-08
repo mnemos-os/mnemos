@@ -1,7 +1,7 @@
 # System Requirements
 
 Reference for operators planning a MNEMOS deployment. Covers the
-resource floor for each of the operating modes that the v4.0 line supports
+resource floor for each of the operating modes that the v5.3 line supports
 today, plus what drops off at each tier.
 
 Profiles are descriptive sizing tiers. The feature set is controlled by
@@ -32,7 +32,7 @@ backend). Pi 4 class is the intended floor for the embedded tier.
 * **Network**: internal only for the contest path; outbound only
   required if using an externally hosted embedding/LLM endpoint.
 
-## Server tier — full v4.0 feature set
+## Server tier — full v5.3 feature set
 
 Intended for the primary deployment host that runs the API + worker
 for production ingest.
@@ -120,4 +120,4 @@ starts.
 
 ---
 
-*Last updated: 2026-05-02 (v5.0.0 doc sync)*
+*Last updated: 2026-05-08 (v5.0.1 doc sync)*

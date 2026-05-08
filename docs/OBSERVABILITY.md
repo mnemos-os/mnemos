@@ -90,7 +90,7 @@ Drop to 10s only if you're actively debugging a latency spike.
 
 ## 3. The shipped metrics
 
-As of v4.2.0a11 the stable metric surface is:
+As of v5.0.1 the stable metric surface is:
 
 ### 3.1 HTTP request rate
 
@@ -235,7 +235,8 @@ routes panel: probably a single hot endpoint with a slow downstream.
 - An LLM provider client (httpx session) not closed. GRAEAE
   pools sessions; if pool size grows unbounded that's a leak.
 - Postgres connection pool growing. Check pool config — should
-  be bounded by `MNEMOS_DB_POOL_MAX_SIZE`.
+  be bounded by `PG_POOL_MAX` (defined in
+  `_DatabaseSettings.pool_max_size`, default 20).
 
 The yellow/red thresholds (500/4000) are conservative for a
 single replica. Adjust for your fleet size.
@@ -245,11 +246,12 @@ single replica. Adjust for your fleet size.
 A slow RSS climb (10 MB / hour over days) is usually a Python-side
 cache that doesn't bound. The two known caches:
 
-- `mnemos.api.lifecycle._cache` (Redis fallback in-memory cache).
+- `mnemos.core.lifecycle._cache` (Redis fallback in-memory cache).
   Bounded at startup; should not grow.
-- `mnemos.domain.graeae.providers` — provider-specific session
-  pools. Grow per-distinct-provider; bounded by your provider
-  count.
+- The provider-worker pools in `mnemos.domain.graeae.provider_worker`
+  + `mnemos.domain.graeae.provider_sync` — provider-specific
+  session pools. Grow per-distinct-provider; bounded by your
+  provider count.
 
 A fast RSS climb (>100 MB / hour) is almost always a request
 loop with a memory-resident result set — usually federation pull
@@ -352,4 +354,4 @@ versions.
 
 ---
 
-*v1.0 — 2026-05-01. Tracks MNEMOS server v4.2.0a11.*
+*v1.0 — 2026-05-08. Tracks MNEMOS server v5.0.1.*

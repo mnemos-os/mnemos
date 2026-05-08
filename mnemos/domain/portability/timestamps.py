@@ -32,10 +32,15 @@ def _parse_iso(value: Optional[str]) -> Optional[datetime]:
 
 
 def _parse_iso_naive(value: Optional[str]) -> Optional[datetime]:
-    """Parse a timestamp and return UTC-as-naive for TIMESTAMP columns."""
+    """Parse a timestamp and return a UTC-aware value for DB writes.
+
+    The helper name is retained for import-call compatibility from the
+    pre-v5.0.3 TIMESTAMP schema. Postgres lifecycle columns are now
+    TIMESTAMPTZ and asyncpg expects aware datetime values.
+    """
     parsed = _parse_iso(value)
     if parsed is None:
         return None
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
-    return parsed
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

@@ -19,10 +19,10 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
-import asyncpg
 import httpx
 
 from mnemos.db import eligibility as _eligibility
+from mnemos.persistence.base import FederationRepository, PersistenceBackend, Transaction
 
 logger = logging.getLogger(__name__)
 
@@ -55,9 +55,9 @@ def _cursor_timestamp_for_wire(updated: datetime) -> str:
 
 
 def _cursor_timestamp_for_db(updated: datetime) -> datetime:
-    if updated.tzinfo is not None:
-        updated = updated.astimezone(timezone.utc)
-    return updated.replace(tzinfo=None)
+    if updated.tzinfo is None:
+        return updated.replace(tzinfo=timezone.utc)
+    return updated.astimezone(timezone.utc)
 
 
 def _parse_cursor_timestamp(value: str) -> datetime:
@@ -100,6 +100,23 @@ def _cap(value, limit: int):
     if isinstance(value, str) and len(value) > limit:
         return value[:limit]
     return value
+
+
+def _coerce_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
 
 
 # ── Pull + store ─────────────────────────────────────────────────────────────
@@ -296,7 +313,7 @@ def _local_migrations_fingerprint() -> str:
 
 
 async def sync_peer(
-    pool: asyncpg.Pool,
+    backend: PersistenceBackend,
     peer_id: str,
 ) -> Tuple[int, int, int]:
     """Run a full sync against one peer. Returns (pulled, new, updated).
@@ -307,21 +324,15 @@ async def sync_peer(
     Operators must explicitly set compat_mode='permissive' on a peer
     to allow cross-version sync.
     """
-    async with pool.acquire() as conn:
-        peer = await conn.fetchrow(
-            """
-            SELECT id::text, name, base_url, auth_token, namespace_filter,
-                   category_filter, enabled, last_sync_cursor,
-                   compat_mode
-            FROM federation_peers WHERE id = $1::uuid
-            """,
-            peer_id,
-        )
+    repo = backend.federation
+    async with backend.transactional() as tx:
+        peer = await repo.get_sync_peer(tx, peer_id)
     if not peer:
         raise ValueError(f"peer {peer_id} not found")
     if not peer["enabled"]:
         logger.info("federation: peer %s disabled — skipping", peer["name"])
         return 0, 0, 0
+    cursor_before = _coerce_datetime(peer["last_sync_cursor"])
 
     # Schema-compatibility pre-flight (added in v3.4 federation_compat).
     # See db/migrations_v3_4_federation_compat.sql for column meaning.
@@ -400,69 +411,15 @@ async def sync_peer(
         # so the next 60s worker tick can re-attempt. Durable failures
         # (incompat, 4xx, parse) advance last_sync_at as normal.
         is_transient = (schema_abort_kind == "transient")
-        async with pool.acquire() as conn:
-            async with conn.transaction():
-                await conn.execute(
-                    """
-                    UPDATE federation_peers
-                    SET peer_mnemos_version = $2, last_schema_check_at = NOW()
-                    WHERE id = $1::uuid
-                    """,
-                    peer_id, peer_version,
-                )
-                log_id = await conn.fetchval(
-                    """
-                    INSERT INTO federation_sync_log (peer_id, cursor_before)
-                    VALUES ($1::uuid, $2) RETURNING id
-                    """,
-                    peer_id, peer["last_sync_cursor"],
-                )
-                await conn.execute(
-                    """
-                    UPDATE federation_sync_log
-                    SET finished_at = NOW(),
-                        memories_pulled = 0,
-                        memories_new = 0,
-                        memories_updated = 0,
-                        error = $2,
-                        cursor_after = $3
-                    WHERE id = $1::uuid
-                    """,
-                    log_id, schema_abort_reason, peer["last_sync_cursor"],
-                )
-                if is_transient:
-                    # Codex review-round-4 finding #1 — advance
-                    # last_sync_at to "due in 60s" rather than not
-                    # advancing at all. Otherwise a peer with a
-                    # persistent transport flake stays at the front of
-                    # the worker's LIMIT-10 ORDER BY last_sync_at queue
-                    # and starves other due peers. Setting last_sync_at
-                    # = NOW() - sync_interval + 60s makes the peer due
-                    # again in ~60s but pushes it to the back of the
-                    # queue so siblings get a turn.
-                    await conn.execute(
-                        """
-                        UPDATE federation_peers
-                        SET last_sync_at = NOW()
-                                          - (sync_interval_secs || ' seconds')::interval
-                                          + INTERVAL '60 seconds',
-                            last_error = $2,
-                            last_error_at = NOW()
-                        WHERE id = $1::uuid
-                        """,
-                        peer_id, schema_abort_reason,
-                    )
-                else:
-                    await conn.execute(
-                        """
-                        UPDATE federation_peers
-                        SET last_sync_at = NOW(),
-                            last_error = $2,
-                            last_error_at = NOW()
-                        WHERE id = $1::uuid
-                        """,
-                        peer_id, schema_abort_reason,
-                    )
+        async with backend.transactional() as tx:
+            await repo.record_schema_abort(
+                tx,
+                peer_id=peer_id,
+                peer_version=peer_version,
+                cursor_before=cursor_before,
+                error=schema_abort_reason,
+                is_transient=is_transient,
+            )
         logger.error(
             "federation: peer %s — strict abort (%s): %s",
             peer["name"], schema_abort_kind, schema_abort_reason,
@@ -483,15 +440,8 @@ async def sync_peer(
 
     # Non-strict-abort paths: still record what we learned about the
     # peer so operators have visibility into "last seen version X".
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE federation_peers
-            SET peer_mnemos_version = $2, last_schema_check_at = NOW()
-            WHERE id = $1::uuid
-            """,
-            peer_id, peer_version,
-        )
+    async with backend.transactional() as tx:
+        await repo.update_peer_schema_check(tx, peer_id, peer_version)
 
     if schema_abort_reason is not None:
         # compat_mode == 'permissive' falls through to here.
@@ -505,16 +455,8 @@ async def sync_peer(
             peer["name"], local_signature,
         )
 
-    cursor_before = peer["last_sync_cursor"]
-
-    async with pool.acquire() as conn:
-        log_id = await conn.fetchval(
-            """
-            INSERT INTO federation_sync_log (peer_id, cursor_before)
-            VALUES ($1::uuid, $2) RETURNING id
-            """,
-            peer_id, cursor_before,
-        )
+    async with backend.transactional() as tx:
+        log_id = await repo.create_sync_log(tx, peer_id, cursor_before)
 
     total_pulled = 0
     total_new = 0
@@ -531,8 +473,8 @@ async def sync_peer(
             )
             if not batch:
                 break
-            async with pool.acquire() as conn:
-                new_n, upd_n = await _store_memories(conn, peer["name"], batch)
+            async with backend.transactional() as tx:
+                new_n, upd_n = await _store_memories(repo, tx, peer["name"], batch)
             total_pulled += len(batch)
             total_new += new_n
             total_updated += upd_n
@@ -545,42 +487,20 @@ async def sync_peer(
         err = f"{type(e).__name__}: {e}"
         logger.exception("federation: pull from %s failed", peer["name"])
 
-    async with pool.acquire() as conn:
-        await conn.execute(
-            """
-            UPDATE federation_sync_log
-            SET finished_at = NOW(),
-                memories_pulled = $2,
-                memories_new = $3,
-                memories_updated = $4,
-                error = $5,
-                cursor_after = $6
-            WHERE id = $1::uuid
-            """,
-            log_id, total_pulled, total_new, total_updated, err, cursor_persisted,
+    async with backend.transactional() as tx:
+        await repo.finish_sync_log(
+            tx,
+            log_id=log_id,
+            memories_pulled=total_pulled,
+            memories_new=total_new,
+            memories_updated=total_updated,
+            error=err,
+            cursor_after=cursor_persisted,
         )
         if err:
-            await conn.execute(
-                """
-                UPDATE federation_peers
-                SET last_sync_at = NOW(), last_error = $2, last_error_at = NOW()
-                WHERE id = $1::uuid
-                """,
-                peer_id, err,
-            )
+            await repo.record_sync_error(tx, peer_id, err)
         else:
-            await conn.execute(
-                """
-                UPDATE federation_peers
-                SET last_sync_at = NOW(),
-                    last_sync_cursor = $2,
-                    last_error = NULL,
-                    last_error_at = NULL,
-                    total_pulled = total_pulled + $3
-                WHERE id = $1::uuid
-                """,
-                peer_id, cursor_persisted, total_pulled,
-            )
+            await repo.record_sync_success(tx, peer_id, cursor_persisted, total_pulled)
 
     logger.info(
         "federation: peer=%s pulled=%d new=%d updated=%d cursor=%s",
@@ -659,7 +579,8 @@ async def pull_memory_by_id(
 
 
 async def _store_memories(
-    conn: asyncpg.Connection,
+    repo: FederationRepository,
+    tx: Transaction,
     peer_name: str,
     memories: List[Dict[str, Any]],
 ) -> Tuple[int, int]:
@@ -671,7 +592,7 @@ async def _store_memories(
         if not remote_id or not isinstance(remote_id, str):
             continue
         if mem.get("type") == "consolidation":
-            upd_n += await _apply_consolidation_tombstone(conn, peer_name, mem)
+            upd_n += await _apply_consolidation_tombstone(repo, tx, peer_name, mem)
             continue
         # Cap inbound strings. A hostile peer otherwise fills the disk.
         content = _cap(mem.get("content", ""), FEDERATION_MAX_CONTENT)
@@ -683,23 +604,10 @@ async def _store_memories(
         subcategory = _cap(mem.get("subcategory"), FEDERATION_MAX_NAME)
         namespace = _cap(mem.get("namespace", "default"), FEDERATION_MAX_NAME)
         local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
-        remote_updated_raw = mem.get("updated") or mem.get("created")
-        if remote_updated_raw:
-            try:
-                remote_updated = datetime.fromisoformat(
-                    remote_updated_raw.replace("Z", "+00:00")
-                )
-            except ValueError:
-                remote_updated = None
-        else:
-            remote_updated = None
+        remote_updated = _coerce_datetime(mem.get("updated") or mem.get("created"))
 
         # Check existing
-        existing = await conn.fetchrow(
-            "SELECT federation_remote_updated FROM memories "
-            "WHERE id = $1 AND deleted_at IS NULL",
-            local_id,
-        )
+        existing = await repo.fetch_federated_memory_marker(tx, local_id)
 
         meta_raw = mem.get("metadata") or {}
         if isinstance(meta_raw, dict):
@@ -713,48 +621,34 @@ async def _store_memories(
                                     "_metadata_truncated": True})
 
         if existing is None:
-            try:
-                await conn.execute(
-                    """
-                    INSERT INTO memories
-                      (id, content, category, subcategory, metadata, verbatim_content,
-                       quality_rating, owner_id, namespace, permission_mode,
-                       source_model, source_provider, source_session, source_agent,
-                       federation_source, federation_remote_updated, created, updated)
-                    VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, 'federation', $8, 644,
-                            $9, $10, $11, $12, $13, $14::timestamptz, NOW(),
-                            ($14::timestamptz AT TIME ZONE 'UTC'))
-                    """,
-                    local_id,
-                    content,
-                    category,
-                    subcategory,
-                    meta_json,
-                    verbatim,
-                    mem.get("quality_rating") or 75,
-                    namespace,
-                    mem.get("source_model"),
-                    mem.get("source_provider"),
-                    mem.get("source_session"),
-                    mem.get("source_agent"),
-                    peer_name,
-                    remote_updated,
-                )
+            inserted = await repo.insert_federated_memory(
+                tx,
+                local_id=local_id,
+                content=content,
+                category=category,
+                subcategory=subcategory,
+                metadata_json=meta_json,
+                verbatim_content=verbatim,
+                quality_rating=mem.get("quality_rating") or 75,
+                namespace=namespace,
+                source_model=mem.get("source_model"),
+                source_provider=mem.get("source_provider"),
+                source_session=mem.get("source_session"),
+                source_agent=mem.get("source_agent"),
+                peer_name=peer_name,
+                remote_updated=remote_updated,
+            )
+            if inserted:
                 new_n += 1
-            except asyncpg.UniqueViolationError:
-                # Concurrent INSERT from another federation consumer
-                # (the partial-fleet rollout window with queue-mode +
-                # legacy durables is the canonical trigger; both
-                # consumers see the same event, both pass the SELECT,
-                # both attempt INSERT, only one wins). Re-fetch and
-                # fall through to the update-when-newer branch so the
-                # losing path still applies a delta if its remote_updated
-                # is the freshest.
-                existing = await conn.fetchrow(
-                    "SELECT federation_remote_updated FROM memories "
-                    "WHERE id = $1 AND deleted_at IS NULL",
-                    local_id,
-                )
+                continue
+            # Concurrent create from another federation consumer (the
+            # partial-fleet rollout window with queue-mode + legacy
+            # durables is the canonical trigger; both consumers see
+            # the same event, both pass the existence check, both attempt
+            # to insert, only one wins). Re-fetch and fall through to the
+            # update-when-newer branch so the losing path still applies
+            # a delta if its remote_updated is the freshest.
+            existing = await repo.fetch_federated_memory_marker(tx, local_id)
 
         if existing is not None:
             # Update only if the inbound remote_updated beats the
@@ -763,52 +657,43 @@ async def _store_memories(
             # guard, two concurrent consumers handling events at
             # different remote_updated timestamps can both pass the
             # Python-side check on the same baseline and the older
-            # one's UPDATE can commit second, rolling local state
+            # one's write can commit second, rolling local state
             # backward to the older remote_updated. Codex round-3
             # audit (2026-05-01).
             if (
-                existing["federation_remote_updated"] is None
-                or (remote_updated and remote_updated > existing["federation_remote_updated"])
-            ):
-                result = await conn.execute(
-                    """
-                    UPDATE memories SET
-                      content = $2, category = $3, subcategory = $4,
-                      metadata = $5::jsonb, verbatim_content = $6,
-                      quality_rating = $7, namespace = $8,
-                      federation_remote_updated = $9::timestamptz,
-                      updated = ($9::timestamptz AT TIME ZONE 'UTC')
-                    WHERE id = $1
-                      AND deleted_at IS NULL
-                      AND (
-                          federation_remote_updated IS NULL
-                          OR federation_remote_updated < $9::timestamptz
-                      )
-                    """,
-                    local_id,
-                    content,
-                    category,
-                    subcategory,
-                    meta_json,
-                    verbatim,
-                    mem.get("quality_rating") or 75,
-                    namespace,
-                    remote_updated,
+                _coerce_datetime(existing["federation_remote_updated"]) is None
+                or (
+                    remote_updated
+                    and _coerce_datetime(remote_updated)
+                    and _coerce_datetime(remote_updated) > _coerce_datetime(existing["federation_remote_updated"])
                 )
-                # asyncpg execute returns "UPDATE <n>" — count only
-                # rows actually affected. A concurrent newer event
+            ):
+                updated = await repo.update_federated_memory_if_newer(
+                    tx,
+                    local_id=local_id,
+                    content=content,
+                    category=category,
+                    subcategory=subcategory,
+                    metadata_json=meta_json,
+                    verbatim_content=verbatim,
+                    quality_rating=mem.get("quality_rating") or 75,
+                    namespace=namespace,
+                    remote_updated=remote_updated,
+                )
+                # Count only rows actually affected. A concurrent newer event
                 # commits first → our WHERE filter fails → 0 rows
                 # → don't increment upd_n. The state in the row is
                 # already as fresh as we have, and ON CONFLICT
                 # idempotency means this is a successful no-op.
-                if result and result.split()[-1] != "0":
+                if updated:
                     upd_n += 1
 
     return new_n, upd_n
 
 
 async def _apply_consolidation_tombstone(
-    conn: asyncpg.Connection,
+    repo: FederationRepository,
+    tx: Transaction,
     peer_name: str,
     event: Dict[str, Any],
 ) -> int:
@@ -828,42 +713,22 @@ async def _apply_consolidation_tombstone(
         consolidated_at = None
     local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{remote_id}"
     local_canonical_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{canonical_remote_id}"
-    result = await conn.execute(
-        """
-        UPDATE memories
-        SET consolidated_into = $2,
-            consolidated_at = COALESCE($3::timestamptz, NOW()),
-            permission_mode = 400,
-            metadata = COALESCE(metadata, '{}'::jsonb)
-                || jsonb_build_object(
-                    'federation_consolidation', jsonb_build_object(
-                        'remote_id', $4,
-                        'remote_consolidated_into', $5,
-                        'peer', $6
-                    )
-                )
-        WHERE id = $1
-          AND deleted_at IS NULL
-          AND consolidated_into IS DISTINCT FROM $2
-          AND EXISTS (
-              SELECT 1 FROM memories
-              WHERE id = $2 AND deleted_at IS NULL
-          )
-        """,
-        local_id,
-        local_canonical_id,
-        consolidated_at,
-        remote_id,
-        canonical_remote_id,
-        peer_name,
+    updated = await repo.apply_consolidation_tombstone(
+        tx,
+        local_id=local_id,
+        local_canonical_id=local_canonical_id,
+        consolidated_at=consolidated_at,
+        remote_id=remote_id,
+        canonical_remote_id=canonical_remote_id,
+        peer_name=peer_name,
     )
-    return 0 if not result or result.split()[-1] == "0" else 1
+    return 1 if updated else 0
 
 
 # ── Background worker ────────────────────────────────────────────────────────
 
 
-async def federation_worker_loop(pool: asyncpg.Pool) -> None:
+async def federation_worker_loop(backend: PersistenceBackend) -> None:
     """Background loop: iterate enabled peers, sync those whose interval has elapsed.
 
     Started from the FastAPI lifespan. Cancels cleanly on shutdown.
@@ -874,7 +739,7 @@ async def federation_worker_loop(pool: asyncpg.Pool) -> None:
     while True:
         try:
             await asyncio.sleep(60)  # check every minute
-            async with pool.acquire() as conn:
+            async with backend.transactional() as tx:
                 # Codex review-round-5 — order by computed next-due
                 # time (last_sync_at + sync_interval), not last_sync_at
                 # alone. Heterogeneous sync_interval_secs values mean a
@@ -884,23 +749,10 @@ async def federation_worker_loop(pool: asyncpg.Pool) -> None:
                 # `ORDER BY COALESCE(last_sync_at, epoch)` would have
                 # let 10 long-interval transient-failing peers starve
                 # short-interval healthy peers every 60s tick.
-                due = await conn.fetch(
-                    """
-                    SELECT id::text, name, sync_interval_secs, last_sync_at
-                    FROM federation_peers
-                    WHERE enabled
-                      AND (last_sync_at IS NULL
-                           OR last_sync_at + (sync_interval_secs || ' seconds')::interval <= NOW())
-                    ORDER BY COALESCE(
-                        last_sync_at + (sync_interval_secs || ' seconds')::interval,
-                        'epoch'::timestamptz
-                    )
-                    LIMIT 10
-                    """
-                )
+                due = await backend.federation.list_due_peers(tx)
             for p in due:
                 try:
-                    await sync_peer(pool, p["id"])
+                    await sync_peer(backend, p["id"])
                 except Exception:
                     logger.exception("federation: sync failed for peer %s", p["name"])
         except asyncio.CancelledError:

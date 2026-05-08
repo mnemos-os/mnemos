@@ -127,7 +127,7 @@ async def tool_recommend_model(
             }
 
     except Exception as e:
-        logger.error(f"[MCP] recommend_model failed: {e}")
+        logger.error(f"[MCP] recommend_model failed: {e}", exc_info=True)
         return {"success": False, "error": str(e)}
 
 

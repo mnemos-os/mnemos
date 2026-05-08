@@ -6,8 +6,14 @@
 > Codex CLI). Defaults are off; configuration is opt-in; surface area is
 > intentionally narrow. APIs may change between minor releases without a
 > deprecation cycle until the surface is promoted to `stable` in a later
-> release. v4.0.0 keeps stdio/HTTP registry parity in the `mnemos.mcp`
+> release. v5.0.1 keeps stdio/HTTP registry parity in the `mnemos.mcp`
 > package, but broad remote connector packaging remains experimental.
+
+For surfaces without native MCP support, the `mnemos-bridge-*` adapter
+packages (Phase 2 of the bridge consolidation, currently in development)
+provide structured Python integration. The connector docs in this directory
+provide the configuration snippets; the bridge packages provide the runtime
+glue.
 
 ## Audience
 
@@ -39,7 +45,7 @@ these EXACT names when building per-tool allow/deny lists in the
 host agent's config (Cline ``autoApprove``, ChatGPT custom
 connector permissions, etc.) — partial matches don't fire.
 
-Source of truth: ``mnemos/mcp/tools/{memory,kg,dag,models}.py``.
+Source of truth: ``mnemos/mcp/tools/{memory,kg,dag,models,kronos,deletions}.py``.
 
 **Read tools (safe to auto-approve on any key) — 10:**
 
@@ -78,9 +84,10 @@ The ``branch_memory`` DAG tool is a write — it creates a new
 branch. ``checkout_memory`` and ``diff_memory_commits`` are
 read-only despite the "DAG" naming.
 
-The MCP server may add tools across releases; check
-``/v1/mcp/discovery`` on a running instance OR
-``mnemos serve mcp-stdio --print-schema`` for the live count.
+The MCP server may add tools across releases; for the live count
+run ``python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY;
+print(len(TOOL_REGISTRY))'`` in the deployed environment, or
+inspect each agent's MCP-server panel after registration.
 
 **Important: the ``mnemos_`` UI prefix some agents add (e.g.,
 Cursor's tool drawer shows ``mnemos_search_memories``) is
@@ -91,15 +98,72 @@ EXACT registry names — strip the prefix when configuring.
 
 | Agent surface | Transport | Status | Notes |
 |---|---|---|---|
+| **Coding agents** |  |  |  |
 | Claude Code | stdio MCP | ✅ stable | The original target; works out of the box |
-| Claude Desktop | stdio MCP or HTTP/SSE | ✅ stable (stdio) / 🧪 experimental (HTTP) | Stdio for local; HTTP/SSE if you want the same MNEMOS to back multiple machines |
 | Cursor | stdio MCP or HTTP/SSE | ✅ stable | Cursor's MCP support is mature |
 | Codex CLI (OpenAI) | stdio MCP or HTTP/SSE | 🧪 experimental | Codex 0.125.0+ has MCP; we test against 0.126.0-alpha.1 |
-| Continue.dev | stdio MCP or HTTP/SSE | 🧪 experimental | Continue v0.9+ has MCP support |
 | Cline (formerly Claude Dev) | stdio MCP or HTTP/SSE | 🧪 experimental | VS Code extension, autonomous-edit loop. Cline v3.x |
+| Continue.dev | stdio MCP or HTTP/SSE | 🧪 experimental | Continue v0.9+ has MCP support |
+| Aider | HTTPS REST | 🧪 experimental | REST-direct workflow; no native MCP client config here |
+| [Zed](./zed.md) | HTTP/SSE MCP | 🧪 experimental | Native MCP via `mcp_servers` in Zed `0.169+` |
+| [GitHub Copilot Chat](./copilot-chat.md) | HTTP/SSE via VS Code participant API | 🧪 experimental | Partial MCP shape; richer OpenAI-compatible bridge path planned |
+| **Generalist chat** |  |  |  |
 | ChatGPT Pro Developer Mode (web) | HTTP/SSE | 🧪 experimental | Requires the Pro / Team / Enterprise / Edu tier with Developer Mode enabled, plus a public HTTPS URL pointing at your MNEMOS |
 | ChatGPT Custom GPT (Actions) | HTTPS REST | 🧪 experimental | Plus and above. OpenAPI spec via `mnemos dump-openapi --target gpt-actions`; Bearer auth; sync request/response (no streaming). [Connector guide](./openai-custom-gpt.md). |
-| ChatGPT consumer (free) | none | ❌ not supported | Free tier doesn't allow Custom GPTs with Actions or MCP; no plan to ship a non-MCP / non-Actions shim |
+| Claude Desktop | stdio MCP or HTTP/SSE | ✅ stable (stdio) / 🧪 experimental (HTTP) | Stdio for local; HTTP/SSE if you want the same MNEMOS to back multiple machines |
+| **Local runners** |  |  |  |
+| [Ollama](./ollama.md) | OpenAI-compatible tool-call | 🧪 experimental | Uses `mnemos-bridge-openai` adapter; no native MCP |
+| [LM Studio](./lm-studio.md) | OpenAI-compatible tool-call | 🧪 experimental | Local server on `http://localhost:1234/v1`; no native MCP |
+| [vLLM](./vllm.md) | OpenAI-compatible tool-call | 🧪 experimental | Requires `--enable-auto-tool-choice` and a per-model parser |
+| OpenWebUI | HTTPS REST / OpenAI-compatible tools | 🧪 experimental | REST/OpenAI-compatible tool-call and Functions setup; no MCP |
+| **Frameworks** |  |  |  |
+| [LangChain](./langchain.md) | MCP adapter over HTTP/SSE | 🧪 experimental | `langchain-mcp-adapters` loads MNEMOS tools into agents |
+| [LlamaIndex](./llamaindex.md) | MCP adapter over HTTP/SSE | 🧪 experimental | `llama-index-tools-mcp` exposes MNEMOS tools to LlamaIndex workflows |
+
+## Available connectors
+
+### Coding agents
+
+- [Claude Code](./claude-code.md) — `.claude.json` SSH-spawned stdio MCP,
+  with HTTP/SSE notes for `:5003`.
+- [Cursor](./cursor.md) — `~/.cursor/mcp.json` setup and restart guidance.
+- [Codex CLI](./codex-cli.md) — `codex mcp add mnemos` plus
+  `~/.codex/config.toml` for Codex `0.125.0+`.
+- [Cline](./cline.md) — VS Code Cline MCP settings with read-only
+  auto-approve guidance.
+- [Continue.dev](./continue.md) — `~/.continue/config.json` MCP server setup.
+- [Aider](./aider.md) — REST-direct workflow for Aider, which has no native
+  MCP client config here.
+- [Zed](./zed.md) — native MCP via `mcp_servers` in `settings.json`.
+- [GitHub Copilot Chat](./copilot-chat.md) — VS Code participant API path
+  with known partial-MCP limitations.
+
+### Generalist chat
+
+- [ChatGPT Pro Developer Mode](./chatgpt-pro-developer-mode.md) — HTTP/SSE
+  custom connector setup through a public HTTPS URL.
+- [OpenAI Custom GPT (Actions)](./openai-custom-gpt.md) — OpenAPI Actions
+  setup for sync REST-over-HTTPS.
+- [Claude Desktop](./claude-desktop.md) — Desktop config paths for macOS,
+  Windows, and Linux with stdio MCP JSON.
+
+### Local runners
+
+- [Ollama](./ollama.md) — OpenAI-compatible tool-call path through the
+  `mnemos-bridge-openai` adapter.
+- [LM Studio](./lm-studio.md) — local OpenAI-compatible server at
+  `http://localhost:1234/v1`.
+- [vLLM](./vllm.md) — `--enable-auto-tool-choice` with per-model parser
+  configuration.
+- [OpenWebUI](./openwebui.md) — REST/OpenAI-compatible tool-call and
+  Functions setup; no MCP.
+
+### Frameworks
+
+- [LangChain](./langchain.md) — `langchain-mcp-adapters`
+  `MultiServerMCPClient` to MNEMOS SSE.
+- [LlamaIndex](./llamaindex.md) — `llama-index-tools-mcp` `McpToolSpec` to
+  MNEMOS SSE.
 
 ## Quick start
 
@@ -113,7 +177,7 @@ server as a child process. See the per-surface guides:
 - [Claude Desktop](./claude-desktop.md)
 - [Cursor](./cursor.md)
 - [Codex CLI](./codex-cli.md)
-- [Continue.dev](./continue-dev.md)
+- [Continue.dev](./continue.md)
 - [Cline (VS Code)](./cline.md)
 
 ### If you want ChatGPT to talk to your MNEMOS
@@ -155,7 +219,7 @@ Automated connector smoke coverage lives in
 subcommand for Claude Code, Claude Desktop, Cursor, Codex CLI,
 Continue.dev, and Cline, plus the HTTP/SSE bridge used by ChatGPT
 Pro Developer Mode. The tests use a loopback mock MNEMOS REST backend,
-send MCP `tools/list`, assert the canonical 18-tool registry, then call
+send MCP `tools/list`, assert the canonical 23-tool registry, then call
 `search_memories` with a benign query and verify the success envelope.
 
 Run the connector smoke directly:
@@ -297,8 +361,11 @@ to it, we ship the fix as a PR. That's the contract.
 
 While `experimental`:
 
-- Endpoints under `/admin/tunnels/*` may be renamed, restructured, or
-  withdrawn in any minor release.
+- Endpoints under `/admin/tunnels/*` are **not implemented as of v5.0.1**;
+  the `mnemos-tunnel-setup` script that calls them is aspirational. They
+  may be implemented, renamed, restructured, or withdrawn in any minor
+  release. The manual `mnemos serve mcp-http` + ngrok path documented in
+  each connector page works today regardless.
 - Default ports (5004 for the MCP HTTP/SSE bridge) may change.
 - Bearer auth is the current baseline. Per-user token mapping exists on the
   HTTP/SSE bridge; OAuth on the MCP edge remains later work.

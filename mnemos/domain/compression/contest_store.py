@@ -26,7 +26,6 @@ import json
 import logging
 from typing import Any, Dict, Optional
 
-from mnemos.core.config import hot_rs_enabled
 from mnemos.db.eligibility import eligible_for_compression
 
 from .contest import ContestOutcome
@@ -34,24 +33,16 @@ from .contest import ContestOutcome
 logger = logging.getLogger(__name__)
 
 
-# Optional Rust hot-path accelerator. Loaded lazily so the absence of
-# the wheel does not affect the default Python path.
-_HOT_RS = None
-_HOT_RS_ENABLED = hot_rs_enabled()
-if _HOT_RS_ENABLED:
-    try:
-        import mnemos_hot as _HOT_RS  # type: ignore[import-not-found]
-        logger.info(
-            "mnemos_hot Rust accelerator enabled (compression commit hashes will use mnemos_hot %s)",
-            getattr(_HOT_RS, "__version__", "?"),
-        )
-    except ImportError as _exc:
-        logger.warning(
-            "MNEMOS_HOT_RS_ENABLED=1 but mnemos_hot wheel is not importable: %s. "
-            "Falling back to hashlib compression commit hashes.",
-            _exc,
-        )
-        _HOT_RS = None
+# Note on sha256: a previous revision routed compression commit hashes
+# through ``mnemos_hot.sha256_batch``. Microbench on the actual call
+# pattern (single-payload batches) showed the Rust path was ~7x slower
+# than ``hashlib.sha256``: Python's hashlib already wraps OpenSSL in
+# C with the GIL released, so the PyO3 marshalling cost of crossing
+# the FFI for one payload dominates. The Rust path is gone here; the
+# ``mnemos_hot`` wheel still exposes ``sha256_batch`` for any future
+# call site that genuinely batches payloads (where the FFI cost
+# amortizes), but ``_compression_commit_hash`` is naturally one-at-a-
+# time and uses ``hashlib`` directly.
 
 
 _INSERT_CANDIDATE_SQL = """
@@ -309,22 +300,11 @@ def _compression_commit_hash(
     branch: str,
 ) -> str:
     payload = (parent_commit_hash + variant_content + branch).encode("utf-8")
-    return _sha256_batch([payload])[0]
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _sha256_batch_python(payloads: list[bytes]) -> list[str]:
     return [hashlib.sha256(payload).hexdigest() for payload in payloads]
-
-
-def _sha256_batch(payloads: list[bytes]) -> list[str]:
-    if _HOT_RS is not None:
-        try:
-            result = _HOT_RS.sha256_batch(payloads)
-            if len(result) == len(payloads):
-                return [str(digest) for digest in result]
-        except Exception:
-            pass
-    return _sha256_batch_python(payloads)
 
 
 def _jsonb_arg(value: Any) -> str:

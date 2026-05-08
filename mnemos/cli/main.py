@@ -164,6 +164,25 @@ serve_app = typer.Typer(
     no_args_is_help=False,
 )
 worker_app = typer.Typer(help="Run MNEMOS background workers.", no_args_is_help=True)
+artemis_app = typer.Typer(help="ARTEMIS corpus maintenance commands.", no_args_is_help=True)
+morpheus_app = typer.Typer(help="MORPHEUS run maintenance commands.", no_args_is_help=True)
+
+
+DOC_IMPORT_EXTENSIONS = {
+    ".md",
+    ".markdown",
+    ".rst",
+    ".txt",
+    ".pdf",
+    ".doc",
+    ".docx",
+    ".ppt",
+    ".pptx",
+    ".xls",
+    ".xlsx",
+    ".html",
+    ".htm",
+}
 
 
 def _version_option_callback(value: bool) -> None:
@@ -296,6 +315,171 @@ def _echo_json_response(response: httpx.Response) -> None:
         typer.echo(response.text)
         return
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+def _print_dedup_markdown(payload: dict[str, Any]) -> None:
+    typer.echo("# ARTEMIS duplicate-content sweep")
+    typer.echo("")
+    typer.echo(f"- Namespace: {payload.get('namespace') or '*'}")
+    typer.echo(f"- Groups: {payload['group_count']}")
+    typer.echo(f"- Duplicate rows: {payload['duplicate_count']}")
+    typer.echo(f"- Auto-merge: {'yes' if payload['auto_merge'] else 'no'}")
+    if payload["auto_merge"]:
+        typer.echo(f"- Rows consolidated: {payload['merged_count']}")
+    if not payload["groups"]:
+        return
+    typer.echo("")
+    typer.echo("| owner_id | namespace | canonical_id | duplicates | content_hash |")
+    typer.echo("| --- | --- | --- | ---: | --- |")
+    for group in payload["groups"]:
+        typer.echo(
+            "| {owner_id} | {namespace} | {canonical_id} | {count} | `{hash}` |".format(
+                owner_id=group["owner_id"],
+                namespace=group["namespace"],
+                canonical_id=group["canonical_id"],
+                count=len(group["duplicate_ids"]),
+                hash=group["content_hash"][:16],
+            )
+        )
+
+
+async def _open_cli_persistence_backend():
+    """Open a backend for one-shot CLI maintenance commands."""
+    import asyncpg
+
+    import mnemos.core.lifecycle as lifecycle
+
+    try:
+        return lifecycle.get_persistence_backend(), False
+    except Exception:
+        pass
+
+    settings = get_settings()
+    backend_type = lifecycle._select_persistence_backend(settings)
+    if backend_type == "sqlite":
+        backend = await lifecycle._build_sqlite_backend(
+            lifecycle._sqlite_path_from_settings(settings),
+            settings,
+        )
+        return backend, True
+
+    database_dsn = lifecycle._database_dsn_from_settings(settings)
+    if database_dsn:
+        pool = await asyncpg.create_pool(database_dsn)
+    else:
+        from mnemos.core.config import PG_CONFIG
+
+        pool = await asyncpg.create_pool(
+            user=PG_CONFIG["user"],
+            password=PG_CONFIG["password"],
+            database=PG_CONFIG["database"],
+            host=PG_CONFIG["host"],
+            port=PG_CONFIG["port"],
+            min_size=PG_CONFIG["pool_min_size"],
+            max_size=PG_CONFIG["pool_max_size"],
+        )
+    return lifecycle._build_postgres_backend(pool, settings), True
+
+
+async def _open_cli_morpheus_pool():
+    """Open a raw Postgres pool for one-shot MORPHEUS maintenance commands."""
+    import asyncpg
+
+    import mnemos.core.lifecycle as lifecycle
+
+    try:
+        return lifecycle.get_pool_manager().pool, False
+    except Exception:
+        pass
+
+    settings = get_settings()
+    if lifecycle._select_persistence_backend(settings) != "postgres":
+        raise RuntimeError("mnemos morpheus sweep-orphans requires a Postgres backend")
+
+    database_dsn = lifecycle._database_dsn_from_settings(settings)
+    if database_dsn:
+        pool = await asyncpg.create_pool(database_dsn)
+    else:
+        from mnemos.core.config import PG_CONFIG
+
+        pool = await asyncpg.create_pool(
+            user=PG_CONFIG["user"],
+            password=PG_CONFIG["password"],
+            database=PG_CONFIG["database"],
+            host=PG_CONFIG["host"],
+            port=PG_CONFIG["port"],
+            min_size=PG_CONFIG["pool_min_size"],
+            max_size=PG_CONFIG["pool_max_size"],
+        )
+    return pool, True
+
+
+async def _dedup_sweep_async(
+    *,
+    namespace: str | None,
+    auto_merge: bool,
+) -> dict[str, Any]:
+    from mnemos.domain.artemis_dedup import sweep_duplicate_content
+
+    backend, close_backend = await _open_cli_persistence_backend()
+    try:
+        return await sweep_duplicate_content(
+            backend,
+            namespace=namespace,
+            auto_merge=auto_merge,
+        )
+    finally:
+        if close_backend:
+            await backend.close()
+
+
+async def _sweep_morpheus_orphans_async(*, max_age_hours: int) -> int:
+    from mnemos.domain.morpheus.runner import sweep_orphan_runs
+
+    pool, close_pool = await _open_cli_morpheus_pool()
+    try:
+        return await sweep_orphan_runs(pool, max_age_hours=max_age_hours)
+    finally:
+        if close_pool:
+            await pool.close()
+
+
+def _post_document_import(
+    path: Path,
+    *,
+    tag: str,
+    category: str,
+    subcategory: str | None,
+    permission_mode: int | None,
+    allow_archive_snapshot: bool,
+) -> dict[str, Any]:
+    base, headers = _api_env(require_key=True)
+    data: dict[str, str] = {
+        "category": category,
+        "project_tag": tag,
+    }
+    if subcategory:
+        data["subcategory"] = subcategory
+    if permission_mode is not None:
+        data["permission_mode"] = str(permission_mode)
+    if allow_archive_snapshot:
+        data["allow_archive_snapshot"] = "true"
+    with path.open("rb") as handle:
+        files = {"file": (path.name, handle)}
+        response = httpx.post(
+            f"{base}/v1/documents/import",
+            data=data,
+            files=files,
+            headers=headers,
+            timeout=120,
+        )
+    try:
+        body = response.json()
+    except ValueError:
+        body = {"text": response.text}
+    body["status_code"] = response.status_code
+    body["path"] = str(path)
+    return body
 
 
 def _infer_import_source(source: Path) -> ImportSource:
@@ -445,6 +629,120 @@ def worker_deletion_requests(
 def worker_persephone() -> None:
     """Run the PERSEPHONE archival worker."""
     _run_async_module_main("mnemos.workers.persephone_archival_worker")
+
+
+@artemis_app.command("dedup-sweep")
+def artemis_dedup_sweep(
+    namespace: Optional[str] = typer.Option(None, "--namespace", help="Limit sweep to one namespace.", is_flag=False),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report duplicates without modifying rows."),
+    auto_merge: bool = typer.Option(False, "--auto-merge", help="Consolidate duplicate rows into the oldest row."),
+    json_output: bool = typer.Option(False, "--json", help="Emit JSON instead of markdown."),
+) -> None:
+    """Find duplicate active memories by normalized content hash."""
+    if dry_run and auto_merge:
+        typer.echo("ERROR: choose either --dry-run or --auto-merge.", err=True)
+        raise typer.Exit(2)
+    payload = asyncio.run(
+        _dedup_sweep_async(namespace=namespace, auto_merge=auto_merge)
+    )
+    if json_output:
+        typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        _print_dedup_markdown(payload)
+
+
+@morpheus_app.command("sweep-orphans")
+def morpheus_sweep_orphans(
+    max_age_hours: int = typer.Option(
+        2,
+        "--max-age-hours",
+        help="Fail running MORPHEUS runs older than this many hours.",
+        is_flag=False,
+    ),
+) -> None:
+    """Fail MORPHEUS runs stuck in running past the orphan timeout."""
+    if max_age_hours <= 0:
+        typer.echo("ERROR: --max-age-hours must be positive.", err=True)
+        raise typer.Exit(2)
+    try:
+        swept = asyncio.run(_sweep_morpheus_orphans_async(max_age_hours=max_age_hours))
+    except RuntimeError as exc:
+        typer.echo(f"ERROR: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"Swept {swept} MORPHEUS orphan run(s).")
+
+
+@app.command("import-doc")
+def import_doc(
+    file: Path = typer.Argument(..., help="Document file to import."),
+    tag: str = typer.Option(..., "--tag", help="Active project tag.", is_flag=False),
+    category: str = typer.Option("documents", "--category", help="Memory category.", is_flag=False),
+    subcategory: Optional[str] = typer.Option(None, "--subcategory", help="Memory subcategory.", is_flag=False),
+    permission_mode: Optional[int] = typer.Option(None, "--permission-mode", help="Unix-style permission mode.", is_flag=False),
+    allow_archive_snapshot: bool = typer.Option(
+        False,
+        "--allow-archive-snapshot",
+        help="Allow imports that match historical archive path heuristics.",
+    ),
+) -> None:
+    """Import one document and tag it with an active project."""
+    if not file.exists() or not file.is_file():
+        raise typer.BadParameter(f"not a file: {file}", param_hint="file")
+    result = _post_document_import(
+        file,
+        tag=tag,
+        category=category,
+        subcategory=subcategory,
+        permission_mode=permission_mode,
+        allow_archive_snapshot=allow_archive_snapshot,
+    )
+    typer.echo(json.dumps(result, indent=2, sort_keys=True))
+    if int(result.get("status_code") or 0) >= 400:
+        raise typer.Exit(1)
+
+
+@app.command("import-project")
+def import_project(
+    repo_path: Path = typer.Argument(..., help="Repository path to scan for docs."),
+    tag: str = typer.Option(..., "--tag", help="Active project tag.", is_flag=False),
+    category: str = typer.Option("documents", "--category", help="Memory category.", is_flag=False),
+    permission_mode: Optional[int] = typer.Option(None, "--permission-mode", help="Unix-style permission mode.", is_flag=False),
+    allow_archive_snapshot: bool = typer.Option(
+        False,
+        "--allow-archive-snapshot",
+        help="Allow imports that match historical archive path heuristics.",
+    ),
+) -> None:
+    """Recursively import docs from a repository with a project tag."""
+    if not repo_path.exists() or not repo_path.is_dir():
+        raise typer.BadParameter(f"not a directory: {repo_path}", param_hint="repo-path")
+    results: list[dict[str, Any]] = []
+    for path in sorted(repo_path.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in DOC_IMPORT_EXTENSIONS:
+            continue
+        if any(part in {".git", ".hg", ".svn", "__pycache__"} for part in path.parts):
+            continue
+        results.append(
+            _post_document_import(
+                path,
+                tag=tag,
+                category=category,
+                subcategory=None,
+                permission_mode=permission_mode,
+                allow_archive_snapshot=allow_archive_snapshot,
+            )
+        )
+    payload = {
+        "project_tag": tag,
+        "repo_path": str(repo_path),
+        "documents_seen": len(results),
+        "imported": sum(1 for item in results if int(item.get("status_code") or 0) < 400),
+        "failed": sum(1 for item in results if int(item.get("status_code") or 0) >= 400),
+        "results": results,
+    }
+    typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+    if payload["failed"]:
+        raise typer.Exit(1)
 
 
 @app.command()
@@ -760,6 +1058,8 @@ def dump_openapi(
 
 app.add_typer(serve_app, name="serve")
 app.add_typer(worker_app, name="worker")
+app.add_typer(artemis_app, name="artemis")
+app.add_typer(morpheus_app, name="morpheus")
 
 
 if __name__ == "__main__":

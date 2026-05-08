@@ -1,6 +1,6 @@
 # MNEMOS Quick Start Requirements
 
-**Applies to**: current v4.0.0 release line
+**Applies to**: current v5.0.1 release line
 **TL;DR**: Python 3.11+ for package installs; no host Python for single-binary.
 Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
 **Full Details**: See `SYSTEM_REQUIREMENTS.md`
@@ -10,7 +10,7 @@ Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
 ## Single Binary (Fastest Edge Deploy)
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v4.0.0/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -34,7 +34,7 @@ sudo apt install -y git curl build-essential libpq-dev
 # 3. MNEMOS package (2 minutes)
 python3.11 -m venv ~/.venvs/mnemos
 source ~/.venvs/mnemos/bin/activate
-pip install mnemos-os==4.0.0
+pip install mnemos-os==5.0.1
 
 # 4. SQLite-backed dev profile
 mnemos install --profile dev
@@ -47,7 +47,7 @@ For a production `server` profile, add PostgreSQL + pgvector and Redis:
 sudo apt install -y postgresql-16 postgresql-16-pgvector postgresql-client redis-server
 python3.11 -m venv venv
 source venv/bin/activate
-pip install mnemos-os==4.0.0
+pip install mnemos-os==5.0.1
 export MNEMOS_PROFILE=server
 export RATE_LIMIT_STORAGE_URI=redis://localhost:6379/1
 mnemos install --profile server
@@ -326,6 +326,6 @@ kill -9 <PID>
 
 ---
 
-**Version**: v4.0.0
-**Updated**: 2026-04-28
+**Version**: v5.0.1
+**Updated**: 2026-05-08
 **Accuracy**: Production-verified

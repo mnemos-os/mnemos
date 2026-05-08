@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable, Iterable, Mapping
 import asyncpg
 
 from mnemos.core.config import Settings, get_settings
-from mnemos.domain.federation import FEDERATION_ID_PREFIX, _store_memories, pull_memory_by_id
+from mnemos.domain.federation import _store_memories, pull_memory_by_id
 from mnemos.nats.backoff import ReconnectBackoff
 from mnemos.nats.client import get_node_name
 
@@ -207,7 +207,7 @@ async def handle_message(
     peer: FederationNatsPeer,
     msg: Any,
     *,
-    store: Callable[[Any, str, list[dict[str, Any]]], Awaitable[tuple[int, int]]] = _store_memories,
+    store: Callable[[Any, str, list[dict[str, Any]]], Awaitable[tuple[int, int]]] | None = None,
     delete: Callable[[asyncpg.Pool, str, str], Awaitable[int]] | None = None,
     fetch: Callable[[FederationNatsPeer, str], Awaitable[list[dict[str, Any]]]] | None = None,
 ) -> None:
@@ -239,8 +239,8 @@ async def handle_message(
         await delete(pool, peer.name, memory_id)
         return
 
-    fetch = fetch or _fetch_authorized_memories
-    memories = await fetch(peer, memory_id)
+    fetcher = fetch or _fetch_authorized_memories
+    memories = await fetcher(peer, memory_id)
     if not memories:
         logger.info(
             "federation nats peer=%s memory_id=%s not returned by authorized feed",
@@ -248,8 +248,16 @@ async def handle_message(
             memory_id,
         )
         return
-    async with pool.acquire() as conn:
-        await store(conn, peer.name, memories)
+    if store is not None:
+        async with pool.acquire() as conn:
+            await store(conn, peer.name, memories)
+        return
+
+    import mnemos.core.lifecycle as lifecycle
+
+    backend = lifecycle.get_persistence_backend()
+    async with backend.transactional() as tx:
+        await _store_memories(backend.federation, tx, peer.name, memories)
 
 
 async def _fetch_authorized_memories(
@@ -273,22 +281,18 @@ async def _fetch_authorized_memories(
 
 async def delete_federated_memory(pool: asyncpg.Pool, peer_name: str, memory_id: str) -> int:
     """Hard-delete a federated row matching the poll-path local id shape."""
-    local_id = f"{FEDERATION_ID_PREFIX}{peer_name}:{memory_id}"
-    async with pool.acquire() as conn:
-        result = await conn.execute(
-            """
-            DELETE FROM memories
-            WHERE id = $1
-              AND federation_source = $2
-              AND deleted_at IS NULL
-            """,
-            local_id,
-            peer_name,
-        )
+    import mnemos.core.lifecycle as lifecycle
+
     try:
-        return int(str(result).rsplit(" ", 1)[-1])
-    except (IndexError, ValueError):
-        return 0
+        backend = lifecycle.get_persistence_backend()
+    except RuntimeError:
+        from mnemos.persistence.postgres import PostgresBackend
+
+        backend = PostgresBackend(pool, settings=None)
+
+    async with backend.transactional() as tx:
+        deleted = await backend.federation.delete_federated_memory(tx, peer_name, memory_id)
+    return int(deleted)
 
 
 async def _connect_peer(peer: FederationNatsPeer):

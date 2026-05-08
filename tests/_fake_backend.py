@@ -17,10 +17,17 @@ lifecycle for the duration of a test.
 
 from __future__ import annotations
 
+import hashlib
+from datetime import datetime
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
+
+
+def _content_hash(content: str) -> str:
+    normalized = (content or "").replace("\r\n", "\n").replace("\r", "\n")
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 class _FakeMemoryRepo:
@@ -81,10 +88,61 @@ class _FakeMemoryRepo:
         ))
         return self._resolve("update_memory", None)
 
-    async def delete_memory(self, tx, memory_id, *, visibility):
+    async def find_active_duplicate_by_content_hash(
+        self, tx, *, owner_id, namespace, content_hash, cross_namespace=False,
+    ):
+        self.calls.append((
+            "find_active_duplicate_by_content_hash",
+            {
+                "owner_id": owner_id,
+                "namespace": namespace,
+                "content_hash": content_hash,
+                "cross_namespace": cross_namespace,
+            },
+        ))
+        return self._resolve("find_active_duplicate_by_content_hash", None)
+
+    async def bump_recall_and_get_memory(self, tx, memory_id, *, visibility):
+        self.calls.append((
+            "bump_recall_and_get_memory",
+            {"memory_id": memory_id, "visibility": visibility},
+        ))
+        return self._resolve("bump_recall_and_get_memory", None)
+
+    async def find_duplicate_content_groups(self, tx, *, namespace=None):
+        self.calls.append(("find_duplicate_content_groups", {"namespace": namespace}))
+        return self._resolve("find_duplicate_content_groups", [])
+
+    async def consolidate_duplicate_memories(self, tx, *, canonical_id, duplicate_ids):
+        self.calls.append((
+            "consolidate_duplicate_memories",
+            {"canonical_id": canonical_id, "duplicate_ids": list(duplicate_ids)},
+        ))
+        return self._resolve("consolidate_duplicate_memories", len(duplicate_ids))
+
+    async def delete_memory(
+        self,
+        tx,
+        memory_id,
+        *,
+        visibility,
+        requested_by=None,
+        requested_at=None,
+        request_kind="admin_purge",
+        reason=None,
+        source=None,
+    ):
         self.calls.append((
             "delete_memory",
-            {"memory_id": memory_id, "visibility": visibility},
+            {
+                "memory_id": memory_id,
+                "visibility": visibility,
+                "requested_by": requested_by,
+                "requested_at": requested_at,
+                "request_kind": request_kind,
+                "reason": reason,
+                "source": source,
+            },
         ))
         return self._resolve(
             "delete_memory",
@@ -334,6 +392,7 @@ class _PoolBackedMemoryRepo:
             row for row in self._pool.state["memories"].values()
             if self._visible(row, visibility)
         ]
+        rows = [row for row in rows if row.get("deleted_at") is None]
         if not include_archived:
             rows = [row for row in rows if row.get("archived_at") is None]
         if category is not None:
@@ -357,6 +416,8 @@ class _PoolBackedMemoryRepo:
     async def get_memory(self, tx, memory_id, *, visibility, include_archived=False):
         row = self._pool.state["memories"].get(memory_id)
         if row is None or not self._visible(row, visibility):
+            return None
+        if row.get("deleted_at") is not None:
             return None
         if row.get("archived_at") is not None and not include_archived:
             return None
@@ -419,8 +480,83 @@ class _PoolBackedMemoryRepo:
             "source_provider": kwargs.get("source_provider"),
             "source_session": kwargs.get("source_session"),
             "source_agent": kwargs.get("source_agent"),
+            "content_hash": _content_hash(kwargs["content"]),
+            "recall_count": 0,
+            "last_recalled_at": None,
+            "archived_at": None,
+            "deleted_at": None,
+            "consolidated_into": None,
         }
         return memory_id
+
+    async def find_active_duplicate_by_content_hash(
+        self, tx, *, owner_id, namespace, content_hash, cross_namespace=False,
+    ):
+        rows = []
+        for row in self._pool.state["memories"].values():
+            if row.get("owner_id") != owner_id:
+                continue
+            if not cross_namespace and row.get("namespace") != namespace:
+                continue
+            if row.get("deleted_at") is not None or row.get("archived_at") is not None:
+                continue
+            if row.get("consolidated_into") is not None:
+                continue
+            if row.get("content_hash") == content_hash:
+                rows.append(row)
+        if not rows:
+            return None
+        rows.sort(key=lambda row: (row.get("created") or "", row.get("id") or ""))
+        row = rows[0]
+        return {"id": row["id"], "last_recalled_at": row.get("last_recalled_at")}
+
+    async def bump_recall_and_get_memory(self, tx, memory_id, *, visibility):
+        row = self._pool.state["memories"].get(memory_id)
+        if row is None or not self._visible(row, visibility):
+            return None
+        if row.get("deleted_at") is not None or row.get("archived_at") is not None:
+            return None
+        row["recall_count"] = int(row.get("recall_count") or 0) + 1
+        row["last_recalled_at"] = datetime(2026, 5, 3, 12, 0, 0)
+        return row
+
+    async def find_duplicate_content_groups(self, tx, *, namespace=None):
+        grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+        for row in self._pool.state["memories"].values():
+            if namespace is not None and row.get("namespace") != namespace:
+                continue
+            if row.get("deleted_at") is not None or row.get("archived_at") is not None:
+                continue
+            if row.get("consolidated_into") is not None or not row.get("content_hash"):
+                continue
+            key = (row.get("owner_id"), row.get("namespace"), row.get("content_hash"))
+            grouped.setdefault(key, []).append(row)
+        result = []
+        for (owner_id, ns, content_hash), rows in grouped.items():
+            if len(rows) < 2:
+                continue
+            rows.sort(key=lambda row: (row.get("created") or "", row.get("id") or ""))
+            memory_ids = [row["id"] for row in rows]
+            result.append({
+                "owner_id": owner_id,
+                "namespace": ns,
+                "content_hash": content_hash,
+                "duplicate_count": len(memory_ids),
+                "memory_ids": memory_ids,
+                "canonical_id": memory_ids[0],
+            })
+        return result
+
+    async def consolidate_duplicate_memories(self, tx, *, canonical_id, duplicate_ids):
+        changed = 0
+        for duplicate_id in duplicate_ids:
+            row = self._pool.state["memories"].get(duplicate_id)
+            if row is None or row.get("deleted_at") is not None:
+                continue
+            row["consolidated_into"] = canonical_id
+            row["deleted_at"] = datetime(2026, 5, 3, 12, 0, 0)
+            changed += 1
+        return changed
 
     async def gather_stats(self, tx):
         from mnemos.persistence.base import MemoryStatsRow

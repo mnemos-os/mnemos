@@ -1,4 +1,4 @@
-"""State API: GET/PUT/DELETE /state/{key}, GET /state
+"""State API routes for /state/{key} and /state
 
 Per-owner, per-namespace KV store. All operations are scoped to the caller's
 `user.user_id` and `user.namespace`; keys from one namespace are invisible to
@@ -12,9 +12,8 @@ from typing import Any, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
-import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
-from mnemos.api.routes._postgres_only import _require_postgres_backend
+from mnemos.api.persistence_helpers import backend_or_503
 from mnemos.core.security import scope_namespace, scope_owner
 
 logger = logging.getLogger(__name__)
@@ -30,18 +29,19 @@ async def list_state_keys(
     owner_id: Optional[str] = Query(None, description="Admin-only: target another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: target another namespace"),
 ):
-    _require_postgres_backend()
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            rows = await conn.fetch(
-                'SELECT key, updated::text, version FROM state '
-                'WHERE owner_id = $1 AND namespace = $2 '
-                'AND deleted_at IS NULL ORDER BY key',
-                target_owner, target_ns,
+        async with backend.transactional() as tx:
+            rows = await backend.state_kv.list_namespace(
+                tx,
+                owner_id=target_owner,
+                namespace=target_ns,
             )
         return {"keys": [dict(r) for r in rows]}
+    except NotImplementedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error listing state keys: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -54,16 +54,16 @@ async def get_state(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    _require_postgres_backend()
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc.get_pool_manager().acquire() as conn:
-            row = await conn.fetchrow(
-                'SELECT key, value, updated::text, version FROM state '
-                'WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
-                'AND deleted_at IS NULL',
-                target_owner, target_ns, key,
+        async with backend.transactional() as tx:
+            row = await backend.state_kv.get(
+                tx,
+                key,
+                owner_id=target_owner,
+                namespace=target_ns,
             )
         if not row:
             raise HTTPException(status_code=404, detail=f"State key '{key}' not found")
@@ -82,6 +82,8 @@ async def get_state(
         return result
     except HTTPException:
         raise
+    except NotImplementedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error getting state key: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -95,23 +97,17 @@ async def set_state(
     owner_id: Optional[str] = Query(None, description="Admin-only: write on behalf of another owner"),
     namespace: Optional[str] = Query(None, description="Admin-only: write into another namespace"),
 ):
-    _require_postgres_backend()
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
     try:
-        async with _lc.get_pool_manager().transactional() as conn:
-            row = await conn.fetchrow(
-                # state.value is TEXT (post v4.2.0a5 migration). The
-                # route still wraps caller payloads in json.dumps so
-                # consumers can re-parse with json.loads at read time;
-                # the column type just no longer enforces JSON shape.
-                '''INSERT INTO state (owner_id, namespace, key, value, updated)
-                   VALUES ($1, $2, $3, $4, NOW())
-                   ON CONFLICT (owner_id, namespace, key) DO UPDATE
-                   SET value = $4, updated = NOW(), version = state.version + 1
-                   WHERE state.deleted_at IS NULL
-                   RETURNING key, value, updated::text, version''',
-                target_owner, target_ns, key, json.dumps(req.value),
+        async with backend.transactional() as tx:
+            row = await backend.state_kv.set(
+                tx,
+                key,
+                json.dumps(req.value),
+                owner_id=target_owner,
+                namespace=target_ns,
             )
         if row is None:
             raise HTTPException(
@@ -121,6 +117,8 @@ async def set_state(
         return dict(row)
     except HTTPException:
         raise
+    except NotImplementedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         logger.error(f"Error setting state key '{key}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
@@ -133,14 +131,18 @@ async def delete_state(
     owner_id: Optional[str] = Query(None),
     namespace: Optional[str] = Query(None),
 ):
-    _require_postgres_backend()
+    backend = backend_or_503()
     target_owner = scope_owner(user, owner_id)
     target_ns = scope_namespace(user, namespace)
-    async with _lc.get_pool_manager().transactional() as conn:
-        result = await conn.execute(
-            'DELETE FROM state WHERE owner_id = $1 AND namespace = $2 AND key = $3 '
-            'AND deleted_at IS NULL',
-            target_owner, target_ns, key,
-        )
-    if result == 'DELETE 0':
+    try:
+        async with backend.transactional() as tx:
+            deleted = await backend.state_kv.delete(
+                tx,
+                key,
+                owner_id=target_owner,
+                namespace=target_ns,
+            )
+    except NotImplementedError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    if not deleted:
         raise HTTPException(status_code=404, detail=f"State key '{key}' not found")

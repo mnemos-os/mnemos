@@ -1,6 +1,6 @@
 # GRAEAE Feature Surface
 
-**Status:** current v5.0.0 documentation. v5.0.0 shipped on 2026-05-02.
+**Status:** current v5.0.1 documentation (on top of v5.0.0 GA shipped 2026-05-02).
 
 GRAEAE is MNEMOS's multi-provider reasoning bus. It fans a prompt out to live
 LLM providers, scores the responses, persists consultations, and writes a
@@ -11,9 +11,9 @@ hash-chained audit record for each committed consultation.
 | Capability | Current module | Notes |
 |---|---|---|
 | Provider routing | `mnemos/domain/graeae/engine.py` | Config-driven providers with OpenAI-compatible, Anthropic, and Gemini adapter paths. |
-| Circuit breaking | `mnemos/domain/graeae/_circuit_breaker.py` | Per-provider CLOSED / OPEN / HALF_OPEN guard; Redis-backed in server multi-worker mode, in-process fallback otherwise. |
-| Rate limiting | `mnemos/domain/graeae/_rate_limiter.py` | Sliding-window requests-per-minute guard; Redis-backed when configured. |
-| Concurrency limiting | `mnemos/domain/graeae/_concurrency.py` | Per-provider async slot limiter; Redis-backed when configured. |
+| Circuit breaking | `mnemos/core/resilience.py` | Per-provider CLOSED / OPEN / HALF_OPEN guard; Redis-backed in server multi-worker mode, in-process fallback otherwise. |
+| Rate limiting | `mnemos/core/resilience.py` | Sliding-window requests-per-minute guard; Redis-backed when configured. |
+| Concurrency limiting | `mnemos/core/resilience.py` | Per-provider async slot limiter; Redis-backed when configured. |
 | Quality weighting | `mnemos/domain/graeae/_quality.py` | Rolling success-rate and latency tracker used to adjust provider weights. |
 | Response cache | `mnemos/domain/graeae/_cache.py` | In-memory normalized prompt cache with TTL; not a persistent semantic cache. |
 | Model registry sync | `mnemos/domain/graeae/provider_sync.py`, `mnemos/domain/graeae/elo_sync.py`, `scripts/sync_provider_models.py` | Provider model discovery plus Arena.ai/LMArena weighting when the sync job is installed. |

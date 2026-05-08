@@ -8,7 +8,7 @@ from typing import Any, Optional
 import asyncpg
 
 from . import types as webhook_types
-from .nats_events import publish_delivery_queued
+from .nats_events import publish_delivery_queued, publish_webhook_outbox_insert
 from .types import _DeliveryResult
 
 
@@ -60,6 +60,15 @@ async def _insert_successor_delivery(
     )
     if row is not None:
         await publish_delivery_queued(
+            delivery_id=str(row["id"]),
+            subscription_id=delivery["subscription_id"],
+            event_type=delivery["event_type"],
+            url=_record_value(delivery, "url") or "",
+            payload_hash=delivery["payload_hash"],
+            namespace=_record_value(delivery, "namespace"),
+            owner_id=_record_value(delivery, "owner_id"),
+        )
+        await publish_webhook_outbox_insert(
             delivery_id=str(row["id"]),
             subscription_id=delivery["subscription_id"],
             event_type=delivery["event_type"],

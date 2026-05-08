@@ -92,7 +92,7 @@ async def create_session(
         )
 
     except Exception as e:
-        logger.error(f"[SESSIONS] Failed to create session: {e}")
+        logger.error(f"[SESSIONS] Failed to create session: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Session creation failed: {str(e)}")
 
 
@@ -332,7 +332,7 @@ async def add_session_message(
         tokens_used = len(response_text) // 4
 
     except Exception as e:
-        logger.error(f"[SESSIONS] Provider routing failed: {e}")
+        logger.error(f"[SESSIONS] Provider routing failed: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail=f"Provider unavailable: {str(e)}")
 
     # Store assistant response

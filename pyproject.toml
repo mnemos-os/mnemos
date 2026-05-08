@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mnemos-os"
-version = "5.0.0"
+version = "5.0.1"
 description = "MNEMOS-OS v5: agent memory OS with full divergent dream-state pipeline (REPLAY → CLUSTER → CONSOLIDATE → SYNTHESISE → EXTRACT), GDPR right-to-be-forgotten, PERSEPHONE archival, PANTHEON unified LLM facade, KRONOS recall observability, multi-backend persistence, and multi-worker support"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -28,7 +28,18 @@ dependencies = [
   "uvicorn[standard]>=0.30.0",
   "starlette>=0.40.0",
   "pydantic>=2.8.0",
-  "pydantic-settings>=2.0.0",
+  # pydantic-settings: pinned <2.12 because 2.12.0 inverted the
+  # precedence rule between `validation_alias` env vars and init
+  # kwargs (env was higher; now lower). MNEMOS instantiates
+  # `_DatabaseSettings(**db_section)` from TOML and relies on
+  # `PG_BACKEND` / `PG_DSN` / etc. env vars to override empty or
+  # inherited TOML values. Surfaced 2026-05-08 by the PROTEUS
+  # fresh-install barrage (#199); the precedence boundary is
+  # exactly between 2.11 (works) and 2.12 (broken). See
+  # `tests/test_postgres_embedding_dim.py::test_runtime_settings_pg_backend_overrides_toml_init`.
+  # Lift this pin only after verifying the runtime override path
+  # still works (or refactoring it to be precedence-agnostic).
+  "pydantic-settings>=2.0.0,<2.12",
   "python-multipart>=0.0.9",
   "asyncpg>=0.29.0",
   # NB: psycopg/psycopg2 are deliberately NOT default deps. Both are
@@ -85,9 +96,10 @@ morpheus = ["numpy>=1.24"]
 persephone = ["zstandard>=0.25"]
 pantheon = []
 kronos = ["numpy>=1.24"]
+kronos-gpu = ["cupy>=12"]
 knossos = []
 apollo = []
-artemis = ["networkx>=3.3"]
+artemis = ["networkx>=3.3", "scipy>=1.11"]
 nats = ["nats-py>=2.14.0"]
 hot = ["mnemos-hot>=0.2.0"]
 edge = [
@@ -252,7 +264,6 @@ forbidden_modules = [
   "mnemos.cli",
   "mnemos.tools",
   "mnemos.installer",
-  "mnemos.hooks",
 ]
 
 [tool.pytest.ini_options]

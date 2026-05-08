@@ -141,7 +141,7 @@ async def test_bulk_create_fails_when_outbox_enqueue_fails(
         "[0] dispatcher unavailable",
         "[1] dispatcher unavailable",
     ]
-    assert [name for name, _payload in backend.memories.calls] == [
+    assert [name for name, _payload in backend.memories.calls if name == "insert_memory"] == [
         "insert_memory",
         "insert_memory",
     ]

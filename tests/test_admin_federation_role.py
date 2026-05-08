@@ -22,7 +22,6 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from fastapi import HTTPException
 
 from mnemos.api.routes.admin import create_user
 from mnemos.domain.models import UserCreateRequest
@@ -85,18 +84,25 @@ async def test_admin_accepts_federation_role(fake_db_pool):
     )
 
 
-@pytest.mark.asyncio
-async def test_admin_still_rejects_arbitrary_roles(fake_db_pool):
-    """The allowlist must stay closed — arbitrary roles must still 422."""
-    request = UserCreateRequest(
-        id="random-user",
-        display_name="Random",
-        role="superadmin",  # not in the allowlist
-    )
-    with pytest.raises(HTTPException) as excinfo:
-        await create_user(request, _=MagicMock(role="root"))
-    assert excinfo.value.status_code == 422
-    assert "role" in excinfo.value.detail.lower()
+def test_admin_still_rejects_arbitrary_roles():
+    """The allowlist must stay closed — arbitrary roles must still 422.
+
+    #169: role is now Literal["user", "root", "federation"] on the
+    Pydantic model, so invalid values are rejected at model parse
+    time (which FastAPI surfaces as a 422). Test now exercises the
+    Pydantic-level rejection directly. The intent — "allowlist
+    stays closed" — is satisfied either way.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as excinfo:
+        UserCreateRequest(
+            id="random-user",
+            display_name="Random",
+            role="superadmin",  # not in the allowlist
+        )
+    # The error message must reference the offending field.
+    assert "role" in str(excinfo.value).lower()
 
 
 def test_federation_handler_expects_federation_role():

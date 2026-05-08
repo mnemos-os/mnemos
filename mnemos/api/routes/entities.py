@@ -8,7 +8,7 @@ namespace are invisible to another. Root may cross-read by passing
 import json
 import logging
 import uuid
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -21,15 +21,20 @@ from mnemos.core.security import assert_owned_context, is_root, scope_namespace,
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["entities"])
 
-from mnemos.domain.memory_categorization.constants import ENTITY_TYPES
-
 
 def _require_entities_backend() -> None:
     _require_postgres_backend()
 
 
 class EntityCreateRequest(BaseModel):
-    entity_type: str
+    # #171: Literal[...] enforces the same set ENTITY_TYPES contains.
+    # The values are duplicated here (not Literal[*ENTITY_TYPES] because
+    # PEP 646 unpacking doesn't work in Literal contexts in stable
+    # Python yet); a regression test in tests/test_entities_route.py
+    # asserts the two stay in sync.
+    entity_type: Literal[
+        "person", "project", "concept", "document", "decision", "event"
+    ]
     name: str
     description: Optional[str] = None
     metadata: Optional[dict] = None
@@ -48,8 +53,8 @@ async def create_entity(
     req: EntityCreateRequest,
     user: UserContext = Depends(get_current_user),
 ):
-    if req.entity_type not in ENTITY_TYPES:
-        raise HTTPException(status_code=400, detail=f"entity_type must be one of: {ENTITY_TYPES}")
+    # #171: entity_type is now Literal[...] in the request model —
+    # Pydantic auto-422s on invalid values before we get here.
     _require_entities_backend()
     try:
         entity_id = str(uuid.uuid4())
@@ -130,7 +135,8 @@ async def list_entities(
                     target_owner, target_ns, limit
                 )
         return {"entities": [dict(r) for r in rows], "count": len(rows)}
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error listing entities: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -200,7 +206,8 @@ async def update_entity(
         return dict(row)
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error updating entity: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -248,7 +255,11 @@ async def link_entities(
         return {"status": "linked", "entity_id": entity_id, "related_id": req.related_id}
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.error(
+            f"Error linking entities {entity_id} <-> {req.related_id}: {e}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
@@ -285,7 +296,10 @@ async def delete_entity(entity_id: str, user: UserContext = Depends(get_current_
             raise HTTPException(status_code=404, detail="Entity not found")
     except HTTPException:
         raise
-    except Exception:
+    except Exception as e:
+        logger.error(
+            f"Error deleting entity {entity_id}: {e}", exc_info=True
+        )
         raise HTTPException(status_code=500, detail="Internal server error")
 
 

@@ -1,0 +1,61 @@
+services:
+  # Run this service on PYTHIA, CERBERUS, and PROTEUS with host-specific
+  # MNEMOS_ETCD_NAME and MNEMOS_NODE_IP values.
+  etcd3:
+    image: quay.io/coreos/etcd:v3.5.15
+    network_mode: host
+    profiles: ["etcd3"]
+    environment:
+      ETCDCTL_API: "3"
+    volumes:
+      - etcd3_data:/etcd-data
+    command:
+      - /usr/local/bin/etcd
+      - --name=${MNEMOS_ETCD_NAME:-pythia}
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://${MNEMOS_NODE_IP:-192.168.207.67}:2379
+      - --listen-peer-urls=http://0.0.0.0:2380
+      - --initial-advertise-peer-urls=http://${MNEMOS_NODE_IP:-192.168.207.67}:2380
+      - --initial-cluster=pythia=http://192.168.207.67:2380,cerberus=http://192.168.207.96:2380,proteus=http://192.168.207.25:2380
+      - --initial-cluster-token=mnemos-patroni-v5
+      - --initial-cluster-state=${MNEMOS_ETCD_CLUSTER_STATE:-new}
+
+  patroni-pythia:
+    image: ${MNEMOS_PATRONI_PGVECTOR_IMAGE:-localhost/mnemos-patroni-pgvector:pg16}
+    network_mode: host
+    profiles: ["pythia"]
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - pythia_pgdata:/var/lib/postgresql/data
+      - ./patroni-pythia.yml:/etc/patroni/patroni.yml:ro
+    command: ["patroni", "/etc/patroni/patroni.yml"]
+    restart: unless-stopped
+
+  patroni-cerberus:
+    image: ${MNEMOS_PATRONI_PGVECTOR_IMAGE:-localhost/mnemos-patroni-pgvector:pg16}
+    network_mode: host
+    profiles: ["cerberus"]
+    user: postgres
+    environment:
+      PGDATA: /var/lib/postgresql/data
+    volumes:
+      - cerberus_pgdata:/var/lib/postgresql/data
+      - ./patroni-cerberus.yml:/etc/patroni/patroni.yml:ro
+    command: ["patroni", "/etc/patroni/patroni.yml"]
+    restart: unless-stopped
+
+  haproxy:
+    image: docker.io/haproxy:2.9
+    network_mode: host
+    profiles: ["proxy"]
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    restart: unless-stopped
+
+volumes:
+  etcd3_data:
+  pythia_pgdata:
+  cerberus_pgdata:

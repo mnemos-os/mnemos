@@ -94,15 +94,25 @@ def _usage_tier(source: dict[str, Any], quality_score: float, cost: float | None
 
 
 def _provider_health(provider: str, status: dict[str, Any]) -> dict[str, Any]:
-    circuit = (status.get("circuit_breakers") or {}).get(provider, {})
-    quality = (status.get("quality") or {}).get(provider, {})
-    rate_limiter = (status.get("rate_limiters") or {}).get(provider, {})
+    def _as_dict(value: Any) -> dict[str, Any]:
+        return value if isinstance(value, dict) else {}
+
+    circuit = _as_dict((status.get("circuit_breakers") or {}).get(provider))
+    quality = _as_dict((status.get("quality") or {}).get(provider))
+    rate_limiter_raw = (status.get("rate_limiters") or {}).get(provider)
+    # Some resilience backends return per-provider counters as scalars
+    # (e.g. an int for "current limited count"). Coerce shape so the
+    # health response stays consistent regardless of backend variant.
+    if isinstance(rate_limiter_raw, dict):
+        rate_limited_value: Any = rate_limiter_raw.get("limited")
+    else:
+        rate_limited_value = rate_limiter_raw
     concurrency = (status.get("concurrency") or {}).get(provider, {})
     return {
         "state": circuit.get("state") or "unknown",
         "success_rate": quality.get("success_rate"),
         "p50_latency_ms": quality.get("p50_latency_ms"),
-        "rate_limited": rate_limiter.get("limited"),
+        "rate_limited": rate_limited_value,
         "concurrency": concurrency,
     }
 

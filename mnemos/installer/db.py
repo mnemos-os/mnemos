@@ -55,21 +55,33 @@ def _profile_uses_sqlite(profile: str) -> bool:
 
 
 def _psql_superuser(sql: str, dbname: str = "postgres", timeout: int = 30) -> tuple[int, str, str]:
-    """Run SQL as the postgres superuser via sudo."""
+    """Run SQL as the postgres superuser via sudo.
+
+    Uses `-v ON_ERROR_STOP=1` so psql exits non-zero on the first SQL
+    error. Without this flag psql continues past non-fatal errors and
+    can exit 0 even when DDL failed — letting run_migrations() report
+    'OK' on partial schema drift. Codex round-20 HIGH.
+    """
     return _run(
         ["sudo", "-u", "postgres", "psql", "-d", dbname, "-c", sql,
-         "--no-password", "-A", "-t"],
+         "--no-password", "-A", "-t", "-v", "ON_ERROR_STOP=1"],
         timeout=timeout,
     )
 
 
 def _psql_superuser_file(filepath: str, dbname: str, timeout: int = 120) -> tuple[int, str, str]:
-    """Run a SQL file as postgres superuser."""
+    """Run a SQL file as postgres superuser.
+
+    Uses `-v ON_ERROR_STOP=1` so psql exits non-zero on the first SQL
+    error in the file. Without this, a CREATE/ALTER failure mid-file
+    would emit a warning and continue, leaving partial schema while
+    psql reports success. Codex round-20 HIGH.
+    """
     with open(filepath, encoding="utf-8") as f:
         sql = f.read()
     return _run(
         ["sudo", "-u", "postgres", "psql", "-d", dbname, "-f", "-",
-         "--no-password"],
+         "--no-password", "-v", "ON_ERROR_STOP=1"],
         timeout=timeout,
         input=sql,
     )
@@ -126,17 +138,31 @@ def verify_connection(config: Config) -> bool:
 
 
 def setup_sqlite_database(config: Config) -> bool:
-    """Create and migrate the SQLite database through the SQLite backend."""
+    """Create and migrate the SQLite database through the SQLite backend.
+
+    Uses ``config.embedding_dim`` (collected at install time from
+    MNEMOS_EMBEDDING_DIM, or carried over from a prior install) to size
+    the vec0 virtual table. The same value gets persisted to config.toml
+    and the systemd env file so subsequent service starts see the same
+    dim — without that, CREATE VIRTUAL TABLE IF NOT EXISTS would be a
+    no-op and the wrong-dim runtime would silently degrade.
+    """
     import asyncio
     from types import SimpleNamespace
 
     from mnemos.persistence.sqlite import SqliteBackend
 
     db_path = Path(config.sqlite_path).expanduser()
-    print(f"[db] Initializing SQLite database at {db_path}...")
+    embedding_dim = getattr(config, "embedding_dim", 768)
+    print(
+        f"[db] Initializing SQLite database at {db_path} "
+        f"(embedding dim: {embedding_dim})..."
+    )
+
+    settings_shim = SimpleNamespace(database=SimpleNamespace(embedding_dim=embedding_dim))
 
     async def _setup() -> bool:
-        backend = SqliteBackend(db_path, SimpleNamespace())
+        backend = SqliteBackend(db_path, settings_shim)
         try:
             await backend.open()
             print(f"[db] SQLite database ready. sqlite-vec loaded: {backend.vec_loaded}")
@@ -151,29 +177,68 @@ def setup_sqlite_database(config: Config) -> bool:
         return False
 
 
-def pgvector_installed(config: Config) -> bool:
-    """Check if pgvector extension is installed in the target database."""
-    env = os.environ.copy()
-    env["PGPASSWORD"] = config.db_password
-    pg_env = {"PGPASSWORD": config.db_password}
-    rc, out, _ = _run(
-        [
-            "psql",
-            "-h", config.db_host,
-            "-p", str(config.db_port),
-            "-U", config.db_user,
-            "-d", config.db_name,
-            "-c", "SELECT 1 FROM pg_extension WHERE extname='vector'",
-            "-A", "-t",
-        ],
-        timeout=10,
-        env=pg_env,
-    )
-    return rc == 0 and out.strip() == "1"
+# #187: removed `pgvector_installed` — defined but never called.
+# Verified across mnemos/+tests/+docs/+scripts/+systemd/+console_
+# scripts. Installer __main__ imports run_migrations / setup_*
+# / create_api_key / verify_connection from this module but NOT
+# pgvector_installed. The pgvector extension is installed
+# unconditionally during `setup_database` via the `CREATE
+# EXTENSION IF NOT EXISTS vector` SQL — no probing variant
+# needed.
 
 
 def setup_database(config: Config, info) -> bool:
     """Create the database user, database, and extensions. Idempotent."""
+
+    # The setup helpers (_psql_superuser) shell out to `sudo -u postgres
+    # psql -d <dbname>` with no `-h`/`-p`/`-U`/PGPASSWORD. That auth shape
+    # only works against the LOCAL postgres on default port 5432. A
+    # config that points at a remote db_host (e.g. cfg.db_host=10.0.0.5)
+    # would otherwise mutate the LOCAL postgres of the same dbname
+    # before run_migrations()'s remote-rejection guard ever runs,
+    # leaving stray users/dbs/extensions on the wrong cluster.
+    #
+    # Round-18: guards are UNCONDITIONAL on profile. Profile is a
+    # deployment-shape signal, not a DB-backend signal — operators
+    # can set MNEMOS_PROFILE=edge while [database].backend="postgres"
+    # with a remote host, and the legacy "personal" canonicalizes to
+    # edge while the underlying config is postgres. Profile-gating
+    # let those configs through; always check.
+    if not _is_local_postgres_host(
+        getattr(config, "db_host", "localhost")
+    ):
+        print(
+            f"[db] ERROR cfg.db_host = {config.db_host!r} is not a local "
+            f"postgres. setup_database() uses sudo -u postgres psql with "
+            f"no -h/-p; it cannot create users/databases/extensions on a "
+            f"remote host without silently mutating the LOCAL postgres "
+            f"of the same name. Run --install on the host that owns the "
+            f"DB (where psql peer-auth works), or use a DSN-aware setup "
+            f"tool. Refusing to proceed before any local mutations.",
+            file=sys.stderr,
+        )
+        return False
+
+    # Same defense for non-default port on localhost. The psql helpers
+    # don't pass -p, so localhost:5433 silently targets the default
+    # local cluster on 5432. Unconditional on profile (round-18).
+    # Round-38 MEDIUM: don't fold falsy values (e.g. 0) into the
+    # default 5432 — that would let an explicit port=0 bypass the
+    # non-default-port guard. Treat None as absent → default; treat
+    # any other value as explicit so the guard fires correctly.
+    raw_port = getattr(config, "db_port", None)
+    db_port_int = 5432 if raw_port is None else int(raw_port)
+    if db_port_int != 5432:
+        print(
+            f"[db] ERROR cfg.db_port = {db_port_int} but the installer "
+            f"only supports the default Postgres port (5432). The setup "
+            f"helpers (sudo -u postgres psql -d <db>) don't pass -p, so "
+            f"a non-default port silently mutates the local 5432 cluster "
+            f"instead. Use a DSN-aware setup tool, or run Postgres on "
+            f"5432 for the installer-driven setup path.",
+            file=sys.stderr,
+        )
+        return False
 
     try:
         _validate_identifier(config.db_user, "db_user")
@@ -256,6 +321,43 @@ def setup_database(config: Config, info) -> bool:
     return True
 
 
+def _is_local_postgres_host(host: str) -> bool:
+    """psql via `sudo -u postgres` only authenticates on the local socket
+    when no `-h` is passed. The helpers in this module don't pass
+    -h/-p/-U/PGPASSWORD. Anything else must be rejected before
+    migrations run.
+
+    Round-47 HIGH: whitespace-only values (e.g. "   ") are NOT
+    treated as local. Runtime passes the unstripped host through to
+    asyncpg, so a whitespace host is an explicit (broken) target —
+    NOT the default socket.
+
+    Round-48 HIGH: also reject any host with leading/trailing
+    whitespace. Same wrong-cluster mutation class.
+
+    Round-49 HIGH: reject explicit `127.0.0.1` / `::1`. Runtime
+    connects via asyncpg using TCP for these values, while
+    `sudo -u postgres psql -d <db>` (no -h) connects via the local
+    SOCKET. On a host running multiple Postgres clusters where
+    socket and TCP listeners hit different instances, the
+    installer's socket-based psql can mutate one DB while runtime
+    targets a different one over TCP. Until the migration runner
+    is TCP/DSN-aware, only empty/None and "localhost" are safe —
+    explicit IPs imply a TCP intent the installer cannot honor.
+    """
+    if host is None or host == "":
+        return True  # truly unset → local default socket
+    # Round-48: reject any value that differs from its stripped form.
+    if host != host.strip():
+        return False  # padded — explicit invalid, treat as non-local
+    h = host.lower()
+    if h == "":
+        return False  # whitespace-only (handled by != strip above too)
+    # Round-49: only "localhost" is acceptable for the socket-based
+    # migration runner. 127.0.0.1 / ::1 imply TCP intent.
+    return h == "localhost"
+
+
 def run_migrations(config: Config) -> bool:
     """Run SQL migration files in order. Idempotent.
 
@@ -265,6 +367,67 @@ def run_migrations(config: Config) -> bool:
     v2 migrations expect v1 tables, v3.1 expects v3, v3.1.2
     expects v3.1.
     """
+    # Round-50 finding 2: validate db_name as a bare identifier BEFORE
+    # any psql invocation. Without this, libpq treats values like
+    # `host=127.0.0.1 port=5433 dbname=mnemos` or `postgres://...` as
+    # full connection strings — bypassing the host/port/DSN/url
+    # refusals and connecting to an arbitrary cluster. setup_database
+    # has had this check since the original slice; run_migrations
+    # was missing it.
+    try:
+        _validate_identifier(config.db_name, "db_name")
+    except ValueError as exc:
+        print(f"[db] ERROR: {exc}", file=sys.stderr)
+        return False
+
+    # The migration helpers (`_psql_superuser`, `_psql_superuser_file`)
+    # use `sudo -u postgres psql -d <dbname>` and never pass
+    # -h/-p/-U/PGPASSWORD. That works for a local install but would
+    # silently target a LOCAL postgres of the same name when
+    # cfg.db_host is remote — running migrations against the wrong DB
+    # while the running service points elsewhere. Refuse early.
+    #
+    # Round-18: guards are UNCONDITIONAL on profile. --upgrade calls
+    # run_migrations(cfg) without checking profile, and operators can
+    # set MNEMOS_PROFILE=edge while [database].backend="postgres" with
+    # a remote host. Profile-gating let those configs reach
+    # _psql_superuser_file and silently mutate the local cluster.
+    # Always check.
+    if not _is_local_postgres_host(
+        getattr(config, "db_host", "localhost")
+    ):
+        print(
+            f"[db] ERROR cfg.db_host = {config.db_host!r} is not a local "
+            f"postgres. The installer's migration runner only authenticates "
+            f"via local socket / 127.0.0.1; it cannot run migrations against "
+            f"a remote host. Run --upgrade on the host that owns the DB, or "
+            f"use a DSN-aware migration tool. Refusing to proceed before "
+            f"any migration/config patching.",
+            file=sys.stderr,
+        )
+        return False
+
+    # Same defense for non-default port on localhost. Unconditional
+    # on profile (round-18).
+    # Round-38 MEDIUM: don't fold falsy values (e.g. 0) into the
+    # default 5432 — that would let an explicit port=0 bypass the
+    # non-default-port guard. Treat None as absent → default; treat
+    # any other value as explicit so the guard fires correctly.
+    raw_port = getattr(config, "db_port", None)
+    db_port_int = 5432 if raw_port is None else int(raw_port)
+    if db_port_int != 5432:
+        print(
+            f"[db] ERROR cfg.db_port = {db_port_int} but the installer "
+            f"only supports the default Postgres port (5432). The "
+            f"migration helpers (sudo -u postgres psql -d <db>) don't "
+            f"pass -p, so a non-default port would silently target the "
+            f"default-port cluster on the same host. Use a DSN-aware "
+            f"migration tool, or run Postgres on 5432 for the "
+            f"installer-driven upgrade path.",
+            file=sys.stderr,
+        )
+        return False
+
     repo_path = Path(__file__).resolve().parents[2]
     migration_files = [
         repo_path / "db" / "migrations.sql",
@@ -320,11 +483,24 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v4_2_pantheon_routing_audit.sql",
         repo_path / "db" / "migrations_v5_0_consolidated_at.sql",
         repo_path / "db" / "migrations_v5_0_morpheus_extract_run_memories.sql",
+        repo_path / "db" / "migrations_v5_0_2_artemis_dedup.sql",
+        repo_path / "db" / "migrations_v5_0_3_timestamp_tz_upgrade.sql",
+        repo_path / "db" / "migrations_v5_1_0_deletion_log.sql",
+        repo_path / "db" / "migrations_v5_2_0_nats_outbox_idempotency.sql",
+        repo_path / "db" / "migrations_v5_2_2_fts_gin_index.sql",
+        repo_path / "db" / "migrations_v5_3_3_deletion_log_export_index.sql",
+        repo_path / "db" / "migrations_v5_3_4_mcp_audit_log.sql",
     ]
 
     print("[db] Running migrations...")
-    success = True
 
+    # Round-21: fail FAST on the first migration error. The migration
+    # order is documented as load-bearing (v2 expects v1 tables, v3.1
+    # expects v3, etc.) so applying later migrations on top of a
+    # failed early one creates ambiguous schema drift that the
+    # operator can't cleanly recover from. Combined with round-20's
+    # ON_ERROR_STOP=1 inside psql, the first error returns False
+    # immediately — no partial-apply window.
     for mig_path in migration_files:
         if not mig_path.exists():
             print(f"[db] Skipping {mig_path.name} (not found)")
@@ -334,12 +510,151 @@ def run_migrations(config: Config) -> bool:
         rc, out, err = _psql_superuser_file(str(mig_path), config.db_name)
         if rc != 0:
             print("FAILED")
-            print(f"[db] ERROR in {mig_path.name}:\n{err}", file=sys.stderr)
-            success = False
-        else:
-            print("OK")
+            print(
+                f"[db] ERROR in {mig_path.name}:\n{err}\n"
+                f"[db] Aborting before applying later migrations — "
+                f"order is load-bearing. Inspect the failed migration, "
+                f"fix the root cause (schema drift, locked table, "
+                f"missing extension), and re-run --upgrade. The DB "
+                f"may be partially migrated through "
+                f"{mig_path.name.replace('.sql', '')}.",
+                file=sys.stderr,
+            )
+            return False
+        print("OK")
 
-    return success
+    # Postgres parallel of the SQLite embed-dim story: db/migrations.sql
+    # creates `embedding vector(768)` which pgvector freezes at column-type
+    # creation. We always reconcile against the configured dim — even when
+    # it's the 768 default — because an existing DB might already be at a
+    # non-default dim from a prior install. The helper is idempotent: it
+    # short-circuits OK when the column type already matches the target,
+    # and refuses safely on populated mismatch. The previous `!= 768` guard
+    # silently downgraded an existing 512-D install when the operator
+    # switched config back to the default model.
+    embedding_dim = getattr(config, "embedding_dim", 768)
+    return _alter_postgres_embedding_dim(config, embedding_dim)
+
+
+def _alter_postgres_embedding_dim(config: Config, embedding_dim: int) -> bool:
+    """Re-size `memories.embedding` to vector(<dim>) when MNEMOS_EMBEDDING_DIM != 768.
+
+    Idempotent: queries the actual stored dim via `format_type(atttypid, atttypmod)`
+    and short-circuits if the column already matches. Safe on a fresh install
+    (table has no rows; ALTER is cheap). On an existing install with rows at
+    a different dim, pgvector refuses the implicit cast and the operator must
+    drop+rebuild — same posture as the SQLite path. We detect that explicitly
+    and refuse with a postgres-correct migration instruction set.
+
+    Postgres-specific constraints:
+    - pgvector ivfflat index supports up to 2000 dimensions. The existing
+      `idx_memories_embedding` is ivfflat, so we cap the supported dim at 2000.
+      Larger dims need a different ANN strategy (halfvec / no ANN index)
+      which isn't wired into the migration baseline yet.
+    """
+    try:
+        # ivfflat ceiling. Larger dims would need halfvec/no-ANN index strategy
+        # (not currently wired into the migration baseline). Fail closed —
+        # don't accept a config the schema can't actually serve.
+        if not 1 <= embedding_dim <= 2000:
+            print(
+                f"[db] ERROR MNEMOS_EMBEDDING_DIM={embedding_dim} out of supported "
+                "range [1, 2000] for pgvector ivfflat index (used by the "
+                "baseline idx_memories_embedding). Larger dims need a different "
+                "ANN strategy (halfvec / no-ANN index) that is not currently "
+                "wired into migrations. Refusing to proceed — accepting this "
+                "would persist embedding_dim into config while leaving the DB "
+                "schema at vector(768), causing runtime cosine comparisons to "
+                "fail.",
+                file=sys.stderr,
+            )
+            return False
+
+        # Check the actual stored column type first — idempotency. If it
+        # already matches, this is a no-op even when rows exist.
+        rc, out, err = _psql_superuser(
+            "SELECT format_type(atttypid, atttypmod) "
+            "FROM pg_attribute "
+            "WHERE attrelid = 'memories'::regclass "
+            "AND attname = 'embedding';",
+            dbname=config.db_name,
+        )
+        current_type = ""
+        if rc == 0 and out.strip():
+            for line in out.strip().splitlines():
+                line = line.strip()
+                if line.startswith("vector("):
+                    current_type = line
+                    break
+        target_type = f"vector({embedding_dim})"
+        if current_type == target_type:
+            print(f"[db] memories.embedding already at {target_type}; nothing to do")
+            return True
+
+        # Type mismatch. The COUNT and ALTER must run under one ACCESS
+        # EXCLUSIVE lock — separate sessions race against any concurrent
+        # writer that inserts a row between our COUNT and our ALTER, and
+        # the ALTER ... USING NULL would silently clear that row.
+        #
+        # Wrap the whole sequence in a plpgsql DO block: lock first, count
+        # second, ALTER iff zero, RAISE EXCEPTION otherwise. The exception
+        # rolls back the lock + the (not-yet-issued) ALTER. The fail-closed
+        # behavior is enforced by postgres itself rather than by Python
+        # parsing of psql output.
+        plpgsql = (
+            "DO $$\n"
+            "DECLARE\n"
+            "  cnt INTEGER;\n"
+            "BEGIN\n"
+            "  LOCK TABLE memories IN ACCESS EXCLUSIVE MODE;\n"
+            "  SELECT COUNT(*) INTO cnt FROM memories WHERE embedding IS NOT NULL;\n"
+            "  IF cnt > 0 THEN\n"
+            "    RAISE EXCEPTION 'MNEMOS_EMBED_DIM_REFUSE: memories.embedding has % "
+            "non-null rows at the existing dim; cannot ALTER to {target_type} via "
+            "USING NULL without destroying data. Run the documented BEGIN; "
+            "UPDATE … SET embedding=NULL; ALTER … TYPE {target_type} USING NULL; "
+            "COMMIT; recovery on a quiesced DB instead.', cnt;\n"
+            "  END IF;\n"
+            "  ALTER TABLE memories ALTER COLUMN embedding TYPE {target_type} USING NULL;\n"
+            "END;\n"
+            "$$;"
+        ).format(target_type=target_type)
+
+        print(f"[db] Resizing memories.embedding from {current_type or 'baseline'} to {target_type}...", end=" ")
+        rc, _, err = _psql_superuser(plpgsql, dbname=config.db_name)
+        if rc != 0:
+            print("FAILED")
+            err_text = err.strip()
+            # plpgsql RAISE surfaces our marker so we can render the operator-
+            # facing recovery instructions instead of a raw psql error.
+            if "MNEMOS_EMBED_DIM_REFUSE" in err_text:
+                # Try to extract the row count from the error.
+                import re as _re
+                m = _re.search(r"has (\d+) non-null rows", err_text)
+                rows_str = m.group(1) if m else "non-zero"
+                print(
+                    f"[db] ERROR memories.embedding is {current_type or 'unknown'} "
+                    f"with {rows_str} non-null rows. Cannot re-size to "
+                    f"{target_type} without re-embedding. To migrate: stop "
+                    f"this service, then run "
+                    f"`psql -d {config.db_name} -c \"BEGIN; "
+                    f"UPDATE memories SET embedding=NULL; "
+                    f"ALTER TABLE memories ALTER COLUMN embedding TYPE "
+                    f"{target_type} USING NULL; COMMIT;\"`, restart the "
+                    f"service, and re-embed all memories.",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    f"[db] ERROR resizing embedding column: {err_text or '(no detail)'}",
+                    file=sys.stderr,
+                )
+            return False
+        print("OK")
+        return True
+    except Exception as exc:
+        print(f"[db] ERROR in _alter_postgres_embedding_dim: {exc}", file=sys.stderr)
+        return False
 
 
 def create_api_key(config: Config) -> str | None:

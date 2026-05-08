@@ -47,7 +47,7 @@ service; everything stays in your MNEMOS.
 ```
 
 The MCP HTTP/SSE bridge (`mnemos serve mcp-http`) shares the exact same
-18 tool definitions as the stdio MCP server. A memory written from Claude
+23 tool definitions as the stdio MCP server. A memory written from Claude
 Desktop is queryable from ChatGPT and vice versa.
 
 ## Setup — manual path (works today)
@@ -59,7 +59,7 @@ Add to your `docker-compose.override.yml` (PYTHIA prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: ghcr.io/mnemos-os/mnemos:4.0.0
+    image: ghcr.io/mnemos-os/mnemos:5.0.1
     pull_policy: never
     depends_on:
       - mnemos
@@ -175,12 +175,14 @@ Ask things like:
 ChatGPT calls MNEMOS's MCP tools and folds the results into the
 conversation. Same memory is visible from your other agents.
 
-## Setup — assisted path (experimental helper)
+## Setup — assisted path (experimental helper, currently inert)
 
-The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is checked
-in as an experimental contract. It calls daemon-side `/admin/tunnels/*`
-endpoints; use the manual path above unless those endpoints are enabled in
-your deployment.
+The `mnemos-tunnel-setup` helper (`scripts/mnemos_tunnel_setup.py`) is
+checked in as an aspirational contract. It expects a daemon-side
+`/admin/tunnels/*` REST surface plus a `mnemos.tunnels.ngrok_bridge`
+module; **neither has shipped as of v5.0.1** (verified in the repo).
+Use the manual path above. The snippet below describes the eventual
+flow:
 
 ```bash
 mnemos-tunnel-setup chatgpt

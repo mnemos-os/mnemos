@@ -329,6 +329,11 @@ command = ["python3", "-m", "mnemos.iris.server"]
 env = {PANTHEON_API_KEY = "pantheon-<tenant-token>"}
 ```
 
+> **Note (historical):** `mnemos.iris.server` was never implemented
+> as a standalone module. The discovery role it described is now
+> served by the unified MCP model tools at `mnemos/mcp/tools/models.py`
+> (`pantheon_list_models` + `pantheon_route_explain`).
+
 **Agent behavior:** On startup, connect to IRIS via MCP. Call `find_model(capabilities=[tool_calling], max_cost_per_mtok=0.001)`. IRIS returns ranked models with metadata. User can see options, IRIS defaults to top-ranked. Runtime `/model query vision` dynamically re-queries and switches.
 
 **Historical estimate:** ~2 hours (integrate IRIS MCP client + dynamic model selection logic). Did not ship in v3.5.0; carried forward with the deferred PANTHEON/IRIS scope.

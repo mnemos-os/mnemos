@@ -20,7 +20,11 @@ SUPPORTED_CONSULTATION_MODES: tuple[str, ...] = (
 class ConsultationRequest(BaseModel):
     prompt: str
     task_type: str = "reasoning"
-    context: Optional[str] = None
+    # #179: removed `context` — was declared but never consumed by
+    # the consultations route handler (consult_graeae). Same shape
+    # as #178 (MemoryUpdateRequest.quality_rating). Pydantic v2
+    # default extra="ignore" preserves backward compat for clients
+    # still passing it.
     mode: ConsultationMode = "auto"
     limit_chars: Optional[int] = None
     format: Optional[str] = "full"
@@ -177,7 +181,12 @@ class MemoryUpdateRequest(BaseModel):
     category: Optional[str] = None
     subcategory: Optional[str] = None
     metadata: Optional[Dict[str, Any]] = None
-    quality_rating: Optional[int] = None
+    # #178: removed `quality_rating` — was declared but never
+    # consumed by the update_memory route handler, so clients
+    # passing it expected updates that silently never happened.
+    # Pydantic v2 default extra="ignore" means existing clients
+    # still parse without error; the field simply no longer
+    # appears in the OpenAPI schema as a "supported" update.
     verbatim_content: Optional[str] = None  # original uncompressed content
     permission_mode: Optional[StrictInt] = None
 
@@ -197,7 +206,12 @@ class RehydrationRequest(BaseModel):
     limit: int = 5
     budget_tokens: Optional[int] = None
     category: Optional[str] = None
-    subcategory: Optional[str] = None
+    # #179 round-2: removed `subcategory` — declared but never read
+    # by rehydrate_memories handler (only category is used in the
+    # SQL filter). Caught when the test scanner was tightened to
+    # bind scans per-handler (the global-blob scan from round-1 was
+    # passing because `request.subcategory` appeared in OTHER
+    # routes like search).
 
 
 class RehydrationResponse(BaseModel):
@@ -264,10 +278,9 @@ class SessionMessageResponse(BaseModel):
     memories_injected: int
 
 
-class SessionHistoryRequest(BaseModel):
-    """Get session conversation history."""
-    limit: int = 50
-    offset: int = 0
+# #179: removed `SessionHistoryRequest` — entire model was declared
+# but never imported. The /sessions/{id}/history route accepts limit
+# and offset as direct Query() params, not via a request model.
 
 
 class SessionHistoryResponse(BaseModel):
@@ -354,7 +367,10 @@ class UserCreateRequest(BaseModel):
     id: str
     display_name: str
     email: Optional[str] = None
-    role: str = "user"  # "user" or "root"
+    # #169: Literal["user", "root", "federation"] enforces the same
+    # set the route handler used to check at runtime. Earlier comment
+    # said "user or root" but the runtime accepted "federation" too.
+    role: Literal["user", "root", "federation"] = "user"
     # Per-user tenancy namespace. v3.2 added users.namespace (2aa41ea)
     # and wired non-root reads to filter on it; the admin provisioning
     # API still silently defaulted every new user to 'default' which
@@ -419,15 +435,13 @@ class ConsultationArtifact(BaseModel):
     created_at: str
 
 
-class ProviderResponse(BaseModel):
-    """Single provider's response in consensus."""
-    provider: str
-    model_id: str
-    status: str
-    response_text: str
-    latency_ms: float
-    final_score: float
-    quality_score: Optional[float] = None
+# #192: removed `ProviderResponse` (Pydantic) — declared but
+# never used by any route or caller. The live consensus-response
+# shape is built ad-hoc by `mnemos/api/routes/consultations.py`
+# and the live in-memory dataclass shape lives in
+# `mnemos/domain/graeae/engine.py` (which #192 also removed when
+# it turned out to be dead too — actual provider response shape
+# is `ProviderQueryResponse`, used by `_provider_worker_payload`).
 
 
 class AuditLogEntry(BaseModel):
@@ -456,20 +470,18 @@ class AuditVerifyResponse(BaseModel):
 
 # ── v3.0.0 Providers (Model Registry & Routing) ───────────────────────────────
 
-class ProviderListResponse(BaseModel):
-    """List of available LLM providers."""
-    providers: List[str]
-    total_models: int
-    last_sync: Optional[str] = None
+# #180: removed `ProviderListResponse` — declared but never used
+# by any route (OAuthProviderListResponse is the live one).
+# Same dead-model shape as #179's SessionHistoryRequest. Pydantic
+# v2 default extra="ignore" preserves backward compat for any
+# external caller that imported it; the class is simply no longer
+# part of the canonical surface.
 
 
-class ModelRecommendation(BaseModel):
-    """Model recommendation for a task type."""
-    recommended: Dict[str, Any]  # {provider, model_id, cost_per_mtok}
-    reasoning: str
-    quality_score: Optional[float] = None
-    context_window: Optional[int] = None
-    alternatives: Optional[List[Dict[str, Any]]] = None
+# #192: removed `ModelRecommendation` (Pydantic) — declared but
+# never used. The live recommendation type is the dataclass at
+# `mnemos/persistence/types.py:27` (re-exported via
+# `mnemos/persistence/__init__.py`).
 
 
 # ── v3.0.0 Webhooks ───────────────────────────────────────────────────────────
@@ -545,7 +557,10 @@ class WebhookDeliveryListResponse(BaseModel):
 class OAuthProviderCreateRequest(BaseModel):
     name: str = Field(..., description="Unique provider name, e.g. 'google', 'github', 'company-sso'")
     display_name: str
-    kind: str = Field("oidc", description="'oidc' | 'oauth2'")
+    # #169: Literal[...] enforces the same set the route handler used
+    # to check at runtime. Pydantic auto-422s on invalid values
+    # before the handler runs.
+    kind: Literal["oidc", "oauth2"] = Field("oidc", description="'oidc' | 'oauth2'")
     issuer_url: Optional[str] = Field(None, description="Required for kind='oidc'")
     client_id: str
     client_secret: str = Field(..., description="Stored in DB; rotate periodically")
@@ -641,6 +656,17 @@ class FederationPeerCreateRequest(BaseModel):
     name: str = Field(
         ...,
         description="Peer name (lowercase alnum + dash, 3-64 chars). Used in federated memory ids.",
+        # #167: enforce the description's claim. The peer name is
+        # spliced into federated memory IDs downstream; weird chars
+        # (newlines, slashes, control chars) would leak into IDs and
+        # confuse parsers. Pattern matches lowercase letters, digits,
+        # and dash, with a leading-letter requirement to avoid
+        # all-digit names that would conflict with numeric ID parsers.
+        # Pydantic v2 uses Rust regex; \z (lowercase) is its
+        # end-of-string anchor.
+        pattern=r"\A[a-z][a-z0-9\-]{2,63}\z",
+        min_length=3,
+        max_length=64,
     )
     base_url: str = Field(..., description="Peer base URL, e.g. https://peer.example.com")
     auth_token: str = Field(..., description="Bearer token the peer issued us (role=federation)")
@@ -648,7 +674,10 @@ class FederationPeerCreateRequest(BaseModel):
     category_filter: Optional[List[str]] = None
     enabled: bool = True
     sync_interval_secs: int = 300
-    compat_mode: str = Field(
+    # #168: Literal["strict", "permissive"] gives type-level
+    # enforcement + auto-422 + OpenAPI enum, replacing the runtime
+    # `if request.compat_mode not in (...)` check at the route.
+    compat_mode: Literal["strict", "permissive"] = Field(
         "strict",
         description=(
             "Schema-compat policy. 'strict' (default) refuses sync when peer's "
@@ -666,7 +695,8 @@ class FederationPeerUpdateRequest(BaseModel):
     category_filter: Optional[List[str]] = None
     enabled: Optional[bool] = None
     sync_interval_secs: Optional[int] = None
-    compat_mode: Optional[str] = None
+    # #168: same Literal[...] tightening on the update path.
+    compat_mode: Optional[Literal["strict", "permissive"]] = None
 
 
 class FederationPeer(BaseModel):

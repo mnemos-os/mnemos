@@ -274,9 +274,12 @@ def schedule_routing_memory(payload: dict[str, Any], metadata: dict[str, Any]) -
     _ensure_routing_log_drainers()
 
 
-async def drain_routing_log_queue_for_tests() -> None:
-    queue = _get_routing_log_queue()
-    await queue.join()
+# #192: removed `drain_routing_log_queue_for_tests` — exported in
+# `__all__` but no test or script ever called it. The drainers
+# spawned by `_ensure_routing_log_drainers` are background tasks
+# that flush the queue cooperatively; tests that need to wait
+# can `await asyncio.sleep(...)` or rely on `_get_routing_log_queue
+# ().join()` directly if a future drain probe is needed.
 
 
 __all__ = [
@@ -287,5 +290,4 @@ __all__ = [
     "routing_payload",
     "schedule_routing_memory",
     "write_routing_memory",
-    "drain_routing_log_queue_for_tests",
 ]

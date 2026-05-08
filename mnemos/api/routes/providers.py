@@ -34,7 +34,7 @@ async def list_providers(
             "status": status,
         }
     except Exception as e:
-        logger.error(f"[PROVIDERS] Error listing providers: {e}")
+        logger.error(f"[PROVIDERS] Error listing providers: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Failed to load providers")
 
 
@@ -48,7 +48,7 @@ async def provider_health(
         engine = get_graeae_engine()
         return engine.provider_status()
     except Exception as e:
-        logger.error(f"[PROVIDERS] Health check error: {e}")
+        logger.error(f"[PROVIDERS] Health check error: {e}", exc_info=True)
         raise HTTPException(status_code=503, detail="Health check failed")
 
 
@@ -140,7 +140,8 @@ async def recommend_model(
 
             if not models:
                 # Final fallback: no rows in model_registry at all (fresh install),
-                # recommend from the static mnemos.domain.graeae.providers config in config.toml.
+                # recommend from the `[graeae.providers]` config.toml block via
+                # `mnemos.domain.graeae.engine.get_graeae_engine().providers`.
                 try:
                     from mnemos.domain.graeae.engine import get_graeae_engine
                     engine = get_graeae_engine()
@@ -214,5 +215,5 @@ async def recommend_model(
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"[PROVIDERS] Recommendation failed: {e}")
+        logger.error(f"[PROVIDERS] Recommendation failed: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Recommendation failed: {str(e)}")

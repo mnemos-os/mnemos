@@ -101,7 +101,8 @@ def load_provider_registry() -> dict:
             data = json.load(f)
     except Exception as e:
         logger.error(
-            f"[GRAEAE] failed to parse Provider Registry File {key_file}: {e}"
+            f"[GRAEAE] failed to parse Provider Registry File {key_file}: {e}",
+            exc_info=True,
         )
         return {}
 

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import os
 import sys
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -91,6 +92,35 @@ class _FeedPool:
         return _FeedAcquire(self.conn)
 
 
+class _NoopRawTx:
+    async def commit(self):
+        return None
+
+    async def rollback(self):
+        return None
+
+
+class _FeedBackend:
+    def __init__(self, pool: _FeedPool):
+        from mnemos.persistence.postgres import PostgresFederationRepository
+
+        self.pool = pool
+        self.federation = PostgresFederationRepository()
+
+    @asynccontextmanager
+    async def transactional(self):
+        from mnemos.persistence.postgres import PostgresTransaction
+
+        yield PostgresTransaction(self.pool.conn, _NoopRawTx())
+
+
+def _install_feed_backend(monkeypatch, pool: _FeedPool) -> None:
+    import mnemos.core.lifecycle as lc
+
+    monkeypatch.setattr(lc, "_pool", pool)
+    monkeypatch.setattr(lc, "_persistence_backend", _FeedBackend(pool))
+
+
 # ── Module wiring ────────────────────────────────────────────────────────────
 
 
@@ -120,6 +150,97 @@ class TestFederationWiring:
             auth_token="x" * 40,
         )
         assert req.sync_interval_secs == 300
+
+    def test_federation_peer_name_accepts_valid_shapes(self):
+        """#167: lowercase alnum + dash, 3-64 chars, leading letter."""
+        from mnemos.domain.models import FederationPeerCreateRequest
+
+        for valid in ("abc", "peer-1", "alpha-beta", "p123", "a" * 64):
+            req = FederationPeerCreateRequest(
+                name=valid,
+                base_url="https://example.com",
+                auth_token="x" * 40,
+            )
+            assert req.name == valid
+
+    def test_compat_mode_accepts_strict_and_permissive(self):
+        """#168: Literal["strict", "permissive"] accepts both values."""
+        from mnemos.domain.models import FederationPeerCreateRequest
+
+        for mode in ("strict", "permissive"):
+            req = FederationPeerCreateRequest(
+                name="peer-alpha",
+                base_url="https://example.com",
+                auth_token="x" * 40,
+                compat_mode=mode,
+            )
+            assert req.compat_mode == mode
+
+    def test_compat_mode_rejects_invalid_values(self):
+        """#168: Literal type rejects everything outside the enum."""
+        import pytest
+        from pydantic import ValidationError
+        from mnemos.domain.models import FederationPeerCreateRequest
+
+        for invalid in ("loose", "STRICT", "permissive ", "", "off"):
+            with pytest.raises(ValidationError):
+                FederationPeerCreateRequest(
+                    name="peer-alpha",
+                    base_url="https://example.com",
+                    auth_token="x" * 40,
+                    compat_mode=invalid,
+                )
+
+    def test_compat_mode_update_accepts_none(self):
+        """#168: update model has Optional[Literal[...]] so omitting
+        the field is valid."""
+        from mnemos.domain.models import FederationPeerUpdateRequest
+
+        req = FederationPeerUpdateRequest()
+        assert req.compat_mode is None
+
+        req = FederationPeerUpdateRequest(compat_mode="permissive")
+        assert req.compat_mode == "permissive"
+
+    def test_compat_mode_update_rejects_invalid_values(self):
+        """#168: same Literal tightening applies to the update path."""
+        import pytest
+        from pydantic import ValidationError
+        from mnemos.domain.models import FederationPeerUpdateRequest
+
+        with pytest.raises(ValidationError):
+            FederationPeerUpdateRequest(compat_mode="loose")
+
+    def test_federation_peer_name_rejects_invalid_shapes(self):
+        """#167: enforce the constraint the description claims —
+        previously the field was unconstrained, so weird names like
+        peer\\nINJECTED-LOG slipped through."""
+        import pytest
+        from pydantic import ValidationError
+        from mnemos.domain.models import FederationPeerCreateRequest
+
+        invalid_cases = [
+            "ab",           # too short (< 3)
+            "a" * 65,       # too long (> 64)
+            "Peer-Alpha",   # uppercase
+            "peer_alpha",   # underscore not allowed
+            "peer.alpha",   # period not allowed
+            "peer alpha",   # whitespace
+            "peer\nalpha",  # newline (log-injection shape)
+            "peer\x00",     # null byte
+            "1peer",        # leading digit
+            "-peer",        # leading dash
+            "peer/alpha",   # slash
+            "メモ",          # non-ASCII
+            "",             # empty
+        ]
+        for invalid in invalid_cases:
+            with pytest.raises(ValidationError):
+                FederationPeerCreateRequest(
+                    name=invalid,
+                    base_url="https://example.com",
+                    auth_token="x" * 40,
+                )
 
     def test_router_registered_in_app(self):
         import mnemos.api.main as api_server
@@ -162,18 +283,17 @@ class TestFederationIdConvention:
 class TestFederationFeedCursor:
     @pytest.mark.asyncio
     async def test_same_timestamp_tie_pages_without_losing_rows(self, monkeypatch):
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
         from mnemos.domain import federation as fed
 
-        updated = datetime(2026, 4, 27, 12, 0, 0)
+        updated = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)
         rows = [
             _feed_row("00000000-0000-0000-0000-000000000001", updated),
             _feed_row("00000000-0000-0000-0000-000000000002", updated),
             _feed_row("00000000-0000-0000-0000-000000000003", updated),
         ]
         pool = _FeedPool(rows)
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         first = await handler.federation_feed(
             None, None, since=None, namespace=None, category=None, limit=2
@@ -192,10 +312,9 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_cross_timestamp_paging_advances_with_compound_cursor(self, monkeypatch):
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
-        t0 = datetime(2026, 4, 27, 12, 0, 0)
+        t0 = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)
         t1 = t0 + timedelta(seconds=1)
         rows = [
             _feed_row("00000000-0000-0000-0000-000000000001", t0),
@@ -203,7 +322,7 @@ class TestFederationFeedCursor:
             _feed_row("00000000-0000-0000-0000-000000000003", t1),
         ]
         pool = _FeedPool(rows)
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         first = await handler.federation_feed(
             None, None, since=None, namespace=None, category=None, limit=2
@@ -217,11 +336,10 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_empty_feed_keeps_cursor_unchanged(self, monkeypatch):
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
         from mnemos.domain import federation as fed
 
-        updated = datetime(2026, 4, 27, 12, 0, 0)
+        updated = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)
         cursor = fed._encode_feed_cursor(
             updated,
             "00000000-0000-0000-0000-000000000009",
@@ -229,7 +347,7 @@ class TestFederationFeedCursor:
         pool = _FeedPool([
             _feed_row("00000000-0000-0000-0000-000000000001", updated),
         ])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         response = await handler.federation_feed(
             None, None, since=cursor, namespace=None, category=None, limit=10
@@ -243,17 +361,16 @@ class TestFederationFeedCursor:
     async def test_malformed_cursor_returns_bad_request(self, monkeypatch):
         from fastapi import HTTPException
 
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
-        updated = datetime(2026, 4, 27, 12, 0, 0)
+        updated = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)
         rows = [
             _feed_row("aaa-low", updated),
             _feed_row("memabc", updated),
             _feed_row("zzz-high", updated),
         ]
         pool = _FeedPool(rows)
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         with pytest.raises(HTTPException) as exc:
             await handler.federation_feed(
@@ -273,14 +390,13 @@ class TestFederationFeedCursor:
     async def test_empty_malformed_cursor_response_returns_bad_request(self, monkeypatch):
         from fastapi import HTTPException
 
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
-        updated = datetime(2026, 4, 27, 12, 0, 0)
+        updated = datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc)
         pool = _FeedPool([
             _feed_row("before-boundary", updated - timedelta(seconds=1)),
         ])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         with pytest.raises(HTTPException) as exc:
             await handler.federation_feed(
@@ -298,14 +414,13 @@ class TestFederationFeedCursor:
 
     @pytest.mark.asyncio
     async def test_feed_sql_uses_updated_id_tie_breaker(self, monkeypatch):
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
         from mnemos.domain import federation as fed
 
         pool = _FeedPool([])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
         cursor = fed._encode_feed_cursor(
-            datetime(2026, 4, 27, 12, 0, 0),
+            datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc),
             "memabc",
         )
 
@@ -327,13 +442,12 @@ class TestFederationFeedCursor:
 class TestFederationMemoryEndpoint:
     @pytest.mark.asyncio
     async def test_returns_visible_memory_by_id(self, monkeypatch):
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
-        row = _feed_row("mem_visible", datetime(2026, 4, 27, 12, 0, 0))
+        row = _feed_row("mem_visible", datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc))
         row["namespace"] = "shared"
         pool = _FeedPool([row])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         response = await handler.federation_memory(
             "mem_visible",
@@ -354,13 +468,12 @@ class TestFederationMemoryEndpoint:
     async def test_returns_404_when_memory_filtered_out(self, monkeypatch):
         from fastapi import HTTPException
 
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
-        row = _feed_row("mem_hidden", datetime(2026, 4, 27, 12, 0, 0))
+        row = _feed_row("mem_hidden", datetime(2026, 4, 27, 12, 0, 0, tzinfo=timezone.utc))
         row["namespace"] = "private"
         pool = _FeedPool([row])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         with pytest.raises(HTTPException) as exc:
             await handler.federation_memory(
@@ -458,6 +571,7 @@ class TestStoreMemoriesConcurrency:
         import asyncpg
 
         from mnemos.domain.federation import _store_memories
+        from mnemos.persistence.postgres import PostgresFederationRepository, PostgresTransaction
 
         # Hand-rolled fake connection that simulates the race:
         #   - SELECT returns None (row not present at start of handler)
@@ -500,7 +614,8 @@ class TestStoreMemoriesConcurrency:
             "created": "2026-05-01T01:00:00Z",
         }]
 
-        new_n, upd_n = await _store_memories(_FakeConn(), "pythia", feed)
+        tx = PostgresTransaction(_FakeConn(), _NoopRawTx())
+        new_n, upd_n = await _store_memories(PostgresFederationRepository(), tx, "pythia", feed)
 
         assert new_n == 0, "INSERT lost the race; no row counted as new"
         assert upd_n == 1, "post-conflict refetch + update-when-newer must apply"
@@ -530,6 +645,7 @@ class TestStoreMemoriesConcurrency:
         upd_n is NOT incremented.
         """
         from mnemos.domain.federation import _store_memories
+        from mnemos.persistence.postgres import PostgresFederationRepository, PostgresTransaction
 
         execute_calls: list[tuple] = []
 
@@ -561,7 +677,8 @@ class TestStoreMemoriesConcurrency:
             "created": "2026-05-01T01:00:00Z",
         }]
 
-        new_n, upd_n = await _store_memories(_FakeConn(), "pythia", feed)
+        tx = PostgresTransaction(_FakeConn(), _NoopRawTx())
+        new_n, upd_n = await _store_memories(PostgresFederationRepository(), tx, "pythia", feed)
 
         assert new_n == 0
         assert upd_n == 0, (
@@ -598,7 +715,6 @@ class TestFederationFeedPreferCompressed:
 
     @pytest.mark.asyncio
     async def test_compressed_branch_replaces_raw_content(self, monkeypatch):
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 5, 1, 0, 0, 0)
@@ -611,7 +727,7 @@ class TestFederationFeedPreferCompressed:
         row["compressed_content"] = "<<COMPRESSED PAYLOAD>>"
         row["verbatim_content"] = None  # CASE WHEN NULLed it
         pool = _FeedPool([row])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         resp = await handler.federation_feed(
             None, None,
@@ -657,7 +773,6 @@ class TestFederationFeedPreferCompressed:
         variant for a row, the COALESCE picks raw m.content and
         compressed_content stays None. Operators get the fallback
         behavior they'd see with prefer_compressed=false."""
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 5, 1, 0, 0, 0)
@@ -667,7 +782,7 @@ class TestFederationFeedPreferCompressed:
         # verbatim_content stays present because CASE picks the raw
         # value when v.compressed_content IS NULL.
         pool = _FeedPool([row])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         resp = await handler.federation_feed(
             None, None,
@@ -698,14 +813,13 @@ class TestFederationFeedPreferCompressed:
         verbatim_content + a 0.5+ compression ratio would have
         slipped through and grown the payload.
         """
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 5, 1, 0, 0, 0)
         row = _feed_row("00000000-0000-0000-0000-000000000020", updated)
         row["compressed_content"] = "<<COMPRESSED>>"
         pool = _FeedPool([row])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         await handler.federation_feed(
             None, None,
@@ -744,13 +858,12 @@ class TestFederationFeedPreferCompressed:
         SQL + MemoryItem shape to v4.2.0a13 — no LEFT JOIN, no
         COALESCE, raw content + verbatim_content + compressed_content
         as None."""
-        import mnemos.core.lifecycle as lc
         from mnemos.api.routes import federation as handler
 
         updated = datetime(2026, 5, 1, 0, 0, 0)
         row = _feed_row("00000000-0000-0000-0000-000000000012", updated)
         pool = _FeedPool([row])
-        monkeypatch.setattr(lc, "_pool", pool)
+        _install_feed_backend(monkeypatch, pool)
 
         # Explicit False — the function signature uses
         # ``prefer_compressed: bool = Query(False, ...)`` and a

@@ -52,9 +52,21 @@ def _is_blocked_ip(ip: _IPAddress) -> bool:
 
 
 async def _resolve_addrs(host: str) -> List[str]:
-    """Resolve host asynchronously so DNS cannot block the event loop."""
+    """Resolve host asynchronously so DNS cannot block the event loop.
+
+    Bounded by ``WEBHOOK_DNS_TIMEOUT`` (default 10.0s,
+    `_WebhookSettings.dns_timeout`). Without the timeout, slow DNS
+    can stall the validation-time hop indefinitely; the lease-budget
+    calc in `_derive_lease_defaults` already includes this timeout
+    in its 90-sec floor, so the runtime contract assumes the cap
+    is enforced here.
+    """
     loop = asyncio.get_event_loop()
-    infos = await loop.getaddrinfo(host, None)
+    timeout = get_settings().webhook.dns_timeout
+    infos = await asyncio.wait_for(
+        loop.getaddrinfo(host, None),
+        timeout=timeout,
+    )
     return [info[4][0] for info in infos]
 
 
@@ -91,6 +103,16 @@ async def validate_webhook_url(
 
     try:
         addrs = await _resolve_addrs(host)
+    except asyncio.TimeoutError:
+        # NB: must come BEFORE the OSError clause. In Python 3.11+
+        # asyncio.TimeoutError aliases builtin TimeoutError which
+        # IS an OSError subclass — without the explicit ordering,
+        # `except (socket.gaierror, OSError)` swallows the timeout
+        # path and the operator-facing detail loses its specificity.
+        raise HTTPException(
+            status_code=422,
+            detail="url host DNS resolution timed out",
+        )
     except (socket.gaierror, OSError):
         raise HTTPException(status_code=422, detail="url host could not be resolved")
     first_validated_addr: str | None = None

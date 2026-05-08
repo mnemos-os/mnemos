@@ -1,37 +1,27 @@
-# Cline → MNEMOS
+# Cline -> MNEMOS
 
-> **Status: experimental.** Cline (formerly Claude Dev) is a
-> VS Code extension that drives autonomous code-edit sessions.
-> Tested against Cline v3.x. The stdio path is stable; HTTP/SSE
-> inherits whatever stability the upstream MCP HTTP transport
-> carries.
+Cline can use MNEMOS from VS Code by adding a `mnemos` MCP server to the extension's MCP settings JSON.
 
-## What this gets you
+## What you need — token, host (192.168.207.67), relevant port(s)
 
-Cline's autonomous-edit loop gains the MNEMOS MCP tools — see
-the canonical exact-name table in
-[README.md](./README.md#canonical-mcp-tool-surface).
-Practically: Cline can search MNEMOS for prior architecture
-decisions before suggesting an approach, save its own decisions
-as memories during the session, and pull KG triples for
-entity-aware reasoning.
+- Cline for VS Code with MCP support.
+- A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
+- MNEMOS REST reachable at `http://192.168.207.67:5002`.
+- The `mnemos` CLI installed where VS Code launches extensions.
+- macOS Cline path: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`.
+- Linux Cline path: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`.
+- Windows Cline path: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`.
+- Optional HTTP/SSE bridge reachable at `http://192.168.207.67:5003/sse`.
+- VS Code window reload after editing the file.
+- A model selected in Cline that can call tools.
 
-## Prerequisites
+## Configuration — copy-paste-runnable code block; use $MNEMOS_TOKEN placeholder (never the live token)
 
-- Cline v3.0 or later (MCP support landed in 3.x).
-- A running MNEMOS instance.
-- Bearer token (`MNEMOS_API_KEY`).
+> Set MNEMOS_TOKEN from ~/.api_keys_master.json or source your shell env.
 
-## Setup — local stdio (recommended)
-
-Cline's MCP config is at one of:
-
-- macOS: `~/Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-- Linux: `~/.config/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json`
-- Windows / WSL2: `%APPDATA%\Code\User\globalStorage\saoudrizwan.claude-dev\settings\cline_mcp_settings.json`
-
-The simpler path: open Cline's settings panel from the VS Code
-extension UI and edit the `mcpServers` block visually.
+Open Cline settings, then merge this into the `mcpServers` object.
+The `autoApprove` list includes read-only tools only; write tools should
+still prompt for approval.
 
 ```json
 {
@@ -40,185 +30,68 @@ extension UI and edit the `mcpServers` block visually.
       "command": "mnemos",
       "args": ["serve", "mcp-stdio"],
       "env": {
-        "MNEMOS_BASE": "http://localhost:5002",
-        "MNEMOS_API_KEY": "<your bearer token>"
+        "MNEMOS_BASE": "http://192.168.207.67:5002",
+        "MNEMOS_API_KEY": "$MNEMOS_TOKEN"
       },
       "disabled": false,
       "autoApprove": [
         "search_memories",
         "list_memories",
         "get_memory",
-        "get_stats"
+        "get_stats",
+        "kg_search",
+        "kg_timeline",
+        "log_memory",
+        "diff_memory_commits",
+        "checkout_memory",
+        "recommend_model"
       ]
     }
   }
 }
 ```
 
-The ``autoApprove`` field is a Cline-specific feature: tools
-listed there don't trigger the per-call approval prompt that
-Cline normally puts in front of every tool invocation. The list
-above auto-approves READ-only tools (``search_memories``,
-``list_memories``, ``get_memory``, ``get_stats``) while keeping
-ALL write tools gated on operator confirmation:
-
-* memory writes — ``create_memory``, ``update_memory``,
-  ``delete_memory``, ``bulk_create_memories``
-* KG writes — ``kg_create_triple``, ``update_triple``,
-  ``delete_triple`` *(note: the two ``triple`` tools have no
-  ``kg_`` prefix in the MCP registry — autoApprove matches
-  exact names)*
-
-See "Auto-approving write tools? Provision a non-root user
-first" further down before extending this list.
-
-## Setup — HTTP/SSE (remote MNEMOS)
+For HTTP/SSE, use this shape only if your Cline build supports remote MCP:
 
 ```json
 {
   "mcpServers": {
-    "mnemos": {
-      "url": "https://mnemos.example.com/sse",
+    "mnemos-sse": {
+      "url": "http://192.168.207.67:5003/sse",
       "headers": {
-        "Authorization": "Bearer <your bearer token>"
+        "Authorization": "Bearer $MNEMOS_TOKEN"
       },
       "disabled": false,
-      "autoApprove": ["search_memories", "list_memories", "get_memory", "get_stats"]
+      "autoApprove": ["search_memories", "list_memories", "get_memory"]
     }
   }
 }
 ```
 
-## Restart VS Code
+Reload the VS Code window from the command palette after saving. A Cline
+task that was already running will not pick up the new server.
 
-Cline's MCP server registrations are loaded once per VS Code
-window. Reload the window (Ctrl/Cmd+Shift+P → "Developer:
-Reload Window") after editing the config; full IDE restart is
-not required.
+## Verification — one curl or one tool-list call that proves registration worked
 
-## Smoke test
+```bash
+# Server up?
+curl -fsS http://192.168.207.67:5002/health | jq -r '.status'    # → "healthy"
 
-Open the Cline panel, start a new task:
-
-```
-> Search MNEMOS for "test memory" and tell me the first three results.
+# Confirm the canonical MCP tool registry includes kg_search:
+python3 -c 'from mnemos.mcp.tools import TOOL_REGISTRY; print("kg_search" in TOOL_REGISTRY)'  # → True
 ```
 
-Cline should request approval for the `search_memories` tool
-(unless you auto-approved it), then execute. If MNEMOS is
-empty:
+(MCP discovery is the protocol's `tools/list` JSON-RPC method over
+SSE/stdio, not a REST endpoint.)
 
-```
-> Create a MNEMOS memory in category "test" with content "First Cline smoke test".
-```
+In Cline, start a new task and ask it to search MNEMOS for a harmless
+phrase. It should request or use the `search_memories` tool.
 
-Cline will request approval for `create_memory`. After
-approval, re-search to confirm.
+## Common gotchas — 2-4 bullets of real failure modes
 
-## Troubleshooting
-
-| Symptom                                  | Likely cause                                | Fix                                                    |
-|------------------------------------------|---------------------------------------------|--------------------------------------------------------|
-| MCP panel shows server as `disabled`     | `disabled: true` in config                  | Set `disabled: false` and reload window                |
-| Tool calls return `MNEMOS UNREACHABLE`   | Wrong `MNEMOS_BASE` URL                     | `curl <MNEMOS_BASE>/health` from a separate shell      |
-| Tool calls return 401                    | Bearer token wrong                          | Verify with curl                                       |
-| Cline asks for approval on every read    | `autoApprove` not set                       | Add read-only tools to the array                       |
-| `mnemos` binary not found                | Cline's PATH doesn't include the venv       | Use absolute path in `command`                         |
-| WSL2 + Cline-on-Windows: spawn fails     | Same WSL2 path issue as Cursor              | Use HTTP/SSE shape OR run VS Code in WSL2 session      |
-
-## Cline-specific: keep destructive tools manually-approved
-
-Even when you trust Cline to autonomously edit code,
-auto-approving any of MNEMOS's write tools on a root API key
-is a footgun — a single hallucinated tool call can wipe or
-corrupt useful context. The recommendation in the example
-config near the top of this page keeps **all** write tools
-manually-approved.
-
-See the canonical exact-name MCP tool surface in
-[README.md](./README.md#canonical-mcp-tool-surface)
-for the full set of read + write tools and the ``kg_``-prefix
-asymmetry on ``update_triple`` / ``delete_triple``.
-
-### Auto-approving write tools? Provision a non-root user first
-
-If you want to expand auto-approve to include write tools
-(``create_memory`` / ``update_memory``), the prerequisite is a
-**non-root user with its own ``users.namespace``** so the
-permission boundary is enforced server-side. Setup:
-
-1. **Server side (one-time)**, create the user + key:
-   ```sql
-   INSERT INTO users (id, role, namespace, display_name)
-   VALUES ('cline-sandbox-user', 'user', 'cline-sandbox', 'Cline Sandbox');
-   -- then issue an API key for that user via the admin path or
-   -- direct INSERT into api_keys with user_id='cline-sandbox-user'
-   ```
-2. **Client side**, bind the new key + namespace stamp to the
-   MCP server. The autoApprove list below auto-approves ALL
-   READ tools plus only the **inserts** of NEW rows
-   (``create_memory``, ``bulk_create_memories``). Every
-   tool that mutates EXISTING rows (``update_memory``,
-   ``delete_memory``, ``update_triple``, ``delete_triple``)
-   stays manually-approved even in this sandbox, because a
-   hallucinated call against a stale id has cross-session
-   blast radius (DAG tombstones / edits on prior memories
-   survive sandbox teardown). KG inserts (``kg_create_triple``)
-   are also kept manual-approve here because hallucinated KG
-   triples are easy to inject and hard to clean up — flip it
-   on if your sandbox is genuinely throwaway.
-
-   ```json
-   {
-     "mcpServers": {
-       "mnemos-cline-sandbox": {
-         "command": "mnemos",
-         "args": ["serve", "mcp-stdio"],
-         "env": {
-           "MNEMOS_BASE": "...",
-           "MNEMOS_API_KEY": "<the new non-root key>",
-           "MNEMOS_DEFAULT_NAMESPACE": "cline-sandbox"
-         },
-         "autoApprove": [
-           "search_memories", "list_memories", "get_memory", "get_stats",
-           "kg_search", "kg_timeline",
-           "log_memory", "diff_memory_commits", "checkout_memory",
-           "recommend_model",
-           "create_memory", "bulk_create_memories"
-         ]
-       }
-     }
-   }
-   ```
-
-With the non-root key + ``users.namespace``, the server enforces
-the scope: even a hallucinated `update_memory` call against a
-stale memory ID outside the namespace is rejected at the auth
-seam, not just stamped at write time.
-
-### What about just setting ``MNEMOS_DEFAULT_NAMESPACE`` with a root key?
-
-Don't. The env var is a **WRITE STAMP** only — see the security
-caveat in [claude-code.md](./claude-code.md). A root API key
-with the env stamp will write new memories into the configured
-namespace by default, but can still ``update_memory`` /
-``delete_memory`` against ANY memory ID across all namespaces.
-Auto-approving `update_memory` on a root key with only the env
-stamp is the dangerous shape this section exists to prevent.
-
-If you must run a root key (one-tenant install, no per-user
-auth), do NOT extend ``autoApprove`` to ``update_memory`` or
-the kg-write tools. The minimal example at the top of this page
-covers the supported auto-approve set for the root-key shape.
-
-## Cross-references
-
-- [README.md](./README.md) — connector subsystem framing.
-- [continue-dev.md](./continue-dev.md) — the closest VS Code-
-  extension peer.
-- [claude-code.md](./claude-code.md) — same MCP shape, different
-  IDE.
-
----
-
-*v1.0 — 2026-05-01. Tracks MNEMOS server v4.2.0a12.*
+- Cline's `autoApprove` matches exact tool names; `kg_delete_triple` is not
+  the same as `delete_triple`.
+- VS Code launched from the dock may not inherit shell env variables.
+- Do not auto-approve write tools unless the MNEMOS token is namespace
+  scoped and non-root.
+- The extension path still contains `claude-dev` on many installs.

@@ -115,25 +115,21 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" bash << ENVEOF
 
     if [ ! -f .env ]; then
         cat > .env << 'ENV'
-# Database
-DATABASE_HOST=localhost
-DATABASE_PORT=5432
-DATABASE_NAME=mnemos
-DATABASE_USER=mnemos
-DATABASE_PASSWORD=mnemos_secure_password
+# Database — names match _DatabaseSettings env_prefix="PG_"
+PG_HOST=localhost
+PG_PORT=5432
+PG_DATABASE=mnemos
+PG_USER=mnemos
+PG_PASSWORD=mnemos_secure_password
+PG_POOL_MIN=5
+PG_POOL_MAX=20
 
 # API Server
-MNEMOS_HOST=0.0.0.0
-MNEMOS_PORT=5000
-MNEMOS_DEBUG=false
-
-# Graeae Integration
-GRAEAE_URL=http://localhost:5002
-GRAEAE_FALLBACK_ON_ERROR=true
+MNEMOS_BIND=0.0.0.0
+MNEMOS_PORT=5002
 
 # Logging
-LOG_LEVEL=INFO
-LOG_FILE=/var/log/mnemos/api.log
+MNEMOS_LOG_LEVEL=INFO
 ENV
         chmod 600 .env
         echo ".env file created"
@@ -238,8 +234,10 @@ ssh "$DEPLOY_USER@$DEPLOY_HOST" bash << VERIFYEOF
     source venv/bin/activate
     timeout 5 python -c "from mnemos.api.main import app; print('API server imports OK')"
 
-    # Check if modules import
-    timeout 5 python -c "from mnemos.hooks import HookRegistry; print('Hooks module OK')"
+    # Check if other key modules import. (#182: dropped the
+    # legacy hooks-package smoke-check because the package was
+    # removed — dead since v4.0.)
+    timeout 5 python -c "from mnemos.mcp.tools import TOOL_REGISTRY; print('MCP tools OK')"
 
     echo "Module imports verified"
 VERIFYEOF

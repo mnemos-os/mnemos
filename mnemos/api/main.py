@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from mnemos.api.routes.admin import router as admin_router
+from mnemos.api.routes.mcp_audit import router as mcp_audit_router
 from mnemos.api.routes.consultations import router as consultations_router
 from mnemos.api.routes.dag import router as dag_router
 from mnemos.api.routes.entities import router as entities_router
@@ -199,6 +200,65 @@ import secrets as _secrets
 
 from starlette.middleware.sessions import SessionMiddleware as _SessionMiddleware
 
+# #155: minimum token length to consider "strong enough" for the
+# trust boundary. The installer's autogen produces 256-bit
+# (`secrets.token_hex(32)` = 64 chars), so anything materially shorter
+# than that suggests a hand-typed value or operator typo. 32 hex chars
+# = 128 bits is the lower floor for "still cryptographically robust";
+# below that we WARN but don't refuse. The dependency check itself
+# uses `hmac.compare_digest`, which doesn't care about length — but
+# a 4-char token is trivially brute-forceable.
+_AUDIT_TOKEN_MIN_LENGTH = 32
+
+
+def _warn_if_audit_token_unset(settings) -> bool:
+    """Emit a one-time startup WARN when the audit token is unset OR
+    suspiciously short.
+
+    Slice #152: after #150/#151 the installer makes
+    ``[server].internal_audit_token`` default-on. An unset token at
+    API startup therefore signals an operator-initiated downgrade
+    OR a partial upgrade — surface it so nobody is surprised that
+    ``/v1/internal/mcp_audit`` is in legacy bearer-token mode.
+
+    Slice #155: also warn when a token IS set but is below the
+    minimum-length floor (``_AUDIT_TOKEN_MIN_LENGTH``). The
+    dependency's ``hmac.compare_digest`` check doesn't care about
+    length, so a short token still locks down the endpoint, but a
+    4-char token is trivially brute-forceable. The autogen path
+    produces 64-char hex; anything dramatically shorter is almost
+    certainly a typo or placeholder.
+
+    Returns True iff the warning was emitted (testable separately
+    from the module import-time call site, which avoids forcing
+    test-side reloads of mnemos.api.main + mnemos.core.config).
+    """
+    token = (settings.server.internal_audit_token or "").strip()
+    if not token:
+        logging.getLogger(__name__).warning(
+            "MNEMOS_INTERNAL_AUDIT_TOKEN / [server].internal_audit_token is "
+            "not set — /v1/internal/mcp_audit is operating in LEGACY mode. "
+            "Any authenticated bearer-token caller can POST audit rows. "
+            "Run `python -m mnemos.installer --upgrade` to autogen a "
+            "service-only credential, or set MNEMOS_INTERNAL_AUDIT_TOKEN "
+            "in your service environment to a 256-bit hex value."
+        )
+        return True
+    if len(token) < _AUDIT_TOKEN_MIN_LENGTH:
+        logging.getLogger(__name__).warning(
+            "MNEMOS_INTERNAL_AUDIT_TOKEN / [server].internal_audit_token is "
+            "set but is only %d characters (minimum recommended: %d). "
+            "/v1/internal/mcp_audit lockdown is engaged, but the configured "
+            "token is below the brute-force-resistance floor. Rotate to a "
+            "256-bit hex value (e.g. `python -c 'import secrets; "
+            "print(secrets.token_hex(32))'`).",
+            len(token),
+            _AUDIT_TOKEN_MIN_LENGTH,
+        )
+        return True
+    return False
+
+
 _oauth_state_secret = _settings.server.session_secret
 if not _oauth_state_secret:
     logging.getLogger(__name__).warning(
@@ -207,6 +267,8 @@ if not _oauth_state_secret:
         "value in your environment for production."
     )
     _oauth_state_secret = _secrets.token_urlsafe(48)
+
+_warn_if_audit_token_unset(_settings)
 app.add_middleware(
     _SessionMiddleware,
     secret_key=_oauth_state_secret,
@@ -249,6 +311,7 @@ app.include_router(ingest_router)
 app.include_router(kg_router)
 app.include_router(portability_router)  # v3.2: /v1/export + /v1/import (MPF v0.1)
 app.include_router(admin_router)
+app.include_router(mcp_audit_router)  # Phase-D MCP audit (#146)
 app.include_router(kronos_router)
 app.include_router(versions_router)
 app.include_router(journal_router)

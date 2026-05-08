@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 
-from mnemos.domain.kronos.scoring import ewma
+from mnemos.domain.kronos.backends.selector import get_backend
 
 
 @dataclass(frozen=True)
@@ -75,7 +75,7 @@ async def forecast_recall_load(
             ci_upper=0.0,
         )
 
-    smoothed = ewma(history, alpha=0.3)
+    smoothed = get_backend().ewma(history, alpha=0.3)
     per_hour = max(0.0, float(smoothed[-1]))
     residuals = history - smoothed
     residual_std = float(np.std(residuals))

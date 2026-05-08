@@ -1,6 +1,9 @@
-# MNEMOS v3.1.0 Requirements Comparison
+# MNEMOS Requirements Comparison
 
 **Quick comparison between bare metal and Docker deployments**
+
+> Originally written for v3.1.0 (2026-04-19). The bare-metal vs Docker
+> tradeoffs and resource floors below remain accurate as of v5.0.1.
 
 ---
 
@@ -565,6 +568,6 @@ Per Month: $441-542
 
 ---
 
-**Version**: 3.1.0  
-**Updated**: 2026-04-19  
+**Originally Written For**: v3.1.0  
+**Verified Current For**: v5.0.1 (2026-05-08)  
 **Audience**: DevOps, SREs, developers making deployment decisions

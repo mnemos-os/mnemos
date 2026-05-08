@@ -117,7 +117,7 @@ async def test_all_chunks_committed_returns_200(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 200
@@ -163,7 +163,7 @@ async def test_partial_failure_returns_207_multi_status(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 207, (
@@ -203,7 +203,7 @@ async def test_total_failure_returns_502(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 502
@@ -254,7 +254,7 @@ async def test_batch_import_partial_failure_returns_207(
             ("files", ("doc1.pdf", b"%PDF-1.4\nx")),
             ("files", ("doc2.pdf", b"%PDF-1.4\nx")),
         ],
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 207, (
@@ -305,7 +305,7 @@ async def test_batch_import_total_failure_returns_502(
             ("files", ("doc1.pdf", b"%PDF-1.4\nx")),
             ("files", ("doc2.pdf", b"%PDF-1.4\nx")),
         ],
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 502
@@ -333,7 +333,7 @@ async def test_batch_import_all_empty_files_returns_207_not_502(
             ("files", ("empty1.pdf", b"")),
             ("files", ("empty2.pdf", b"")),
         ],
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 207, (
@@ -375,7 +375,7 @@ async def test_batch_import_all_success_returns_200(
             ("files", ("doc1.pdf", b"%PDF-1.4\nx")),
             ("files", ("doc2.pdf", b"%PDF-1.4\nx")),
         ],
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 200
@@ -452,7 +452,7 @@ async def test_batch_import_mid_batch_pool_loss_returns_top_level_503(
             ("files", ("doc1.pdf", b"%PDF-1.4\nx")),
             ("files", ("doc2.pdf", b"%PDF-1.4\nx")),
         ],
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 503, (
@@ -519,7 +519,7 @@ async def test_single_import_mid_file_infra_loss_preserves_committed_chunks(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 503, (
@@ -593,7 +593,7 @@ async def test_single_import_transaction_exit_infra_loss_surfaces_unconfirmed_id
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 503, (
@@ -655,7 +655,7 @@ async def test_batch_import_mid_file_infra_loss_preserves_per_file_committed_chu
         files=[
             ("files", ("doc1.pdf", b"%PDF-1.4\nx")),
         ],
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 503, (
@@ -717,7 +717,7 @@ async def test_import_uses_canonical_id_from_returning_clause(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
@@ -764,7 +764,7 @@ async def test_import_chunk_key_is_stable_and_present_in_insert(
     resp1 = await client.post(
         "/v1/documents/import",
         files={"file": ("stable.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp1.status_code == 200
@@ -783,7 +783,7 @@ async def test_import_chunk_key_is_stable_and_present_in_insert(
     resp2 = await client.post(
         "/v1/documents/import",
         files={"file": ("stable.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp2.status_code == 200
@@ -847,7 +847,7 @@ async def test_import_chunk_key_includes_content_digest(
     resp1 = await client.post(
         "/v1/documents/import",
         files={"file": ("draft.pdf", b"%PDF-1.4\nv1")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp1.status_code == 200
@@ -872,7 +872,7 @@ async def test_import_chunk_key_includes_content_digest(
     resp2 = await client.post(
         "/v1/documents/import",
         files={"file": ("draft.pdf", b"%PDF-1.4\nv2")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp2.status_code == 200
@@ -971,7 +971,7 @@ async def test_unconfirmed_memory_ids_uses_canonical_id_after_conflict(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 503
@@ -1027,7 +1027,7 @@ async def test_import_chunk_key_includes_permission_mode(
     resp1 = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents", "permission_mode": "644"},
+        data={"category": "documents", "project_tag": "mnemos", "permission_mode": "644"},
         headers=auth_headers,
     )
     assert resp1.status_code == 200
@@ -1038,7 +1038,7 @@ async def test_import_chunk_key_includes_permission_mode(
     resp2 = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents", "permission_mode": "600"},
+        data={"category": "documents", "project_tag": "mnemos", "permission_mode": "600"},
         headers=auth_headers,
     )
     assert resp2.status_code == 200
@@ -1078,7 +1078,7 @@ async def test_import_chunk_key_includes_category(
     resp1 = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp1.status_code == 200
@@ -1087,7 +1087,7 @@ async def test_import_chunk_key_includes_category(
     resp2 = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "research"},
+        data={"category": "research", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp2.status_code == 200
@@ -1156,7 +1156,7 @@ async def test_import_resolves_legacy_v70_chunk_key_to_canonical_id(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, resp.text
@@ -1321,7 +1321,7 @@ async def test_legacy_update_falls_through_to_on_conflict_on_unique_violation(
     resp = await client.post(
         "/v1/documents/import",
         files={"file": ("doc.pdf", b"%PDF-1.4\nx")},
-        data={"category": "documents"},
+        data={"category": "documents", "project_tag": "mnemos"},
         headers=auth_headers,
     )
     assert resp.status_code == 200, (

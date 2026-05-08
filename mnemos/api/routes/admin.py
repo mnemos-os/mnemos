@@ -2,9 +2,10 @@
 import hashlib
 import logging
 import secrets
-from typing import List, Optional
+from datetime import datetime
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 import mnemos.core.lifecycle as _lc
@@ -13,6 +14,7 @@ from mnemos.api.persistence_helpers import require_postgres_pool_or_503
 from mnemos.core.config import get_settings
 from mnemos.core.extras import is_extra_installed, missing_extra_detail
 from mnemos.core.security import is_root
+from mnemos.db.deletion_log import fetch_deletion_log
 from mnemos.domain.models import (
     ApiKeyCreateRequest,
     ApiKeyResponse,
@@ -42,11 +44,9 @@ async def create_user(
 ):
     """Create a new user. id must be unique."""
     require_postgres_pool_or_503(route_label="POST /admin/users")
-    if request.role not in ("user", "root", "federation"):
-        raise HTTPException(
-            status_code=422,
-            detail="role must be 'user', 'root', or 'federation'",
-        )
+    # #169: role is now Literal["user", "root", "federation"] in
+    # the request model — Pydantic auto-422s on invalid values
+    # before we get here.
     async with _lc.get_pool_manager().acquire() as conn:
         existing = await conn.fetchrow("SELECT id FROM users WHERE id=$1", request.id)
         if existing:
@@ -214,8 +214,10 @@ async def create_oauth_provider(
 ):
     """Register a new OAuth provider (root only)."""
     require_postgres_pool_or_503(route_label="POST /admin/oauth/providers")
-    if request.kind not in ("oidc", "oauth2"):
-        raise HTTPException(status_code=422, detail="kind must be 'oidc' or 'oauth2'")
+    # #169: kind is now Literal["oidc", "oauth2"] in the request
+    # model — Pydantic auto-422s on invalid values before we get here.
+    # The conditional checks below remain because they require
+    # cross-field validation (issuer_url, authorize_url, token_url).
     if request.kind == "oidc" and not request.issuer_url:
         raise HTTPException(status_code=422, detail="issuer_url required when kind='oidc'")
     if request.kind == "oauth2" and not (request.authorize_url and request.token_url):
@@ -333,8 +335,15 @@ async def list_oauth_identities(
 # compressed variant. Per-memory enqueue on write is v3.2 hot-path work.
 
 
-_VALID_REASONS = {"on_write", "manual", "scheduled", "reprocess"}
-_VALID_PROFILES = {"balanced", "quality_first", "speed_first", "custom"}
+# #170: type aliases mirror the Pydantic Literal enums on the
+# request models below.
+# #181: removed the duplicate `_VALID_REASONS` / `_VALID_PROFILES`
+# sets that #170 retained "for any operator-introspection callers."
+# No such callers exist anywhere in the codebase. If a future need
+# arises, derive from `typing.get_args(CompressionReason)` rather
+# than re-declaring.
+CompressionReason = Literal["on_write", "manual", "scheduled", "reprocess"]
+CompressionProfile = Literal["balanced", "quality_first", "speed_first", "custom"]
 
 
 async def _invalidate_memory_read_caches() -> None:
@@ -360,11 +369,11 @@ class CompressionEnqueueRequest(BaseModel):
         min_length=1,
         max_length=1000,
     )
-    reason: str = Field(
+    reason: CompressionReason = Field(
         default="manual",
         description="Queue row reason. One of: on_write | manual | scheduled | reprocess",
     )
-    scoring_profile: str = Field(
+    scoring_profile: CompressionProfile = Field(
         default="balanced",
         description="Scoring profile for this batch. One of: "
                     "balanced | quality_first | speed_first | custom",
@@ -449,16 +458,9 @@ async def compression_enqueue(
     for existing pending rows first.
     """
     require_postgres_pool_or_503(route_label="POST /admin/compression/enqueue")
-    if request.reason not in _VALID_REASONS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"reason must be one of {sorted(_VALID_REASONS)}",
-        )
-    if request.scoring_profile not in _VALID_PROFILES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"scoring_profile must be one of {sorted(_VALID_PROFILES)}",
-        )
+    # #170: reason + scoring_profile are now Literal[...] in the
+    # request model — Pydantic auto-422s on invalid values before
+    # we get here.
 
     async with _lc.get_pool_manager().acquire() as conn:
         async with conn.transaction():
@@ -495,11 +497,11 @@ async def compression_enqueue(
 
 
 class CompressionEnqueueAllRequest(BaseModel):
-    reason: str = Field(
+    reason: CompressionReason = Field(
         default="manual",
         description="Reason stamped on every queued row.",
     )
-    scoring_profile: str = Field(default="balanced")
+    scoring_profile: CompressionProfile = Field(default="balanced")
     priority: int = Field(default=0)
     category: Optional[str] = Field(
         default=None,
@@ -541,16 +543,9 @@ async def compression_enqueue_all(
     enqueue the full corpus in one call.
     """
     require_postgres_pool_or_503(route_label="POST /admin/compression/enqueue-all")
-    if request.reason not in _VALID_REASONS:
-        raise HTTPException(
-            status_code=422,
-            detail=f"reason must be one of {sorted(_VALID_REASONS)}",
-        )
-    if request.scoring_profile not in _VALID_PROFILES:
-        raise HTTPException(
-            status_code=422,
-            detail=f"scoring_profile must be one of {sorted(_VALID_PROFILES)}",
-        )
+    # #170: reason + scoring_profile are now Literal[...] in the
+    # request model — Pydantic auto-422s on invalid values before
+    # we get here.
 
     # Build WHERE clause incrementally. Avoid f-string injection by binding
     # every user-controlled value via asyncpg parameters.
@@ -800,6 +795,68 @@ def _row_to_deletion_request(row) -> DeletionRequestItem:
         status=row["status"],
         notes=row.get("notes"),
     )
+
+
+def _row_get(row, key: str, default=None):
+    try:
+        return row[key]
+    except (KeyError, TypeError):
+        getter = getattr(row, "get", None)
+        if callable(getter):
+            return getter(key, default)
+        return default
+
+
+def _row_to_deletion_log_item(row) -> dict:
+    def _ts(value):
+        return value.isoformat() if hasattr(value, "isoformat") else value
+
+    return {
+        "id": str(_row_get(row, "id")),
+        "memory_id": _row_get(row, "memory_id"),
+        "content_hash": _row_get(row, "content_hash"),
+        "owner_id": _row_get(row, "owner_id"),
+        "namespace": _row_get(row, "namespace"),
+        "requested_by": _row_get(row, "requested_by"),
+        "requested_at": _ts(_row_get(row, "requested_at")),
+        "executed_at": _ts(_row_get(row, "executed_at")),
+        "request_kind": _row_get(row, "request_kind"),
+        "reason": _row_get(row, "reason"),
+        "source": _row_get(row, "source") or [],
+    }
+
+
+@router.get("/deletion-log")
+async def list_deletion_log(
+    from_ts: datetime = Query(..., alias="from"),
+    to_ts: datetime = Query(..., alias="to"),
+    owner_id: Optional[str] = None,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200),
+    _: UserContext = Depends(require_root),
+):
+    """List root-only deletion-log audit rows."""
+    require_postgres_pool_or_503(route_label="GET /admin/deletion-log")
+    if from_ts > to_ts:
+        raise HTTPException(
+            status_code=422,
+            detail="from must be earlier than or equal to to",
+        )
+    async with _lc.get_pool_manager().acquire() as conn:
+        rows, total = await fetch_deletion_log(
+            conn,
+            from_ts=from_ts,
+            to_ts=to_ts,
+            owner_id=owner_id,
+            page=page,
+            page_size=page_size,
+        )
+    return {
+        "items": [_row_to_deletion_log_item(row) for row in rows],
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+    }
 
 
 def _normalize_deletion_target(
@@ -1335,6 +1392,11 @@ async def force_purge_deletion_request(
             conn,
             existing["target_user_id"],
             existing["target_namespace"],
+            requested_by=_.user_id,
+            requested_at=None,
+            request_kind="admin_purge",
+            reason=_row_get(existing, "notes"),
+            source=["admin.force_purge_deletion_request", request_id],
             invalidate_cache=False,
         )
         purged_target = (existing["target_user_id"], existing["target_namespace"])
