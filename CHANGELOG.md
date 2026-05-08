@@ -4,6 +4,33 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — MCP principal context cache TTL + size bound (#203)
+
+Audit MED finding (`mem_1778221719390_8cb1ba`) at
+`mnemos/mcp/http.py`: `_principal_context_cache` was an unbounded
+`dict[str, MCPUserContext]` that NEVER expired. Operator role /
+namespace changes were hidden for the lifetime of the process,
+and high-churn principal-id flow (token rotation, CI matrix)
+could grow the cache without bound.
+
+Fix: TTL = 300s + size cap = 1024. New `_principal_cache_get`
+and `_principal_cache_set` helpers handle expiry on read,
+half-oldest eviction on cap-overflow, and a `_monotonic` clock
+indirection so tests can advance time without sleeping.
+
+Backward compat: tests under
+`tests/test_mcp_user_passthrough.py` and
+`tests/test_mcp_nats_sse.py` historically did
+`cache[key] = MCPUserContext(...)` (bare entry, not tuple). The
+get helper treats bare entries as never-expires so those tests
+keep passing without churn.
+
+Pinned by `tests/test_mcp_principal_cache_ttl.py` (5 tests):
+TTL/cap constants in sane range, set + within-TTL get returns
+the context, past-TTL get evicts and returns None, beyond-cap
+set evicts oldest and stays at-or-below cap, bare-context
+backward compat still works.
+
 ### Fixed — Postgres `semantic_search` embedding-dim guard (#202)
 
 Audit MED finding (`mem_1778221719390_8cb1ba`) at

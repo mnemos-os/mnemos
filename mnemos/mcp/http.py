@@ -363,7 +363,70 @@ async def handle_sse(request):
         reset_mcp_backend_context(context_tokens)
 
 
-_principal_context_cache: dict[str, MCPUserContext] = {}
+# MCP principal context cache (entry → resolved MCPUserContext +
+# monotonic-time expiry). Until #203 this was an unbounded dict
+# that NEVER expired — operator role / namespace changes were
+# hidden for the process lifetime. Bounded LRU + TTL closes
+# both gaps without per-request httpx round-trips.
+_principal_context_cache: dict[str, tuple[MCPUserContext, float]] = {}
+_PRINCIPAL_CACHE_TTL_SECONDS = 300.0  # 5 min — short enough that
+# role/namespace changes propagate within a sane window; long
+# enough that high-rps SSE callers don't re-hit /auth/oauth/me.
+_PRINCIPAL_CACHE_MAX = 1024  # cap per-process. Beyond this the
+# half-oldest entries are evicted; principal-id churn (e.g. token
+# rotation in CI) won't grow the dict without bound.
+
+
+def _principal_cache_get(principal_id: str) -> MCPUserContext | None:
+    """Return cached context if fresh, else None (also evict
+    stale entries on read so the cache shrinks lazily).
+
+    Tests historically assigned bare MCPUserContext values to
+    ``_principal_context_cache[key]``; tolerate that shape by
+    treating a non-tuple entry as "never expires" — the
+    `_principal_cache_set` helper writes the tuple shape, but
+    direct-assigned bare values continue to work in tests.
+    """
+    entry = _principal_context_cache.get(principal_id)
+    if entry is None:
+        return None
+    if isinstance(entry, tuple):
+        ctx, expires_at = entry
+        if _monotonic() >= expires_at:
+            _principal_context_cache.pop(principal_id, None)
+            return None
+        return ctx
+    # Backward-compat: bare MCPUserContext (test helper / direct
+    # assign). Treat as never-expires.
+    return entry  # type: ignore[return-value]
+
+
+def _principal_cache_set(principal_id: str,
+                         context: MCPUserContext) -> None:
+    """Write the tuple-shaped entry with TTL; cap size."""
+    if len(_principal_context_cache) >= _PRINCIPAL_CACHE_MAX \
+            and principal_id not in _principal_context_cache:
+        # Evict the half-oldest entries by expiry time so a single
+        # eviction storm doesn't repeat on every subsequent set.
+        # Bare-context entries (test direct-assign) sort to the
+        # bottom — `float("inf")` keeps them past any tuple entry.
+        def _expiry_key(item: tuple[str, Any]) -> float:
+            v = item[1]
+            return v[1] if isinstance(v, tuple) else float("inf")
+        items = sorted(_principal_context_cache.items(),
+                       key=_expiry_key)
+        for k, _ in items[: max(1, len(items) // 2)]:
+            _principal_context_cache.pop(k, None)
+    _principal_context_cache[principal_id] = (
+        context,
+        _monotonic() + _PRINCIPAL_CACHE_TTL_SECONDS,
+    )
+
+
+# Indirection so tests can monkeypatch the clock.
+def _monotonic() -> float:
+    import time
+    return time.monotonic()
 
 
 def _query_value(request, name: str, default: str) -> str:
@@ -391,8 +454,10 @@ def _is_operator_context(context: MCPUserContext) -> bool:
 async def _resolve_mcp_user_context(request) -> MCPUserContext:
     principal = getattr(getattr(request, "state", None), "mnemos_mcp_principal", None)
     principal_id = getattr(getattr(request, "state", None), "mnemos_mcp_principal_id", None)
-    if principal_id and principal_id in _principal_context_cache:
-        return _principal_context_cache[principal_id]
+    if principal_id:
+        cached = _principal_cache_get(principal_id)
+        if cached is not None:
+            return cached
 
     if principal is not None and principal.api_key:
         try:
@@ -412,7 +477,7 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
                 namespace=body.get("namespace") or principal.user_id or "default",
             )
             if principal_id:
-                _principal_context_cache[principal_id] = context
+                _principal_cache_set(principal_id, context)
             return context
         except Exception as exc:
             logger.warning("MCP NATS SSE principal context lookup failed: %s", exc)
@@ -423,7 +488,7 @@ async def _resolve_mcp_user_context(request) -> MCPUserContext:
         namespace=getattr(principal, "user_id", None) or "default",
     )
     if principal_id:
-        _principal_context_cache[principal_id] = context
+        _principal_cache_set(principal_id, context)
     return context
 
 
