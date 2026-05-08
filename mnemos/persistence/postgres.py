@@ -306,6 +306,41 @@ def _queue_federation_nats_upsert(tx: PostgresTransaction, row: Row | None) -> N
 
 
 class PostgresMemoryRepository(MemoryRepository):
+    # Set by PostgresBackend on construction so search paths can fail
+    # loudly on dim mismatches. None disables the check (e.g. tests
+    # that bypass the backend). Mirrors SqliteMemoryRepository's
+    # `_expected_embedding_dim` so the operator-facing error has the
+    # same shape on both backends — surfaced 2026-05-08 by the
+    # cross-code audit (#202).
+    _expected_embedding_dim: int | None = None
+
+    def _require_dim(self, embedding: Sequence[float], op: str) -> None:
+        """Fail loudly if the embedding length doesn't match the
+        configured dim. Without this guard, `embedding <=> $1::vector`
+        in semantic_search rejects the cast at the asyncpg layer with
+        a generic ``DataError``; the operator-facing message names
+        the wrong layer (asyncpg type cast) instead of the actual
+        cause (mismatched embedding model). The SQLite repository
+        has the same guard for the same reason — keep both backends
+        in lockstep so MNEMOS_EMBEDDING_DIM mismatches surface the
+        same way regardless of profile.
+        """
+        expected = self._expected_embedding_dim
+        if expected is None:
+            return
+        actual = len(embedding)
+        if actual != expected:
+            raise ValueError(
+                f"Postgres embedding dim mismatch on {op}: got "
+                f"{actual}-D vector but the configured "
+                f"MNEMOS_EMBEDDING_DIM is {expected}. The embedding "
+                f"endpoint may have been switched to a different "
+                f"model. Verify INFERENCE_EMBED_HOST / model "
+                f"selection and either restart with the matching "
+                f"MNEMOS_EMBEDDING_DIM or swap the embedding "
+                f"endpoint back to the model the DB was sized for."
+            )
+
     async def assert_memory_readable(self, tx: Transaction, memory_id: str, user: UserContext) -> None:
         await mcp_repo.assert_memory_readable(_postgres_tx(tx).conn, memory_id, user)
 
@@ -761,6 +796,9 @@ class PostgresMemoryRepository(MemoryRepository):
         search_trace_id: str | None = None,
         search_started_at: float | None = None,
     ) -> list[Row]:
+        # Fail loudly on dim mismatches before the asyncpg cast layer
+        # produces a vague DataError. Mirrors SqliteMemoryRepository.
+        self._require_dim(embedding, "semantic_search")
         conn = _postgres_tx(tx).conn
         # $1 is the embedding vector, used in both SELECT (for the
         # similarity score) and ORDER BY. Passing as a parameter (not
@@ -2102,6 +2140,20 @@ class PostgresBackend(PersistenceBackend):
         self._pool = pool
         self._settings = settings
         self._memories = PostgresMemoryRepository()
+        # Wire the configured embedding dim into the memory repo so
+        # semantic_search fails loudly on dim mismatches with the
+        # operator-friendly error rather than the generic asyncpg
+        # cast error. Settings shape mirrors what SqliteBackend uses.
+        try:
+            self._memories._expected_embedding_dim = int(
+                getattr(settings.database, "embedding_dim", 768)
+            )
+        except (AttributeError, TypeError, ValueError):
+            # Defensive: tests or stripped-down settings shapes may
+            # not carry `database.embedding_dim`. Leave the slot as
+            # None so the guard is a no-op rather than a hard failure
+            # at construction.
+            self._memories._expected_embedding_dim = None
         self._kg_triples = PostgresKGRepository()
         self._memory_versions = PostgresVersionRepository()
         self._memory_branches = PostgresBranchRepository()

@@ -4,6 +4,36 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — Postgres `semantic_search` embedding-dim guard (#202)
+
+Audit MED finding (`mem_1778221719390_8cb1ba`) at
+`mnemos/persistence/postgres.py:semantic_search`: the path cast
+arbitrary-length embeddings to `vector` without validating
+against the configured dim. `SqliteMemoryRepository` already had
+`_require_dim` for this exact case; the Postgres path was the
+asymmetric gap.
+
+Without the guard, an embedding-endpoint switch (e.g. operator
+points `INFERENCE_EMBED_HOST` at a different model whose dim
+doesn't match the schema-sized column) surfaces as a generic
+asyncpg `DataError` from the `<=>` cast layer. With the guard,
+the path raises a Python `ValueError` naming the actual vs
+expected dim and the remediation steps (verify
+`INFERENCE_EMBED_HOST` / restart with matching
+`MNEMOS_EMBEDDING_DIM` / swap the embedding endpoint back).
+
+Mirrors the SQLite-path `_require_dim` shape so MNEMOS surfaces
+the same operator-facing message regardless of profile.
+`PostgresBackend.__init__` now plumbs
+`settings.database.embedding_dim` into the memory repo (with a
+defensive fallback to None for stripped-down test settings).
+
+Pinned by `tests/test_postgres_semantic_search_dim_validation.py`
+(6 tests): no-op when unset, short/long vector raises with
+operator-friendly message, exact-match passes, message names
+remediation steps, source-level guard that the
+`_require_dim` call is the first statement of `semantic_search`.
+
 ### Fixed — `BulkCreateRequest.memories` capped at 1000 (#201)
 
 Audit MED finding (`mem_1778221719390_8cb1ba`):
