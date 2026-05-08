@@ -490,6 +490,7 @@ def run_migrations(config: Config) -> bool:
         repo_path / "db" / "migrations_v5_2_2_fts_gin_index.sql",
         repo_path / "db" / "migrations_v5_3_3_deletion_log_export_index.sql",
         repo_path / "db" / "migrations_v5_3_4_mcp_audit_log.sql",
+        repo_path / "db" / "migrations_v5_3_5_model_registry_capabilities_gin.sql",
     ]
 
     print("[db] Running migrations...")

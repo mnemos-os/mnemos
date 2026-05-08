@@ -4,6 +4,38 @@ All notable changes to MNEMOS are documented here.
 
 ## [Unreleased]
 
+### Fixed — Webhook deliveries limit cap + capabilities GIN index (#205)
+
+Two LOW audit findings (`mem_1778221719390_8cb1ba`) bundled.
+
+(a) `mnemos/api/routes/webhooks.py:list_deliveries` — the
+`limit: int = 50` parameter had no caller-side bound. A caller
+could pass `limit=10_000_000` and pull a multi-million-row
+delivery dump in one round-trip. Capped at 200 with
+`Query(50, ge=1, le=200)` matching adjacent listing endpoints
+(`memories.py` uses `ge=1, le=500`; the webhook endpoint is the
+operational shape with smaller pages).
+
+(b) `model_registry.capabilities @> $3` containment queries (used
+by `providers.py:106` for provider/model discovery) had no GIN
+index. As the registry grows (provider syncs, model retirements)
+this can degrade to seq-scan. Added
+`migrations_v5_3_5_model_registry_capabilities_gin.sql`
+(`CREATE INDEX IF NOT EXISTS ... USING GIN (capabilities)`),
+registered in `mnemos/installer/db.py` canonical loader and in
+both `docker-compose.yml` + `docker-compose.staging.yml`
+(initdb mount + `postgres-upgrade` apply step) so existing
+volumes get the index too. SQLite path is unaffected (no
+TEXT[] column there).
+
+Pinned by `tests/test_webhooks_limit_and_capabilities_gin.py`
+(4 tests): the FastAPI `Query(...)` `ge`/`le` bounds, the
+migration file exists with `CREATE INDEX ... USING GIN`,
+registration in installer's canonical list, ordering after
+`v5_3_4`. The pre-existing
+`tests/test_migration_lists_sync.py` was updated to include
+the new migration.
+
 ### Fixed — GC stale `(principal, tool)` keys in MCP rate-limit buckets (#204)
 
 Audit LOW finding (`mem_1778221719390_8cb1ba`) at

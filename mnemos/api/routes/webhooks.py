@@ -7,7 +7,7 @@ import logging
 import secrets
 from typing import List
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 
 import mnemos.core.lifecycle as _lc
 from mnemos.api.dependencies import UserContext, get_current_user
@@ -273,7 +273,11 @@ async def revoke_webhook(
 async def list_deliveries(
     webhook_id: str,
     user: UserContext = Depends(get_current_user),
-    limit: int = 50,
+    # #205: cap caller-controlled limit. The default-50 case is the
+    # operational shape; a 200 ceiling matches the bound on adjacent
+    # listing endpoints and prevents an authenticated caller from
+    # asking for a million-row delivery dump in one round-trip.
+    limit: int = Query(50, ge=1, le=200),
 ):
     """List recent delivery attempts for a subscription."""
     webhook_id = parse_uuid_or_404(webhook_id, "webhook")
