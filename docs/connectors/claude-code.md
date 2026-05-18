@@ -1,27 +1,17 @@
-# Claude Code -> MNEMOS
+# Claude Code → MNEMOS
 
-Claude Code can use MNEMOS as a shared memory layer by SSH-spawning the MNEMOS stdio MCP server from `.claude.json`.
+Claude Code can use MNEMOS as a shared memory layer by SSH-spawning the MNEMOS stdio MCP server from `~/.claude.json`.
 
-## What you need — token, host (192.168.207.67), relevant port(s)
+## Requirements
 
-- A MNEMOS bearer token exported as `MNEMOS_TOKEN`.
-- MNEMOS REST reachable at `http://192.168.207.67:5002`.
-- SSH access from the Claude Code machine to `192.168.207.67`.
-- `mnemos` installed on the remote host and visible on its PATH.
-- Claude Code installed and able to read `~/.claude.json`.
-- Optional HTTP/SSE MCP bridge reachable at `http://192.168.207.67:5003/sse`.
-- Use stdio over SSH when Claude Code runs off-host.
-- Use HTTP/SSE only when the host agent supports remote MCP transport.
-- Keep the bearer token scoped to the user or namespace Claude Code should use.
-- Do not paste the live token into docs, tickets, or shared screenshots.
+- MNEMOS bearer token (see `~/.api_keys_master.json` or your shell env)
+- MNEMOS REST reachable at `http://192.168.207.67:5002` (v5.x unified port)
+- SSH access from Claude Code machine to `192.168.207.67`
+- mnemos package installed at `/opt/mnemos` with virtualenv at `/opt/mnemos/venv`
 
-## Configuration — copy-paste-runnable code block; use $MNEMOS_TOKEN placeholder (never the live token)
+## Configuration
 
-> Set MNEMOS_TOKEN from ~/.api_keys_master.json or source your shell env.
-
-Merge this `mcpServers` entry into `~/.claude.json`. The MCP process runs
-on `192.168.207.67`, so `MNEMOS_BASE` points at loopback from the remote
-host's point of view.
+Merge into `~/.claude.json`. The MCP process runs on the remote host; `MNEMOS_BASE` defaults to `localhost:5002` which is correct from there.
 
 ```json
 {
@@ -29,76 +19,31 @@ host's point of view.
     "mnemos": {
       "command": "ssh",
       "args": [
-        "mnemos@192.168.207.67",
-        "env",
-        "MNEMOS_BASE=http://127.0.0.1:5002",
-        "MNEMOS_API_KEY=$MNEMOS_TOKEN",
-        "mnemos",
-        "serve",
-        "mcp-stdio"
+        "-o", "BatchMode=yes",
+        "-o", "StrictHostKeyChecking=accept-new",
+        "jasonperlow@192.168.207.67",
+        "/usr/bin/env",
+        "PYTHONPATH=/opt/mnemos",
+        "MNEMOS_API_KEY=<your-token-here>",
+        "/opt/mnemos/venv/bin/python",
+        "-m", "mnemos.mcp.stdio"
       ]
     }
   }
 }
 ```
 
-If your remote install lives in a virtualenv, replace `mnemos` with the
-absolute path, for example `/opt/mnemos/venv/bin/mnemos`.
+## Notes
 
-The SSH account must authenticate non-interactively. Claude Code cannot
-answer a password or MFA prompt while it is starting an MCP server.
+- Port 5002 is the unified API port (MNEMOS + GRAEAE) as of v5.x. Port 5001 is retired.
+- `PYTHONPATH=/opt/mnemos` is required — the package is editable, not installed in venv site-packages.
+- `MNEMOS_API_KEY` must be in the SSH args via `/usr/bin/env`; Claude Code's `env` block is local-only and does not cross the SSH boundary.
+- GRAEAE MCP tool not yet registered — use `POST http://192.168.207.67:5002/graeae/consult` with Bearer token as fallback.
 
-For same-host development, use a local stdio entry instead of SSH:
-
-```json
-{
-  "mcpServers": {
-    "mnemos-local": {
-      "command": "mnemos",
-      "args": ["serve", "mcp-stdio"],
-      "env": {
-        "MNEMOS_BASE": "http://192.168.207.67:5002",
-        "MNEMOS_API_KEY": "$MNEMOS_TOKEN"
-      }
-    }
-  }
-}
-```
-
-For remote HTTP/SSE, run the bridge on the MNEMOS host and point a
-remote-MCP-capable Claude Code build at `http://192.168.207.67:5003/sse`.
-Keep the same bearer token in the `Authorization` header:
-
-```json
-{
-  "mcpServers": {
-    "mnemos-sse": {
-      "url": "http://192.168.207.67:5003/sse",
-      "headers": {
-        "Authorization": "Bearer $MNEMOS_TOKEN"
-      }
-    }
-  }
-}
-```
-
-Restart Claude Code after editing `.claude.json`; registrations are loaded
-at process start.
-
-## Verification — one curl or one tool-list call that proves registration worked
+## Idempotent fix script (for pre-v5.x configs)
 
 ```bash
-claude mcp list | grep -i mnemos
+python3 ~/.claude/scripts/fix-mnemos-mcp-auth.py
 ```
 
-The `mnemos` server should show as connected or ready. If the CLI build
-does not expose `claude mcp list`, open Claude Code and run `/mcp`.
-
-## Common gotchas — 2-4 bullets of real failure modes
-
-- SSH password prompts make the MCP server appear to hang; use key auth.
-- `MNEMOS_BASE=http://127.0.0.1:5002` is correct only for the SSH-spawned
-  remote process; local stdio should use `http://192.168.207.67:5002`.
-- Literal `$MNEMOS_TOKEN` only works if Claude Code expands environment
-  variables in config; otherwise write a local wrapper that reads the env.
-- HTTP/SSE on `:5003` is plain HTTP unless you put TLS in front of it.
+Safe to run multiple times.
