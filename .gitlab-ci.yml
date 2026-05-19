@@ -15,7 +15,6 @@
 # master.
 
 default:
-  image: python:3.11-slim
   cache:
     key:
       files:
@@ -41,6 +40,7 @@ stages:
 
 lint:ruff:
   stage: lint
+  tags: [argos, ncz-os]
   script:
     - ruff check .
   rules:
@@ -49,6 +49,7 @@ lint:ruff:
 
 lint:import-linter:
   stage: lint
+  tags: [argos, ncz-os]
   script:
     - lint-imports --config pyproject.toml
   rules:
@@ -57,6 +58,7 @@ lint:import-linter:
 
 lint:env-discipline:
   stage: lint
+  tags: [argos, ncz-os]
   script:
     - |
       # Runtime environment reads must route through mnemos/core/config.py.
@@ -75,6 +77,7 @@ lint:env-discipline:
 
 test:unit:
   stage: test
+  tags: [argos, ncz-os]
   script:
     - pytest tests/
         --tb=short
@@ -92,6 +95,7 @@ test:unit:
 
 test:integration:
   stage: test
+  tags: [argos, ncz-os]
   services:
     - name: pgvector/pgvector:pg17
       alias: postgres
@@ -110,7 +114,6 @@ test:integration:
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
     RATE_LIMIT_STORAGE_URI: "redis://redis:6379/0"
   before_script:
-    - apt-get update -qq && apt-get install -qq -y postgresql-client
     - pip install --cache-dir=.cache/pip -e ".[dev]"
     # Wait for Postgres to accept connections (pgvector image does not
     # signal readiness; poll until psql connects).
@@ -207,6 +210,7 @@ test:integration:
 
 test:persistence-parity:
   stage: test
+  tags: [argos, ncz-os]
   services:
     - name: pgvector/pgvector:pg17
       alias: postgres
@@ -222,7 +226,6 @@ test:persistence-parity:
     DATABASE_URL: "postgresql://postgres:test@postgres:5432/mnemos_test"
     MNEMOS_TEST_DB: "postgresql://postgres:test@postgres:5432/mnemos_test"
   before_script:
-    - apt-get update -qq && apt-get install -qq -y postgresql-client
     - pip install --cache-dir=.cache/pip -e ".[dev,sqlite]"
     - |
       for i in $(seq 1 30); do
@@ -266,13 +269,8 @@ test:persistence-parity:
 
 test:multi-worker:
   stage: test
-  image: docker:24
-  services:
-    - name: docker:24-dind
-      alias: docker
+  tags: [argos, ncz-os]
   variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
     COMPOSE_PROJECT_NAME: mnemos-mw-$CI_PIPELINE_ID
     POSTGRES_PASSWORD: mnemos_local
   before_script: []
@@ -342,12 +340,7 @@ test:multi-worker:
 
 build:docker:
   stage: build
-  image: docker:24
-  services:
-    - docker:24-dind
-  variables:
-    DOCKER_HOST: tcp://docker:2375
-    DOCKER_TLS_CERTDIR: ""
+  tags: [argos, ncz-os]
   before_script: []
   script:
     - docker build -t mnemos-os:$CI_COMMIT_SHORT_SHA .
@@ -360,6 +353,7 @@ build:docker:
 
 .release_binary_template:
   stage: release
+  tags: [argos, ncz-os]
   before_script:
     - pip install --cache-dir=.cache/pip -e ".[build]"
   script:
