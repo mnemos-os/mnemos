@@ -118,6 +118,77 @@ do not. The compose files include a one-shot `postgres-upgrade` service so the
 ordered migration tail applies to existing data directories before MNEMOS
 starts.
 
+## Platform and package prerequisites
+
+Supported operator targets are Linux, macOS, Windows through WSL2, and BSD-style
+systems where Python and database dependencies are available. Ubuntu 22.04+,
+Ubuntu 24.04+, and Debian 12 remain the most tested Linux bases.
+
+For bare-metal installs, provide a compiler toolchain, OpenSSL headers, Git,
+curl, and the PostgreSQL client/development libraries when using the server
+profile. macOS operators can install the equivalent packages with Homebrew:
+`postgresql`, `libpq`, `openssl`, and `git`.
+
+## Docker and container resources
+
+Docker Engine 20.10+ is the minimum supported container runtime; Docker 24+ and
+Compose v2 are recommended. Allocate at least 4 GB RAM and 2 CPU cores for a
+small local stack, 8 GB RAM and 4 CPU cores for routine server testing, and
+16 GB+ RAM with 8+ CPU cores for production-like multi-service stacks.
+
+The API listens on `5002` by default. MCP HTTP/SSE commonly uses `5004`.
+PostgreSQL uses `5432`, Redis uses `6379`, and reverse proxies should terminate
+TLS before forwarding to MNEMOS. Outbound network access is only required for
+the LLM, embedding, webhook, federation, or package-index services that the
+operator explicitly enables.
+
+## Provider and optional component requirements
+
+At least one model provider is required for GRAEAE reasoning. Supported
+deployment shapes include hosted provider APIs, local Ollama, or local vLLM.
+Ollama requires enough RAM to hold the selected model; vLLM generally requires
+CUDA-capable GPU capacity sized for the model being served.
+
+Redis is required for multi-worker shared rate-limit and circuit-breaker state.
+It is optional for single-worker development and edge deployments. Local
+embedding, local inference, and GPU-backed APOLLO fallback are optional
+capabilities rather than baseline API requirements.
+
+## Production checklist
+
+Before exposing a server deployment, confirm:
+
+* CPU, memory, disk, and backup capacity match the expected corpus size.
+* PostgreSQL, pgvector, Redis, and Docker or systemd units are installed as
+  required by the selected profile.
+* API keys, OAuth session secrets, provider credentials, rate limiting, backup
+  destinations, and monitoring are configured.
+* Health checks pass on `/health`, model/provider checks pass through the CLI,
+  and the backup and restore path has been tested.
+
+## Scaling and cloud guidance
+
+Scale vertically first: memory and disk I/O usually become visible before CPU
+for normal memory workloads, while GRAEAE consultation throughput depends on
+provider latency and concurrency limits. Scale horizontally only with shared
+Redis state and an external PostgreSQL writer endpoint. See `docs/SCALING.md`
+for the multi-worker contract.
+
+For cloud deployments, choose general-purpose instances with SSD storage and
+managed PostgreSQL where practical. Small deployments can run on a 2-4 vCPU
+host with 8 GB RAM; larger deployments should separate Postgres storage from
+API workers and size disk for corpus growth plus rolling backups.
+
+## Troubleshooting and verification
+
+Common first checks:
+
+* `python3 --version` reports Python 3.11+.
+* `psql --version` reports a supported PostgreSQL client when using `server`.
+* Docker and Compose report supported versions for container deployments.
+* `mnemos doctor` passes after initialization.
+* `curl http://localhost:5002/health` returns healthy service state.
+
 ---
 
 *Last updated: 2026-05-08 (v5.0.1 doc sync)*
