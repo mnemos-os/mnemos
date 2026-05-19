@@ -7,7 +7,7 @@ license: Apache-2.0
 metadata:
   hermes:
     tags: [MNEMOS, Memory, Persistence, Knowledge-Graph, Cross-Session, Semantic-Search]
-    homepage: https://github.com/mnemos-os/mnemos
+    homepage: https://github.com/ncz-os/mnemos
     related_skills: [hermes-agent]
 prerequisites:
   services: [mnemos-api]

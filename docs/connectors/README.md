@@ -341,9 +341,9 @@ open to them. Public evidence:
 - **OpenClaw** (`openclaw/openclaw`):
   [PR #70224](https://github.com/openclaw/openclaw/pull/70224) —
   critical gateway fix, merged 2026-04-22. Contributor status as
-  @perlowja.
+  @ncz-os.
 - **Zeroclaw**: provider-config + backend work in
-  [perlowja/zeroclaw](https://github.com/perlowja/zeroclaw); ongoing.
+  [perlowja/zeroclaw](https://github.com/ncz-os/zeroclaw); ongoing.
 - **Hermes Agent**: design-inspiration credit on the zterm-family
   side; PRs scoped where the runtime intersects MNEMOS's MCP surface.
 - **MemPalace, Mem0, Letta, Graphiti, Cognee**: bug reports and

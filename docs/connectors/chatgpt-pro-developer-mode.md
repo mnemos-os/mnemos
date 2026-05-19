@@ -59,7 +59,7 @@ Add to your `docker-compose.override.yml` (PYTHIA prod example):
 ```yaml
 services:
   mnemos-mcp-http:
-    image: ghcr.io/mnemos-os/mnemos:5.0.1
+    image: ghcr.io/ncz-os/mnemos:5.0.1
     pull_policy: never
     depends_on:
       - mnemos

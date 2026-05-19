@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://github.com/mnemos-os/mpf/blob/master/schema/mpf-v0.2.json",
+  "$id": "https://github.com/ncz-os/mpf/blob/master/schema/mpf-v0.2.json",
   "title": "Memory Portability Format (MPF) v0.2",
   "description": "MNEMOS memory portability envelope. v0.2 keeps the v0.1 record and sidecar model while adding W3C PROV-DM-inspired record provenance and optional bi-temporal tracking fields.",
   "type": "object",

@@ -64,9 +64,9 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/mnemos-os/mnemos"
-Repository = "https://github.com/mnemos-os/mnemos"
-Documentation = "https://github.com/mnemos-os/mnemos/blob/master/README.md"
+Homepage = "https://github.com/ncz-os/mnemos"
+Repository = "https://github.com/ncz-os/mnemos"
+Documentation = "https://github.com/ncz-os/mnemos/blob/master/README.md"
 
 [project.optional-dependencies]
 build = ["pyinstaller>=6.0", "sqlite-vec"]

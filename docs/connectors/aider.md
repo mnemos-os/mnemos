@@ -94,6 +94,6 @@ call is the proof point for Aider.
 
 The path described above is "paste-into-Aider" — manual context fetching.
 For automated tool dispatch (Aider's LLM autonomously calling MNEMOS),
-install the [`mnemos-bridge-aider`](https://gitlab.com/mnemos-os/mnemos-bridge-aider)
+install the [`mnemos-bridge-aider`](https://gitlab.com/ncz-os/mnemos-bridge-aider)
 package which provides both a CLI sidecar (`mnemos-aider search ...`) and
 a Path B integration that hooks into Aider's command/tool surface.

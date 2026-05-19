@@ -610,7 +610,7 @@ The pitch to the docling project:
 > unchanged inside a one-object MPF record (`{kind: "document",
 > payload_version: doc.version, payload: doc.model_dump()}`). No
 > changes to docling-core required. Spec is at
-> github.com/mnemos-os/mnemos/blob/master/docs/MEMORY_EXPORT_FORMAT.md.
+> github.com/ncz-os/mnemos/blob/master/docs/MEMORY_EXPORT_FORMAT.md.
 
 This sits naturally alongside docling's existing RAG integrations
 (`docling-langchain`, `docling-haystack`, `docling-mcp`): MPF is the

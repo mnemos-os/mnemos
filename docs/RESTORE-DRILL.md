@@ -198,5 +198,5 @@ flip its `compat_mode` to `permissive` (operator decision; see
 `docs/FEDERATION.md` for the trade-off).
 
 **Orphan `memory_versions` rows after delete** — known footgun until
-[mnemos-os/mnemos#1](https://github.com/mnemos-os/mnemos/issues/1)
+[mnemos-os/mnemos#1](https://github.com/ncz-os/mnemos/issues/1)
 lands. Sweep with the orphan-cleanup query above.

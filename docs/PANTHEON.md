@@ -529,7 +529,7 @@ The following are interesting follow-ons but explicitly NOT in the v4 cut:
 ## Naming + repo layout
 
 - **Project name:** PANTHEON
-- **Repo:** `github.com/perlowja/pantheon` (new repo, not under MNEMOS)
+- **Repo:** `github.com/ncz-os/pantheon` (new repo, not under MNEMOS)
 - **Top-level dirs:**
   ```
   pantheon/

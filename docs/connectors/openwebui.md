@@ -113,7 +113,7 @@ The OpenAI-compatible tool-call path described above works at the
 configuration level, but for proper MCP→OpenAI schema translation
 (stripping incompatible JSON Schema keywords, wrapping each MNEMOS
 tool as a function-call definition with the correct shape), use the
-[`mnemos-bridge-openai`](https://gitlab.com/mnemos-os/mnemos-bridge-openai) package. It returns
+[`mnemos-bridge-openai`](https://gitlab.com/ncz-os/mnemos-bridge-openai) package. It returns
 ready-to-pass `tools=[...]` lists from `adapter.openai_tools()` and
 handles the round-trip back through MCP via `adapter.handle_tool_call()`.
 The bridge layers on top of `mnemos-bridge-core` and pairs naturally

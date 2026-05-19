@@ -24,7 +24,7 @@ Termux binaries.
 
 Download the binary for your platform from the MNEMOS releases page:
 
-https://github.com/mnemos-os/mnemos/releases
+https://github.com/ncz-os/mnemos/releases
 
 Published artifacts:
 

@@ -239,10 +239,10 @@ For each runner that's part of the operator's stack:
 
 ## Post-release announcements
 
-- [ ] Update `gitlab.com/mnemos-os/mnemos/-/releases/<vx.y.z>` with the
+- [ ] Update `gitlab.com/ncz-os/mnemos/-/releases/<vx.y.z>` with the
       CHANGELOG entry as the release notes (gitlab pulls these from
       tag annotations by default; double-check formatting).
-- [ ] Same for `github.com/mnemos-os/mnemos/releases/<vx.y.z>`.
+- [ ] Same for `github.com/ncz-os/mnemos/releases/<vx.y.z>`.
 - [ ] If the release introduces a new dimension, surface, or API,
       cross-link it from `README.md` (the "Works with" or "Bridge family"
       section).

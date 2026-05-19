@@ -1,0 +1,72 @@
+# SPDX-License-Identifier: MIT
+# InvestorClaw v4.0 — dockerized-skill convention compose
+# Spec: https://raw.githubusercontent.com/mnemos-os/mnemos-ic-runtime/main/RFC.md
+# Skill: https://raw.githubusercontent.com/mnemos-os/mnemos-ic-runtime/main/SKILL.md
+
+# x-* extension keys are ignored by Docker Compose itself (so this file
+# runs cleanly with `docker compose up`), but install tools that
+# implement the compose-x-mcp-services convention read these keys to
+# wire the MCP server registration into the agent's config.
+
+x-mcp-services:
+  ic-engine:
+    transport: streamable-http
+    url: http://127.0.0.1:18090/mcp
+    description: "Portfolio analysis (deterministic, FINOS CDM 5.x compliant)"
+    health: http://127.0.0.1:18090/healthz
+
+x-mcp-service-meta:
+  spec: "compose-x-mcp-services/v1"
+  version: "4.0.9"
+  dashboard_url: http://127.0.0.1:18092/
+  skill_url: https://raw.githubusercontent.com/mnemos-os/mnemos-ic-runtime/main/SKILL.md
+  required_keys: []
+  optional_keys:
+    - { name: TOGETHER_API_KEY, purpose: "narrative LLM (Together MiniMax-M2.7) — fleet default, cheapest tier" }
+    - { name: FINNHUB_KEY,      purpose: "real-time quotes" }
+    - { name: NEWSAPI_KEY,      purpose: "news correlation" }
+    - { name: ALPHA_VANTAGE_KEY, purpose: "backup quote provider" }
+    - { name: FRED_API_KEY,     purpose: "FRED yield curve" }
+    - { name: MASSIVE_API_KEY,  purpose: "backup quote provider" }
+  preferred_agents: ["zeroclaw", "openclaw", "hermes", "claude-code"]
+  supported_agents: ["any MCP client", "any HTTP/REST client"]
+
+services:
+  ic-engine:
+    image: registry.gitlab.com/ncz-os/mnemos-ic-runtime/ic-engine:4.0.9-cpu
+    container_name: ic-engine
+    restart: unless-stopped
+
+    # MCP-HTTP at :18090/mcp + plain REST at :18090/api/portfolio/*
+    # Dashboard + healthz at :18092
+    # Both bind to 127.0.0.1 by default per RFC §8 — set IC_HOST to
+    # override (e.g., 0.0.0.0 for cross-host access; only do this behind
+    # nginx/Tailscale/Caddy with TLS termination).
+    ports:
+      - "127.0.0.1:18090:8090"
+      - "127.0.0.1:18092:8092"
+
+    volumes:
+      # Persistent data — engine cache, reports, optional /data/keys.env.
+      - ic-engine-data:/data
+      # Drop broker exports (CSV/XLS/PDF) here on the host:
+      - ./portfolios:/data/portfolios
+
+    environment:
+      # Fleet default: Together MiniMax-M2.7 for narrative synthesis.
+      # Engine works without these (degraded — stub narratives), but with
+      # an LLM key it produces real natural-language answers.
+      INVESTORCLAW_NARRATIVE_PROVIDER: openai_compat
+      INVESTORCLAW_NARRATIVE_ENDPOINT: https://api.together.xyz/v1
+      INVESTORCLAW_NARRATIVE_MODEL: MiniMaxAI/MiniMax-M2.7
+
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8090/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  ic-engine-data:
+    name: ic-engine-data

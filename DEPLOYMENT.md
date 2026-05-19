@@ -48,7 +48,7 @@ The API will be available at `http://localhost:5002`.
 For the no-Python edge path:
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/ncz-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -680,5 +680,5 @@ memory's version; the v3.5 trigger will reject the next write.
 
 ## Support
 
-- GitHub: https://github.com/mnemos-os/mnemos
-- Issues: https://github.com/mnemos-os/mnemos/issues
+- GitHub: https://github.com/ncz-os/mnemos
+- Issues: https://github.com/ncz-os/mnemos/issues

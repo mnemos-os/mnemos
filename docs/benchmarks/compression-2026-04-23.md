@@ -28,7 +28,7 @@ bytea crash on backslash content), per-engine characterization across
 | Postgres               | `pgvector/pgvector:pg16` container, persistent volume |
 | Judge model            | `google_gemma-4-E4B-it-Q6_K.gguf` via llama.cpp on :8080 |
 | llama-server flags     | `--n-gpu-layers 99 --ctx-size 32768 --parallel 8 --flash-attn on -ctk q8_0 -ctv q8_0` |
-| MNEMOS source          | `github.com/perlowja/mnemos` master @ `c34878a`     |
+| MNEMOS source          | `github.com/ncz-os/mnemos` master @ `c34878a`     |
 | Scoring profile        | `balanced` (quality × ratio_term × speed_factor, quality_floor=0.70) |
 | Engines registered     | LETHE + ANAMNESIS (ALETHEIA disabled per v3.1 default) |
 | Batch size             | 5 queue rows per worker iteration                   |

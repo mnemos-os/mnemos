@@ -10,7 +10,7 @@ Use SQLite for `edge`/`dev`, or PostgreSQL 16 + Redis for `server`.
 ## Single Binary (Fastest Edge Deploy)
 
 ```bash
-curl -L https://github.com/mnemos-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
+curl -L https://github.com/ncz-os/mnemos/releases/download/v5.0.1/mnemos-linux-x86_64 -o mnemos
 chmod +x mnemos
 ./mnemos install --profile edge
 ./mnemos serve --profile edge
@@ -69,7 +69,7 @@ curl -fsSL https://get.docker.com | sh
 sudo usermod -aG docker $USER
 
 # 2. Clone and configure (5 minutes)
-git clone https://github.com/mnemos-os/mnemos
+git clone https://github.com/ncz-os/mnemos
 cd mnemos
 cp .env.example .env
 # Edit .env if needed
@@ -320,8 +320,8 @@ kill -9 <PID>
 
 ## Support
 
-- **GitHub Issues**: https://github.com/mnemos-os/mnemos/issues
-- **Documentation**: https://github.com/mnemos-os/mnemos#readme
+- **GitHub Issues**: https://github.com/ncz-os/mnemos/issues
+- **Documentation**: https://github.com/ncz-os/mnemos#readme
 - **Community**: Discord/Slack (if applicable)
 
 ---
