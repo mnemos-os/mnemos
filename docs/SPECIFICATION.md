@@ -589,7 +589,7 @@ knossos   = []
 apollo    = []
 artemis   = [networkx >=3.3]                                      # ARTEMIS TextRank fallback
 nats      = [nats-py >=2.14.0]
-hot       = [mnemos-hot >=0.1.0]
+hot       = [mnemos-hot >=0.2.0]
 edge      = [aiosqlite >=0.20.0, sqlite-vec >=0.1.6]
 server    = [mnemos-os[nats,persephone,pantheon]]
 ml        = [mnemos-os[morpheus,kronos,apollo,artemis,hot]]
@@ -664,7 +664,8 @@ Grouped by concern:
 - Per-provider env vars for API keys (consumed by registry)
 
 **Misc**
-- `MNEMOS_PROFILE` (core|standard|full — install profile)
+- `MNEMOS_PROFILE` (`server`|`edge`|`dev` — deployment profile;
+  legacy `personal` normalizes to `edge`)
 - `MNEMOS_CONFIG`, `MNEMOS_INSTALL_DOCLING`
 - `MNEMOS_CREATE_DB`, `MNEMOS_CREATE_SERVICE`, `MNEMOS_SERVICE_USER`
 - `MNEMOS_REDIS_URL` (optional SlowAPI backend)
@@ -785,7 +786,7 @@ Raw metrics at v5.0.1, measured from the checked-out tree unless noted.
 | Test files | 146 | Unit + integration + live-gated E2E |
 | Test count | 1055+ passing cases in the doc-sweep tier | `pytest` collection includes parametrized cases; DB-gated tests are selectively ignored in CI/doc sweeps |
 | REST endpoints | 102 mounted application routes | Across 21 routers; excludes generated FastAPI docs/openapi routes |
-| MCP tools | 22 | Memory CRUD + KG + stats + DAG + model recommendation + PANTHEON + KRONOS |
+| MCP tools | 23 registered | Memory CRUD + KG + stats + DAG + model recommendation + PANTHEON + deletions + KRONOS; optional PANTHEON/KRONOS tools are filtered from `tools/list` when their extras are unavailable |
 | DB tables | 32 | See §4.1 |
 | Migrations | 51 Postgres SQL files + 40-file SQLite mirror chain | Idempotent, ordered |
 | Named concepts | ~40 | See Appendix H |
@@ -796,6 +797,14 @@ Raw metrics at v5.0.1, measured from the checked-out tree unless noted.
 | FK edges | 22+ | Explicit ON DELETE on every edge |
 | Invariants | 10 | See §4.4 |
 | State machines | 5 | Circuit breaker, queue, DAG, OAuth state, audit hash-chain |
+
+Registered MCP tools in `mnemos/mcp/tools/__init__.py`: `search_memories`,
+`update_memory`, `get_memory`, `create_memory`, `delete_memory`,
+`list_memories`, `get_stats`, `kg_create_triple`, `kg_search`, `kg_timeline`,
+`update_triple`, `delete_triple`, `bulk_create_memories`, `log_memory`,
+`branch_memory`, `diff_memory_commits`, `checkout_memory`, `recommend_model`,
+`pantheon_list_models`, `pantheon_route_explain`, `list_deletions`,
+`kronos_anomalies`, `kronos_forecast`.
 
 ### 12.1 Effort-estimation dimensions (for a scoping tool)
 

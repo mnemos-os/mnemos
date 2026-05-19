@@ -37,20 +37,30 @@ PERSEPHONE/PANTHEON plus MORPHEUS/KRONOS/APOLLO/ARTEMIS/hot-path acceleration.
 
 | Extra | Subsystem | Adds |
 |---|---|---|
+| `build` | PyInstaller build support | `pyinstaller>=6.0`, `sqlite-vec` |
+| `docling` | Document parsing/import support | `docling>=2.5.0`, `docling-core>=2.0.0`, `pillow>=10.0.0` |
+| `tracing` | OpenTelemetry tracing | `opentelemetry-api>=1.27.0`, `opentelemetry-sdk>=1.27.0`, `opentelemetry-exporter-otlp-proto-http>=1.27.0` |
+| `structlog` | Structured JSON logging | `structlog>=25.0.0` |
+| `sqlite` | SQLite persistence support | `aiosqlite>=0.20.0`, `sqlite-vec>=0.1.6` |
 | `morpheus` | `mnemos/domain/morpheus`, MORPHEUS routes and workers | `numpy>=1.24` |
 | `persephone` | PERSEPHONE archival routes and worker | `zstandard>=0.25` |
 | `pantheon` | PANTHEON facade routes and IRIS MCP tools | no additional dependency |
 | `kronos` | KRONOS admin routes and MCP tools | `numpy>=1.24` |
+| `kronos-gpu` | KRONOS GPU acceleration | `cupy>=12` |
 | `knossos` | KNOSSOS phase-1 stdio/MemPalace shim | no additional dependency |
 | `apollo` | APOLLO compression engine | no additional dependency |
-| `artemis` | ARTEMIS compression engine | `networkx>=3.3` for TextRank scoring |
+| `artemis` | ARTEMIS compression engine | `networkx>=3.3`, `scipy>=1.11` |
 | `nats` | NATS substrate and routing-audit consumer | `nats-py>=2.14.0` |
-| `hot` | Optional Rust hot-path wheel | `mnemos-hot>=0.1.0` |
-
-Legacy runtime extras that are not subsystem bundles remain available:
-`semantic` for fastembed semantic scoring, `gpu` for fastembed CUDA, `phi` for
-OpenVINO + fastembed, `tracing`, `structlog`, `docling`, `build`, `sqlite`, and
-`dev`.
+| `hot` | Optional Rust hot-path wheel | `mnemos-hot>=0.2.0` |
+| `edge` | Edge deployment bundle | `aiosqlite>=0.20.0`, `sqlite-vec>=0.1.6` |
+| `server` | Server deployment bundle | `mnemos-os[nats,persephone,pantheon]` |
+| `ml` | ML deployment bundle | `mnemos-os[morpheus,kronos,apollo,artemis,hot]` |
+| `interop` | Interop deployment bundle | `mnemos-os[knossos]` |
+| `full` | Full deployment bundle | `mnemos-os[morpheus,persephone,pantheon,kronos,knossos,apollo,artemis,nats,hot,edge]` |
+| `semantic` | CPU semantic scoring | `fastembed>=0.3.0` |
+| `gpu` | NVIDIA CUDA semantic scoring | `fastembed-gpu>=0.3.0` |
+| `phi` | Intel iGPU semantic scoring | `openvino-genai>=2024.4.0`, `fastembed>=0.3.0` |
+| `dev` | Development/test tooling | `import-linter>=2.0.0`, `pytest>=8.0.0`, `pytest-asyncio>=0.23.0`, `pytest-cov>=5.0.0`, `ruff>=0.5.0` |
 
 ## Bundle Contents
 
