@@ -21,7 +21,7 @@ This doc covers:
 - Federation health (peer heartbeat, detection of silent failures)
 
 What this doc does NOT cover:
-- Application code (see `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, etc. for feature roadmap)
+- Application code (see `docs/history/V3_5_CHARTER.md`, `docs/history/V3_6_CHARTER.md`, etc. for feature roadmap)
 - High-level architecture (see `README.md` and `docs/MEMORY_ARCHITECTURE.md`)
 - User-facing API (see `API_DOCUMENTATION.md` (root) and `docs/SPECIFICATION.md`)
 
@@ -169,19 +169,19 @@ sshpass -p $PYTHIA_SUDO_PASS ssh root@192.168.207.67 "
   # Pre-upgrade backup
   pg_dump -U postgres mnemos | gzip > \
     /mnt/argonas/backups/mnemos/pre-v3.4.0-upgrade-$(date +%Y%m%d_%H%M%S).sql.gz
-  
+
   # Upgrade
   cd /opt/mnemos && \
   git fetch origin v3.4.0 && \
   git checkout v3.4.0 && \
   pip install -e . && \
-  
+
   # Run migrations (see §5 for safety checks)
   python -m mnemos.installer migrate --db-name=mnemos
-  
+
   # Restart
   sudo systemctl restart mnemos
-  
+
   # Verify
   curl -H 'Authorization: Bearer $TOKEN' http://localhost:5002/health
 "
@@ -834,7 +834,7 @@ The following three shell scripts codify operational patterns and reduce manual 
 
 ## 15. Cross-references
 
-- **Feature roadmap:** `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md` (historical planning docs)
+- **Feature roadmap:** `docs/history/V3_5_CHARTER.md`, `docs/history/V3_6_CHARTER.md`, `docs/history/V4_PLAN.md` (historical planning docs)
 - **Architecture:** `README.md`, `docs/MEMORY_ARCHITECTURE.md`, `docs/SPECIFICATION.md`
 - **API docs:** `API_DOCUMENTATION.md` (root) + the live FastAPI OpenAPI spec at `/docs` on a running instance
 - **Database:** `db/migrations_*.sql` and `db/migrations_sqlite/` (schema changes), `mnemos/installer/db.py` (canonical migration order)
@@ -917,7 +917,7 @@ sudo journalctl -u mnemos -f
 
 ---
 
-**Document version:** 1.0  
-**Last updated:** 2026-05-08  
-**Maintained by:** Operations team  
+**Document version:** 1.0
+**Last updated:** 2026-05-08
+**Maintained by:** Operations team
 **Status:** Active, current for v5.0.1 production line

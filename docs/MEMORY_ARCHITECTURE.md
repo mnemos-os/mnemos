@@ -3,7 +3,7 @@
 This document describes the memory model that underpins MNEMOS — the
 architectural choices, why they were made, and how the pieces fit
 together. It is the reference companion to `SPECIFICATION.md` (the
-external surface contract) and `V4_PLAN.md` (the release roadmap).
+external surface contract) and `docs/history/V4_PLAN.md` (the release roadmap).
 Where those docs answer "what does it do" and "what's coming," this
 one answers "why does it look this way."
 
@@ -549,7 +549,7 @@ round-trip on the native subset.
 ## 11. Where to read next
 
 * `SPECIFICATION.md` — external API contract.
-* `V4_PLAN.md` — release roadmap.
+* `docs/history/V4_PLAN.md` — release roadmap.
 * `COMPRESSION.md` — engine + judge selection rubric.
 * `DREAM_STATE_DESIGN.md` — MORPHEUS / ARTEMIS internals.
 * `KNOSSOS.md` — KG triple storage + traversal.

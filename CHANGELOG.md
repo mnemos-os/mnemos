@@ -2,6 +2,59 @@
 
 All notable changes to MNEMOS are documented here.
 
+## Pre-release history
+
+- ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff.
+- ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth.
+- ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals.
+- ✅ **Plugin `CompressionEngine` ABC** — open extension point; operators register additional engines alongside the built-ins (APOLLO + ARTEMIS).
+- ✅ **Competitive-selection compression contest** — every eligible engine runs per memory; highest composite_score wins; every loser recorded with its reject_reason. Scoring profile is operator-configurable (`balanced` | `quality_first` | `speed_first` | `custom`).
+- ✅ **Persisted audit log** — three new tables (`memory_compression_queue`, `memory_compression_candidates`, `memory_compressed_variants`) with full history queryable via `GET /v1/memories/{id}/compression-manifests`.
+- ✅ **GPU circuit breaker** — per-endpoint three-state breaker (CLOSED → OPEN → HALF_OPEN → CLOSED); gpu_required engines fast-fail during outages instead of piling requests onto a dead endpoint.
+- ✅ **Admin enqueue endpoints** — `POST /admin/compression/enqueue` (specific memory IDs) and `POST /admin/compression/enqueue-all` (bulk with filters) for operators to drive the contest from the API layer.
+- ✅ **Optional too-short content gate** — `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` skips memories below a threshold before spending GPU time on content that can't be meaningfully compressed.
+- ✅ **v2 versioning trigger bytea fix** — the `mnemos_version_snapshot()` trigger no longer crashes on memories containing backslash sequences (common in code, paths, regex, logs).
+- ✅ **CHARON federation schema preflight** — peers exchange schema signatures before sync and return 409 on incompatible strict-mode pairings.
+- ✅ **Dev↔prod MPF restore drill** — `docs/RESTORE-DRILL.md` is validated on the PYTHIA → PROTEUS path.
+- ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
+- ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
+- ✅ **Webhook retry state machine + leases + outbox discipline** — persisted leases, one-success-per-chain guards, repair worker separation, bulk-create parity, and terminal success trigger.
+- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 23 tools from `mnemos/mcp/tools/`, including CRUD, KG, DAG, bulk create, stats, deletion-request management, model recommendation, KRONOS observability, and the PANTHEON model facade.
+- ✅ **Faithful OpenAI-compatible gateway** — propagated generation controls, OpenAI-format SSE, registry-honest model discovery, and explicit 400/404 responses when the selected provider cannot honor a requested feature.
+- ✅ **Namespace-uniform tenancy** — state, journal, entities, sessions, consultations, webhooks, and memory read/history paths use the owner+namespace discipline.
+- ✅ **PostgreSQL streaming-replication doctrine** — single-site HA uses Postgres primary/standby replication; MNEMOS federation is for remote or curated data flows.
+- ✅ **Compression cleanup** — live compression is APOLLO + ARTEMIS through the contest worker; retired compatibility shims and vestigial session compression columns are gone.
+- ✅ **GDPR right-to-be-forgotten** — deletion-request lifecycle (`requested → confirmed → soft_deleted → restored | hard_deleted | cancelled`) plus soft-delete worker (Phase B) and hard-delete worker (Phase C). 30-day restore window; trigger-suppressed hard delete preserves the audit chain.
+- ✅ **MORPHEUS slices 3 + 4** — CONSOLIDATE phase merges near-duplicate clusters into a canonical with read-only pointers (`permission_mode=0o400`, `consolidated_into`); EXTRACT phase mines latent KG triples from prose `verbatim_content`. Both phases opt-in, namespace-scoped, rollbackable via `morpheus_run_id`.
+- ✅ **PERSEPHONE archival subsystem** — cold-set rotation moves rarely-recalled memories into a zstd-compressed `memory_archive` table with stub-pointer in `memories`. Restore on demand. Federation-aware (peers see archive marker via the version trigger).
+- ✅ **PANTHEON + IRIS unified LLM facade** — OpenAI-compat `/pantheon/v1/{models,chat/completions,embeddings,route/explain}`. Auto-populated catalog from GRAEAE muses; alias prefix resolver (`auto:reasoning`, `auto:cheap`, `auto:fast`, `consensus:<task>`); per-(user,session) caps on `consultation_only` tier; rolling-window adaptive routing. IRIS exposes `pantheon_list_models` + `pantheon_route_explain` MCP tools.
+- ✅ **KRONOS v0.1** — recall-pattern anomaly detection (z-score over `recall_count` history), namespace drift detection, recall-load forecasting (EWMA), PERSEPHONE eligibility forecast. CPU-only via numpy; Tesseract GPU integration deferred to v5.1.
+- ✅ **DAG wiring for compression derivations** — every successful compression contest persists a child row in `memory_versions` parented to the source memory's `branch='main'` HEAD on `branch='distilled'` or `branch='narrated'`; `change_type='compress'` extends the CHECK constraint; commit hash is content-derived.
+- ✅ **NATS substrate v0.2** — bounded next slice. PANTHEON routing-log → `mnemos.pantheon.routing` opt-in publish; `pantheon_routing_audit` table fed by an optional consumer worker.
+- ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 23 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
+- ✅ **Document-import retry-safety** — content-derived `import_chunk_key` prevents duplicate chunk insertion on retry; ON CONFLICT (key) DO UPDATE returns canonical row id.
+- ✅ **Connector smoke gallery** — end-to-end smoke per surface (Claude Code, Cursor, Codex CLI, Continue, Cline, Claude Desktop, ChatGPT) with mechanically-validated JSON snippets.
+- ✅ **Rust hot-path accelerator (mnemos_hot v0.2)** — Rust implementations of cosine, top_k, batch cosine, embedding parse, embedding L2-normalize, composite search re-rank, deterministic judge scoring, and SHA-256 batch hashing. All wired with MNEMOS_HOT_RS_ENABLED=1 opt-in plus identical Python fallback.
+- ✅ **Coherent package layout** — production code now lives under `mnemos/` with `api/routes`, `core`, `db`, `domain`, `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`, `tools`, and `cli` subpackages.
+- ✅ **Persistence abstraction** — `PersistenceBackend` owns the contract; `PostgresBackend` uses asyncpg + pgvector + RLS + LISTEN/NOTIFY, and `SqliteBackend` uses aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL.
+- ✅ **Deployment profiles** — `server`, `edge`, and `dev` select safe defaults through `MNEMOS_PROFILE` or `mnemos serve --profile`.
+- ✅ **Multi-worker support** — Redis-backed circuit breaker, rate limiter, and concurrency limiter coordinate API workers; in-process fallback remains for single-worker dev and edge installs.
+- ✅ **Single-binary distribution** — PyInstaller artifacts for linux-x86_64, linux-aarch64, and macos-aarch64 bundle sqlite-vec and the migration chain.
+- ✅ **Unified CLI** — `mnemos serve / install / worker / export / import / consult / health / version` replaces the old top-level Python entry points.
+- ✅ **Architectural enforcement** — seven import-linter contracts keep API, domain, db, core, persistence, MCP, and webhook boundaries honest in CI.
+- ✅ **GRAEAE mode validation** — routing modes plus `single`, `debate`, and `majority` are modeled as a `Literal`; unknown modes 422 instead of falling through.
+- `bulk_create_memories` now runs through the backend transaction and webhook outbox surface, so it works on SQLite-backed edge profiles as well as Postgres-backed server profiles.
+- The SQLite-backed `edge` profile intentionally exposes a narrower HTTP API: sessions, entities, state, and MORPHEUS telemetry routes return 503 because those surfaces still depend on server-profile Postgres SQL.
+- MORPHEUS run and cluster endpoints are operator-only telemetry. They require root credentials because responses can include namespaces, configs, errors, and memory IDs across tenants.
+- v5.0 still does not ship the separate web frontend, mobile clients, or hosted MNEMOS Cloud; those remain roadmap items.
+- The PROTEUS barrage exposed long-tail latency under sustained 50-concurrent writes (p99 ~33s). Search and read paths held up well (search p99 ~300ms; reads p50 ~120ms). Tuning the worker / pool budget is a v5.1 target.
+- PANTHEON v0.2 caps live in an in-process bucket; horizontal scaling needs a Redis-backed cap store (deferred to v5.1+).
+- Web UX in the separate `mnemos-web` frontend repo
+- Mobile clients: Android Termux hardening first, iOS native later
+- Hosted MNEMOS Cloud and foundation-tier OSS standardization work (MCP-MD via LF AI & Data) in the v5.x+ frame
+- Hatchet workflow-engine integration alongside the NATS substrate (deferred from v5.0)
+- KRONOS Tesseract GPU integration (deferred from v5.0)
+
 ## [Unreleased]
 
 ### Fixed — Webhook deliveries limit cap + capabilities GIN index (#205)
@@ -341,7 +394,7 @@ Module-path corrections:
   Same file's `tools/mpf_dump.py` / `tools/mpf_load.py` updated to
   `mnemos/tools/memory_export.py` / `mnemos/tools/memory_import.py`
   / `mnemos/tools/mpf_validate.py`.
-- `docs/V3_5_CHARTER.md:328` + `V3_6_CHARTER.md:141` show
+- `docs/history/V3_5_CHARTER.md:328` + `docs/history/V3_6_CHARTER.md:141` show
   `python3 -m mnemos.iris.server` as a planned MCP server. The
   module was never implemented; added a "historical" note next
   to each block pointing readers at the live MCP model tools at
@@ -456,7 +509,7 @@ Updated "current state" claims (left historical mentions alone):
   — release-line headers (4.0.0 → 5.3.2!) + install pins +
   download URLs.
 - `ROADMAP.md` — "Current status" header.
-- `EVOLUTION.md` — "current vX.Y release line" line.
+- `docs/history/EVOLUTION.md` — "current vX.Y release line" line.
 - `docs/OPERATIONS.md` — header + §11.1 Architecture banner.
 - `docs/INSTALL.md` — install matrix + bundle commands.
 - `docs/SPECIFICATION.md` — header version + "Authoritative for
@@ -2748,8 +2801,8 @@ export under REPEATABLE READ READ ONLY).
 - **`docker-compose.staging.yml`** — PROTEUS staging compose,
   Postgres bound to :5433 (host-Postgres collision avoidance),
   pre-init `mnemos` role for fresh DB initialization.
-- **v3.4 planning charters + ops doc** — `docs/V3_5_CHARTER.md`,
-  `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md`, `docs/OPERATIONS.md`,
+- **v3.4 planning charters + ops doc** — `docs/history/V3_5_CHARTER.md`,
+  `docs/history/V3_6_CHARTER.md`, `docs/history/V4_PLAN.md`, `docs/OPERATIONS.md`,
   `docs/PANTHEON.md` (extended with charter-bound sidecar
   ownership rules), `ROADMAP.md` cut.
 
@@ -2787,7 +2840,7 @@ export under REPEATABLE READ READ ONLY).
 ## [3.3.0] — 2026-04-26
 
 Compression-stack settlement, CI policy flip to GitLab, MORPHEUS
-slice 2 (real cluster + synthesise), and the EVOLUTION.md origin
+slice 2 (real cluster + synthesise), and the docs/history/EVOLUTION.md origin
 narrative. Closes the v3.2 compression-stack open question by
 retiring ALETHEIA from the default contest.
 
@@ -2805,7 +2858,7 @@ retiring ALETHEIA from the default contest.
   Every search result increments the recall counter and updates
   the timestamp. Useful for downstream "warmest" / "coldest"
   prioritization queries.
-- **`docs/EVOLUTION.md`** — five-month development timeline from
+- **`docs/history/EVOLUTION.md`** — five-month development timeline from
   v0.1 design review through v3.2 compression-stack settlement.
   Restructured to put origin story in v1.0 section + ADR block
   for release-gate decisions.

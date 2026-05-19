@@ -140,16 +140,8 @@ gone; operators use the single `mnemos` command.
 - 1055 unit tests passing, with GitLab integration tiers for cross-namespace
   isolation, multi-worker smoke, and Postgres/SQLite persistence parity.
 
-MNEMOS has been in daily production use since December 2025. The current release
-line is **v5.0.1**, on top of the v5.0.0 GA shipped on **2026-05-02** which
-closed the v3.6 + v4.x charters and rolled up the v4.2.0a14 alpha line. The v5.0
-release was the first to ship the full divergent dream-state pipeline
-(CONSOLIDATE + EXTRACT phases), right-to-be-forgotten worker, PERSEPHONE
-archival, PANTHEON unified LLM facade, and KRONOS recall observability —
-alongside the v4.1 foundation of multi-backend persistence, deployment profiles,
-single-binary builds, and multi-worker coordination. The v5.0.x line iterates
-on top with timezone hardening, MCP HTTP/SSE expansion, MPF v0.2 portability,
-and a tightening of the dead-code surface across the audit slices.
+The current release line is **v5.0.1**. See [`CHANGELOG.md`](./CHANGELOG.md)
+for release history and [`ROADMAP.md`](./ROADMAP.md) for forward-looking scope.
 
 ## Quick Install
 
@@ -195,198 +187,29 @@ instructions.
 | `edge` | SQLite + sqlite-vec | In-process single-worker state | Laptops, Pi-class hosts, local appliances, Termux-style installs |
 | `dev` | SQLite + sqlite-vec | In-process single-worker state + DEBUG logging | Local development and tests |
 
-## Works with
+## Architecture
 
-MNEMOS is designed to be the memory layer for the agentic tooling you already use — not a replacement for it. We interoperate on purpose, over three mechanisms, so there is no language lock-in and no pressure to rewrite your agent around us.
-
-### How we interoperate
-
-1. **MCP (Model Context Protocol).** MNEMOS ships stdio and HTTP/SSE MCP transports (`mnemos.mcp.stdio`, `mnemos.mcp.http`) that expose memory operations — search, create, update, delete, DAG versioning, model optimizer — as first-class tool calls. Register it in any MCP-aware client (Claude Code, OpenClaw, ZeroClaw, Hermes) and the agent gets persistent memory without your framework having to know MNEMOS exists at the code level.
-2. **OpenAI-compatible gateway.** `POST /v1/chat/completions` and `GET /v1/models` are drop-in for the OpenAI SDK. Point `OPENAI_BASE_URL` at your MNEMOS instance and any client that already speaks OpenAI gets memory injection, multi-provider routing, propagated generation controls (`temperature`, `max_tokens`, `top_p`), streaming SSE, and explicit 400s when the selected provider cannot honor tools, response formats, penalties, or multimodal content. Request-level opt-out is available with `X-Mnemos-Inject-Memory: false` or body field `mnemos_inject_memory: false`. This is the path for LangChain, LlamaIndex, CrewAI, AutoGen, and anything else that was written against the OpenAI wire protocol.
-3. **Native `/v1/*` REST surface.** For integrations that want to speak to MNEMOS directly: `/v1/memories`, `/v1/consultations`, `/v1/providers`, `/v1/sessions`, `/v1/webhooks`, `/v1/federation`, `/v1/kg/triples`. The full API is language-agnostic; pick your HTTP client and go.
-
-Current MCP tools come from one registry shared by stdio and HTTP/SSE
-(23 tools total): `search_memories`, `list_memories`, `get_memory`,
-`create_memory`, `update_memory`, `delete_memory`,
-`bulk_create_memories`, `list_deletions`, `get_stats`,
-`kg_create_triple`, `kg_search`, `kg_timeline`, `update_triple`,
-`delete_triple`, `log_memory`, `branch_memory`, `diff_memory_commits`,
-`checkout_memory`, `recommend_model`, `pantheon_list_models`,
-`pantheon_route_explain`, `kronos_anomalies`, and `kronos_forecast`.
-
-### Bridge family (Phase 2 of the consolidation, shipped 2026-05-04)
-
-For agent surfaces that don't speak MCP natively, the **`mnemos-bridge-*`**
-package family provides per-surface adapters that translate MCP tool
-definitions into each target SDK's tool-call shape and dispatch tool calls
-back through MCP to MNEMOS. All adapters share a single
-**`mnemos-bridge-core`** library that handles transport, schema
-translation (OpenAI / Gemini / Anthropic dialects), result rendering,
-auth resolution, and dispatch.
-
-```
-gitlab.com/ncz-os/
-├── mnemos-bridge-core              v0.1.3   shared lib (32 tier-1 + live MCP smoke)
-├── mnemos-bridge-openai            v0.1.1   OpenAI Chat Completions + Agents SDK (gpt-5 verified live)
-├── mnemos-bridge-gemini            v0.1.1   Google Gemini SDK + Vertex AI (gemini-3-pro-preview verified live)
-├── mnemos-bridge-anthropic         v0.1.0   Anthropic API (claude-opus-4-7 verified live)
-├── mnemos-bridge-aider             v0.1.0   Aider CLI sidecar + plugin
-├── mnemos-bridge-crewai            v0.1.0   CrewAI BaseTool wrapper (8/8 tests against crewai 1.14)
-└── mnemos-bridge-claude-connector  v0.1.0   OAuth 2.1 + PKCE shim for Claude.ai Connectors
+```text
+Agents / MCP clients / OpenAI-compatible SDKs
+        │
+        │  REST, MCP stdio, MCP HTTP/SSE
+        ▼
+mnemos.api.routes  ->  mnemos.domain  ->  mnemos.db
+        │                    │                │
+        │                    ▼                ▼
+        │             GRAEAE / MOIRAI    PersistenceBackend
+        │                                  ├─ PostgresBackend
+        │                                  └─ SqliteBackend
+        ▼
+mnemos.core lifecycle/config/visibility
+        │
+        ├─ mnemos.webhooks
+        ├─ mnemos.workers
+        ├─ mnemos.mcp
+        └─ mnemos.cli
 ```
 
-Install whichever you need:
-
-```bash
-pip install mnemos-bridge-openai          # or any other adapter; each pulls core
-```
-
-Each adapter exposes the same shape — `MnemosXxxAdapter.connect(mcp_url, mcp_token)`
-returns a context-manageable adapter with `.openai_tools()` /
-`.gemini_tools()` / `.anthropic_tools()` (etc.) plus a per-target
-`.handle_tool_call()` round-trip helper. The connector docs in
-[`docs/connectors/`](./docs/connectors/) show the registration recipe
-per surface.
-
-Tier-2 live integration tests run against real model APIs whenever
-`OPENAI_API_KEY`, `GOOGLE_API_KEY`, and `ANTHROPIC_API_KEY` are present.
-The bridges are tested against PYTHIA's MCP HTTP/SSE on port 5003.
-
-### Today's integration inventory
-
-- **[Claude Code](https://www.anthropic.com/claude-code)** — drop-in hooks (session-start / user-prompt-submit / stop), skill config, and MCP server. See `integrations/claude-code/`. *MCP.*
-- **[OpenClaw](https://github.com/openclaw/openclaw)** — AGENTS.md skill snippet + MCP registration. See `integrations/openclaw/`. *MCP.*
-- **[ZeroClaw](https://github.com/zeroclaw-labs/zeroclaw)** — memory skill over MCP. Works without adding any Python dependency to ZeroClaw's Rust runtime — memory ops cross the wire to a MNEMOS instance running wherever. See `integrations/zeroclaw/`. *MCP.*
-- **[Hermes Agent](https://github.com/nousresearch/hermes-agent)** — optional persistence backend for team / multi-tenant / compliance-regulated Hermes deployments. See `integrations/hermes/`. *MCP + REST.*
-- **[MemPalace](https://github.com/MemPalace/mempalace)** — graduation path, not a replacement. A portability schema + importer lets a MemPalace user who grows into a team preserve their drawers and palaces rather than start over. See [RFC #1112 on MemPalace](https://github.com/MemPalace/mempalace/discussions/1112). *REST bulk import.*
-- **[Mem0](https://github.com/mem0ai/mem0) / [Letta](https://github.com/letta-ai/letta) / [Zep](https://github.com/getzep/zep)** — one-shot bulk consolidation via `POST /v1/memories/bulk`. If you already have a running memory store elsewhere and need to converge, MNEMOS is where they converge *to*. *REST bulk import.*
-- **[LangChain](https://github.com/langchain-ai/langchain) / [LlamaIndex](https://github.com/run-llama/llama_index)** — works today via the **OpenAI-compatible gateway**: point `OPENAI_BASE_URL` at MNEMOS and memory injection + multi-provider routing land automatically. *OpenAI-compat.*
-- **[CrewAI](https://github.com/crewAIInc/crewAI) / [AutoGen](https://github.com/microsoft/autogen)** — shared memory across agents in a crew / group. Works today via the **OpenAI-compatible gateway**. *OpenAI-compat.*
-
-The integrations bundle under [`integrations/`](./integrations/) is the living inventory. New integrations ship as SKILL.md + MCP config + enforcement snippet per framework, plus idempotent install/uninstall scripts where the target framework supports them.
-
-MNEMOS runs as a network service. In the `server` profile you deploy it alongside PostgreSQL and Redis so every agent in your stack shares the same memory kernel over REST; in the `edge` profile it runs as an all-in-one SQLite-backed node for laptops, Pi-class systems, and phone-adjacent installs. It is not an in-process helper or a framework you import.
-
 ---
-
-## Why this exists
-
-MNEMOS was built out of a very practical frustration: serious agentic systems keep losing context at exactly the moment reliability starts to matter.
-
-In most AI tooling, memory is still treated like a convenience feature. A session ends, context evaporates, and the next run has to reconstruct the same decisions, assumptions, architecture tradeoffs, and operating knowledge from scratch. That may be tolerable for hobby projects. It is not good enough for professional users building production systems.
-
-The first version of the problem looked simple. Keep a large context file, inject it into the prompt, and move on. That works until the context becomes expensive, stale, opaque, and impossible to selectively trust. When you compress it, you no longer know exactly what was removed. When multiple agents need it, the whole approach collapses into duplication and drift.
-
-The second version of the problem was operational. Real agentic development means multiple models, multiple providers, failure modes, cost pressure, and different classes of tasks. Memory that cannot survive provider failure, cannot be shared across agents, or cannot explain its own transformations is not really infrastructure.
-
-MNEMOS was built to solve those problems in a way that reflects real platform experience: provenance matters, compression should be inspectable, shared systems need access controls, and memory should behave like a service you can operate, not a feature you hope keeps working.
-
-Its design is informed by years of enterprise platform work, large-vendor systems thinking, open-source infrastructure experience, and current work in the AI industry, without assuming that professional users want marketing language where they really need operational clarity.
-
-**MNEMOS has been in daily production use since December 2025**, backing multiple active agentic systems simultaneously. By early 2026 the running install was holding thousands of memories and had performed thousands of compressions, each with a written quality manifest. The v3.0 release line unified that production codebase into the single-service FastAPI shape; **v5.0.0 is the GA line that closed the v3.6 + v4.x charters**, adding the divergent dream-state pipeline (CONSOLIDATE + EXTRACT), GDPR right-to-be-forgotten worker, PERSEPHONE archival, PANTHEON unified LLM facade, KRONOS recall observability, DAG wiring for compression derivations, and the V4 §6.4 cross-tenant security gates on top of the v4.1 foundation. **v5.0.1 is the current shipped release**, iterating on top with timezone hardening, MCP HTTP/SSE expansion, MPF v0.2 portability, and audit-driven dead-code cleanup. See [`CHANGELOG.md`](./CHANGELOG.md) for the release history.
-
-For the longer story — the original catalyzing moment, the architectural decisions (and mistakes) that took MNEMOS from a single-file prototype to a unified runtime, and the scrubs, refactors, and release-gate audits that landed the public cut — see [`EVOLUTION.md`](./EVOLUTION.md). Written for future contributors as much as for future readers who want to know what they're inheriting.
-
----
-
-## Who this is for
-
-MNEMOS is built for the teams and operators who have already outgrown the prototype memory layer.
-
-**You probably want MNEMOS if:**
-
-- You run multiple agents, or multiple LLM providers, and they need to share a consistent memory pool that survives process restarts and provider outages.
-- Your agents produce outputs someone downstream has to trust — an auditor, a regulator, a customer, a compliance team, yourself in six months.
-- You care whether your memory layer can corrupt, silently swallow writes, or quietly truncate things you wanted to keep.
-- You need real auth (API keys *and* OAuth/OIDC) and real multi-tenant isolation, not a bearer-token sticker over a single-user SQLite file.
-- You have regulatory pressure around reasoning traceability — EMIR Article 57, SOC-2 evidence, GDPR right-to-explanation, or internal model-governance review boards.
-- You need a memory substrate that survives schema migrations, provider circuit-breakers, and federation failures without hand-holding.
-
-**Who this is actually serving, concretely:**
-
-- **Agentic-tooling teams** running multi-agent stacks (crews, swarms, orchestrators) that keep losing shared context at the process boundary.
-- **Platform teams inside larger orgs** wiring LLM routing + memory into an internal developer platform and needing a substrate they can operate, not babysit.
-- **Regulated-industry AI teams** (finance, healthcare, legal, public sector) that need a cryptographic audit trail on every reasoning step and cannot ship without one.
-- **Research labs** exploring consensus-reasoning, long-horizon agent memory, and memory-poisoning defenses — MNEMOS ships DAG versioning and an anti-poisoning guide precisely because those problems are real.
-- **Founders** who've already hit the ceiling of in-process memory libraries and need something that survives process restarts, schema changes, and multi-agent concurrency.
-- **The 56-year-old former IBM / Microsoft veteran** who has been thoroughly indoctrinated into architectural thinking and mission-critical design, and physically cringes at a memory layer that doesn't have the "-isms" and "-itabilities" thought through — atomicity, idempotency, referential integrity, ACIDism on the write path; durability, recoverability, observability, auditability, testability on the operate path; the things your old DBA would have red-pen'd in a review twenty years ago and your old SRE would red-pen now. This is for you. We know.
-
-**You probably don't need MNEMOS if:**
-
-- You are building a single-user chatbot for personal note-taking and raw similarity search over ChromaDB is fine.
-- You only need short-term conversation history within a single session and your SDK already handles that.
-- You don't care whether compressed context is faithful to the original — the "toy" solutions are honest about not providing that guarantee.
-- The phrases *audit trail*, *tamper evidence*, *multi-tenant isolation*, and *compression manifest* don't mean anything to your use case and never will.
-
-If you're in the first list, MNEMOS is designed specifically for you. If you're in the second list, something lighter will serve you better — use Mem0, Zep, or in-process summary buffers. They exist because those use cases are real. MNEMOS is the answer to a different question.
-
----
-
-## Why use this
-
-The field of agent memory systems is crowded and getting more so. Here is the honest case for MNEMOS.
-
-**Most memory systems answer one question badly:** "What did this agent say before?"
-
-That is conversation history. It is useful, but it is not memory infrastructure. Conversation history dies when the session ends, scales to one agent, and tells you nothing about whether the information it contains is still accurate, still complete, or safe to rely on.
-
-MNEMOS answers a different set of questions:
-
-- *When I compressed that memory to fit in a context window, what did I throw away — and was it safe to throw away?*
-- *If three of my LLM providers go down, does my reasoning layer fail or degrade gracefully?*
-- *Can multiple agents share one memory pool without rebuilding context from scratch each session?*
-
-If none of those questions matter for your use case, a simpler tool is probably the right choice. If they do matter, read on.
-
-### The specific gaps in the alternatives
-
-| System | What it does | What it cannot tell you |
-|--------|-------------|------------------------|
-| [**MemGPT / Letta**](https://github.com/letta-ai/letta) | Hierarchical paging within a single agent session | What was lost in compression; what happens when the LLM provider fails |
-| [**Mem0**](https://github.com/mem0ai/mem0) | Store and retrieve memories via API | Compression quality; reasoning consensus |
-| [**Zep**](https://github.com/getzep/zep) | Conversation history + entity extraction | Compression manifests; multi-provider reasoning |
-| [**LangChain**](https://github.com/langchain-ai/langchain) / [**LlamaIndex**](https://github.com/run-llama/llama_index) memory | In-process buffer or summary | Anything after the process exits |
-| [**MemPalace**](https://github.com/mempalace/mempalace) | Desktop-library long-horizon memory with spatial retrieval and AAAK compression; single-user, in-process | Multi-process deployment; multi-user isolation; network-service semantics |
-| [**CrewAI**](https://github.com/crewAIInc/crewAI) / [**AutoGen**](https://github.com/microsoft/autogen) memory | Per-crew or per-agent embedded memory | Cross-session persistence; compression quality |
-
-### What MNEMOS does that none of them do
-
-**Quality contracts on compression.** When MNEMOS compresses a memory, it produces a manifest: what was removed, what was preserved, the quality rating, and which use cases the compressed version is and is not safe for. No other memory system treats compression as something that requires a receipt. The compression pipeline runs in the background distillation worker through the plugin `CompressionEngine` ABC, a competitive per-memory contest, and a persisted audit log recording every winner and loser with its score and disqualification reason.
-
-**A reasoning layer that degrades gracefully.** GRAEAE distributes queries across multiple LLM providers simultaneously, scores responses on relevance, coherence, completeness, and toxicity, and returns the best result. Per-provider circuit breakers prevent a failing provider from degrading the pool. A semantic cache means identical questions skip inference entirely. This is not a load balancer — it is a quality-gated reasoning bus.
-
-**A knowledge graph alongside free-text memory.** MNEMOS stores structured triples (subject → predicate → object) with temporal validity windows alongside unstructured memories, and exposes a timeline API per subject. Most memory systems are text-only.
-
----
-
-### MemPalace and MNEMOS: different problems, not competitors
-
-MemPalace, created by Mila Jovanovic, has pushed long-horizon agent memory into the ecosystem in a way few other projects have. The LongMemEval benchmark attention, the AAAK abbreviation research, and the Palace spatial-memory metaphor are real contributions to a problem — keeping agent memory useful across long time horizons without context explosion — that is genuinely unsolved and genuinely hard. It's work worth taking seriously, and MNEMOS has been influenced by several of its ideas.
-
-In particular, MNEMOS shares MemPalace's bets that:
-
-- Memory deserves first-class treatment as a data structure, not as a side-effect of conversation history.
-- Compression is a design axis, not an afterthought: if you keep everything raw you lose the context-window fight, and if you compress naively you lose fidelity.
-- Long-horizon memory needs structure. Whether you call it a "palace", a DAG, or a temporal knowledge graph, the point is that flat vector similarity runs out of answers fast.
-
-**MNEMOS is not trying to replace MemPalace.** The two projects are solving adjacent problems with different shapes, for different users:
-
-| | MemPalace | MNEMOS |
-|---|---|---|
-| **Form factor** | Desktop library, embedded in-process | Network service (FastAPI on port 5002), runs as a daemon |
-| **Deployment** | `pip install`, runs inside your agent | Deployed alongside your stack the way you'd run PostgreSQL or Redis; many agents and processes connect over REST |
-| **Storage** | ChromaDB (SQLite-backed vector store) | Postgres + pgvector for server deployments, or SQLite + sqlite-vec for edge/dev profiles |
-| **Primary user** | Individual developer on a single machine | Teams / platforms operating shared infrastructure |
-| **Concurrency model** | Single-process, single-user | Multi-tenant with per-owner isolation, multi-process clients |
-| **Audit surface** | Local logs | SHA-256 hash-chained audit chain, tamper-evident and externally reviewable |
-| **Reasoning** | Storage + retrieval | GRAEAE multi-LLM consensus with quality scoring and provider failover |
-
-If you are one developer building a personal agent that runs on your laptop and you want it to work offline with no infrastructure overhead, MemPalace is designed exactly for that and is a legitimate, well-constructed choice.
-
-If you are a team or a platform deploying shared agent memory that multiple processes need to access concurrently, with an audit trail that stands up to external review, a DB backend that survives crashes and schema migrations, and a reasoning layer you can point a regulator or auditor at, MNEMOS is designed for that.
-
-The shared premise — that agent memory deserves first-class treatment — is the same. The deployment target is not. Please don't read this section as a takedown; it's a map.
-
 
 ## What works now
 
@@ -723,128 +546,6 @@ Compression has been operator-batched since v4.0. It is not an automatic session
 - Diff and revert API: `GET /v1/memories/{id}/versions`, `GET /v1/memories/{id}/versions/{n}`, `GET /v1/memories/{id}/diff`, `POST /v1/memories/{id}/revert/{n}`. Non-root callers see only snapshots whose own `owner_id` / `namespace` / `permission_mode` pass `version_visibility_predicate` (`mnemos/core/visibility.py`).
 - DAG (git-like) versioning: `GET /v1/memories/{id}/log`, `POST /v1/memories/{id}/branch`, `POST /v1/memories/{id}/merge`, `GET /v1/memories/{id}/commits/{commit}`. Logs do not bridge across invisible snapshots; a visible child whose immediate parent is hidden reports `parent_hash=null`.
 - SHA-256 hash-chained audit log for consultations: `GET /v1/consultations/audit`, `GET /v1/consultations/audit/verify`
-
----
-
-## Roadmap
-
-### Shipped in v3.0
-
-Landed with the v3.0 release line:
-
-- ✅ **Webhook subscriptions** — outbound notifications on memory write, consultation completion. HMAC-signed delivery, retry with exponential backoff.
-- ✅ **OAuth/OIDC authentication** — browser-based login via Google, GitHub, Azure AD, or custom OIDC providers. Coexists with existing API-key auth.
-- ✅ **Cross-instance memory federation** — pull-based peer sync with Bearer-authenticated peers. Federated memories stored locally with `federation_source` metadata, `fed:{peer}:{remote_id}` id prefix, and a background worker that respects per-peer sync intervals.
-
-### Shipped in v3.1 (compression platform — carried forward in v3.2.x)
-
-- ✅ **Plugin `CompressionEngine` ABC** — open extension point; operators register additional engines alongside the built-ins (APOLLO + ARTEMIS).
-- ✅ **Competitive-selection compression contest** — every eligible engine runs per memory; highest composite_score wins; every loser recorded with its reject_reason. Scoring profile is operator-configurable (`balanced` | `quality_first` | `speed_first` | `custom`).
-- ✅ **Persisted audit log** — three new tables (`memory_compression_queue`, `memory_compression_candidates`, `memory_compressed_variants`) with full history queryable via `GET /v1/memories/{id}/compression-manifests`.
-- ✅ **GPU circuit breaker** — per-endpoint three-state breaker (CLOSED → OPEN → HALF_OPEN → CLOSED); gpu_required engines fast-fail during outages instead of piling requests onto a dead endpoint.
-- ✅ **Admin enqueue endpoints** — `POST /admin/compression/enqueue` (specific memory IDs) and `POST /admin/compression/enqueue-all` (bulk with filters) for operators to drive the contest from the API layer.
-- ✅ **Optional too-short content gate** — `MNEMOS_CONTEST_MIN_CONTENT_LENGTH` skips memories below a threshold before spending GPU time on content that can't be meaningfully compressed.
-- ✅ **v2 versioning trigger bytea fix** — the `mnemos_version_snapshot()` trigger no longer crashes on memories containing backslash sequences (common in code, paths, regex, logs).
-
-### Shipped in v3.4.1
-
-- ✅ **CHARON federation schema preflight** — peers exchange schema signatures before sync and return 409 on incompatible strict-mode pairings.
-- ✅ **Dev↔prod MPF restore drill** — `docs/RESTORE-DRILL.md` is validated on the PYTHIA → PROTEUS path.
-
-### Shipped in v3.5.0
-
-- ✅ **Slice 1: audit quick wins** (`a62a099`) — session history returns the most recent messages first with deterministic system-row pinning, and project URLs now point at `mnemos-os/mnemos`.
-- ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`) — shared memory read visibility, per-snapshot history visibility, same-memory DAG guards, race-safe branch creation, `MN001` to HTTP 409 reconciliation guidance, and a compose `postgres-upgrade` service for existing volumes.
-- ✅ **Webhook retry state machine + leases + outbox discipline** — persisted leases, one-success-per-chain guards, repair worker separation, bulk-create parity, and terminal success trigger.
-- ✅ **MCP unified registry** — stdio and HTTP/SSE expose the same 23 tools from `mnemos/mcp/tools/`, including CRUD, KG, DAG, bulk create, stats, deletion-request management, model recommendation, KRONOS observability, and the PANTHEON model facade.
-- ✅ **Faithful OpenAI-compatible gateway** — propagated generation controls, OpenAI-format SSE, registry-honest model discovery, and explicit 400/404 responses when the selected provider cannot honor a requested feature.
-- ✅ **Namespace-uniform tenancy** — state, journal, entities, sessions, consultations, webhooks, and memory read/history paths use the owner+namespace discipline.
-- ✅ **PostgreSQL streaming-replication doctrine** — single-site HA uses Postgres primary/standby replication; MNEMOS federation is for remote or curated data flows.
-- ✅ **Compression cleanup** — live compression is APOLLO + ARTEMIS through the contest worker; retired compatibility shims and vestigial session compression columns are gone.
-
-### v3.5.1
-
-v3.5.1 is a documentation-triage patch shipped on 2026-04-28. It bumps package/runtime version metadata to 3.5.1 and reconciles release-state docs with the v3.5.0 GA tag; it does not change product behavior from v3.5.0.
-
-### Shipped in v5.0.0
-
-- ✅ **GDPR right-to-be-forgotten** — deletion-request lifecycle (`requested → confirmed → soft_deleted → restored | hard_deleted | cancelled`) plus soft-delete worker (Phase B) and hard-delete worker (Phase C). 30-day restore window; trigger-suppressed hard delete preserves the audit chain.
-- ✅ **MORPHEUS slices 3 + 4** — CONSOLIDATE phase merges near-duplicate clusters into a canonical with read-only pointers (`permission_mode=0o400`, `consolidated_into`); EXTRACT phase mines latent KG triples from prose `verbatim_content`. Both phases opt-in, namespace-scoped, rollbackable via `morpheus_run_id`.
-- ✅ **PERSEPHONE archival subsystem** — cold-set rotation moves rarely-recalled memories into a zstd-compressed `memory_archive` table with stub-pointer in `memories`. Restore on demand. Federation-aware (peers see archive marker via the version trigger).
-- ✅ **PANTHEON + IRIS unified LLM facade** — OpenAI-compat `/pantheon/v1/{models,chat/completions,embeddings,route/explain}`. Auto-populated catalog from GRAEAE muses; alias prefix resolver (`auto:reasoning`, `auto:cheap`, `auto:fast`, `consensus:<task>`); per-(user,session) caps on `consultation_only` tier; rolling-window adaptive routing. IRIS exposes `pantheon_list_models` + `pantheon_route_explain` MCP tools.
-- ✅ **KRONOS v0.1** — recall-pattern anomaly detection (z-score over `recall_count` history), namespace drift detection, recall-load forecasting (EWMA), PERSEPHONE eligibility forecast. CPU-only via numpy; Tesseract GPU integration deferred to v5.1.
-- ✅ **DAG wiring for compression derivations** — every successful compression contest persists a child row in `memory_versions` parented to the source memory's `branch='main'` HEAD on `branch='distilled'` or `branch='narrated'`; `change_type='compress'` extends the CHECK constraint; commit hash is content-derived.
-- ✅ **NATS substrate v0.2** — bounded next slice. PANTHEON routing-log → `mnemos.pantheon.routing` opt-in publish; `pantheon_routing_audit` table fed by an optional consumer worker.
-- ✅ **MCP §6.4 cross-tenant security gates** — uniform error-shape normalization across all 23 tools, parameter-shape audit log (no raw values), per-tool rate buckets, role + namespace validation in the dispatcher, root-bypass logged as warning, generic error messages from `_safe_path_*` helpers (no value echo).
-- ✅ **Document-import retry-safety** — content-derived `import_chunk_key` prevents duplicate chunk insertion on retry; ON CONFLICT (key) DO UPDATE returns canonical row id.
-- ✅ **Connector smoke gallery** — end-to-end smoke per surface (Claude Code, Cursor, Codex CLI, Continue, Cline, Claude Desktop, ChatGPT) with mechanically-validated JSON snippets.
-- ✅ **Rust hot-path accelerator (mnemos_hot v0.2)** — Rust implementations of cosine, top_k, batch cosine, embedding parse, embedding L2-normalize, composite search re-rank, deterministic judge scoring, and SHA-256 batch hashing. All wired with MNEMOS_HOT_RS_ENABLED=1 opt-in plus identical Python fallback.
-
-### Shipped in v4.1.1
-
-- ✅ **Coherent package layout** — production code now lives under `mnemos/` with `api/routes`, `core`, `db`, `domain`, `persistence`, `mcp`, `webhooks`, `workers`, `hooks`, `installer`, `tools`, and `cli` subpackages.
-- ✅ **Persistence abstraction** — `PersistenceBackend` owns the contract; `PostgresBackend` uses asyncpg + pgvector + RLS + LISTEN/NOTIFY, and `SqliteBackend` uses aiosqlite + sqlite-vec + FTS5 + JSON1 + WAL.
-- ✅ **Deployment profiles** — `server`, `edge`, and `dev` select safe defaults through `MNEMOS_PROFILE` or `mnemos serve --profile`.
-- ✅ **Multi-worker support** — Redis-backed circuit breaker, rate limiter, and concurrency limiter coordinate API workers; in-process fallback remains for single-worker dev and edge installs.
-- ✅ **Single-binary distribution** — PyInstaller artifacts for linux-x86_64, linux-aarch64, and macos-aarch64 bundle sqlite-vec and the migration chain.
-- ✅ **Unified CLI** — `mnemos serve / install / worker / export / import / consult / health / version` replaces the old top-level Python entry points.
-- ✅ **Architectural enforcement** — seven import-linter contracts keep API, domain, db, core, persistence, MCP, and webhook boundaries honest in CI.
-- ✅ **GRAEAE mode validation** — routing modes plus `single`, `debate`, and `majority` are modeled as a `Literal`; unknown modes 422 instead of falling through.
-
-### v5.0.0 known limitations
-
-- `bulk_create_memories` now runs through the backend transaction and webhook
-  outbox surface, so it works on SQLite-backed edge profiles as well as
-  Postgres-backed server profiles.
-- The SQLite-backed `edge` profile intentionally exposes a narrower HTTP API:
-  sessions, entities, state, and MORPHEUS telemetry routes return 503 because
-  those surfaces still depend on server-profile Postgres SQL.
-- MORPHEUS run and cluster endpoints are operator-only telemetry. They require
-  root credentials because responses can include namespaces, configs, errors,
-  and memory IDs across tenants.
-- v5.0 still does not ship the separate web frontend, mobile clients, or hosted
-  MNEMOS Cloud; those remain roadmap items.
-- The PROTEUS barrage exposed long-tail latency under sustained 50-concurrent
-  writes (p99 ~33s). Search and read paths held up well (search p99 ~300ms;
-  reads p50 ~120ms). Tuning the worker / pool budget is a v5.1 target.
-- PANTHEON v0.2 caps live in an in-process bucket; horizontal scaling needs a
-  Redis-backed cap store (deferred to v5.1+).
-
-### Beyond v5.0
-
-Forward-looking scope is maintained in [`ROADMAP.md`](./ROADMAP.md), which lists shipped v3.x / v4.x / v5.0 scope and items explicitly deferred with rationale.
-
-Near-term not-yet-scoped candidates:
-
-- Web UX in the separate `mnemos-web` frontend repo
-- Mobile clients: Android Termux hardening first, iOS native later
-- Hosted MNEMOS Cloud and foundation-tier OSS standardization work (MCP-MD via LF AI & Data) in the v5.x+ frame
-- Hatchet workflow-engine integration alongside the NATS substrate (deferred from v5.0)
-- KRONOS Tesseract GPU integration (deferred from v5.0)
-
----
-
-## Architecture
-
-```text
-Agents / MCP clients / OpenAI-compatible SDKs
-        │
-        │  REST, MCP stdio, MCP HTTP/SSE
-        ▼
-mnemos.api.routes  ->  mnemos.domain  ->  mnemos.db
-        │                    │                │
-        │                    ▼                ▼
-        │             GRAEAE / MOIRAI    PersistenceBackend
-        │                                  ├─ PostgresBackend
-        │                                  └─ SqliteBackend
-        ▼
-mnemos.core lifecycle/config/visibility
-        │
-        ├─ mnemos.webhooks
-        ├─ mnemos.workers
-        ├─ mnemos.mcp
-        └─ mnemos.cli
-```
 
 ---
 

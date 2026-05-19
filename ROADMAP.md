@@ -175,11 +175,11 @@ Rolled out in stages, Saturn V-style — each stage delivers a usable payload on
 - KNOSSOS phase 2 and MemPalace re-engagement → deferred after v3.5.0; v3.5.x keeps the phase-1 stdio shim.
 - First wave of goodwill PRs to MemPalace → deferred after v3.5.0 (subject to the 3-4 PRs/24h-per-upstream rate-limit constraint per `~/.claude/rules/github-behavior.md`).
 
-**See:** `docs/V3_5_CHARTER.md`, `docs/V3_6_CHARTER.md`, `docs/V4_PLAN.md`, `docs/OPERATIONS.md` for locked scopes downstream of this tag.
+**See:** `docs/history/V3_5_CHARTER.md`, `docs/history/V3_6_CHARTER.md`, `docs/history/V4_PLAN.md`, `docs/OPERATIONS.md` for locked scopes downstream of this tag.
 
 ### v3.5.0 — audit hardening and uniform tenancy — **SHIPPED 2026-04-28**
 
-v3.5.0 shipped the audit-driven hardening branch that followed v3.4.1. It is not the PANTHEON/IRIS feature release originally sketched in `docs/V3_5_CHARTER.md`; that charter is now historical and its unshipped feature ideas move to later roadmap work.
+v3.5.0 shipped the audit-driven hardening branch that followed v3.4.1. It is not the PANTHEON/IRIS feature release originally sketched in `docs/history/V3_5_CHARTER.md`; that charter is now historical and its unshipped feature ideas move to later roadmap work.
 
 - ✅ **Slice 1: audit quick wins** (`a62a099`). Session history now returns the most recent rows first, pins/caps system rows deterministically, and project metadata points at `mnemos-os/mnemos`.
 - ✅ **Slice 2: memory-read tenancy + DAG integrity** (`d42c475`). Shared `read_visibility_predicate` gates memory list/get/search/rehydrate/gateway context; `version_visibility_predicate` gates version/log/commit/diff paths per snapshot; DAG writers use same-memory parent checks, target-head visibility gates, advisory-lock-before-row-lock ordering, race-safe branch creation, and `MN001` to HTTP 409 reconciliation.
